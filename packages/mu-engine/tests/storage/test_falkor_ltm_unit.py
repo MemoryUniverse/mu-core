@@ -34,6 +34,8 @@ def _ns(
     user: str = "u1",
     visibility: Visibility = Visibility.PRIVATE,
 ) -> Namespace:
+    if visibility is Visibility.SHARED:
+        return Namespace.shared(org=org, workspace=workspace, session="s1")
     return Namespace(org=org, workspace=workspace, user=user, session="s1", visibility=visibility)
 
 

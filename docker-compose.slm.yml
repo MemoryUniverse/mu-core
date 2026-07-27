@@ -1,0 +1,41 @@
+# mu-dev SLM — a REAL local LLM in its OWN GPU container (owner: "make anything in docker, use GPU").
+# Ollama serves Qwen2.5-0.5B-Instruct over an OpenAI-compatible API at :11434/v1; the engine's
+# litellm router calls it over real HTTP (real requests, zero mocks) — the offline stand-in for the
+# unreachable Azure gpt-4.1-mini. DEDICATED mu-dev-slm ONLY. NEVER touches milvus/gcmem.
+#
+#   standalone test:  docker compose -f docker-compose.slm.yml up -d
+#   pull the model:   docker exec mu-dev-slm ollama pull qwen2.5:0.5b
+#   OpenAI endpoint:  http://127.0.0.1:11435/v1/chat/completions   (model "qwen2.5:0.5b")
+#   (host port 11435 — 11434 is taken by a native host ollama; the container is isolated)
+#   stop:             docker compose -f docker-compose.slm.yml down
+
+name: mu-dev-slm
+
+services:
+  slm:
+    image: ollama/ollama:latest
+    container_name: mu-dev-slm
+    ports:
+      - "127.0.0.1:11435:11434"
+    volumes:
+      - mu-dev-slm-data:/root/.ollama
+    environment:
+      # be a good neighbour on the shared 4GB GPU: keep the model resident, one at a time
+      OLLAMA_KEEP_ALIVE: "30m"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+volumes:
+  mu-dev-slm-data:

@@ -23,7 +23,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
     "MemoryItem",
@@ -139,6 +139,14 @@ class Namespace(BaseModel, frozen=True, extra="forbid"):
         if not v or set(v) & _FORBIDDEN_NS_CHARS:
             raise ValueError(f"illegal namespace component: {v!r}")
         return v
+
+    @model_validator(mode="after")
+    def _shared_requires_sentinel_user(self) -> Namespace:
+        if self.visibility is Visibility.SHARED and self.user != "*":
+            raise ValueError(
+                f"SHARED namespace requires user='*' (CANONICAL §1 rule 4), got user={self.user!r}"
+            )
+        return self
 
     @classmethod
     def shared(cls, *, org: str, workspace: str, session: str) -> Namespace:
