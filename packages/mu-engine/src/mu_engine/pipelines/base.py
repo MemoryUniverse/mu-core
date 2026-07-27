@@ -15,11 +15,12 @@ durable dispatcher/backpressure runner land in a later phase.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mu_contracts.domain.events import DomainEvent
 from mu_contracts.domain.model.memory import Namespace
@@ -46,31 +47,45 @@ class StageStatus(StrEnum):
     FAILED = "failed"  # raised; runner compensates/halts per policy
 
 
-@dataclass(frozen=True, slots=True)
-class StageOutcome:
-    """A stage's typed result (PIPELINES §2.1). ``reason`` is required when DEGRADED/SKIPPED."""
+class StageOutcome(BaseModel):
+    """A stage's typed result (PIPELINES §2.1). ``reason`` is required when DEGRADED/SKIPPED.
+
+    Pydantic v2 VO (DEV-STANDARDS rule 2 — never ``dataclass``): frozen, ``extra=forbid``.
+    ``events`` holds concrete ``DomainEvent`` subclasses; pydantic's default
+    ``revalidate_instances='never'`` keeps each subclass instance intact (no downcast to the base).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
 
     status: StageStatus
-    produced: Mapping[str, Any] = field(default_factory=dict)  # merged into ctx.state
+    produced: dict[str, Any] = Field(default_factory=dict)  # merged into ctx.state
     events: Sequence[DomainEvent] = ()  # published AFTER the ledger commit
     reason: str | None = None
     idempotency_key: str | None = None
 
-    def __post_init__(self) -> None:
+    @model_validator(mode="after")
+    def _require_reason(self) -> StageOutcome:
         if self.status in (StageStatus.DEGRADED, StageStatus.SKIPPED) and not self.reason:
             raise ValueError(f"{self.status} StageOutcome requires a reason (PIPELINES §2.1)")
+        return self
 
 
-@dataclass(slots=True)
-class PipelineContext:
+class PipelineContext(BaseModel):
     """Carried through every stage. ``state`` is the running accumulator (mem0's returned-memories
-    list, generalised); ``correlation_id`` traces one dispatch across the bus (PIPELINES §2.1)."""
+    list, generalised); ``correlation_id`` traces one dispatch across the bus (PIPELINES §2.1).
+
+    Pydantic v2 DTO (DEV-STANDARDS rule 2): MUTABLE (stages accumulate into ``state``);
+    ``arbitrary_types_allowed`` so ``state`` may hold live domain objects (the STM ``MemoryItem``,
+    the ``IngestActivity``) under ``Any`` without a per-object schema.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     pipeline: str
     namespace: Namespace
     correlation_id: str
     trigger_event: DomainEvent | None = None
-    state: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime | None = None
     attempt: int = 1
 
@@ -120,7 +135,7 @@ class BaseStage(ABC):
             record = await self._ledger.completed_with_events(key)
             if record is not None:
                 return StageOutcome(
-                    StageStatus.SKIPPED,
+                    status=StageStatus.SKIPPED,
                     reason="ledger-hit",
                     idempotency_key=key,
                     events=record.events,
@@ -146,10 +161,15 @@ class HaltPolicy(StrEnum):
     CONTINUE = "continue"  # best-effort: log the stage, run the rest (DISTILL sub-steps)
 
 
-@dataclass(frozen=True, slots=True)
-class Pipeline:
+class Pipeline(BaseModel):
     """An ordered, named list of stages + policy (PIPELINES §2.3). Declared once; holds NO infra —
-    the runner (or the owning service) injects the substrate and drives the stages."""
+    the runner (or the owning service) injects the substrate and drives the stages.
+
+    Pydantic v2 value object (DEV-STANDARDS rule 2): frozen; ``arbitrary_types_allowed`` because a
+    ``Stage`` is a behavioural ``Protocol`` (validated structurally, not by a data schema).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
 
     name: str
     stages: tuple[Stage, ...]

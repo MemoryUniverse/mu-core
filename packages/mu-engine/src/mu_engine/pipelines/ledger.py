@@ -16,9 +16,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Protocol
 
+from pydantic import BaseModel, ConfigDict
 from redis.asyncio import Redis
 
 from mu_contracts.domain import events as _events
@@ -35,9 +35,15 @@ __all__ = [
 _LEDGER_IO_TIMEOUT_S = 5.0
 
 
-@dataclass(frozen=True, slots=True)
-class StageLedgerRecord:
-    """(B4) the durably-recorded events for a completed stage key (PIPELINES §2.4)."""
+class StageLedgerRecord(BaseModel):
+    """(B4) the durably-recorded events for a completed stage key (PIPELINES §2.4).
+
+    Pydantic v2 value object (DEV-STANDARDS rule 2 — never ``dataclass``): frozen. ``events`` holds
+    concrete ``DomainEvent`` subclasses; pydantic's default ``revalidate_instances='never'`` keeps
+    each subclass instance intact so a replay re-publishes the exact recorded event.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
 
     events: Sequence[DomainEvent]
 

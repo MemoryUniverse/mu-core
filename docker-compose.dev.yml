@@ -7,7 +7,7 @@
 #   stop:   docker compose -f docker-compose.dev.yml down          (add -v to drop volumes)
 #
 # Host ports (wired into .env.test -> central Settings, never hardcoded in code):
-#   postgres  15432 -> 5432   |  cache/redis 16379 -> 6379
+#   postgres  15432 -> 5432   |  cache/valkey 16379 -> 6379
 #   qdrant    16333 -> 6333 (REST), 16334 -> 6334 (gRPC)  |  falkordb 16380 -> 6379
 
 name: mu-dev
@@ -33,15 +33,16 @@ services:
     networks: [mu-dev]
 
   cache:
-    image: redis:7-alpine
+    # Valkey (BSD) — the decided KV/STM store; NOT Redis (SSPL-relicensed). Wire-compatible.
+    image: valkey/valkey:8-alpine
     container_name: mu-dev-cache
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["valkey-server", "--appendonly", "yes"]
     ports:
       - "127.0.0.1:16379:6379"
     volumes:
       - mu-dev-cache-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "valkey-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10

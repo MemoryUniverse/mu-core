@@ -16,9 +16,11 @@ from datetime import datetime
 import pytest
 import pytest_asyncio
 from falkordb.asyncio import FalkorDB
+from qdrant_client import AsyncQdrantClient
 
 from mu_contracts.config import Settings
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
+from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.domain.memory import (
     MemoryItem,
     MemoryKind,
@@ -113,3 +115,28 @@ async def ltm(falkor_db: FalkorDB) -> AsyncIterator[FalkorLtmAdapter]:
             if name.startswith("mu_g__ws"):
                 with contextlib.suppress(Exception):  # best-effort teardown only
                     await falkor_db.select_graph(name).delete()
+
+
+# MTM dim for the cross-store supersession test — a tiny vector is enough to prove the point-state
+# flip (no semantic search here); the real embedder dim is exercised in the mu-local E2E.
+_MTM_TEST_DIM = 8
+
+
+@pytest_asyncio.fixture
+async def qdrant_client(settings: Settings, uid: str) -> AsyncIterator[AsyncQdrantClient]:
+    client = AsyncQdrantClient(url=settings.storage.vector.url)
+    try:
+        await client.get_collections()  # fail-loud probe; BLOCKED (never faked) if qdrant is down
+        yield client
+    finally:
+        for coll in (await client.get_collections()).collections:
+            if uid in coll.name:
+                with contextlib.suppress(Exception):  # best-effort teardown only
+                    await client.delete_collection(coll.name)
+        await client.close()
+
+
+@pytest_asyncio.fixture
+async def mtm(qdrant_client: AsyncQdrantClient) -> QdrantMtmAdapter:
+    """REAL Qdrant MTM adapter (the cross-store supersede target), ZERO mocks."""
+    return QdrantMtmAdapter(qdrant_client, dim=_MTM_TEST_DIM)

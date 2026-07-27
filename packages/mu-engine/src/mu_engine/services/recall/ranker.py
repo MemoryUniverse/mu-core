@@ -119,20 +119,37 @@ class ThreeChannelRecallRanker:
         pool = self._settings.channel_pool_size
         floor_limit = self._settings.recency_floor_limit
 
-        # Channels run concurrently. Each coroutine owns its domain-error handling so the LTM store
-        # being down degrades (named) without cancelling the MTM/STM siblings; CancelledError is
-        # NEVER caught here — it propagates out of gather (DEV-STANDARDS rule 1).
-        floor_task = self._stm.recent(ns, limit=floor_limit) if channels.stm else _empty_scored()
-        mtm_task = (
-            self._mtm.semantic(ns, query_vec, limit=pool, caller_identity_set=caller_identity_set)
-            if channels.mtm
-            else _empty_scored()
-        )
-        ltm_task = self._ltm_channel(ns, pool, caller_identity_set) if channels.ltm else _ltm_ok([])
+        # Channels run concurrently under a STRUCTURED-CONCURRENCY TaskGroup (DEV-STANDARDS rule 1):
+        # the LTM arm owns its own degrade (``_ltm_channel`` returns a named tuple, never raises),
+        # so an LTM outage degrades WITHOUT failing the group. An STM/MTM store-down IS a hard deny:
+        # the TaskGroup cancels the siblings (no orphaned in-flight I/O) and surfaces the error. We
+        # unwrap the single store error from the ExceptionGroup so the caller sees the domain
+        # exception (a deny), not the wrapper. ``CancelledError`` is never caught — it propagates.
+        try:
+            async with asyncio.TaskGroup() as tg:
+                floor_t = tg.create_task(
+                    self._stm.recent(ns, limit=floor_limit) if channels.stm else _empty_scored()
+                )
+                mtm_t = tg.create_task(
+                    self._mtm.semantic(
+                        ns, query_vec, limit=pool, caller_identity_set=caller_identity_set
+                    )
+                    if channels.mtm
+                    else _empty_scored()
+                )
+                ltm_t = tg.create_task(
+                    self._ltm_channel(ns, pool, caller_identity_set)
+                    if channels.ltm
+                    else _ltm_ok([])
+                )
+        except* StoreUnavailableError as eg:
+            # STM/MTM store-down is a deny: surface the underlying domain error loud + unwrapped,
+            # not the TaskGroup ExceptionGroup wrapper (§5 "re-raise loud, not a silent partial").
+            raise eg.exceptions[0] from None
 
-        floor, mtm_hits, (ltm_hits, ltm_degraded) = await asyncio.gather(
-            floor_task, mtm_task, ltm_task
-        )
+        floor = floor_t.result()
+        mtm_hits = mtm_t.result()
+        ltm_hits, ltm_degraded = ltm_t.result()
 
         # Fuse MTM ⊕ LTM by tier-stable id; a cosine score and a graph-hop count fuse by RANK only.
         fused_pairs = self._fusion.fuse(

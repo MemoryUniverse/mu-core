@@ -34,11 +34,28 @@ from mu_engine.storage.domain.memory import FactObjectKind, Polarity
 
 __all__ = [
     "ExtractedFact",
+    "ExtractionSettings",
     "FactExtractorPort",
     "HeuristicSpoExtractor",
     "LlmFactExtractor",
     "decompose_to_spo",
 ]
+
+
+class ExtractionSettings(BaseModel):
+    """LLM fact-extraction knobs (data-extraction-methodology §2.3).
+
+    Central-config home (DEV-STANDARDS rule 3): ``max_tokens``/``temperature`` are NOT inlined in
+    the ``complete()`` call path — they flow from here (the sanctioned defaults, same tracked-seam
+    pattern as ``DistillSettings``/``RecallSettings``: wired from ``settings.model.extraction`` when
+    that subtree lands, taken explicitly until then, no re-shape). ``temperature=0`` keeps the
+    salient-fact pass deterministic (mem0's Call-A determinism, ``main.py:432-456``).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_tokens: int = 1024
+    temperature: float = 0.0
 
 
 class ExtractedFact(BaseModel):
@@ -385,13 +402,12 @@ class LlmFactExtractor:
         provider: LLMProviderPort,
         *,
         model_group: str,
-        max_tokens: int = 1024,
-        temperature: float = 0.0,
+        settings: ExtractionSettings | None = None,
     ) -> None:
         self._provider = provider
         self._model_group = model_group
-        self._max_tokens = max_tokens
-        self._temperature = temperature
+        # max_tokens/temperature flow from central config, never inlined here (rule 3).
+        self._settings = settings or ExtractionSettings()
 
     async def extract(self, text: str, *, now: datetime) -> list[ExtractedFact]:
         completion = await self._provider.complete(
@@ -400,8 +416,8 @@ class LlmFactExtractor:
                 Message(role=MessageRole.USER, content=text),
             ],
             model=self._model_group,
-            max_tokens=self._max_tokens,
-            temperature=self._temperature,
+            max_tokens=self._settings.max_tokens,
+            temperature=self._settings.temperature,
             response_format="json_object",
         )
         fact_strings = _parse_mem0_facts(completion.text)
@@ -431,12 +447,15 @@ def build_extractor(
     use_llm: bool,
     llm_provider: LLMProviderPort | None = None,
     model_group: str | None = None,
+    settings: ExtractionSettings | None = None,
 ) -> FactExtractorPort:
     """Resolve the configured extractor (DEV-STANDARDS rule 6 strategy selection; fail-loud).
 
     ``use_llm=False`` (MVP default) → :class:`HeuristicSpoExtractor`. ``use_llm=True`` requires
     a wired ``LLMProviderPort`` + ``model_group`` (``models.hard_extract_model``) → the mem0
     LLM extractor; a missing provider is a wiring bug and raises (never a silent downgrade).
+    ``settings`` threads the central-config ``max_tokens``/``temperature`` (DEV-STANDARDS rule 3 —
+    never hardcoded in the extractor's ``complete()`` call).
     """
     if not use_llm:
         return HeuristicSpoExtractor()
@@ -444,4 +463,4 @@ def build_extractor(
         raise ValueError(
             "LLM extractor selected (use_llm=True) but no llm_provider/model_group wired"
         )
-    return LlmFactExtractor(llm_provider, model_group=model_group)
+    return LlmFactExtractor(llm_provider, model_group=model_group, settings=settings)

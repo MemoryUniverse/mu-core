@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 from enum import StrEnum
@@ -45,8 +46,15 @@ from mu_contracts.domain.events import (
     MemorySuperseded,
 )
 from mu_contracts.domain.model.memory import Tier
+from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
 from mu_contracts.ports.time import Clock
 from mu_engine.platform.clock import SystemClock
+from mu_engine.platform.observability import (
+    NoopAuditLog,
+    NoopMetricSink,
+    NoopTracer,
+    TraceScope,
+)
 from mu_engine.services.extract import ExtractedFact, FactExtractorPort, HeuristicSpoExtractor
 from mu_engine.storage.domain.memory import (
     MemoryItem,
@@ -69,6 +77,10 @@ __all__ = [
 ]
 
 _log = structlog.get_logger("mu_engine.pipelines.distill")
+
+_OP = "distill.consolidate"
+_LATENCY_METRIC = "mu_operation_latency_seconds"
+_ERROR_METRIC = "mu_operation_errors_total"
 
 
 # --------------------------------------------------------------------------------------- settings
@@ -209,6 +221,9 @@ class DistillPipeline:
         mtm: MtmTierRepository | None = None,
         bus: EventPublisher | None = None,
         lease: WriterLeasePort | None = None,
+        tracer: Tracer | None = None,
+        metrics: MetricSink | None = None,
+        audit: AuditLog | None = None,
     ) -> None:
         self._ltm = ltm
         self._settings = settings or DistillSettings()
@@ -217,6 +232,11 @@ class DistillPipeline:
         self._mtm = mtm  # cross-store invalidate for an un-promoted MTM-resident loser (§7.5)
         self._bus = bus
         self._lease: WriterLeasePort = lease or InProcessWriterLease()
+        # Central observability (DEV-STANDARDS rule 4): span + latency/error metrics + content-free
+        # audit on the consolidation op. Sinks default no-op so the pipeline is testable unwired.
+        self._tracer: Tracer = tracer or NoopTracer()
+        self._metrics: MetricSink = metrics or NoopMetricSink()
+        self._audit: AuditLog = audit or NoopAuditLog()
 
     async def distill(self, ns: Namespace, window: Sequence[MemoryItem]) -> DistillReport:
         """Consolidate a window of promoted MTM facts into LTM (the S3 pass).
@@ -224,8 +244,35 @@ class DistillPipeline:
         Structured items (subject/predicate/object already set by S2) promote with their
         tier-stable id preserved (CANONICAL §7.1 id-stability). Unstructured items are run
         through the extractor, minting new proposition ids with provenance back to the source.
-        Runs under the exclusive writer lease so a concurrent reconcile can't double-write.
+        Runs under the exclusive writer lease so a concurrent reconcile can't double-write. Wrapped
+        in central observability (DEV-STANDARDS rule 4): a content-free span, latency (always) +
+        error (on failure) metrics, and a content-free audit row on success. ``CancelledError``
+        propagates and is never counted as a failure.
         """
+        started = time.perf_counter()
+        with self._tracer.span(_OP, attributes={"ns": ns.to_prefix()}):
+            try:
+                report = await self._distill(ns, window)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                self._metrics.inc(_ERROR_METRIC, labels={"operation": _OP})
+                raise
+            finally:
+                self._metrics.observe(
+                    _LATENCY_METRIC, time.perf_counter() - started, labels={"operation": _OP}
+                )
+        self._audit.record(
+            TraceScope(correlation_id=ns.to_prefix()),
+            operation=_OP,
+            outcome="ok",
+            tier="ltm",
+            visibility=ns.visibility.value,
+            counts={"facts": report.facts_extracted, "superseded": report.superseded},
+        )
+        return report
+
+    async def _distill(self, ns: Namespace, window: Sequence[MemoryItem]) -> DistillReport:
         async with self._lease.acquire(ns):
             candidates = await self._collect_facts(ns, window)
             if self._bus is not None:
@@ -363,9 +410,18 @@ class DistillPipeline:
                 ns, loser.id, winner.id, at=at, reason="functional_supersede"
             )
             # cross-store: an un-promoted MTM-resident loser must also drop from MTM recall (§7.5).
+            # The MTM point is keyed by the INGEST id (CANONICAL §7.1 id-stability), NOT the LTM
+            # fact-node id: a structured fact keeps its ingest id STM->MTM->LTM, but an EXTRACTED
+            # fact mints a fresh LTM node id and records its source ingest id in
+            # metadata["derived_from"]. Passing the fact-node id here targets a non-existent Qdrant
+            # point (404, the id-linkage crash); resolve the ingest id so the RIGHT MTM point flips.
             if self._mtm is not None:
                 await self._mtm.invalidate(
-                    ns, loser.id, winner.id, at=at, reason="functional_supersede"
+                    ns,
+                    self._mtm_point_id(loser),
+                    self._mtm_point_id(winner),
+                    at=at,
+                    reason="functional_supersede",
                 )
             loser_ids.append(loser.id)
             if self._bus is not None:
@@ -388,6 +444,19 @@ class DistillPipeline:
         if not same_object and predicate in self._settings.functional_predicates:
             return True  # functional supersession (single-cardinality, different object)
         return False
+
+    @staticmethod
+    def _mtm_point_id(item: MemoryItem) -> str:
+        """The MTM point (ingest) id a fact traces back to (CANONICAL §7.1 id-stability).
+
+        A STRUCTURED fact promoted STM->MTM->LTM keeps its tier-stable id, so the LTM node id IS
+        the MTM point id. An EXTRACTED fact mints a fresh LTM node id and records its originating
+        ingest id in ``metadata['derived_from']`` — THAT is the id of the MTM-resident source
+        point (the fact-node id has no MTM point and 404s the cross-store invalidate). The MTM
+        supersede must key the loser by this ingest id, never the fact-node id (§7.5).
+        """
+        derived = item.metadata.get("derived_from")
+        return str(derived) if derived else item.id
 
     async def _maybe_promote_event(self, ns: Namespace, item: MemoryItem) -> None:
         if self._bus is not None:

@@ -156,7 +156,7 @@ class WriteStmStage(BaseStage):
         item = _build_memory_item(activity, at=self._clock.now())
         await self._stm.put(item)
         return StageOutcome(
-            StageStatus.OK,
+            status=StageStatus.OK,
             produced={"stm_item": item, "memory_ids": [item.id], "content_hash": item.content_hash},
             events=[MemoryCaptured(namespace=activity.namespace, ids=[item.id], tier=Tier.STM)],
             idempotency_key=self.idempotency_key(ctx),
@@ -205,9 +205,10 @@ class DeterministicPromoteStage(BaseStage):
         activity = _activity(ctx)
         if self._promotion_reason(activity) is None:
             return ""
-        content_hash = ctx.state.get("content_hash") or _build_memory_item(
-            activity, at=self._clock.now()
-        ).content_hash
+        content_hash = (
+            ctx.state.get("content_hash")
+            or _build_memory_item(activity, at=self._clock.now()).content_hash
+        )
         return content_hash
 
     async def _resolve_item(self, ctx: PipelineContext, activity: IngestActivity) -> MemoryItem:
@@ -227,7 +228,7 @@ class DeterministicPromoteStage(BaseStage):
         activity = _activity(ctx)
         reason = self._promotion_reason(activity)
         if reason is None:
-            return StageOutcome(StageStatus.OK, produced={"promoted": False})
+            return StageOutcome(status=StageStatus.OK, produced={"promoted": False})
 
         item = await self._resolve_item(ctx, activity)
         vectors = await self._embedder.embed([activity.atomic_fact_text()])
@@ -243,7 +244,7 @@ class DeterministicPromoteStage(BaseStage):
         )
         await self._mtm.upsert(promoted)
         return StageOutcome(
-            StageStatus.OK,
+            status=StageStatus.OK,
             produced={"promoted": True, "mtm_item": promoted},
             events=[
                 MemoryPromoted(
@@ -270,7 +271,7 @@ class EmitIngestCompletedStage(BaseStage):
     async def _execute(self, ctx: PipelineContext) -> StageOutcome:
         memory_ids = list(ctx.state.get("memory_ids") or [])
         return StageOutcome(
-            StageStatus.OK,
+            status=StageStatus.OK,
             produced={},
             events=[IngestCompleted(namespace=ctx.namespace, memory_ids=memory_ids)],
             idempotency_key=self.idempotency_key(ctx),

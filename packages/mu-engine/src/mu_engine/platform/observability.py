@@ -37,12 +37,24 @@ __all__ = [
     "NoopMetricSink",
     "NoopTracer",
     "SafeTraceFields",
+    "TraceScope",
     "build_audit",
     "build_metrics",
     "build_tracer",
     "sanitize_label_value",
     "sanitize_labels",
 ]
+
+
+class TraceScope(BaseModel):
+    """The minimal concrete :class:`~mu_contracts.ports.observability.TurnTraceScope` — a
+    content-free ``correlation_id`` only. The scope a service passes to :meth:`AuditLog.record`
+    when it has no richer per-request scope (e.g. the embedded LOCAL ingest/distill path)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    correlation_id: str
+
 
 # Bounded backpressure for the durable audit queue (DEV-STANDARDS: bounded queues, never
 # unbounded). On overflow the recorder falls back to the structlog mirror (never silently drops).
@@ -191,7 +203,12 @@ def build_tracer(*, enabled: bool, service_name: str = "mu") -> Tracer:
 
 
 def build_metrics(*, enabled: bool) -> MetricSink:
-    """Real Prometheus sink when ``enabled``, else :class:`NoopMetricSink`."""
+    """Real Prometheus sink when ``enabled``, else :class:`NoopMetricSink`.
+
+    Each real sink owns a PRIVATE ``CollectorRegistry`` (not the process-global default) so two
+    composition roots in one process (e.g. successive integration tests) never collide on a
+    'Duplicated timeseries' at registration — the sink is instance-isolated, like every other
+    Layer-0 singleton the container owns (DEV-STANDARDS rule 9)."""
     if not enabled:
         return NoopMetricSink()
     return _PrometheusMetricSink()
@@ -252,6 +269,10 @@ class _OtelTracer:
 
 class _PrometheusMetricSink:
     def __init__(self) -> None:
+        from prometheus_client import CollectorRegistry
+
+        # Instance-private registry (never the process-global default) — see build_metrics.
+        self._registry = CollectorRegistry()
         self._counters: dict[str, object] = {}
         self._hists: dict[str, object] = {}
         self._gauges: dict[str, object] = {}
@@ -266,7 +287,7 @@ class _PrometheusMetricSink:
         clean = sanitize_labels(labels) if labels else {}
         counter = self._counters.get(name)
         if not isinstance(counter, Counter):
-            counter = Counter(name, name, self._names(clean))
+            counter = Counter(name, name, self._names(clean), registry=self._registry)
             self._counters[name] = counter
         (counter.labels(**clean) if clean else counter).inc(value)
 
@@ -276,7 +297,7 @@ class _PrometheusMetricSink:
         clean = sanitize_labels(labels) if labels else {}
         hist = self._hists.get(name)
         if not isinstance(hist, Histogram):
-            hist = Histogram(name, name, self._names(clean))
+            hist = Histogram(name, name, self._names(clean), registry=self._registry)
             self._hists[name] = hist
         (hist.labels(**clean) if clean else hist).observe(value)
 
@@ -286,7 +307,7 @@ class _PrometheusMetricSink:
         clean = sanitize_labels(labels) if labels else {}
         gauge = self._gauges.get(name)
         if not isinstance(gauge, Gauge):
-            gauge = Gauge(name, name, self._names(clean))
+            gauge = Gauge(name, name, self._names(clean), registry=self._registry)
             self._gauges[name] = gauge
         (gauge.labels(**clean) if clean else gauge).set(value)
 

@@ -15,14 +15,14 @@ Plus the NAMED shared-arm degrade (``SHARED_RECALL_UNAVAILABLE``): the private a
 intact and LABELLED, never a silent private-only drop (recall-service-design §1.6).
 """
 # mypy: disable-error-code="no-any-unimported, arg-type"
-# ^ Two SYSTEMIC, pre-existing typing gaps this integration-wiring file inherits (peers ship the
-#   same in their test wiring): (1) ``no-any-unimported`` — ``falkordb`` ships no stubs, so the
-#   FalkorDB param type is ``Any`` under ``disallow_any_unimported`` (the adapter itself carries the
-#   same ``# type: ignore`` on its ctor); (2) ``arg-type`` — ``@retry_io`` is annotated to return
-#   ``Callable[P, Awaitable[R]]``, which WIDENS a decorated adapter method past the ``Coroutine``
-#   an async Protocol method requires, so a concrete adapter fails the structural match at the
-#   composition site (a decorator-typing bug in ``platform/decorators.py``, out of this file's
-#   ownership — reported separately, never a runtime issue: the objects ARE the ports at runtime).
+# ^ (1) ``no-any-unimported`` — ``falkordb`` ships no stubs, so the FalkorDB param type is ``Any``
+#   under ``disallow_any_unimported`` (the adapter itself carries the same ``# type: ignore`` on
+#   its ctor). (2) ``arg-type`` — this test wires an ``object``-typed local fake into
+#   ``RecallService`` (``shared_recall=``). NOTE: the former ``@retry_io`` decorator-typing gap this
+#   suppression ALSO used to cover is RESOLVED — ``retry_io`` now returns
+#   ``Callable[P, Coroutine[Any, Any, R]]``, so a decorated adapter method structurally satisfies
+#   its async ``Protocol`` with no suppression at any composition site (mu-local ``composition.py``
+#   no longer needs its file-level disable).
 
 from __future__ import annotations
 

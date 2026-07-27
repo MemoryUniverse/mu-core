@@ -30,7 +30,25 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-__all__ = ["BackendChoice", "StorageSettings"]
+__all__ = ["BackendChoice", "ObservabilitySettings", "StorageSettings"]
+
+
+class ObservabilitySettings(BaseModel):
+    """Which of the three content-free sinks the embedded LOCAL engine wires (DEV-STANDARDS rule 4).
+
+    Config-sourced (never hardcoded in the container): the composition root reads this and builds
+    the real ``Tracer``/``MetricSink``/``AuditLog`` via ``mu_engine.platform.observability`` —
+    tracer + metrics + a structured-log audit are ON by default so a real embedded run emits spans,
+    latency/error metrics and content-free audit rows on every meaningful op. Flip any off (e.g. in
+    a bare unit context) without touching wiring. Mirrors the SHARED-plane ``PlatformSelectors``
+    observability flags; folds into ``settings.observability`` when that subtree lands.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    otel_enabled: bool = True
+    metrics_enabled: bool = True
+    audit_enabled: bool = True
 
 
 class BackendChoice(BaseModel):

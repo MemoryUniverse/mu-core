@@ -16,8 +16,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import time
-from collections.abc import Awaitable, Callable
-from typing import ParamSpec, TypeVar
+from collections.abc import Awaitable, Callable, Coroutine
+from typing import Any, ParamSpec, TypeVar
 
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
@@ -47,16 +47,21 @@ def retry_io(
     base_delay_s: float = 0.05,
     max_delay_s: float = 2.0,
     timeout_s: float | None = None,
-) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """Retry a transient-failing async I/O call with exponential backoff (tenacity).
 
     * retries only when :func:`classify_error` says RETRYABLE; terminal errors surface at once;
     * ``CancelledError`` is re-raised immediately (cancellation-safe);
     * ``timeout_s`` (when set) bounds EACH attempt via ``asyncio.wait_for`` — a hang becomes a
       retryable ``TimeoutError`` rather than a stuck task.
+
+    Returns a ``Coroutine``-returning callable (not merely ``Awaitable``): the wrapper is a genuine
+    ``async def``, so a decorated adapter method still structurally satisfies an async ``Protocol``
+    method (which requires ``Coroutine[Any, Any, R]``). Annotating the narrower return keeps
+    ``mypy --strict`` conformance at every repository composition site — no blanket suppression.
     """
 
-    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Coroutine[Any, Any, R]]:
         @functools.wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             retrying = AsyncRetrying(
@@ -83,7 +88,7 @@ def timed(
     tracer: Tracer | None = None,
     metrics: MetricSink | None = None,
     latency_metric: str = _LATENCY_METRIC,
-) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """Open a content-free span for ``operation`` and observe its latency (spec §11).
 
     Duration uses ``time.perf_counter`` (monotonic) — NOT ``Clock``/wall-clock — so it is correct
@@ -93,7 +98,7 @@ def timed(
     _tracer = tracer or NoopTracer()
     _metrics = metrics or NoopMetricSink()
 
-    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Coroutine[Any, Any, R]]:
         @functools.wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             start = time.perf_counter()
@@ -117,12 +122,12 @@ def guard(
     *,
     metrics: MetricSink | None = None,
     error_metric: str = _ERROR_METRIC,
-) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """Emit a content-free failure metric on any error, then RE-RAISE (never swallow — DEV-STANDARDS
     rule 8). ``CancelledError`` propagates without being counted as a failure (it is not one)."""
     _metrics = metrics or NoopMetricSink()
 
-    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    def decorator(func: Callable[P, Awaitable[R]]) -> Callable[P, Coroutine[Any, Any, R]]:
         @functools.wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             try:

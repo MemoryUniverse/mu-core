@@ -11,22 +11,21 @@ Backend SELECTION + mandatory-role validation reuse the phase-0 engine registry
 (``mu_engine.storage.registry`` / ``factories.STORE_REGISTRY``). The network-store CLIENTS are
 constructed here (not hidden inside a registry factory) so the facade owns their async lifecycle
 and ``close()`` deterministically releases every connection (DEV-STANDARDS resource management) —
-the exact wiring the engine's own REAL-container integration fixtures use. One Redis connection is
-shared by STM and the pipeline ledger (matching those fixtures).
+the exact wiring the engine's own REAL-container integration fixtures use. STM binds the Redis
+client; the pipeline ledger is IN-PROCESS (:class:`~mu_engine.pipelines.ledger.InMemoryStageLedger`,
+step (2)) — a cross-process durable ledger is a daemon (``mu-client``) concern, not this daemonless
+single-session facade.
+
+Central observability is wired here (DEV-STANDARDS rule 4): the composition root builds the three
+content-free sinks (:class:`Tracer` / :class:`MetricSink` / :class:`AuditLog`) from
+:class:`~mu_local.config.ObservabilitySettings` and threads them into every service, so ingest /
+recall / distill emit spans, latency/error metrics and content-free audit rows on their meaningful
+ops (no more silently-no-op sinks).
 
 NO LLM this phase (Azure PARKED): ``llm`` is ``None`` ⇒ heuristic mode. Ingest promotion and the
 DISTILL extractor are deterministic (real-integration-testable now); any synthesis verb refuses
 loudly (:class:`~mu_local.errors.LlmNotConfiguredError`).
 """
-# mypy: disable-error-code="arg-type"
-# ^ The SAME systemic decorator-typing gap the engine's own integration wiring documents and
-#   suppresses (see mu-engine tests/services/test_recall_federate_live_int.py header): every
-#   `@retry_io`-decorated adapter method is annotated to return `Awaitable[R]`, which WIDENS it
-#   past the `Coroutine[...]` an async Protocol method requires, so a concrete adapter
-#   (RedisStmAdapter / QdrantMtmAdapter / FalkorLtmAdapter / RedisStageLedger) fails the
-#   structural match at THIS composition site. A `platform/decorators.py` typing bug, out of this
-#   file's ownership, NEVER a runtime issue — the objects ARE the ports at runtime (the REAL
-#   container integration test proves it).
 
 from __future__ import annotations
 
@@ -38,10 +37,12 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings, get_settings
+from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
 from mu_engine.pipelines.distill import DistillPipeline
 from mu_engine.pipelines.ledger import InMemoryStageLedger
 from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import SystemClock
+from mu_engine.platform.observability import build_audit, build_metrics, build_tracer
 from mu_engine.platform.tenancy import DefaultTenancyGuard
 from mu_engine.providers.embedding import SentenceTransformerEmbedder, build_embedder
 from mu_engine.providers.settings import default_local_catalog
@@ -61,7 +62,7 @@ from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
 from mu_engine.storage.domain.namespace import Visibility
 from mu_engine.storage.factories import STORE_REGISTRY
 from mu_engine.storage.registry import assert_mandatory_roles
-from mu_local.config import BackendChoice, StorageSettings
+from mu_local.config import BackendChoice, ObservabilitySettings, StorageSettings
 from mu_local.errors import BackendUnavailableError
 from mu_local.shared_null import LocalNullSharedRecall
 
@@ -79,9 +80,16 @@ _SUPPORTED_EMBEDDING = frozenset({"minilm_local"})
 class LocalContainer:
     """The ONE place adapters bind for the embedded LOCAL engine (spec §2.2)."""
 
-    def __init__(self, storage: StorageSettings, *, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        storage: StorageSettings,
+        *,
+        settings: Settings | None = None,
+        observability: ObservabilitySettings | None = None,
+    ) -> None:
         self._settings: Settings = settings or get_settings()
         self._closers: list[Callable[[], Awaitable[None]]] = []
+        self._obs: ObservabilitySettings = observability or ObservabilitySettings()
 
         # (0) fail-loud mandatory-role + graph-not-folded validation (reuse the engine registry).
         assert_mandatory_roles(
@@ -131,11 +139,16 @@ class LocalContainer:
         # (6) LLM PARKED ⇒ heuristic mode.
         self.llm: object | None = None
 
-        # (7) platform singletons.
+        # (7) platform singletons + the three content-free observability sinks (DEV-STANDARDS
+        #     rule 4) — built once here from ObservabilitySettings and threaded into every service.
         self._clock = SystemClock()
         self._bus = InprocBus()
+        self.tracer: Tracer = build_tracer(enabled=self._obs.otel_enabled, service_name="mu-local")
+        self.metrics: MetricSink = build_metrics(enabled=self._obs.metrics_enabled)
+        self.audit: AuditLog = build_audit(enabled=self._obs.audit_enabled)
 
-        # (8) application services — each facade verb delegates to exactly one of these.
+        # (8) application services — each facade verb delegates to exactly one of these; each gets
+        #     the wired sinks so its meaningful op emits spans/metrics/audit (never silently no-op).
         self.ingest = IngestService(
             stm=self.stm,
             mtm=self.mtm,
@@ -143,9 +156,18 @@ class LocalContainer:
             bus=self._bus,
             ledger=self._ledger,
             clock=self._clock,
+            tracer=self.tracer,
+            metrics=self.metrics,
+            audit=self.audit,
         )
         self.distill = DistillPipeline(
-            ltm=self.ltm, extractor=HeuristicSpoExtractor(), clock=self._clock, mtm=self.mtm
+            ltm=self.ltm,
+            extractor=HeuristicSpoExtractor(),
+            clock=self._clock,
+            mtm=self.mtm,
+            tracer=self.tracer,
+            metrics=self.metrics,
+            audit=self.audit,
         )
         recall_settings = RecallSettings()
         fusion = ReciprocalRankFusion()
@@ -168,6 +190,8 @@ class LocalContainer:
             fusion=fusion,
             settings=recall_settings,
             clock=self._clock,
+            metrics=self.metrics,
+            tracer=self.tracer,
         )
 
     async def close(self) -> None:
