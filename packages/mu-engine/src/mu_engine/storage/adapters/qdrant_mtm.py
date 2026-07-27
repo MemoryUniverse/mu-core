@@ -18,6 +18,7 @@ from typing import Any
 
 from qdrant_client import AsyncQdrantClient, models
 
+from mu_engine.platform.decorators import retry_io
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
@@ -25,6 +26,9 @@ from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper, collection_nam
 from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["QdrantMtmAdapter"]
+
+# Per-attempt I/O budget (DEV-STANDARDS async sharpener: "timeouts on every external call").
+_STORE_IO_TIMEOUT_S = 10.0
 
 # payload fields promoted to server-side indexes (spec §3.2).
 _KEYWORD_INDEXES = (
@@ -67,6 +71,7 @@ class QdrantMtmAdapter:
         self._ensured.add(name)
         return name
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def upsert(self, item: MemoryItem) -> None:
         name = await self._ensure_collection(item.namespace)
         row = self._mapper.to_store(item)
@@ -95,6 +100,7 @@ class QdrantMtmAdapter:
             )
         return models.Filter(must=must)
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def semantic(
         self,
         ns: Namespace,
@@ -139,6 +145,7 @@ class QdrantMtmAdapter:
             )
         return out
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def invalidate(
         self, ns: Namespace, loser_id: str, winner_id: str, *, at: datetime, reason: str
     ) -> None:

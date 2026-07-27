@@ -9,9 +9,12 @@ license = "Apache-2.0"
 readme = "README.md"
 dependencies = [
     "mu-contracts",
-    # relational + migrations
+    # relational + migrations (async drivers: asyncpg = Postgres server plane; aiosqlite = the
+    # SQLite client plane — the ONE schema binds to both, storage-schema-rowmapper-spec §2)
     "sqlalchemy>=2.0.36,<2.1",
     "alembic>=1.14,<2",
+    "asyncpg>=0.30,<0.31",
+    "aiosqlite>=0.20,<0.22",
     # stores (Valkey-compatible KV/STM, vector, graph)
     "redis>=5.2,<6",
     "qdrant-client>=1.12.1,<2",

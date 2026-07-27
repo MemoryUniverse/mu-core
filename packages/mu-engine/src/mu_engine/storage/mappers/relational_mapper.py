@@ -28,6 +28,9 @@ class RelationalMapper:
     def to_store(self, item: MemoryItem) -> RelationalRow:
         # ONLY ids / hashes / enums / counts / timestamps — NEVER content/subject/object text.
         cols: dict[str, Any] = {
+            # un-collapsed η (ADR 0026): org is the tenancy/billing/residency root, distinct
+            # from the workspace grouping — both are explicit columns, never collapsed.
+            "org_id": item.namespace.org,
             "workspace_id": item.workspace_id,
             "namespace_prefix": item.namespace.to_prefix(),
             "owner_id": item.owner_id,

@@ -56,19 +56,39 @@ def _dt_opt() -> Mapped[datetime | None]:
 
 
 # ============================================================ §2.1 control-plane identity/authz
+# Un-collapsed η (CANONICAL §1 rule 3 / ADR 0026): `org` is the tenant/billing/RESIDENCY root,
+# `workspace` is a many-per-org grouping. The tenancy grain is `org`, so every tenant-scoped
+# table carries an explicit `org_id` column (NOT collapsed into `workspace_id`), and residency
+# keys on `orgs.residency_region` (rule 7). One org contains many workspaces.
+class Org(Base):
+    __tablename__ = "orgs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)  # tenant/billing/residency root
+    slug: Mapped[str] = mapped_column(String, nullable=False)  # content-free handle
+    residency_region: Mapped[str] = mapped_column(String, nullable=False, default="")  # rule 7
+    created_at: Mapped[datetime] = _dt()
+
+    __table_args__ = (Index("ux_orgs_slug", "slug", unique=True),)
+
+
 class Workspace(Base):
     __tablename__ = "workspaces"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     slug: Mapped[str] = mapped_column(String, nullable=False)  # content-free handle
     created_at: Mapped[datetime] = _dt()
 
-    __table_args__ = (Index("ux_workspaces_slug", "slug", unique=True),)
+    __table_args__ = (
+        Index("ux_workspaces_org_slug", "org_id", "slug", unique=True),  # slug unique WITHIN org
+        Index("ix_workspaces_org", "org_id"),
+    )
 
 
 class Membership(Base):
     __tablename__ = "workspace_memberships"
 
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     principal_id: Mapped[str] = mapped_column(String, nullable=False)
     role: Mapped[str] = mapped_column(String, nullable=False)  # OWNER|ADMIN|MEMBER|GUEST
@@ -76,7 +96,10 @@ class Membership(Base):
     expires_at: Mapped[datetime | None] = _dt_opt()
     created_at: Mapped[datetime] = _dt()
 
-    __table_args__ = (PrimaryKeyConstraint("workspace_id", "principal_id"),)
+    __table_args__ = (
+        PrimaryKeyConstraint("workspace_id", "principal_id"),
+        Index("ix_ws_membership_org", "org_id", "principal_id"),
+    )
 
 
 class Principal(Base):
@@ -90,6 +113,7 @@ class NamespaceDef(Base):
     __tablename__ = "namespaces"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     owner_principal_id: Mapped[str] = mapped_column(String, nullable=False)
     allowed_visibilities: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
@@ -99,6 +123,7 @@ class SessionDef(Base):
     __tablename__ = "sessions"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     namespace_id: Mapped[str] = mapped_column(String, nullable=False)
     state: Mapped[str] = mapped_column(String, nullable=False)  # open|closed
@@ -121,6 +146,7 @@ class AgentBinding(Base):
     __tablename__ = "agent_bindings"
 
     agent_principal_id: Mapped[str] = mapped_column(String, nullable=False)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     namespace_id: Mapped[str | None] = mapped_column(String, default="")
     session_id: Mapped[str | None] = mapped_column(String, default="")
@@ -137,6 +163,7 @@ class AclEntry(Base):
     __tablename__ = "acl_entries"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     object_ref: Mapped[str] = mapped_column(String, nullable=False)  # ShareableRef id (by value)
     subject_principal_id: Mapped[str] = mapped_column(String, nullable=False)
@@ -165,6 +192,7 @@ class Grant(Base):
     __tablename__ = "grants"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     object_ref: Mapped[str] = mapped_column(String, nullable=False)  # SHARED objects only
     grantor: Mapped[str] = mapped_column(String, nullable=False)
@@ -196,6 +224,7 @@ class MemoryProvenance(Base):
     __tablename__ = "memory_provenance"
 
     memory_id: Mapped[str] = mapped_column(String, primary_key=True)  # tier-stable id
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy/billing root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     namespace_prefix: Mapped[str] = mapped_column(String, nullable=False)  # to_prefix()
     owner_id: Mapped[str] = mapped_column(String, nullable=False)
@@ -212,8 +241,10 @@ class MemoryProvenance(Base):
     meta: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
 
     __table_args__ = (
-        Index("ux_prov_chash", "workspace_id", "content_hash", unique=True),  # idempotent sync
-        Index("ix_prov_owner", "workspace_id", "owner_id"),
+        # idempotent sync dedupe at the ratified (org, workspace) grain (ADR 0026; Cognee unique
+        # key → (org_id, workspace_id, name)); content_hash is the version key within that grain.
+        Index("ux_prov_chash", "org_id", "workspace_id", "content_hash", unique=True),
+        Index("ix_prov_owner", "org_id", "workspace_id", "owner_id"),
         Index(
             "ix_prov_artifact",
             "workspace_id",
@@ -229,6 +260,7 @@ class FactProvenance(Base):
     __tablename__ = "fact_provenance"
 
     memory_id: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     namespace_prefix: Mapped[str] = mapped_column(String, nullable=False)
     subject_entity_uid: Mapped[str] = mapped_column(String, nullable=False)  # NOT surface text
@@ -263,6 +295,7 @@ class ProvenanceLedgerRow(Base):
         String, nullable=False
     )  # ORIGIN|DERIVED|SUPERSEDED|COMPOSED
     memory_id: Mapped[str] = mapped_column(String, nullable=False)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     actor_id: Mapped[str] = mapped_column(String, nullable=False)
     at: Mapped[datetime] = _dt()
@@ -270,7 +303,7 @@ class ProvenanceLedgerRow(Base):
 
     __table_args__ = (
         PrimaryKeyConstraint("stream_id", "version"),
-        Index("ix_prov_ledger_memory", "workspace_id", "memory_id"),
+        Index("ix_prov_ledger_memory", "org_id", "workspace_id", "memory_id"),
     )
 
 
@@ -281,6 +314,7 @@ class UsageEventRow(Base):
     event_id: Mapped[str] = mapped_column(String, primary_key=True)
     seq: Mapped[int] = mapped_column(BigInteger, nullable=False)  # per-workspace monotonic
     occurred_at: Mapped[datetime] = _dt()
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # billing/tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     namespace: Mapped[str] = mapped_column(String, nullable=False)
     principal_id: Mapped[str] = mapped_column(String, nullable=False)
@@ -308,6 +342,7 @@ class UsageEventRow(Base):
     __table_args__ = (
         Index("ix_usage_ws_seq", "workspace_id", "seq"),
         Index("ix_usage_ws_occurred", "workspace_id", "occurred_at"),
+        Index("ix_usage_org_occurred", "org_id", "occurred_at"),  # billing rollup at org grain
     )
 
 
@@ -324,6 +359,7 @@ class UsageRollupRow(Base):
     __tablename__ = "usage_rollup"
 
     bucket_key: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # billing/tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     dimension: Mapped[str] = mapped_column(String, nullable=False)
     hour_bucket: Mapped[datetime] = _dt()
@@ -337,6 +373,7 @@ class DeviceRow(Base):
     __tablename__ = "devices"
 
     device_id: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     principal_id: Mapped[str] = mapped_column(String, nullable=False)  # the ONE owning principal
     public_key: Mapped[str] = mapped_column(String, nullable=False)
@@ -355,12 +392,13 @@ class DeviceRow(Base):
     revoked_at: Mapped[datetime | None] = _dt_opt()
     revoked_by: Mapped[str | None] = mapped_column(String)
 
-    __table_args__ = (Index("ix_devices_principal", "workspace_id", "principal_id"),)
+    __table_args__ = (Index("ix_devices_principal", "org_id", "principal_id"),)
 
 
 class PrivateSyncLogRow(Base):
     __tablename__ = "private_sync_log"
 
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # sync-log key root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     principal_id: Mapped[str] = mapped_column(String, nullable=False)  # the per-user stream
     seq: Mapped[int] = mapped_column(BigInteger, nullable=False)  # hub-assigned ordering authority
@@ -379,16 +417,18 @@ class PrivateSyncLogRow(Base):
     payload_ref: Mapped[str | None] = mapped_column(String)
 
     __table_args__ = (
-        PrimaryKeyConstraint("workspace_id", "principal_id", "seq"),
+        # ADR 0026: the sync-log stream key is (org_id, principal_id); seq is the hub-assigned
+        # per-stream ordering authority within it.
+        PrimaryKeyConstraint("org_id", "principal_id", "seq"),
         UniqueConstraint(
-            "workspace_id",
+            "org_id",
             "principal_id",
             "content_hash",
             "origin_device_id",
             "lamport",
             name="ux_synclog_occurrence",
         ),
-        Index("ix_synclog_stream_seq", "workspace_id", "principal_id", "seq"),
+        Index("ix_synclog_stream_seq", "org_id", "principal_id", "seq"),
     )
 
 
@@ -397,6 +437,7 @@ class ConflictRecordRow(Base):
     __tablename__ = "conflict_records"
 
     conflict_id: Mapped[str] = mapped_column(String, primary_key=True)
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     namespace_prefix: Mapped[str] = mapped_column(String, nullable=False)
     member_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)  # memory ids
@@ -424,6 +465,7 @@ class AuditLogRow(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     ts: Mapped[datetime] = _dt()
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     actor_id: Mapped[str] = mapped_column(String, nullable=False)
     action: Mapped[str] = mapped_column(String, nullable=False)
@@ -432,13 +474,17 @@ class AuditLogRow(Base):
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
 
-    __table_args__ = (Index("ix_audit_ws_ts", "workspace_id", "ts"),)
+    __table_args__ = (
+        Index("ix_audit_ws_ts", "workspace_id", "ts"),
+        Index("ix_audit_org_ts", "org_id", "ts"),
+    )
 
 
 # ============================================================ §2.10 trust_ledger_entries
 class TrustLedgerEntryRow(Base):
     __tablename__ = "trust_ledger_entries"
 
+    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String, nullable=False)
     seq: Mapped[int] = mapped_column(BigInteger, nullable=False)  # per-workspace monotonic
     action: Mapped[str] = mapped_column(String, nullable=False)  # TrustLedgerAction

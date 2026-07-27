@@ -60,8 +60,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 minversion = "8.0"
 asyncio_mode = "auto"
+# src-layout namespace packages: importlib import-mode + namespace-package awareness so the
+# per-package `tests/` trees (identically-named `tests` roots) collect without sys.path clashes.
+consider_namespace_packages = true
 testpaths = ["packages/mu-contracts/tests", "packages/mu-engine/tests", "packages/mu-local/tests"]
-addopts = "-ra --strict-markers --strict-config"
+addopts = "-ra --strict-markers --strict-config --import-mode=importlib"
 markers = [
     "unit: isolated logic; mocks permitted (DEV-STANDARDS: mocks ONLY in pure unit tests).",
     "integration: real running mu-dev-* containers, ZERO mocks (DEV-STANDARDS: non-negotiable).",

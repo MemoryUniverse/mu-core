@@ -28,6 +28,9 @@ from typing import Any
 
 from falkordb.asyncio import FalkorDB
 
+from mu_contracts.ports.time import Clock
+from mu_engine.platform.clock import SystemClock
+from mu_engine.platform.decorators import retry_io
 from mu_engine.storage.domain.entity import EntityCandidate, EntityResolution
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -38,14 +41,28 @@ __all__ = ["FalkorLtmAdapter"]
 
 _SHORTLIST_SIZE = 5
 _SIMILARITY_THRESHOLD = 0.84  # graph_falkor.py resolve_entity deterministic band
+# Per-attempt I/O budget (DEV-STANDARDS async sharpener: "timeouts on every external call").
+# A default resilience budget carried in code, mirroring the retry_io/timed defaults already
+# in platform.decorators; a hang becomes a retryable TimeoutError, never a stuck task.
+_STORE_IO_TIMEOUT_S = 10.0
 
 
 class FalkorLtmAdapter:
-    """Implements ``GraphStorePort``/``LtmTierRepository`` over a real FalkorDB connection."""
+    """Implements ``GraphStorePort``/``LtmTierRepository`` over a real FalkorDB connection.
 
-    def __init__(self, db: FalkorDB, *, mapper: GraphMapper | None = None) -> None:  # type: ignore[no-any-unimported]  # falkordb ships no stubs
+    ALL domain time flows through the injected :class:`Clock` port in UTC (MAJOR-3): the
+    bi-temporal ``invalid_at > $now`` graph filter must be UTC-correct — a local-tz ``now``
+    (host is +03:00) would mis-compare against the UTC ISO strings stored on the nodes.
+    Every external openCypher call is wrapped by :func:`retry_io` (transient-only retry/backoff
+    + a per-attempt timeout) so no store call is unbounded (MAJOR-4).
+    """
+
+    def __init__(  # type: ignore[no-any-unimported]  # falkordb ships no stubs
+        self, db: FalkorDB, *, mapper: GraphMapper | None = None, clock: Clock | None = None
+    ) -> None:
         self._db = db
         self._mapper = mapper or GraphMapper()
+        self._clock: Clock = clock or SystemClock()
 
     def _graph(self, ns: Namespace) -> Any:
         # partition: one graph per (workspace, visibility|user) — graph_falkor.py:262-266.
@@ -55,6 +72,7 @@ class FalkorLtmAdapter:
             name = f"mu_g__{ns.workspace}__{ns.user}"
         return self._db.select_graph(name)
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def upsert_fact(self, item: MemoryItem) -> None:
         g = self._graph(item.namespace)
         row = self._mapper.to_store(item)
@@ -78,6 +96,7 @@ class FalkorLtmAdapter:
                 params={"ns": props["namespace"], "id": item.id, "art": item.artifact_ref},
             )
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def graph_recall(
         self,
         ns: Namespace,
@@ -96,7 +115,7 @@ class FalkorLtmAdapter:
         params: dict[str, Any] = {
             "ns": prefix,
             "active": MemoryState.ACTIVE.value,
-            "now": datetime.now().astimezone().isoformat(),
+            "now": self._clock.now().isoformat(),  # injected Clock, UTC (MAJOR-3)
             "limit": limit,
         }
         if subject is not None:
@@ -123,6 +142,7 @@ class FalkorLtmAdapter:
             )
         return out
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def facts_at(
         self, ns: Namespace, at: datetime, *, subject: str | None = None
     ) -> list[MemoryItem]:
@@ -142,6 +162,7 @@ class FalkorLtmAdapter:
         res = await g_query(self._graph(ns), cypher, params)
         return [MemoryItem.model_validate_json(r[0]) for r in res]
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def find_conflicts(self, ns: Namespace, subject: str, predicate: str) -> list[MemoryItem]:
         # active facts sharing (subject, predicate) — the conflict access pattern
         # (graph_falkor.py find_conflicts; spec §2.5 ix_fact_conflict mirror).
@@ -155,11 +176,12 @@ class FalkorLtmAdapter:
             "subject": subject,
             "predicate": predicate,
             "active": MemoryState.ACTIVE.value,
-            "now": datetime.now().astimezone().isoformat(),
+            "now": self._clock.now().isoformat(),  # injected Clock, UTC (MAJOR-3)
         }
         res = await g_query(self._graph(ns), cypher, params)
         return [MemoryItem.model_validate_json(r[0]) for r in res]
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def invalidate(
         self, ns: Namespace, loser_id: str, winner_id: str, *, at: datetime, reason: str
     ) -> None:
@@ -183,6 +205,7 @@ class FalkorLtmAdapter:
             },
         )
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def resolve_entity(self, ns: Namespace, name: str) -> EntityResolution:
         # PORT graph_falkor.py resolve_entity: deterministic match OR bounded shortlist.
         canonical = name.strip().casefold()

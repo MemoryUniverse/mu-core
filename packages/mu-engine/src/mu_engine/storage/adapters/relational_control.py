@@ -20,26 +20,38 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from mu_engine.platform.decorators import retry_io
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.mappers.relational_mapper import RelationalMapper
 from mu_engine.storage.relational.schema import AuditLogRow, MemoryProvenance
 
 __all__ = ["RelationalControlPlaneAdapter"]
 
+# Per-attempt I/O budget (DEV-STANDARDS async sharpener: "timeouts on every external call").
+_STORE_IO_TIMEOUT_S = 15.0
+
 
 class RelationalControlPlaneAdapter:
-    """Content-free relational mirror + control plane over a real async engine."""
+    """Content-free relational mirror + control plane over a real async engine.
+
+    Every external SQL call is wrapped by :func:`retry_io` (transient-only retry/backoff +
+    per-attempt timeout) so no store call is unbounded (MAJOR-4); the writes are idempotent
+    (``ON CONFLICT DO UPDATE`` / append at a monotonic grain) so a retry never double-writes.
+    """
 
     def __init__(self, engine: AsyncEngine, *, mapper: RelationalMapper | None = None) -> None:
         self._engine = engine
         self._mapper = mapper or RelationalMapper()
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def sync_provenance(self, item: MemoryItem) -> str:
         """Idempotent upsert of the content-free MemoryItem mirror (spec §2.4)."""
         row = self._mapper.to_store(item)
         values: dict[str, Any] = {"memory_id": item.id, **row.cols}
         dialect = self._engine.dialect.name
-        conflict_key = ("workspace_id", "content_hash")
+        # dedupe grain = the ratified (org, workspace, content_hash) (ADR 0026), matching the
+        # ux_prov_chash unique index — a retried SyncWorkflow push never double-writes.
+        conflict_key = ("org_id", "workspace_id", "content_hash")
         stmt: Executable
         if dialect == "postgresql":
             pg = pg_insert(MemoryProvenance).values(**values)
@@ -59,6 +71,7 @@ class RelationalControlPlaneAdapter:
             await conn.execute(stmt)
         return item.id
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def get_provenance(self, workspace_id: str, memory_id: str) -> dict[str, Any] | None:
         table = MemoryProvenance.__table__
         stmt = select(table).where(
@@ -69,6 +82,7 @@ class RelationalControlPlaneAdapter:
             row = result.mappings().first()
         return dict(row) if row is not None else None
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def list_by_namespace(self, namespace_prefix: str, *, limit: int) -> list[dict[str, Any]]:
         # scoped by to_prefix() — tenancy isolation (spec §2 tenancy rule).
         table = MemoryProvenance.__table__
@@ -78,9 +92,11 @@ class RelationalControlPlaneAdapter:
             rows = result.mappings().all()
         return [dict(r) for r in rows]
 
+    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def append_audit(
         self,
         *,
+        org_id: str,
         workspace_id: str,
         actor_id: str,
         action: str,
@@ -88,9 +104,11 @@ class RelationalControlPlaneAdapter:
         success: bool,
         payload: dict[str, Any] | None = None,
     ) -> None:
-        # content-free audit row (spec §2.9): ids/hashes/counts/enums only.
+        # content-free audit row (spec §2.9): ids/hashes/counts/enums only. org_id is the
+        # ratified tenancy root (ADR 0026), distinct from the workspace grouping.
         stmt = insert(AuditLogRow).values(
             ts=datetime.now(UTC),
+            org_id=org_id,
             workspace_id=workspace_id,
             actor_id=actor_id,
             action=action,

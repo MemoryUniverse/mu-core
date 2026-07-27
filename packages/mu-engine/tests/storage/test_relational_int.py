@@ -32,9 +32,9 @@ async def test_sync_provenance_idempotent(
         n = await conn.scalar(
             text(
                 "select count(*) from memory_provenance "
-                "where workspace_id=:w and content_hash=:h"
+                "where org_id=:o and workspace_id=:w and content_hash=:h"
             ),
-            {"w": item.workspace_id, "h": item.content_hash},
+            {"o": ns.org, "w": item.workspace_id, "h": item.content_hash},
         )
     assert n == 1
     row = await adapter.get_provenance(item.workspace_id, item.id)
@@ -87,6 +87,7 @@ async def test_audit_append(pg_engine: AsyncEngine, make_ns: Callable[..., Names
     adapter = RelationalControlPlaneAdapter(pg_engine)
     ns = make_ns()
     await adapter.append_audit(
+        org_id=ns.org,
         workspace_id=ns.workspace,
         actor_id="u1",
         action="memory.write",
@@ -96,7 +97,7 @@ async def test_audit_append(pg_engine: AsyncEngine, make_ns: Callable[..., Names
     )
     async with pg_engine.connect() as conn:
         n = await conn.scalar(
-            text("select count(*) from audit_log where workspace_id=:w"),
-            {"w": ns.workspace},
+            text("select count(*) from audit_log where org_id=:o and workspace_id=:w"),
+            {"o": ns.org, "w": ns.workspace},
         )
     assert n == 1

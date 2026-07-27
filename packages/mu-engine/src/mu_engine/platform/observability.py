@@ -14,9 +14,11 @@ as a metric label (cardinality, spec §11).
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Mapping
 from types import TracebackType
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
@@ -30,6 +32,7 @@ from mu_contracts.ports.observability import (
 )
 
 __all__ = [
+    "DurableAuditSink",
     "NoopAuditLog",
     "NoopMetricSink",
     "NoopTracer",
@@ -40,6 +43,10 @@ __all__ = [
     "sanitize_label_value",
     "sanitize_labels",
 ]
+
+# Bounded backpressure for the durable audit queue (DEV-STANDARDS: bounded queues, never
+# unbounded). On overflow the recorder falls back to the structlog mirror (never silently drops).
+_DURABLE_AUDIT_QUEUE_MAX = 1024
 
 # ── content-free guards ──────────────────────────────────────────────────────────────────────
 # Keys: short snake_case (bounds metric-label cardinality, spec §11).
@@ -190,12 +197,21 @@ def build_metrics(*, enabled: bool) -> MetricSink:
     return _PrometheusMetricSink()
 
 
-def build_audit(*, enabled: bool) -> AuditLog:
-    """The content-free audit recorder when ``enabled``, else :class:`NoopAuditLog`.
-    NOTE: the DURABLE recorder (Postgres audit rows, spec §11) lands with the governance phase; the
-    ``enabled`` path currently emits content-free structured logs (tracked gap)."""
+def build_audit(*, enabled: bool, durable_sink: DurableAuditSink | None = None) -> AuditLog:
+    """The content-free audit recorder (spec §11).
+
+    * not ``enabled`` -> :class:`NoopAuditLog`;
+    * ``enabled`` AND a ``durable_sink`` is CONFIGURED -> :class:`_DurableAuditLog`, which
+      persists durable content-free audit rows (e.g. the Postgres ``audit_log`` table via
+      ``ControlPlaneRepository.append_audit``) and mirrors to structured logs (MINOR-7 — the
+      durable recorder is now the enabled path, no longer a structlog-only stub);
+    * ``enabled`` with no durable sink wired -> :class:`_StructlogAuditLog` (content-free
+      structured logs only).
+    """
     if not enabled:
         return NoopAuditLog()
+    if durable_sink is not None:
+        return _DurableAuditLog(durable_sink)
     return _StructlogAuditLog()
 
 
@@ -307,3 +323,125 @@ class _StructlogAuditLog:
         payload.update(fields.as_attributes())
         self._log.info("audit", **payload)
         return _AuditEvent(id=scope.correlation_id)
+
+
+class AuditRecord(BaseModel):
+    """A validated, content-free durable-audit payload (ids/hashes/counts/enums only)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    correlation_id: str
+    operation: str
+    outcome: str
+    tier: str | None = None
+    visibility: str | None = None
+    store: str | None = None
+    fields: SafeTraceFields
+
+
+@runtime_checkable
+class DurableAuditSink(Protocol):
+    """The async durable sink a :class:`_DurableAuditLog` drains into (e.g. the relational
+    ``ControlPlaneRepository`` writing content-free ``audit_log`` rows). Kept as a thin async
+    Protocol so ``platform`` does not depend on a concrete store adapter."""
+
+    async def append(self, record: AuditRecord) -> None: ...
+
+
+class _DurableAuditLog:
+    """Durable content-free audit recorder (MINOR-7).
+
+    ``record()`` stays synchronous (the ``AuditLog`` port shape) and NON-BLOCKING: it validates
+    content-free, enqueues onto a BOUNDED queue (DEV-STANDARDS backpressure), and lazily starts a
+    background drain task that awaits the async :class:`DurableAuditSink`. It also mirrors to
+    structured logs so nothing is lost if there is no running loop or the queue is saturated
+    (fail-loud fallback, never a silent drop)."""
+
+    def __init__(self, sink: DurableAuditSink) -> None:
+        import structlog
+
+        self._sink = sink
+        self._mirror = _StructlogAuditLog()
+        self._log = structlog.get_logger("mu.audit")
+        self._queue: asyncio.Queue[AuditRecord] = asyncio.Queue(maxsize=_DURABLE_AUDIT_QUEUE_MAX)
+        self._drain_task: asyncio.Task[None] | None = None
+
+    def record(
+        self,
+        scope: TurnTraceScope,
+        *,
+        operation: str,
+        outcome: str,
+        tier: str | None = None,
+        visibility: str | None = None,
+        store: str | None = None,
+        ids: Mapping[str, str] | None = None,
+        hashes: Mapping[str, str] | None = None,
+        counts: Mapping[str, int] | None = None,
+    ) -> TurnTraceEvent:
+        # Content-free validation happens BEFORE anything is persisted or logged (fail-loud).
+        fields = SafeTraceFields(ids=ids or {}, hashes=hashes or {}, counts=counts or {})
+        record = AuditRecord(
+            correlation_id=scope.correlation_id,
+            operation=operation,
+            outcome=outcome,
+            tier=tier,
+            visibility=visibility,
+            store=store,
+            fields=fields,
+        )
+        # Always mirror the content-free line; the durable row is the primary sink.
+        self._mirror.record(
+            scope,
+            operation=operation,
+            outcome=outcome,
+            tier=tier,
+            visibility=visibility,
+            store=store,
+            ids=ids,
+            hashes=hashes,
+            counts=counts,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop (sync context): the mirror line above is the record of last resort.
+            return _AuditEvent(id=scope.correlation_id)
+        self._ensure_drain(loop)
+        try:
+            self._queue.put_nowait(record)
+        except asyncio.QueueFull:
+            # Saturated: the mirror already captured it; do not block the caller (backpressure).
+            pass
+        return _AuditEvent(id=scope.correlation_id)
+
+    def _ensure_drain(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._drain_task is None or self._drain_task.done():
+            self._drain_task = loop.create_task(self._drain())
+
+    async def _drain(self) -> None:
+        while True:
+            record = await self._queue.get()
+            try:
+                await self._sink.append(record)
+            except asyncio.CancelledError:
+                raise  # cancellation propagates (DEV-STANDARDS rule 1)
+            except Exception:
+                # A durable-write failure must not kill the drain loop; the mirror line already
+                # captured the event. Emit a content-free failure marker.
+                self._log.warning(
+                    "audit_durable_write_failed", correlation_id=record.correlation_id
+                )
+            finally:
+                self._queue.task_done()
+
+    async def aclose(self) -> None:
+        """Flush pending durable writes and stop the drain task (lifecycle teardown)."""
+        if self._drain_task is None:
+            return
+        await self._queue.join()
+        self._drain_task.cancel()
+        try:
+            await self._drain_task
+        except asyncio.CancelledError:
+            pass

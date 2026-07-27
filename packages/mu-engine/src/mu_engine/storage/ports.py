@@ -188,6 +188,7 @@ class ControlPlaneRepository(Protocol):
     async def append_audit(
         self,
         *,
+        org_id: str,
         workspace_id: str,
         actor_id: str,
         action: str,
