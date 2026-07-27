@@ -1,0 +1,157 @@
+"""Stage / Pipeline / Context / Outcome — the connective tissue of the staged framework.
+
+PORT-generalise of the prototype ``local_client/service.py:268`` ``remember()`` hand-rolled
+CAPTURE->INGEST->promote pipeline (per-stage idempotency via ``metadata["persistence_pending"]``)
+and the ledger-gate-then-mark discipline of ``workflows/sync.py:150-160``
+(``/home/user/hackathon/memory_universe/...``). Shapes pinned by ``PIPELINES-design.md §2.1-§2.3``.
+
+Dependency rule (engine-core-spec §0): this module imports ONLY ports + domain — never a store
+client, never ``datetime.now()``. Every clock is the injected ``Clock`` (``ports/time.py``); a
+``Stage`` is pure orchestration over ports, so the SAME object runs in-process OR as a Temporal
+activity (the ``sync_workflow.py`` determinism rule). This slice ships the in-process shape; the
+durable dispatcher/backpressure runner land in a later phase.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
+from typing import Any, Protocol, runtime_checkable
+
+from mu_contracts.domain.events import DomainEvent
+from mu_contracts.domain.model.memory import Namespace
+from mu_contracts.ports.time import Clock
+from mu_engine.pipelines.ledger import StageLedger
+
+__all__ = [
+    "BaseStage",
+    "HaltPolicy",
+    "Pipeline",
+    "PipelineContext",
+    "Stage",
+    "StageOutcome",
+    "StageStatus",
+]
+
+
+class StageStatus(StrEnum):
+    """A stage's typed result axis (PIPELINES §2.1). Never inferred from absence-of-exception."""
+
+    OK = "ok"  # produced output, advance
+    SKIPPED = "skipped"  # idempotent no-op (ledger hit) — NOT a failure; carries recorded events
+    DEGRADED = "degraded"  # ran a NAMED fallback; MUST carry a reason + event
+    FAILED = "failed"  # raised; runner compensates/halts per policy
+
+
+@dataclass(frozen=True, slots=True)
+class StageOutcome:
+    """A stage's typed result (PIPELINES §2.1). ``reason`` is required when DEGRADED/SKIPPED."""
+
+    status: StageStatus
+    produced: Mapping[str, Any] = field(default_factory=dict)  # merged into ctx.state
+    events: Sequence[DomainEvent] = ()  # published AFTER the ledger commit
+    reason: str | None = None
+    idempotency_key: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.status in (StageStatus.DEGRADED, StageStatus.SKIPPED) and not self.reason:
+            raise ValueError(f"{self.status} StageOutcome requires a reason (PIPELINES §2.1)")
+
+
+@dataclass(slots=True)
+class PipelineContext:
+    """Carried through every stage. ``state`` is the running accumulator (mem0's returned-memories
+    list, generalised); ``correlation_id`` traces one dispatch across the bus (PIPELINES §2.1)."""
+
+    pipeline: str
+    namespace: Namespace
+    correlation_id: str
+    trigger_event: DomainEvent | None = None
+    state: dict[str, Any] = field(default_factory=dict)
+    started_at: datetime | None = None
+    attempt: int = 1
+
+
+@runtime_checkable
+class Stage(Protocol):
+    """One idempotent step. Pure orchestration over ports: no direct IO, no wall-clock in ``run``
+    beyond what a port provides — so the identical object runs in-process OR as a Temporal
+    activity (PIPELINES §2.2)."""
+
+    name: str
+
+    def idempotency_key(self, ctx: PipelineContext) -> str: ...
+
+    async def run(self, ctx: PipelineContext) -> StageOutcome: ...
+
+    async def compensate(self, ctx: PipelineContext, outcome: StageOutcome) -> None: ...
+
+
+class BaseStage(ABC):
+    """Implements the ledger gate + event discipline ONCE (PIPELINES §2.2).
+
+    The ledger-gate-then-mark-completed-after-success ordering is exactly ``SyncWorkflow.sync``
+    (``workflows/sync.py:150-160``): check the ledger first, mark completed only after success.
+    Centralising it here means no concrete stage can get idempotency wrong (the mem0 defect where
+    a retried ``remember`` double-increments ``mention_count`` cannot recur).
+
+    (B4) ``mark_completed(key, events=...)`` writes the completion marker AND the events into ONE
+    durable ledger row — never "mark then publish" as two steps — so a crash cannot leave the key
+    marked complete with its events lost. A ledger hit returns the recorded events; ``SKIPPED``
+    therefore NEVER means "no events".
+    """
+
+    name: str
+
+    def __init__(self, *, ledger: StageLedger, clock: Clock) -> None:
+        self._ledger = ledger
+        self._clock = clock
+
+    def idempotency_key(self, ctx: PipelineContext) -> str:
+        """Deterministic from ctx; empty string => stage is not ledger-gated (PIPELINES §2.2)."""
+        raise NotImplementedError
+
+    async def run(self, ctx: PipelineContext) -> StageOutcome:
+        key = self.idempotency_key(ctx)
+        if key:
+            record = await self._ledger.completed_with_events(key)
+            if record is not None:
+                return StageOutcome(
+                    StageStatus.SKIPPED,
+                    reason="ledger-hit",
+                    idempotency_key=key,
+                    events=record.events,
+                )
+        outcome = await self._execute(ctx)
+        if outcome.status in (StageStatus.OK, StageStatus.DEGRADED) and key:
+            await self._ledger.mark_completed(key, events=outcome.events)
+        return outcome
+
+    @abstractmethod
+    async def _execute(self, ctx: PipelineContext) -> StageOutcome: ...
+
+    async def compensate(self, ctx: PipelineContext, outcome: StageOutcome) -> None:
+        """Saga rollback; default no-op for read-only / append-only stages (PIPELINES §2.2)."""
+        return None
+
+
+class HaltPolicy(StrEnum):
+    """How a runner reacts to a FAILED stage (PIPELINES §2.3)."""
+
+    COMPENSATE = "compensate"  # saga: roll back completed stages in reverse (TRANSFER)
+    HALT_LOUD = "halt_loud"  # stop, keep the durable partial, re-raise (INGEST)
+    CONTINUE = "continue"  # best-effort: log the stage, run the rest (DISTILL sub-steps)
+
+
+@dataclass(frozen=True, slots=True)
+class Pipeline:
+    """An ordered, named list of stages + policy (PIPELINES §2.3). Declared once; holds NO infra —
+    the runner (or the owning service) injects the substrate and drives the stages."""
+
+    name: str
+    stages: tuple[Stage, ...]
+    halt_policy: HaltPolicy
+    durable: bool = False
