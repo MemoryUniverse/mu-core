@@ -1,0 +1,220 @@
+"""FalkorDB graph adapter — the LTM tier repository (``storage-pluggable §3.4``).
+
+Graph is MANDATORY (owner override 1): there is no ``sqlfold``/``none`` LTM mode.
+
+PORT of the ``:Memory`` MERGE, ``SUPERSEDED_BY``/``CONFLICTS_WITH`` lifecycle, and the
+``find_conflicts``/``facts_at``/``resolve_entity`` logic from
+``/home/user/hackathon/memory_universe/shared/stores/graph_falkor.py:98,131,908-952,259``,
+re-implemented as openCypher over the FalkorDB async client.
+
+DELIBERATE DEVIATION (recorded, CODE-ADOPTION rule 4): ``storage-pluggable §2.2`` pins the
+openCypher **query dialect** + Graphiti's ``GraphDriver`` as the engine seam. This adapter
+emits openCypher directly through the lightweight ``falkordb`` async client rather than
+vendoring ``graphiti-core`` — the query dialect (the portable part) is identical; only the
+driver object differs. ``graphiti-core`` is NOT installed at this phase to keep the
+dependency/RAM footprint down on the shared box; the ``GraphDriver`` swap is a constructor
+change (the adapter already isolates all Cypher here). The bi-temporal semantics
+(``valid_at``/``invalid_at`` invalidate-don't-delete) match Graphiti's model exactly.
+
+Mandatory read filters on every traversal (spec §4.3): ``m.namespace = $ns`` (exact) AND
+``m.state = 'active'`` AND ``(m.invalid_at = '' OR m.invalid_at > $now)``; SHARED adds the
+Model-A ``ANY(id IN $caller ...)`` predicate.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from falkordb.asyncio import FalkorDB
+
+from mu_engine.storage.domain.entity import EntityCandidate, EntityResolution
+from mu_engine.storage.domain.memory import MemoryItem, MemoryState
+from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.domain.recall import RecallChannel, Scored
+from mu_engine.storage.mappers.graph_mapper import GraphMapper
+
+__all__ = ["FalkorLtmAdapter"]
+
+_SHORTLIST_SIZE = 5
+_SIMILARITY_THRESHOLD = 0.84  # graph_falkor.py resolve_entity deterministic band
+
+
+class FalkorLtmAdapter:
+    """Implements ``GraphStorePort``/``LtmTierRepository`` over a real FalkorDB connection."""
+
+    def __init__(self, db: FalkorDB, *, mapper: GraphMapper | None = None) -> None:  # type: ignore[no-any-unimported]  # falkordb ships no stubs
+        self._db = db
+        self._mapper = mapper or GraphMapper()
+
+    def _graph(self, ns: Namespace) -> Any:
+        # partition: one graph per (workspace, visibility|user) — graph_falkor.py:262-266.
+        if ns.visibility is Visibility.SHARED:
+            name = f"mu_g__{ns.workspace}__shared"
+        else:
+            name = f"mu_g__{ns.workspace}__{ns.user}"
+        return self._db.select_graph(name)
+
+    async def upsert_fact(self, item: MemoryItem) -> None:
+        g = self._graph(item.namespace)
+        row = self._mapper.to_store(item)
+        props = row.props
+        set_authorized = ", m.authorized_ids = $authorized_ids" if "authorized_ids" in props else ""
+        cypher = (
+            "MERGE (m:Memory {namespace: $namespace, id: $id}) "
+            "SET m.subject = $subject, m.predicate = $predicate, m.object = $object, "
+            "m.object_kind = $object_kind, m.polarity = $polarity, m.state = $state, "
+            "m.valid_at = $valid_at, m.invalid_at = $invalid_at, "
+            "m.content_hash = $content_hash, m.artifact_ref = $artifact_ref, "
+            "m.provenance_id = $provenance_id, m.content = $content, m.memory_json = $memory_json"
+            f"{set_authorized}"
+        )
+        await g.query(cypher, params=dict(props))
+        if item.artifact_ref:
+            await g.query(
+                "MATCH (m:Memory {namespace: $ns, id: $id}) "
+                "MERGE (a:Artifact {namespace: $ns, id: $art}) "
+                "MERGE (m)-[:REFERENCES]->(a)",
+                params={"ns": props["namespace"], "id": item.id, "art": item.artifact_ref},
+            )
+
+    async def graph_recall(
+        self,
+        ns: Namespace,
+        *,
+        subject: str | None = None,
+        predicate: str | None = None,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        prefix = ns.to_prefix()
+        where = [
+            "m.namespace = $ns",
+            "m.state = $active",
+            "(m.invalid_at = '' OR m.invalid_at > $now)",
+        ]
+        params: dict[str, Any] = {
+            "ns": prefix,
+            "active": MemoryState.ACTIVE.value,
+            "now": datetime.now().astimezone().isoformat(),
+            "limit": limit,
+        }
+        if subject is not None:
+            where.append("m.subject = $subject")
+            params["subject"] = subject
+        if predicate is not None:
+            where.append("m.predicate = $predicate")
+            params["predicate"] = predicate
+        if ns.visibility is Visibility.SHARED and caller_identity_set is not None:
+            where.append("ANY(cid IN $caller WHERE cid IN m.authorized_ids)")
+            params["caller"] = list(caller_identity_set)
+        cypher = (
+            f"MATCH (m:Memory) WHERE {' AND '.join(where)} "
+            "RETURN m.memory_json AS mj ORDER BY m.valid_at DESC LIMIT $limit"
+        )
+        res = await g_query(self._graph(ns), cypher, params)
+        out: list[Scored[MemoryItem]] = []
+        for rank, record in enumerate(res):
+            item = MemoryItem.model_validate_json(record[0])
+            out.append(
+                Scored(
+                    item=item, score=1.0 / (rank + 1), channel=RecallChannel.LTM_GRAPH, rank=rank
+                )
+            )
+        return out
+
+    async def facts_at(
+        self, ns: Namespace, at: datetime, *, subject: str | None = None
+    ) -> list[MemoryItem]:
+        # bi-temporal as-of read: valid_at <= at AND (invalid_at empty OR invalid_at > at).
+        at_iso = at.isoformat()
+        where = [
+            "m.namespace = $ns",
+            "m.valid_at <> ''",
+            "m.valid_at <= $at",
+            "(m.invalid_at = '' OR m.invalid_at > $at)",
+        ]
+        params: dict[str, Any] = {"ns": ns.to_prefix(), "at": at_iso}
+        if subject is not None:
+            where.append("m.subject = $subject")
+            params["subject"] = subject
+        cypher = f"MATCH (m:Memory) WHERE {' AND '.join(where)} RETURN m.memory_json AS mj"
+        res = await g_query(self._graph(ns), cypher, params)
+        return [MemoryItem.model_validate_json(r[0]) for r in res]
+
+    async def find_conflicts(self, ns: Namespace, subject: str, predicate: str) -> list[MemoryItem]:
+        # active facts sharing (subject, predicate) — the conflict access pattern
+        # (graph_falkor.py find_conflicts; spec §2.5 ix_fact_conflict mirror).
+        cypher = (
+            "MATCH (m:Memory) WHERE m.namespace = $ns AND m.subject = $subject "
+            "AND m.predicate = $predicate AND m.state = $active "
+            "AND (m.invalid_at = '' OR m.invalid_at > $now) RETURN m.memory_json AS mj"
+        )
+        params = {
+            "ns": ns.to_prefix(),
+            "subject": subject,
+            "predicate": predicate,
+            "active": MemoryState.ACTIVE.value,
+            "now": datetime.now().astimezone().isoformat(),
+        }
+        res = await g_query(self._graph(ns), cypher, params)
+        return [MemoryItem.model_validate_json(r[0]) for r in res]
+
+    async def invalidate(
+        self, ns: Namespace, loser_id: str, winner_id: str, *, at: datetime, reason: str
+    ) -> None:
+        # invalidate-don't-delete (spec §4.2 lifecycle): stamp loser state='superseded' +
+        # invalid_at, MERGE (old)-[:SUPERSEDED_BY]->(new) + (old)-[:CONFLICTS_WITH]->(new).
+        g = self._graph(ns)
+        at_iso = at.isoformat()
+        await g.query(
+            "MATCH (loser:Memory {namespace: $ns, id: $loser}) "
+            "SET loser.state = $superseded, loser.invalid_at = $at "
+            "WITH loser MATCH (winner:Memory {namespace: $ns, id: $winner}) "
+            "MERGE (loser)-[s:SUPERSEDED_BY]->(winner) SET s.created_at = $at, s.reason = $reason "
+            "MERGE (loser)-[c:CONFLICTS_WITH]->(winner) SET c.created_at = $at",
+            params={
+                "ns": ns.to_prefix(),
+                "loser": loser_id,
+                "winner": winner_id,
+                "superseded": MemoryState.SUPERSEDED.value,
+                "at": at_iso,
+                "reason": reason,
+            },
+        )
+
+    async def resolve_entity(self, ns: Namespace, name: str) -> EntityResolution:
+        # PORT graph_falkor.py resolve_entity: deterministic match OR bounded shortlist.
+        canonical = name.strip().casefold()
+        cypher = (
+            "MATCH (e:Entity) WHERE e.namespace = $ns AND "
+            "(e.canonical_name = $canon OR $canon IN e.alias_keys) "
+            "RETURN e.entity_uid AS uid, e.canonical_name AS cn, e.aliases AS al LIMIT $k"
+        )
+        res = await g_query(
+            self._graph(ns),
+            cypher,
+            {"ns": ns.to_prefix(), "canon": canonical, "k": _SHORTLIST_SIZE},
+        )
+        candidates = tuple(
+            EntityCandidate(
+                entity_uid=str(r[0]),
+                canonical_name=str(r[1]),
+                aliases=tuple(r[2] or ()),
+                similarity=1.0,
+            )
+            for r in res
+        )
+        if len(candidates) == 1 and candidates[0].similarity >= _SIMILARITY_THRESHOLD:
+            return EntityResolution(
+                canonical_name=candidates[0].canonical_name,
+                entity_uid=candidates[0].entity_uid,
+                candidates=candidates,
+            )
+        return EntityResolution(canonical_name=canonical, entity_uid=None, candidates=candidates)
+
+
+async def g_query(graph: Any, cypher: str, params: dict[str, Any]) -> list[list[Any]]:
+    """Run an openCypher read and return the raw result rows (result_set)."""
+    result = await graph.query(cypher, params=params)
+    return list(result.result_set or [])

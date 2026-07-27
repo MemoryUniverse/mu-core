@@ -1,0 +1,21 @@
+# mu-contracts — the LEAN shared vocabulary (PACKAGING-v2 §1.3).
+# pydantic-ONLY. No engine, no stores, no strategies, no embedders.
+# The versioned public surface mu-engine / mu-local / mu-client / mu-server all pin.
+[project]
+name = "mu-contracts"
+version = "0.1.0"
+description = "Memory Universe — shared wire vocabulary: domain models, event catalog, ports, errors, config base."
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0"
+readme = "README.md"
+dependencies = [
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mu_contracts"]

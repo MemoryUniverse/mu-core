@@ -1,0 +1,91 @@
+# mu-dev local store stack — REAL stores for integration tests (DEV-STANDARDS: ZERO mocks).
+# DEDICATED mu-dev-* instances ONLY. NEVER touches gcmem-* or milvus-standalone (shared box).
+# Images are all cached locally — no network pull. Host ports chosen free (avoid 6333/19530).
+#
+#   run:    docker compose -f docker-compose.dev.yml up -d
+#   verify: docker compose -f docker-compose.dev.yml ps
+#   stop:   docker compose -f docker-compose.dev.yml down          (add -v to drop volumes)
+#
+# Host ports (wired into .env.test -> central Settings, never hardcoded in code):
+#   postgres  15432 -> 5432   |  cache/redis 16379 -> 6379
+#   qdrant    16333 -> 6333 (REST), 16334 -> 6334 (gRPC)  |  falkordb 16380 -> 6379
+
+name: mu-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mu-dev-postgres
+    environment:
+      POSTGRES_USER: mu
+      POSTGRES_PASSWORD: mu_dev_pw
+      POSTGRES_DB: mu
+    ports:
+      - "127.0.0.1:15432:5432"
+    volumes:
+      - mu-dev-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mu -d mu"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks: [mu-dev]
+
+  cache:
+    image: redis:7-alpine
+    container_name: mu-dev-cache
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:16379:6379"
+    volumes:
+      - mu-dev-cache-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks: [mu-dev]
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: mu-dev-qdrant
+    ports:
+      - "127.0.0.1:16333:6333"
+      - "127.0.0.1:16334:6334"
+    volumes:
+      - mu-dev-qdrant-data:/qdrant/storage
+    healthcheck:
+      # qdrant image ships no curl/wget; bash /dev/tcp is the dependency-free readiness probe.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333' 2>/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    networks: [mu-dev]
+
+  falkordb:
+    image: falkordb/falkordb:v4.20.1
+    container_name: mu-dev-falkordb
+    ports:
+      - "127.0.0.1:16380:6379"
+    volumes:
+      - mu-dev-falkordb-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks: [mu-dev]
+
+volumes:
+  mu-dev-postgres-data:
+  mu-dev-cache-data:
+  mu-dev-qdrant-data:
+  mu-dev-falkordb-data:
+
+networks:
+  mu-dev:
+    name: mu-dev

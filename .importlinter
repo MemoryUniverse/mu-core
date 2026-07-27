@@ -1,0 +1,37 @@
+# import-linter — the intra-mu-core boundary (PACKAGING-v2 §5.2), CI gate.
+# The load-bearing contracts for THIS repo: core-layers + mu-local-layers.
+# Cross-plane gates (mu-client / mu-server never touch each other) live in those
+# repos' own CI as grep gates (§5.3) — they cannot be resolved from here.
+
+[importlinter]
+root_packages =
+    mu_contracts
+    mu_engine
+    mu_local
+
+# contracts is the base; engine sits above and may not be imported downward-in.
+[importlinter:contract:core-layers]
+name = core-layers (contracts <- engine)
+type = layers
+layers =
+    mu_engine
+    mu_contracts
+
+# mu-local (embedded engine) sits above engine + contracts.
+[importlinter:contract:mu-local-layers]
+name = mu-local-layers (contracts <- engine <- local)
+type = layers
+layers =
+    mu_local
+    mu_engine
+    mu_contracts
+
+# contracts is pydantic-only: it must never reach up into engine or local.
+[importlinter:contract:contracts-imports-nothing-in-project]
+name = contracts imports nothing in-project
+type = forbidden
+source_modules =
+    mu_contracts
+forbidden_modules =
+    mu_engine
+    mu_local

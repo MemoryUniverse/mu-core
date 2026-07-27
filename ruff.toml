@@ -1,0 +1,33 @@
+# Ruff — lint + format, CI gate (DEV-STANDARDS "Ruff (lint) + ruff-format clean").
+target-version = "py312"
+line-length = 100
+src = ["packages/mu-contracts/src", "packages/mu-engine/src", "packages/mu-local/src"]
+
+[lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "C4",        # comprehensions
+    "ASYNC",     # flake8-async (cancellation/blocking-in-loop discipline)
+    "S",         # bandit (security)
+    "T20",       # flake8-print (DEV-STANDARDS: no print)
+    "RUF",       # ruff-specific
+    "ANN",       # missing annotations (strict typing bar)
+    "TID",       # tidy-imports
+]
+ignore = [
+    "ANN401",    # allow explicit Any where deliberately annotated
+]
+
+[lint.per-file-ignores]
+"**/tests/**" = ["S101", "ANN"]   # asserts + loose annotations OK in tests
+
+[lint.isort]
+known-first-party = ["mu_contracts", "mu_engine", "mu_local"]
+
+[format]
+docstring-code-format = true

@@ -1,0 +1,68 @@
+# mu-core — uv workspace root (VIRTUAL: no [project], not itself a distribution).
+# Ships four OPEN distributions from packages/*  (PACKAGING-v2 §1.2, §1.3):
+#   mu-contracts, mu-engine, mu-local  (mu-sdk scaffolded in the mu-sdk-python repo).
+# This root carries ONLY the workspace declaration, the shared dev toolchain,
+# and the tool configs (mypy/pytest live here; ruff -> ruff.toml; import-linter -> .importlinter).
+
+[tool.uv.workspace]
+members = ["packages/mu-contracts", "packages/mu-engine", "packages/mu-local"]
+
+# In-project cross-package edges are resolved from the workspace, never PyPI
+# (PACKAGING-v2 §5.4/§5.5: version-pinned at extraction time; workspace-linked pre-split).
+[tool.uv.sources]
+mu-contracts = { workspace = true }
+mu-engine = { workspace = true }
+mu-local = { workspace = true }
+
+# Dev toolchain (PEP 735 dependency-groups; installed with `uv sync`).
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<0.25",
+    "mypy>=1.13,<2",
+    "ruff>=0.8,<0.9",
+    "import-linter>=2.1,<3",
+    "testcontainers>=4.9,<5",
+]
+
+# ----------------------------------------------------------------------------
+# mypy — strict, gate (DEV-STANDARDS "strict static typing"; CI-blocking).
+# ----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_any_unimported = true
+no_implicit_reexport = true
+show_error_codes = true
+pretty = true
+mypy_path = ["packages/mu-contracts/src", "packages/mu-engine/src", "packages/mu-local/src"]
+namespace_packages = true
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+# Third-party libs without shipped stubs — ignore missing imports at the boundary only.
+module = [
+    "qdrant_client.*",
+    "falkordb.*",
+    "graphiti_core.*",
+    "litellm.*",
+    "sentence_transformers.*",
+    "testcontainers.*",
+]
+ignore_missing_imports = true
+
+# ----------------------------------------------------------------------------
+# pytest — asyncio auto mode + the two required markers (DEV-STANDARDS testing).
+# ----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+asyncio_mode = "auto"
+testpaths = ["packages/mu-contracts/tests", "packages/mu-engine/tests", "packages/mu-local/tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "unit: isolated logic; mocks permitted (DEV-STANDARDS: mocks ONLY in pure unit tests).",
+    "integration: real running mu-dev-* containers, ZERO mocks (DEV-STANDARDS: non-negotiable).",
+]
