@@ -27,9 +27,21 @@ content-free sinks (:class:`Tracer` / :class:`MetricSink` / :class:`AuditLog`) f
 recall / distill emit spans, latency/error metrics and content-free audit rows on their meaningful
 ops (no more silently-no-op sinks).
 
-NO LLM this phase (Azure PARKED): ``llm`` is ``None`` ⇒ heuristic mode. Ingest promotion and the
-DISTILL extractor are deterministic (real-integration-testable now); any synthesis verb refuses
-loudly (:class:`~mu_local.errors.LlmNotConfiguredError`).
+LLM WIRING (closed 2026-07-27, was the ``self.llm: object | None = None`` hardcoded seam): ``llm``
+defaults to ``None`` ⇒ heuristic mode — UNCHANGED, backward compatible (ingest promotion and the
+DISTILL extractor stay deterministic; ``ask``/adjudication still refuse loudly via
+:class:`~mu_local.errors.LlmNotConfiguredError`). When ``storage.llm`` carries a
+:class:`~mu_local.config.ModelProfileSettings`, this root builds a REAL
+:class:`~mu_engine.providers.model_router.ModelRouter` — the SAME LOCAL_HTTP/OpenAI-compatible
+catalog shape the reference integration test proved against the real docker SLM
+(``mu-engine/tests/pipelines/test_distill_llm_slm_int.py``: ``SlmTestSettings`` + ``build_model_
+router`` + ``LlmFactExtractor`` dropping in unchanged against ``ModelRouter`` because it satisfies
+``LLMProviderPort`` structurally) — and threads it two places: (a) ``LlmFactExtractor(router, ...)``
+replaces ``HeuristicSpoExtractor`` for the DISTILL pipeline's SPO extraction; (b) the router itself
+is exposed as ``self.llm`` so ``LocalMemory.ask()`` can call ``router.generate(Task.ANSWER, ...)``.
+No cloud reachability is assumed — building a ``ModelRouter`` for a LOCAL_HTTP deployment opens no
+in-process weights (unlike the L5 warm-local singleton the embedder uses), so this stays a cheap,
+synchronous construction here, same discipline as the embedder build above.
 """
 
 from __future__ import annotations
@@ -46,9 +58,16 @@ from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import SystemClock
 from mu_engine.platform.observability import build_audit, build_metrics, build_tracer
 from mu_engine.platform.tenancy import DefaultTenancyGuard
+from mu_engine.providers.catalog import ModelDeployment, ModelKind, ProviderKind, ProviderRecord
 from mu_engine.providers.embedding import SentenceTransformerEmbedder, build_embedder
-from mu_engine.providers.settings import default_local_catalog
-from mu_engine.services.extract import HeuristicSpoExtractor
+from mu_engine.providers.model_router import ModelRouter, build_model_router
+from mu_engine.providers.settings import ModelCatalogSettings, ModelSettings, default_local_catalog
+from mu_engine.services.extract import (
+    ExtractionSettings,
+    FactExtractorPort,
+    HeuristicSpoExtractor,
+    LlmFactExtractor,
+)
 from mu_engine.services.ingest import IngestService
 from mu_engine.services.recall import (
     PrincipalAuthorizedIdsResolver,
@@ -62,7 +81,12 @@ from mu_engine.storage.domain.namespace import Visibility
 from mu_engine.storage.factories import STORE_REGISTRY
 from mu_engine.storage.ports import GraphStorePort, MtmTierRepository, StmTierRepository
 from mu_engine.storage.registry import assert_mandatory_roles
-from mu_local.config import BackendChoice, ObservabilitySettings, StorageSettings
+from mu_local.config import (
+    BackendChoice,
+    ModelProfileSettings,
+    ObservabilitySettings,
+    StorageSettings,
+)
 from mu_local.errors import BackendUnavailableError
 from mu_local.shared_null import LocalNullSharedRecall
 
@@ -79,6 +103,43 @@ _SUPPORTED_VECTOR = frozenset({"qdrant", "pgvector", "chroma", "faiss"})
 _SUPPORTED_GRAPH = frozenset({"falkordb"})
 _SUPPORTED_RELATIONAL = frozenset({"sqlite", "postgres", "mysql"})
 _SUPPORTED_EMBEDDING = frozenset({"minilm_local"})
+
+
+def _build_llm_catalog(profile: ModelProfileSettings) -> tuple[ModelSettings, ModelCatalogSettings]:
+    """Layer ONE ``ProviderKind.LOCAL_HTTP`` deployment onto the real ``default_local_catalog()``
+    base (untouched offline MiniLM embedder) — the SAME shape the reference SLM integration test
+    builds (``mu-engine/tests/pipelines/test_distill_llm_slm_int.py:163-196``,
+    ``_build_slm_catalog``). Every ``ModelSettings`` task field points at ``profile.model_group`` so
+    the ONE deployment satisfies the registry's per-task validation (``registry.py:79-88``)."""
+    provider = ProviderRecord(
+        key=profile.provider_key,
+        kind=ProviderKind.LOCAL_HTTP,
+        litellm_provider=profile.provider,
+        api_base=profile.base_url,
+        is_local=True,
+    )
+    deployment = ModelDeployment(
+        model_group=profile.model_group,
+        provider_key=profile.provider_key,
+        model_id=f"{profile.provider}/{profile.model}",
+        kind=ModelKind.LLM,
+        extra_params={"api_key": profile.api_key},  # passthrough seam (catalog.py:94), not a secret
+    )
+    base = default_local_catalog()
+    catalog = base.model_copy(update={"providers": [provider], "deployments": [deployment]})
+    models = ModelSettings(
+        provider=profile.provider_key,
+        answer_model=profile.model_group,
+        adjudicate_model=profile.model_group,
+        hard_extract_model=profile.model_group,
+        routine_extract_model=profile.model_group,
+        summarize_model=profile.model_group,
+        classify_model=profile.model_group,
+        rerank_model=profile.model_group,
+        max_output_tokens=profile.max_tokens,
+        temperature=profile.temperature,
+    )
+    return models, catalog
 
 
 class LocalContainer:
@@ -146,8 +207,19 @@ class LocalContainer:
         )
         self._register_closer(self.control, "_engine")
 
-        # (6) LLM PARKED ⇒ heuristic mode.
-        self.llm: object | None = None
+        # (6) LLM: None (default) ⇒ heuristic mode, unchanged; configured ⇒ a REAL ModelRouter
+        #     (the reference SLM-integration catalog shape) + the LlmFactExtractor it feeds DISTILL.
+        self.llm: ModelRouter | None = None
+        self._extractor: FactExtractorPort = HeuristicSpoExtractor()
+        if storage.llm is not None:
+            self.llm = self._build_llm_router(storage.llm)
+            self._extractor = LlmFactExtractor(
+                self.llm,
+                model_group=storage.llm.model_group,
+                settings=ExtractionSettings(
+                    max_tokens=storage.llm.max_tokens, temperature=storage.llm.temperature
+                ),
+            )
 
         # (7) platform singletons + the three content-free observability sinks (DEV-STANDARDS
         #     rule 4) — built once here from ObservabilitySettings and threaded into every service.
@@ -172,7 +244,7 @@ class LocalContainer:
         )
         self.distill = DistillPipeline(
             ltm=self.ltm,
-            extractor=HeuristicSpoExtractor(),
+            extractor=self._extractor,
             clock=self._clock,
             mtm=self.mtm,
             tracer=self.tracer,
@@ -242,6 +314,13 @@ class LocalContainer:
                 f"embedding backend {choice.backend!r} did not resolve to a local embedder"
             )
         return embedder
+
+    @staticmethod
+    def _build_llm_router(profile: ModelProfileSettings) -> ModelRouter:
+        """Build the REAL ``ModelRouter`` for a configured LLM profile via the ONE model-layer
+        composition entry point (``build_model_router``, model-router.py:302)."""
+        models, catalog = _build_llm_catalog(profile)
+        return build_model_router(models=models, catalog=catalog)
 
     def _kv_cfg(self, choice: BackendChoice) -> dict[str, Any]:
         """``STORE_REGISTRY.build("kv", ...)`` kwargs (spec §3.2). Only the ``redis`` factory has

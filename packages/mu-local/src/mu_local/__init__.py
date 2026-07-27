@@ -7,7 +7,7 @@ result views + the library-local error types.
 """
 
 from mu_local.composition import LocalContainer
-from mu_local.config import BackendChoice, StorageSettings
+from mu_local.config import BackendChoice, ModelProfileSettings, StorageSettings
 from mu_local.errors import BackendUnavailableError, LlmNotConfiguredError
 from mu_local.local_memory import LocalMemory
 from mu_local.views import (
@@ -29,6 +29,7 @@ __all__ = [
     "MemoryListView",
     "MemoryRecordView",
     "MemoryWriteResult",
+    "ModelProfileSettings",
     "StorageSettings",
     "__version__",
 ]

@@ -18,9 +18,13 @@ over the async engine, and ``async with`` releases every store connection. The s
 names (``LocalMemory`` sync / ``AsyncLocalMemory``) wraps this via ``asyncio.run`` in a later phase
 — a tracked, explicit gap, not a silent stub.
 
-NO LLM this phase (Azure PARKED): ``add``/``recall``/``search``/``context``/``consolidate`` are
-fully real (heuristic extraction + deterministic assembly); ``ask`` refuses loudly with
-:class:`~mu_local.errors.LlmNotConfiguredError` (spec §7, T7).
+LLM WIRING (closed 2026-07-27): ``add``/``recall``/``search``/``context``/``consolidate`` are
+always real (heuristic extraction + deterministic assembly work with or without an LLM). ``ask``
+still refuses loudly with :class:`~mu_local.errors.LlmNotConfiguredError` (spec §7, T7) in
+heuristic mode (no ``storage.llm`` configured) — mu-local NEVER fabricates an empty/degraded
+synthesis. When a :class:`~mu_local.config.ModelProfileSettings` IS configured, ``ask`` recalls
+context (the same deterministic assembly :meth:`context` uses) and synthesises a REAL answer via
+the composition root's :class:`~mu_engine.providers.model_router.ModelRouter` ANSWER task.
 """
 
 from __future__ import annotations
@@ -31,6 +35,8 @@ from typing import Any
 
 from mu_contracts.domain.model.scope import ClientScope
 from mu_engine.pipelines.concrete.ingest import IngestActivity
+from mu_engine.providers._contracts import Message, MessageRole
+from mu_engine.providers.catalog import Task
 from mu_engine.services.ingest import IngestResult
 from mu_engine.services.recall.dto import RecallChannels, RecallQuery, RecallResult
 from mu_engine.storage.domain.memory import MemoryTier
@@ -51,6 +57,10 @@ __all__ = ["LocalMemory"]
 _DEFAULT_USER = "default"
 _DEFAULT_SESSION = "default"
 _HOST = "mu-local"
+# PORT of the reference SLM integration test's ANSWER-task system prompt
+# (mu-engine/tests/pipelines/test_distill_llm_slm_int.py:393-396) — a named module constant, never
+# an inline literal at the call site (DEV-STANDARDS rule 3).
+_ASK_SYSTEM_PROMPT = "Answer the question using ONLY the given facts. Be concise."
 
 
 class LocalMemory:
@@ -213,19 +223,26 @@ class LocalMemory:
         user: str = _DEFAULT_USER,
         session: str | None = None,
         limit: int = 10,
-    ) -> None:
-        """Synthesise an answer over recalled context. Heuristic mode (``llm=None``) refuses loudly
-        — mu-local NEVER returns an empty/degraded synthesis (spec §7, T7). Use
-        :meth:`recall`/:meth:`context` for retrieval without synthesis."""
-        del question, user, session, limit
+    ) -> str:
+        """Synthesise an answer over recalled context via the configured LLM's ANSWER task.
+        Heuristic mode (``llm=None``, the default) refuses loudly — mu-local NEVER returns an
+        empty/degraded synthesis (spec §7, T7). Use :meth:`recall`/:meth:`context` for retrieval
+        without synthesis."""
         if self._container.llm is None:
             raise LlmNotConfiguredError(
                 "ask() requires a configured LLM; LocalMemory is in heuristic mode (llm=None). "
                 "Use recall()/context() for retrieval without synthesis."
             )
-        # LLM synthesis path is DEFERRED (Azure PARKED); it folds in behind the injected LLM
-        # without changing this contract. Unreachable while llm is None.
-        raise LlmNotConfiguredError("LLM synthesis path is not wired in this phase")
+        assembled = await self.context(question, user=user, session=session, limit=limit)
+        messages = [
+            Message(role=MessageRole.SYSTEM, content=_ASK_SYSTEM_PROMPT),
+            Message(
+                role=MessageRole.USER,
+                content=f"Facts:\n{assembled.text}\n\nQuestion: {question}",
+            ),
+        ]
+        completion = await self._container.llm.generate(Task.ANSWER, messages)
+        return completion.text
 
     # ----------------------------------------------------------------------------- lifecycle
     async def aclose(self) -> None:
