@@ -17,6 +17,11 @@ from mu_engine.storage.ports import RedisRecord
 
 __all__ = ["RedisMapper"]
 
+# Genuine structural constant, NOT a tunable (DEV-STANDARDS rule 3 exemption): this is the fixed
+# on-wire key-catalog root (storage-indexing §1.1), shared byte-for-byte with every other
+# component that reads/writes ``mu/...`` keys. Making it Settings-driven would let one process
+# silently diverge from the documented key format everyone else assumes — it is a protocol
+# constant like an enum value, not an operator-facing knob.
 _KEY_PREFIX = "mu"
 
 

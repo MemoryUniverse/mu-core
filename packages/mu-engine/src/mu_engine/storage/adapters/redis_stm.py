@@ -21,23 +21,38 @@ from mu_engine.storage.mappers.redis_mapper import RedisMapper
 
 __all__ = ["RedisStmAdapter"]
 
-# Per-attempt I/O budget (DEV-STANDARDS async sharpener: "timeouts on every external call").
-_STORE_IO_TIMEOUT_S = 5.0
+# Constructor DEFAULT only (DEV-STANDARDS rule 3: no hardcoded constant lives in adapter LOGIC).
+# The live value is DI-threaded from the central Settings tree (``RedisSettings``/
+# ``ValkeySettings`` ``.store_io_timeout_s``) by the ``STORE_REGISTRY`` factory
+# (``mu_engine.storage.factories._build_redis``/``_build_valkey``); a bare
+# ``RedisStmAdapter(client)`` (e.g. in a unit test) still gets a sane, named default.
+_DEFAULT_STORE_IO_TIMEOUT_S = 5.0
 
 
 class RedisStmAdapter:
     """Implements ``StmTierRepository`` over a real Redis/Valkey connection.
 
     Every external call is wrapped by :func:`retry_io` (transient-only retry/backoff +
-    per-attempt timeout) so no store call is unbounded (MAJOR-4).
+    per-attempt timeout) so no store call is unbounded (MAJOR-4). The timeout is a
+    per-instance, DI-threaded ``retry_io`` wrapper (never a class-level decorator baking in a
+    module constant) so ``store_io_timeout_s`` is genuinely tunable from Settings.
     """
 
-    def __init__(self, client: Redis, *, mapper: RedisMapper | None = None) -> None:
+    def __init__(
+        self,
+        client: Redis,
+        *,
+        mapper: RedisMapper | None = None,
+        store_io_timeout_s: float = _DEFAULT_STORE_IO_TIMEOUT_S,
+    ) -> None:
         self._redis = client
         self._mapper = mapper or RedisMapper()
+        self._retry = retry_io(timeout_s=store_io_timeout_s)
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def put(self, item: MemoryItem) -> None:
+        return await self._retry(self._put_impl)(item)
+
+    async def _put_impl(self, item: MemoryItem) -> None:
         row = self._mapper.to_store(item)
         recency = RedisMapper.recency_key(item.namespace)
         # ONE atomic transaction (MINOR-6): SET payload + ZADD recency + EXPIRE apply together
@@ -49,8 +64,10 @@ class RedisStmAdapter:
             pipe.expire(recency, row.ttl_s)
         await pipe.execute()
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
+        return await self._retry(self._get_impl)(ns, memory_id)
+
+    async def _get_impl(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         key = RedisMapper.memory_key(ns, memory_id)
         blob = await self._redis.get(key)
         if blob is None:
@@ -59,8 +76,10 @@ class RedisStmAdapter:
 
         return self._mapper.from_store(RedisRecord(key=key, ttl_s=None, blob=_as_str(blob)))
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def recent(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]:
+        return await self._retry(self._recent_impl)(ns, limit=limit)
+
+    async def _recent_impl(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]:
         recency = RedisMapper.recency_key(ns)
         ids = await self._redis.zrevrange(recency, 0, max(0, limit - 1))
         out: list[Scored[MemoryItem]] = []
@@ -78,8 +97,10 @@ class RedisStmAdapter:
             )
         return out
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def evict(self, ns: Namespace, memory_id: str) -> None:
+        return await self._retry(self._evict_impl)(ns, memory_id)
+
+    async def _evict_impl(self, ns: Namespace, memory_id: str) -> None:
         pipe = self._redis.pipeline(transaction=True)
         pipe.delete(RedisMapper.memory_key(ns, memory_id))
         pipe.zrem(RedisMapper.recency_key(ns), memory_id)

@@ -30,6 +30,7 @@ from mu_contracts.ports.observability import (
     TurnTraceEvent,
     TurnTraceScope,
 )
+from mu_engine.platform.settings import ObservabilitySettings
 
 __all__ = [
     "DurableAuditSink",
@@ -56,9 +57,10 @@ class TraceScope(BaseModel):
     correlation_id: str
 
 
-# Bounded backpressure for the durable audit queue (DEV-STANDARDS: bounded queues, never
-# unbounded). On overflow the recorder falls back to the structlog mirror (never silently drops).
-_DURABLE_AUDIT_QUEUE_MAX = 1024
+# DEV-STANDARDS rule 3: the durable audit queue's bounded-backpressure size (bounded queues,
+# never unbounded) is NOT a hardcoded constant here — it is DI-threaded from
+# :class:`ObservabilitySettings` by :func:`build_audit` / :class:`_DurableAuditLog.__init__`. On
+# overflow the recorder falls back to the structlog mirror (never silently drops).
 
 # ── content-free guards ──────────────────────────────────────────────────────────────────────
 # Keys: short snake_case (bounds metric-label cardinality, spec §11).
@@ -214,7 +216,12 @@ def build_metrics(*, enabled: bool) -> MetricSink:
     return _PrometheusMetricSink()
 
 
-def build_audit(*, enabled: bool, durable_sink: DurableAuditSink | None = None) -> AuditLog:
+def build_audit(
+    *,
+    enabled: bool,
+    durable_sink: DurableAuditSink | None = None,
+    settings: ObservabilitySettings | None = None,
+) -> AuditLog:
     """The content-free audit recorder (spec §11).
 
     * not ``enabled`` -> :class:`NoopAuditLog`;
@@ -224,11 +231,15 @@ def build_audit(*, enabled: bool, durable_sink: DurableAuditSink | None = None) 
       durable recorder is now the enabled path, no longer a structlog-only stub);
     * ``enabled`` with no durable sink wired -> :class:`_StructlogAuditLog` (content-free
       structured logs only).
+
+    ``settings`` DI-threads the queue bound (DEV-STANDARDS rule 3); the Container passes
+    ``settings.platform.observability`` when that subtree lands (tracked seam, same pattern as
+    ``DistillSettings``).
     """
     if not enabled:
         return NoopAuditLog()
     if durable_sink is not None:
-        return _DurableAuditLog(durable_sink)
+        return _DurableAuditLog(durable_sink, settings=settings)
     return _StructlogAuditLog()
 
 
@@ -378,13 +389,16 @@ class _DurableAuditLog:
     structured logs so nothing is lost if there is no running loop or the queue is saturated
     (fail-loud fallback, never a silent drop)."""
 
-    def __init__(self, sink: DurableAuditSink) -> None:
+    def __init__(
+        self, sink: DurableAuditSink, *, settings: ObservabilitySettings | None = None
+    ) -> None:
         import structlog
 
         self._sink = sink
         self._mirror = _StructlogAuditLog()
         self._log = structlog.get_logger("mu.audit")
-        self._queue: asyncio.Queue[AuditRecord] = asyncio.Queue(maxsize=_DURABLE_AUDIT_QUEUE_MAX)
+        queue_max = (settings or ObservabilitySettings()).durable_audit_queue_max
+        self._queue: asyncio.Queue[AuditRecord] = asyncio.Queue(maxsize=queue_max)
         self._drain_task: asyncio.Task[None] | None = None
 
     def record(

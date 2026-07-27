@@ -2,6 +2,9 @@
 target-version = "py312"
 line-length = 100
 src = ["packages/mu-contracts/src", "packages/mu-engine/src", "packages/mu-local/src"]
+# .trash is the project's mandated graveyard for removed/replaced files (never a bare `rm`) —
+# dead code by definition, never a lint target.
+exclude = [".trash"]
 
 [lint]
 select = [

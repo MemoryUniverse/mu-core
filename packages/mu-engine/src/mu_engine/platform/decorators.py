@@ -24,6 +24,7 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait
 from mu_contracts.ports.observability import MetricSink, Tracer
 from mu_engine.platform.exceptions import RetryClass, classify_error
 from mu_engine.platform.observability import NoopMetricSink, NoopTracer
+from mu_engine.platform.settings import RetrySettings
 
 __all__ = ["guard", "retry_io", "timed"]
 
@@ -32,6 +33,10 @@ R = TypeVar("R")
 
 _LATENCY_METRIC = "mu_operation_latency_seconds"
 _ERROR_METRIC = "mu_operation_errors_total"
+
+# Constructor DEFAULTS only (DEV-STANDARDS rule 3): a Settings-shaped default object, not bare
+# literals scattered at the decorator's signature — see :class:`RetrySettings`.
+_DEFAULT_RETRY = RetrySettings()
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -43,9 +48,9 @@ def _is_retryable(exc: BaseException) -> bool:
 
 def retry_io(
     *,
-    max_attempts: int = 3,
-    base_delay_s: float = 0.05,
-    max_delay_s: float = 2.0,
+    max_attempts: int = _DEFAULT_RETRY.max_attempts,
+    base_delay_s: float = _DEFAULT_RETRY.base_delay_s,
+    max_delay_s: float = _DEFAULT_RETRY.max_delay_s,
     timeout_s: float | None = None,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Coroutine[Any, Any, R]]]:
     """Retry a transient-failing async I/O call with exponential backoff (tenacity).

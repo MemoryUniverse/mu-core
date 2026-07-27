@@ -27,8 +27,12 @@ from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["QdrantMtmAdapter"]
 
-# Per-attempt I/O budget (DEV-STANDARDS async sharpener: "timeouts on every external call").
-_STORE_IO_TIMEOUT_S = 10.0
+# Constructor DEFAULT only (DEV-STANDARDS rule 3: no hardcoded constant lives in adapter LOGIC).
+# The live value is DI-threaded from the central Settings tree
+# (``QdrantSettings.store_io_timeout_s``) by the ``STORE_REGISTRY`` factory
+# (``mu_engine.storage.factories._build_qdrant``); a bare ``QdrantMtmAdapter(client, dim=...)``
+# (e.g. in a unit test) still gets a sane, named default.
+_DEFAULT_STORE_IO_TIMEOUT_S = 10.0
 
 # payload fields promoted to server-side indexes (spec §3.2).
 _KEYWORD_INDEXES = (
@@ -45,13 +49,26 @@ _KEYWORD_INDEXES = (
 
 
 class QdrantMtmAdapter:
-    """Implements ``MtmTierRepository`` over a real Qdrant connection."""
+    """Implements ``MtmTierRepository`` over a real Qdrant connection.
 
-    def __init__(self, client: AsyncQdrantClient, *, dim: int) -> None:
+    Every external call is wrapped by :func:`retry_io` (transient-only retry/backoff + a
+    per-attempt timeout) so no store call is unbounded; the timeout is a per-instance,
+    DI-threaded ``retry_io`` wrapper (never a class-level decorator baking in a module
+    constant) so ``store_io_timeout_s`` is genuinely tunable from ``QdrantSettings``.
+    """
+
+    def __init__(
+        self,
+        client: AsyncQdrantClient,
+        *,
+        dim: int,
+        store_io_timeout_s: float = _DEFAULT_STORE_IO_TIMEOUT_S,
+    ) -> None:
         self._qdrant = client
         self._dim = dim
         self._mapper = QdrantMapper(dim=dim)
         self._ensured: set[str] = set()
+        self._retry = retry_io(timeout_s=store_io_timeout_s)
 
     async def _ensure_collection(self, ns: Namespace) -> str:
         name = collection_name(ns, self._dim)
@@ -71,8 +88,10 @@ class QdrantMtmAdapter:
         self._ensured.add(name)
         return name
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def upsert(self, item: MemoryItem) -> None:
+        return await self._retry(self._upsert_impl)(item)
+
+    async def _upsert_impl(self, item: MemoryItem) -> None:
         name = await self._ensure_collection(item.namespace)
         row = self._mapper.to_store(item)
         await self._qdrant.upsert(
@@ -100,8 +119,24 @@ class QdrantMtmAdapter:
             )
         return models.Filter(must=must)
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def semantic(
+        self,
+        ns: Namespace,
+        query_vector: list[float],
+        *,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+        sparse_query: SparseQuery | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        return await self._retry(self._semantic_impl)(
+            ns,
+            query_vector,
+            limit=limit,
+            caller_identity_set=caller_identity_set,
+            sparse_query=sparse_query,
+        )
+
+    async def _semantic_impl(
         self,
         ns: Namespace,
         query_vector: list[float],
@@ -145,8 +180,14 @@ class QdrantMtmAdapter:
             )
         return out
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def invalidate(
+        self, ns: Namespace, loser_id: str, winner_id: str, *, at: datetime, reason: str
+    ) -> None:
+        return await self._retry(self._invalidate_impl)(
+            ns, loser_id, winner_id, at=at, reason=reason
+        )
+
+    async def _invalidate_impl(
         self, ns: Namespace, loser_id: str, winner_id: str, *, at: datetime, reason: str
     ) -> None:
         # id-stable supersede write (spec §3.3): stamp state='superseded' + invalid_at on the

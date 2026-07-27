@@ -5,21 +5,61 @@ reads its knobs from a ``BackendChoice.config``-shaped dict (``dsn``/``url``/``h
 ``port``/``dim``), NEVER a hardcoded literal — the values flow from the central Settings
 tree (DEV-STANDARDS rule 3). Registered on import so ``STORE_REGISTRY.build(role, backend,
 **cfg)`` resolves.
+
+EXTENSION SEAM (graph role, owner override 2026-07-27): a future graph driver — e.g.
+``neo4j``, ``kuzu``, ``ladybug``, ``neptune`` — registers with ZERO change to the engine or
+to this file's existing entries by adding one more block of this exact shape::
+
+    @STORE_REGISTRY.register("graph", "neo4j")  # new (role, backend) key
+    def _build_neo4j(**cfg: Any) -> SomeNeo4jGraphAdapter:
+        driver = Neo4jDriver(uri=cfg["uri"], auth=(cfg["user"], cfg["password"]))
+        return SomeNeo4jGraphAdapter(driver)  # must satisfy GraphStorePort
+
+The engine, ``mu_engine.storage.ports.GraphStorePort``, and every caller only ever import
+the Protocol; none of them import ``falkordb`` (or would import ``neo4j``) directly — the
+vendor client lives ONLY inside the adapter + this factory. Selecting the new backend is then
+a config change (``StorageSettings.graph.backend = "neo4j"``), never a code change.
+
+VECTOR ROLE (owner override 2026-07-27: "genuinely MULTI-backend NOW, mem0 pattern"): the
+``vector`` role now self-registers FOUR backends the exact same way — ``qdrant`` (reference,
+SHARED-safe), ``pgvector`` (SHARED-safe, SQL WHERE + HNSW), ``chroma`` (embedded floor, partial
+filter — widened, never incomplete) and ``faiss`` (brute-force, PRIVATE-plane ONLY — the registry's
+``_BRUTE_FORCE_VECTOR_BACKENDS`` gate refuses it on SHARED at build time). Every one of them
+implements ``MtmTierRepository`` and none of them is imported by the engine directly — only through
+this factory, exactly like the graph seam above. Selecting a different vector backend is a
+``StorageSettings.vector`` / ``BackendChoice`` config change, never a code change.
+
+KV + RELATIONAL ROLES (owner stage 2026-07-27, same mem0-pattern multi-backend requirement):
+``kv`` now self-registers FOUR backends — ``redis``/``valkey`` (wire-identical, real
+``mu-dev-cache`` — recreated as ``valkey/valkey:8-alpine``), ``memory`` (embedded, in-process
+floor, D2), ``memcached`` (real ``mu-dev-memcached``, CAS-emulated recency floor, D6).
+``relational`` adds ``mysql`` (real ``mu-dev-mysql``, ``asyncmy`` async driver) alongside the
+existing ``postgres``/``sqlite`` — the SAME ``RelationalControlPlaneAdapter`` class binds to
+all three dialects (dialect-aware upsert seam, spec §2.1/§3.1, D7). Every new backend is
+selected purely by a ``StorageSettings`` config value, never a code change at the call site.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+import aiomcache
 from falkordb.asyncio import FalkorDB
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from mu_contracts.config import get_settings
+from mu_engine.storage.adapters.chroma_mtm import ChromaMtmAdapter
+from mu_engine.storage.adapters.faiss_mtm import FaissMtmAdapter
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
+from mu_engine.storage.adapters.memcached_stm import MemcachedStmAdapter
+from mu_engine.storage.adapters.memory_stm import InMemoryStmAdapter
+from mu_engine.storage.adapters.pgvector_mtm import PgVectorMtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
 from mu_engine.storage.adapters.relational_control import RelationalControlPlaneAdapter
+from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
 from mu_engine.storage.registry import StoreRegistry
 
 __all__ = ["STORE_REGISTRY"]
@@ -29,29 +69,178 @@ STORE_REGISTRY = StoreRegistry()
 
 @STORE_REGISTRY.register("relational", "postgres")
 def _build_postgres(**cfg: Any) -> RelationalControlPlaneAdapter:
+    pg_settings = get_settings().storage.postgres
     engine = create_async_engine(cfg["dsn"], pool_pre_ping=True)
-    return RelationalControlPlaneAdapter(engine)
+    return RelationalControlPlaneAdapter(
+        engine,
+        store_io_timeout_s=cfg.get("store_io_timeout_s", pg_settings.store_io_timeout_s),
+    )
 
 
 @STORE_REGISTRY.register("relational", "sqlite")
 def _build_sqlite(**cfg: Any) -> RelationalControlPlaneAdapter:
+    """SQLite is the embedded/test-only relational floor with no dedicated ``SQLiteSettings``
+    subtree (unlike postgres/mysql) — its I/O timeout falls back to the adapter's own named
+    constructor default (never a bare literal) when ``cfg`` doesn't override it.
+    """
     engine = create_async_engine(cfg.get("dsn", "sqlite+aiosqlite:///:memory:"))
-    return RelationalControlPlaneAdapter(engine)
+    kwargs: dict[str, Any] = {}
+    if "store_io_timeout_s" in cfg:
+        kwargs["store_io_timeout_s"] = cfg["store_io_timeout_s"]
+    return RelationalControlPlaneAdapter(engine, **kwargs)
+
+
+@STORE_REGISTRY.register("relational", "mysql")
+def _build_mysql(**cfg: Any) -> RelationalControlPlaneAdapter:
+    """MySQL/MariaDB relational backend (``storage-pluggable-spec.md §3.1`` "new | dev's stack
+    is MySQL"), ``asyncmy`` async driver. Falls back to the central ``MySQLSettings`` when
+    ``cfg`` doesn't supply a ``dsn`` (DEV-STANDARDS rule 3), exactly like the ``pgvector``/
+    ``chroma`` vector factories below fall back to their own settings subtree.
+    """
+    mysql_settings = get_settings().storage.mysql
+    dsn = cfg.get("dsn") or mysql_settings.dsn
+    engine = create_async_engine(dsn, pool_pre_ping=True)
+    return RelationalControlPlaneAdapter(
+        engine,
+        store_io_timeout_s=cfg.get("store_io_timeout_s", mysql_settings.store_io_timeout_s),
+    )
 
 
 @STORE_REGISTRY.register("vector", "qdrant")
 def _build_qdrant(*, dim: int, **cfg: Any) -> QdrantMtmAdapter:
+    qdrant_settings = get_settings().storage.vector
     client = AsyncQdrantClient(url=cfg["url"], prefer_grpc=cfg.get("prefer_grpc", False))
-    return QdrantMtmAdapter(client, dim=dim)
+    return QdrantMtmAdapter(
+        client,
+        dim=dim,
+        store_io_timeout_s=cfg.get("store_io_timeout_s", qdrant_settings.store_io_timeout_s),
+    )
 
 
 @STORE_REGISTRY.register("graph", "falkordb")
 def _build_falkordb(**cfg: Any) -> FalkorLtmAdapter:
+    """Builds the CANONICAL graph adapter (owner override: graph role = FalkorDB, KEPT).
+
+    Instantiated THROUGH this registry seam like every other role's factory — the composition
+    root selects ``(graph, "falkordb")`` by config key, never constructs ``FalkorLtmAdapter``
+    from a hardcoded import path. The adapter's own tunables (``resolve_entity`` shortlist
+    size / similarity band, the per-attempt I/O timeout) are DI-threaded here from the central
+    Settings tree (``FalkorDBSettings``), with ``cfg`` (a ``BackendChoice.config`` override)
+    taking precedence — see this module's EXTENSION SEAM note above for how a future
+    (graph, "neo4j"|"kuzu"|"ladybug"|"neptune") backend registers alongside this one.
+    """
     db = FalkorDB(host=cfg["host"], port=cfg["port"])
-    return FalkorLtmAdapter(db)
+    graph_settings = get_settings().storage.graph
+    return FalkorLtmAdapter(
+        db,
+        shortlist_size=cfg.get("shortlist_size", graph_settings.entity_shortlist_size),
+        similarity_threshold=cfg.get(
+            "similarity_threshold", graph_settings.entity_similarity_threshold
+        ),
+        store_io_timeout_s=cfg.get("store_io_timeout_s", graph_settings.store_io_timeout_s),
+    )
 
 
 @STORE_REGISTRY.register("kv", "redis")
 def _build_redis(**cfg: Any) -> RedisStmAdapter:
+    redis_settings = get_settings().storage.cache
     client = Redis.from_url(cfg["url"], decode_responses=True)
-    return RedisStmAdapter(client)
+    return RedisStmAdapter(
+        client,
+        store_io_timeout_s=cfg.get("store_io_timeout_s", redis_settings.store_io_timeout_s),
+    )
+
+
+@STORE_REGISTRY.register("kv", "valkey")
+def _build_valkey(**cfg: Any) -> ValkeyStmAdapter:
+    """The DECIDED KV/STM backend, registered under its OWN key (owner stage 2026-07-27,
+    ``storage-pluggable-spec.md §3.2``) — same ``redis-py`` client (wire-identical), falls back
+    to the central ``ValkeySettings`` when ``cfg`` doesn't supply a ``url`` (DEV-STANDARDS rule 3).
+    """
+    valkey_settings = get_settings().storage.valkey
+    url = cfg.get("url") or valkey_settings.url
+    client = Redis.from_url(url, decode_responses=True)
+    return ValkeyStmAdapter(
+        client,
+        store_io_timeout_s=cfg.get("store_io_timeout_s", valkey_settings.store_io_timeout_s),
+    )
+
+
+@STORE_REGISTRY.register("kv", "memory")
+def _build_memory_kv(**cfg: Any) -> InMemoryStmAdapter:
+    """Embedded, zero-server KV floor (``storage-pluggable-spec.md §1``/§3.2 ``memory``; D2).
+    Bounds fall back to the central ``InMemoryKvSettings`` when ``cfg`` doesn't override them.
+    """
+    mem_settings = get_settings().storage.kv_memory
+    return InMemoryStmAdapter(
+        max_items_per_namespace=int(
+            cfg.get("max_items_per_namespace", mem_settings.max_items_per_namespace)
+        ),
+        default_ttl_s=cfg.get("default_ttl_s", mem_settings.default_ttl_s),
+    )
+
+
+@STORE_REGISTRY.register("kv", "memcached")
+def _build_memcached(**cfg: Any) -> MemcachedStmAdapter:
+    """Memcached KV backend (``storage-pluggable-spec.md §3.2`` "new | dev only has Memcached"),
+    real ``mu-dev-memcached`` container via ``aiomcache``. No native sorted set — the CAS-guarded
+    recency-list emulation (degrade D6) is tuned by ``MemcachedSettings`` (``recency_cap``,
+    ``cas_max_attempts``, ``default_ttl_s``), overridable per ``cfg`` (DEV-STANDARDS rule 3).
+    """
+    mc_settings = get_settings().storage.memcached
+    host = cfg.get("host", mc_settings.host)
+    port = int(cfg.get("port", mc_settings.port))
+    client = aiomcache.Client(host, port)
+    return MemcachedStmAdapter(
+        client,
+        recency_cap=int(cfg.get("recency_cap", mc_settings.recency_cap)),
+        cas_max_attempts=int(cfg.get("cas_max_attempts", mc_settings.cas_max_attempts)),
+        default_ttl_s=int(cfg.get("default_ttl_s", mc_settings.default_ttl_s)),
+        store_io_timeout_s=float(cfg.get("store_io_timeout_s", mc_settings.store_io_timeout_s)),
+    )
+
+
+@STORE_REGISTRY.register("vector", "pgvector")
+def _build_pgvector(*, dim: int, **cfg: Any) -> PgVectorMtmAdapter:
+    """mem0 ``VectorStoreFactory`` pattern (``factory.py:164-205``) — the pgvector alt MTM backend,
+    SHARED-safe (``storage-pluggable-spec.md §3.3``: SQL ``WHERE`` + HNSW filter BEFORE ANN
+    truncation). Connection knobs fall back to the central ``PgVectorSettings`` when ``cfg`` (a
+    ``BackendChoice.config`` override) doesn't supply them (DEV-STANDARDS rule 3).
+    """
+    pgv_settings = get_settings().storage.pgvector
+    dsn = cfg.get("dsn") or pgv_settings.dsn
+    return PgVectorMtmAdapter(
+        dsn=str(dsn),
+        dim=dim,
+        hnsw=bool(cfg.get("hnsw", pgv_settings.hnsw)),
+        min_size=int(cfg.get("min_size", pgv_settings.pool_min_size)),
+        max_size=int(cfg.get("max_size", pgv_settings.pool_max_size)),
+        store_io_timeout_s=float(cfg.get("store_io_timeout_s", pgv_settings.store_io_timeout_s)),
+    )
+
+
+@STORE_REGISTRY.register("vector", "chroma")
+def _build_chroma(*, dim: int, **cfg: Any) -> ChromaMtmAdapter:
+    """Embedded Chroma MTM floor (``storage-pluggable-spec.md §1``: "Vector / MTM ... Chroma
+    (embedded, ``path=``) — filterable, single-node"). No server/container; the on-disk path
+    falls back to the central ``ChromaSettings`` when ``cfg`` doesn't supply one.
+    """
+    chroma_settings = get_settings().storage.chroma
+    path = cfg.get("path") or chroma_settings.path
+    return ChromaMtmAdapter(
+        path=str(path),
+        dim=dim,
+        store_io_timeout_s=float(cfg.get("store_io_timeout_s", chroma_settings.store_io_timeout_s)),
+        min_widen=int(cfg.get("min_widen", chroma_settings.min_widen)),
+    )
+
+
+@STORE_REGISTRY.register("vector", "faiss")
+def _build_faiss(*, dim: int, **cfg: Any) -> FaissMtmAdapter:
+    """Brute-force in-proc MTM floor. PRIVATE-plane ONLY (degrade rule D3) — the registry (and this
+    adapter, defense-in-depth) refuse it on the SHARED plane
+    (``mu_engine.storage.registry._BRUTE_FORCE_VECTOR_BACKENDS``).
+    """
+    faiss_settings = get_settings().storage.faiss
+    path = cfg.get("path") if "path" in cfg else faiss_settings.path
+    return FaissMtmAdapter(path=str(path) if path else None, dim=dim)

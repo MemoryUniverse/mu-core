@@ -9,6 +9,7 @@
 # Host ports (wired into .env.test -> central Settings, never hardcoded in code):
 #   postgres  15432 -> 5432   |  cache/valkey 16379 -> 6379
 #   qdrant    16333 -> 6333 (REST), 16334 -> 6334 (gRPC)  |  falkordb 16380 -> 6379
+#   mysql     13306 -> 3306   |  memcached 11211 -> 11211
 
 name: mu-dev
 
@@ -81,11 +82,49 @@ services:
       start_period: 5s
     networks: [mu-dev]
 
+  mysql:
+    # relational role, new backend (owner stage: KV+RELATIONAL multi-backend). SQLAlchemy Core
+    # stays DB-agnostic (storage-pluggable-spec.md §2.1/§3.1) — no MySQL-only SQL in the adapter.
+    image: mysql:8
+    container_name: mu-dev-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: mu_dev_pw
+      MYSQL_USER: mu
+      MYSQL_PASSWORD: mu_dev_pw
+      MYSQL_DATABASE: mu
+    ports:
+      - "127.0.0.1:13306:3306"
+    volumes:
+      - mu-dev-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u", "mu", "-pmu_dev_pw"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    networks: [mu-dev]
+
+  memcached:
+    # KV/STM role, new backend (spec §3.2) — no sorted-set floor (D6); the adapter emulates a
+    # bounded recency list via a single CAS-guarded key (see memcached_stm.py docstring).
+    image: memcached:1.6-alpine
+    container_name: mu-dev-memcached
+    ports:
+      - "127.0.0.1:11211:11211"
+    healthcheck:
+      test: ["CMD-SHELL", "echo stats | nc -w 2 127.0.0.1 11211 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks: [mu-dev]
+
 volumes:
   mu-dev-postgres-data:
   mu-dev-cache-data:
   mu-dev-qdrant-data:
   mu-dev-falkordb-data:
+  mu-dev-mysql-data:
 
 networks:
   mu-dev:

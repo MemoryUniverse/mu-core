@@ -19,6 +19,22 @@ change (the adapter already isolates all Cypher here). The bi-temporal semantics
 Mandatory read filters on every traversal (spec §4.3): ``m.namespace = $ns`` (exact) AND
 ``m.state = 'active'`` AND ``(m.invalid_at = '' OR m.invalid_at > $now)``; SHARED adds the
 Model-A ``ANY(id IN $caller ...)`` predicate.
+
+OWNER DECISIONS (2026-07-27, AUTHORITATIVE):
+1. Graph = FalkorDB, KEPT. This adapter is OUR OWN — it ports Graphiti's bi-temporal
+   *pattern* (invalidate-don't-delete, ``valid_at``/``invalid_at``), it does NOT import
+   ``graphiti_core``. It sits behind :class:`~mu_engine.storage.ports.GraphStorePort` +
+   ``StoreRegistry`` exactly like the vector/kv/relational roles (registered in
+   ``mu_engine.storage.factories`` under ``(graph, "falkordb")`` — see that module's
+   docstring for the EXTENSION SEAM a future ``neo4j``/``kuzu``/``ladybug``/``neptune``
+   driver would register under, with ZERO change to this file or to the engine).
+2. MULTI-ORG HARDEN — the physical FalkorDB graph-partition name is keyed on
+   ``(org, workspace, visibility|user)``, NOT workspace alone (see :meth:`graph_name_for`).
+   Two orgs sharing a workspace id therefore land in DIFFERENT physical graphs; FalkorDB's
+   native multi-graph-per-tenant design (``select_graph``) is preserved — never collapsed to
+   one shared graph. The ``m.namespace = $ns`` (org-scoped ``to_prefix()``) property filter on
+   every query stays as mandatory defense-in-depth ON TOP of that physical partition, not
+   instead of it.
 """
 
 from __future__ import annotations
@@ -39,12 +55,15 @@ from mu_engine.storage.mappers.graph_mapper import GraphMapper
 
 __all__ = ["FalkorLtmAdapter"]
 
-_SHORTLIST_SIZE = 5
-_SIMILARITY_THRESHOLD = 0.84  # graph_falkor.py resolve_entity deterministic band
+# Constructor DEFAULTS only (DEV-STANDARDS rule 3: no hardcoded constant lives in adapter
+# LOGIC). The live values are DI-threaded in from the central Settings tree
+# (``mu_contracts.config.FalkorDBSettings``) by the ``STORE_REGISTRY`` factory
+# (``mu_engine.storage.factories._build_falkordb``); a bare ``FalkorLtmAdapter(db)`` (e.g. in
+# a unit test) still gets a sane, named default rather than a silent unconfigured 0/None.
+_DEFAULT_SHORTLIST_SIZE = 5
+_DEFAULT_SIMILARITY_THRESHOLD = 0.84  # graph_falkor.py resolve_entity deterministic band
 # Per-attempt I/O budget (DEV-STANDARDS async sharpener: "timeouts on every external call").
-# A default resilience budget carried in code, mirroring the retry_io/timed defaults already
-# in platform.decorators; a hang becomes a retryable TimeoutError, never a stuck task.
-_STORE_IO_TIMEOUT_S = 10.0
+_DEFAULT_STORE_IO_TIMEOUT_S = 10.0
 
 
 class FalkorLtmAdapter:
@@ -54,26 +73,52 @@ class FalkorLtmAdapter:
     bi-temporal ``invalid_at > $now`` graph filter must be UTC-correct — a local-tz ``now``
     (host is +03:00) would mis-compare against the UTC ISO strings stored on the nodes.
     Every external openCypher call is wrapped by :func:`retry_io` (transient-only retry/backoff
-    + a per-attempt timeout) so no store call is unbounded (MAJOR-4).
+    + a per-attempt timeout) so no store call is unbounded (MAJOR-4). The retry timeout, the
+    ``resolve_entity`` shortlist size, and its similarity band are constructor parameters
+    (DI-threaded from Settings by the factory), never module-level literals baked into the
+    decorated method — this lets ONE instance be tuned without touching the class.
     """
 
     def __init__(  # type: ignore[no-any-unimported]  # falkordb ships no stubs
-        self, db: FalkorDB, *, mapper: GraphMapper | None = None, clock: Clock | None = None
+        self,
+        db: FalkorDB,
+        *,
+        mapper: GraphMapper | None = None,
+        clock: Clock | None = None,
+        shortlist_size: int = _DEFAULT_SHORTLIST_SIZE,
+        similarity_threshold: float = _DEFAULT_SIMILARITY_THRESHOLD,
+        store_io_timeout_s: float = _DEFAULT_STORE_IO_TIMEOUT_S,
     ) -> None:
         self._db = db
         self._mapper = mapper or GraphMapper()
         self._clock: Clock = clock or SystemClock()
+        self._shortlist_size = shortlist_size
+        self._similarity_threshold = similarity_threshold
+        # a per-instance retry wrapper (not a class-level decorator) so `store_io_timeout_s`
+        # is genuinely DI-threaded per instance, not fixed at import time.
+        self._retry = retry_io(timeout_s=store_io_timeout_s)
+
+    def graph_name_for(self, ns: Namespace) -> str:
+        """The physical FalkorDB graph a namespace resolves to — pure, no I/O.
+
+        Partition key = ``(org, workspace, visibility|user)`` (multi-org harden, owner
+        directive 2026-07-27): ``mu_g__{org}__{workspace}__shared`` for the SHARED plane,
+        ``mu_g__{org}__{workspace}__{user}`` for PRIVATE. Public so tests/observability can
+        assert on — and print — the exact physical partition a namespace lands in without
+        duplicating this computation (e.g. proving two orgs sharing a workspace id land in
+        two distinct graphs).
+        """
+        if ns.visibility is Visibility.SHARED:
+            return f"mu_g__{ns.org}__{ns.workspace}__shared"
+        return f"mu_g__{ns.org}__{ns.workspace}__{ns.user}"
 
     def _graph(self, ns: Namespace) -> Any:
-        # partition: one graph per (workspace, visibility|user) — graph_falkor.py:262-266.
-        if ns.visibility is Visibility.SHARED:
-            name = f"mu_g__{ns.workspace}__shared"
-        else:
-            name = f"mu_g__{ns.workspace}__{ns.user}"
-        return self._db.select_graph(name)
+        return self._db.select_graph(self.graph_name_for(ns))
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def upsert_fact(self, item: MemoryItem) -> None:
+        return await self._retry(self._upsert_fact_impl)(item)
+
+    async def _upsert_fact_impl(self, item: MemoryItem) -> None:
         g = self._graph(item.namespace)
         row = self._mapper.to_store(item)
         props = row.props
@@ -96,8 +141,24 @@ class FalkorLtmAdapter:
                 params={"ns": props["namespace"], "id": item.id, "art": item.artifact_ref},
             )
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def graph_recall(
+        self,
+        ns: Namespace,
+        *,
+        subject: str | None = None,
+        predicate: str | None = None,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        return await self._retry(self._graph_recall_impl)(
+            ns,
+            subject=subject,
+            predicate=predicate,
+            limit=limit,
+            caller_identity_set=caller_identity_set,
+        )
+
+    async def _graph_recall_impl(
         self,
         ns: Namespace,
         *,
@@ -142,8 +203,12 @@ class FalkorLtmAdapter:
             )
         return out
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def facts_at(
+        self, ns: Namespace, at: datetime, *, subject: str | None = None
+    ) -> list[MemoryItem]:
+        return await self._retry(self._facts_at_impl)(ns, at, subject=subject)
+
+    async def _facts_at_impl(
         self, ns: Namespace, at: datetime, *, subject: str | None = None
     ) -> list[MemoryItem]:
         # bi-temporal as-of read: valid_at <= at AND (invalid_at empty OR invalid_at > at).
@@ -162,8 +227,12 @@ class FalkorLtmAdapter:
         res = await g_query(self._graph(ns), cypher, params)
         return [MemoryItem.model_validate_json(r[0]) for r in res]
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def find_conflicts(self, ns: Namespace, subject: str, predicate: str) -> list[MemoryItem]:
+        return await self._retry(self._find_conflicts_impl)(ns, subject, predicate)
+
+    async def _find_conflicts_impl(
+        self, ns: Namespace, subject: str, predicate: str
+    ) -> list[MemoryItem]:
         # active facts sharing (subject, predicate) — the conflict access pattern
         # (graph_falkor.py find_conflicts; spec §2.5 ix_fact_conflict mirror).
         cypher = (
@@ -181,8 +250,14 @@ class FalkorLtmAdapter:
         res = await g_query(self._graph(ns), cypher, params)
         return [MemoryItem.model_validate_json(r[0]) for r in res]
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def invalidate(
+        self, ns: Namespace, loser_id: str, winner_id: str, *, at: datetime, reason: str
+    ) -> None:
+        return await self._retry(self._invalidate_impl)(
+            ns, loser_id, winner_id, at=at, reason=reason
+        )
+
+    async def _invalidate_impl(
         self, ns: Namespace, loser_id: str, winner_id: str, *, at: datetime, reason: str
     ) -> None:
         # invalidate-don't-delete (spec §4.2 lifecycle): stamp loser state='superseded' +
@@ -205,8 +280,10 @@ class FalkorLtmAdapter:
             },
         )
 
-    @retry_io(timeout_s=_STORE_IO_TIMEOUT_S)
     async def resolve_entity(self, ns: Namespace, name: str) -> EntityResolution:
+        return await self._retry(self._resolve_entity_impl)(ns, name)
+
+    async def _resolve_entity_impl(self, ns: Namespace, name: str) -> EntityResolution:
         # PORT graph_falkor.py resolve_entity: deterministic match OR bounded shortlist.
         canonical = name.strip().casefold()
         cypher = (
@@ -217,7 +294,7 @@ class FalkorLtmAdapter:
         res = await g_query(
             self._graph(ns),
             cypher,
-            {"ns": ns.to_prefix(), "canon": canonical, "k": _SHORTLIST_SIZE},
+            {"ns": ns.to_prefix(), "canon": canonical, "k": self._shortlist_size},
         )
         candidates = tuple(
             EntityCandidate(
@@ -228,7 +305,7 @@ class FalkorLtmAdapter:
             )
             for r in res
         )
-        if len(candidates) == 1 and candidates[0].similarity >= _SIMILARITY_THRESHOLD:
+        if len(candidates) == 1 and candidates[0].similarity >= self._similarity_threshold:
             return EntityResolution(
                 canonical_name=candidates[0].canonical_name,
                 entity_uid=candidates[0].entity_uid,

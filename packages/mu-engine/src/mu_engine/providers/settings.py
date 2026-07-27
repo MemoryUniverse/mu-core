@@ -80,6 +80,10 @@ class RouterSettings(BaseModel):
     strategy: str = "simple-shuffle"
     fallbacks: list[dict[str, list[str]]] = Field(default_factory=list)  # cross-group chains
     ctx_fallbacks: list[dict[str, list[str]]] = Field(default_factory=list)  # ctx-window fallbacks
+    # Fallback token ceiling when neither the deployment catalog nor litellm knows a model
+    # group's context window (``ModelRouter._max_input_tokens``, model-layer-spec §2.7) — a
+    # conservative modern default, never a bare literal in the router's logic (rule 3).
+    default_context_window: int = 128_000
 
 
 class ModelCatalogSettings(BaseModel):

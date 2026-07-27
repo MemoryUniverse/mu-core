@@ -27,12 +27,27 @@ from mu_engine.platform.decorators import retry_io
 
 __all__ = [
     "InMemoryStageLedger",
+    "LedgerSettings",
     "RedisStageLedger",
     "StageLedger",
     "StageLedgerRecord",
 ]
 
-_LEDGER_IO_TIMEOUT_S = 5.0
+
+class LedgerSettings(BaseModel):
+    """``RedisStageLedger`` I/O knobs (PIPELINES-design.md §2.4).
+
+    Declared here as a tracked seam (same pattern as ``pipelines/distill.py``'s
+    ``DistillSettings``): the central ``Settings`` tree does not yet carry the pipelines
+    subtree, so the ledger takes this explicitly and the composition root wires
+    ``settings.pipelines.ledger`` when it lands — no re-shape. DEV-STANDARDS rule 3: no
+    hardcoded timeout lives in the ledger's decorated methods.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # Per-attempt I/O budget (DEV-STANDARDS async sharpener: "timeouts on every external call").
+    redis_io_timeout_s: float = 5.0
 
 
 class StageLedgerRecord(BaseModel):
@@ -106,22 +121,36 @@ class RedisStageLedger:
     wrapped by :func:`retry_io` (transient-only retry + per-attempt timeout) so none is unbounded.
     """
 
-    def __init__(self, client: Redis, *, key_prefix: str = "mu:pipeline-ledger") -> None:
+    def __init__(
+        self,
+        client: Redis,
+        *,
+        key_prefix: str = "mu:pipeline-ledger",
+        settings: LedgerSettings | None = None,
+    ) -> None:
         self._redis = client
         self._prefix = key_prefix
+        # per-instance, DI-threaded retry wrapper (never a class-level decorator baking in a
+        # module constant) so `redis_io_timeout_s` is genuinely tunable from Settings.
+        self._settings = settings or LedgerSettings()
+        self._retry = retry_io(timeout_s=self._settings.redis_io_timeout_s)
 
     def _key(self, key: str) -> str:
         return f"{self._prefix}:{key}"
 
-    @retry_io(timeout_s=_LEDGER_IO_TIMEOUT_S)
     async def completed_with_events(self, key: str) -> StageLedgerRecord | None:
+        return await self._retry(self._completed_with_events_impl)(key)
+
+    async def _completed_with_events_impl(self, key: str) -> StageLedgerRecord | None:
         raw = await self._redis.get(self._key(key))
         if raw is None:
             return None
         blob = raw.decode("utf-8") if isinstance(raw, bytes) else raw
         return StageLedgerRecord(events=_decode_events(blob))
 
-    @retry_io(timeout_s=_LEDGER_IO_TIMEOUT_S)
     async def mark_completed(self, key: str, *, events: Sequence[DomainEvent] = ()) -> None:
+        return await self._retry(self._mark_completed_impl)(key, events=events)
+
+    async def _mark_completed_impl(self, key: str, *, events: Sequence[DomainEvent] = ()) -> None:
         # NX: the first completion wins; a retry never overwrites the recorded events (B4).
         await self._redis.set(self._key(key), _encode_events(events), nx=True)

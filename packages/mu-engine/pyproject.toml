@@ -10,17 +10,27 @@ readme = "README.md"
 dependencies = [
     "mu-contracts",
     # relational + migrations (async drivers: asyncpg = Postgres server plane; aiosqlite = the
-    # SQLite client plane — the ONE schema binds to both, storage-schema-rowmapper-spec §2)
+    # SQLite client plane; asyncmy = the MySQL/MariaDB plane — the ONE schema binds to all three,
+    # storage-schema-rowmapper-spec §2 / storage-pluggable-spec §2.1)
     "sqlalchemy>=2.0.36,<2.1",
     "alembic>=1.14,<2",
     "asyncpg>=0.30,<0.31",
     "aiosqlite>=0.20,<0.22",
+    "asyncmy>=0.2.9,<1",
     # stores (Valkey-compatible KV/STM, vector, graph)
     "redis>=5.2,<6",
     "qdrant-client>=1.12.1,<2",
     "falkordb>=1.0.10,<2",
-    # bi-temporal LTM graph driver / openCypher (ported per CODE-ADOPTION, not adopted whole)
-    "graphiti-core>=0.3,<1",
+    # KV role additional backends (storage-pluggable-spec §3.2): memcached client + the
+    # in-process floor's recency sorted-set emulation (spec §5 "sortedcontainers ZSET")
+    "aiomcache>=0.8,<1",
+    "sortedcontainers>=2.4,<3",
+    # NOTE: graphiti-core is deliberately NOT a dependency (storage-rework review FIX-2,
+    # 2026-07-27) — mu_engine.storage.adapters.falkor_ltm PORTS Graphiti's bi-temporal
+    # invalidate-don't-delete *pattern* (owner R2) over openCypher via the plain ``falkordb``
+    # client; it never imports ``graphiti_core`` (confirmed: `grep -rn graphiti_core packages/*/
+    # src` matches only prose in docstrings, zero import statements). Vendoring the whole
+    # package would add RAM/dependency footprint on the shared box for code we don't call.
     # model access (LiteLLM Router) + local embedder
     "litellm>=1.53,<2",
     "sentence-transformers>=3.3,<4",
@@ -30,6 +40,9 @@ dependencies = [
     "structlog>=24.4,<25",
     "prometheus-client>=0.21,<1",
     "tenacity>=9.0,<10",
+    "chromadb>=0.5.20,<0.6",
+    "faiss-cpu>=1.9,<2",
+    "pgvector>=0.3.6,<1",
 ]
 
 [build-system]

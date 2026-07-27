@@ -56,6 +56,10 @@ class ExtractionSettings(BaseModel):
 
     max_tokens: int = 1024
     temperature: float = 0.0
+    # Chit-chat/noise floor for the deterministic decomposer (methodology §1.2): a chunk with
+    # fewer than this many whitespace-split tokens is dropped before pattern-matching — never a
+    # bare literal at the call site (DEV-STANDARDS rule 3).
+    min_tokens: int = 3
 
 
 class ExtractedFact(BaseModel):
@@ -176,7 +180,11 @@ _NOISE_SUBJECTS = frozenset(
     {"there", "it", "this", "that", "here", "they", "we", "you", "i", "he", "she"}
 )
 _ARTICLES = frozenset({"a", "an", "the"})
-_MIN_TOKENS = 3
+# Constructor/param DEFAULT only (DEV-STANDARDS rule 3: no hardcoded constant lives in the
+# decomposer LOGIC) — mirrors ``ExtractionSettings.min_tokens``; the live value is DI-threaded
+# by :class:`HeuristicSpoExtractor` (a bare :func:`decompose_to_spo` call, e.g. in a unit test,
+# still gets a sane, named default).
+_DEFAULT_MIN_TOKENS = 3
 
 
 def _parse_temporal(raw: str) -> datetime:
@@ -329,7 +337,9 @@ def _decompose_sentence(sentence: str, *, base_offset: int, full_text: str) -> E
     return None
 
 
-def decompose_to_spo(text: str, *, now: datetime) -> list[ExtractedFact]:
+def decompose_to_spo(
+    text: str, *, now: datetime, min_tokens: int = _DEFAULT_MIN_TOKENS
+) -> list[ExtractedFact]:
     """Deterministically split ``text`` into atomic SPO ``ExtractedFact``s (no model call).
 
     Sentence-splits on ``.;\\n``, drops chit-chat/noise (too-short, expletive subject, no
@@ -337,13 +347,15 @@ def decompose_to_spo(text: str, *, now: datetime) -> list[ExtractedFact]:
     possessive-attribute → copula(±negation) → prepositional-verb → transitive-verb. Anything
     that matches no pattern is dropped (honest: this is a heuristic, not a parser). ``now`` is
     accepted for signature symmetry with the port; dates come only from the text itself.
+    ``min_tokens`` is DI-threaded from :class:`ExtractionSettings` by
+    :class:`HeuristicSpoExtractor`/:class:`LlmFactExtractor` (never a bare literal here).
     """
     facts: list[ExtractedFact] = []
     offset = 0
     for raw in re.split(r"[.;\n]", text):
         chunk = raw.strip()
         if chunk:
-            if len(chunk.split()) >= _MIN_TOKENS:
+            if len(chunk.split()) >= min_tokens:
                 fact = _decompose_sentence(chunk, base_offset=offset, full_text=text)
                 if fact is not None:
                     facts.append(fact)
@@ -363,8 +375,12 @@ class HeuristicSpoExtractor:
 
     name = "heuristic_spo_v1"
 
+    def __init__(self, *, settings: ExtractionSettings | None = None) -> None:
+        # min_tokens flows from central config, never inlined here (rule 3).
+        self._settings = settings or ExtractionSettings()
+
     async def extract(self, text: str, *, now: datetime) -> list[ExtractedFact]:
-        return decompose_to_spo(text, now=now)
+        return decompose_to_spo(text, now=now, min_tokens=self._settings.min_tokens)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -423,7 +439,7 @@ class LlmFactExtractor:
         fact_strings = _parse_mem0_facts(completion.text)
         out: list[ExtractedFact] = []
         for fs in fact_strings:
-            out.extend(decompose_to_spo(fs, now=now))
+            out.extend(decompose_to_spo(fs, now=now, min_tokens=self._settings.min_tokens))
         return out
 
 

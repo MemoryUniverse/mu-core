@@ -14,6 +14,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator, Callable
 
+import aiomcache
 import pytest
 import pytest_asyncio
 from falkordb.asyncio import FalkorDB
@@ -143,3 +144,34 @@ async def pg_engine(settings: Settings) -> AsyncIterator[AsyncEngine]:
         yield engine
     finally:
         await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def mysql_engine(settings: Settings) -> AsyncIterator[AsyncEngine]:
+    engine = create_async_engine(settings.storage.mysql.dsn, pool_pre_ping=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)  # idempotent (checkfirst)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def valkey_client(settings: Settings) -> AsyncIterator[Redis]:
+    client: Redis = Redis.from_url(settings.storage.valkey.url, decode_responses=True)
+    await client.ping()  # fail-loud if the container is down
+    try:
+        yield client
+    finally:
+        await client.aclose()
+
+
+@pytest_asyncio.fixture
+async def memcached_client(settings: Settings) -> AsyncIterator[aiomcache.Client]:
+    client = aiomcache.Client(settings.storage.memcached.host, settings.storage.memcached.port)
+    await client.version()  # fail-loud if the container is down
+    try:
+        yield client
+    finally:
+        await client.close()

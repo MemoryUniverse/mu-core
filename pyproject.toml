@@ -47,10 +47,16 @@ explicit_package_bases = true
 module = [
     "qdrant_client.*",
     "falkordb.*",
-    "graphiti_core.*",
     "litellm.*",
     "sentence_transformers.*",
     "testcontainers.*",
+    "asyncpg.*",
+    "pgvector.*",
+    "chromadb.*",
+    "faiss.*",
+    "sortedcontainers.*",
+    "aiomcache.*",
+    "asyncmy.*",
 ]
 ignore_missing_imports = true
 

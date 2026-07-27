@@ -148,7 +148,12 @@ async def test_add_promote_recall_round_trips_across_all_three_stores(mem: Local
 
 
 def test_unsupported_backend_fails_loud_not_silent() -> None:
-    """Selecting a not-yet-built embedded backend (FAISS/Kùzu) raises a NAMED
-    ``BackendUnavailableError`` at the composition root — never a silent fallback (spec §7)."""
+    """Selecting a graph backend the STORE_REGISTRY does not ship (e.g. Kùzu — only ``falkordb``
+    is registered for the mandatory graph role, storage-rework review FIX-1) raises a NAMED
+    ``BackendUnavailableError`` at the composition root — never a silent fallback (spec §7).
+
+    (``vector=faiss`` no longer belongs here: the registry ships it and ``LocalContainer`` now
+    routes every kv/vector/graph role through ``STORE_REGISTRY.build`` — FAISS is a supported,
+    PRIVATE-plane-only vector backend, not an unsupported one.)"""
     with pytest.raises(BackendUnavailableError):
-        LocalMemory(StorageSettings(vector=BackendChoice(backend="faiss")))
+        LocalMemory(StorageSettings(graph=BackendChoice(backend="kuzu")))

@@ -39,8 +39,10 @@ from mu_engine.providers.warm_local import WarmLocalCustomLLM, WarmLocalSingleto
 
 __all__ = ["ModelRouter", "build_model_router"]
 
-# Fallback token ceiling when neither the deployment nor litellm knows the group's context
-# window (measurement default only; never a call parameter). A conservative modern default.
+# Constructor DEFAULT only (DEV-STANDARDS rule 3: no hardcoded constant lives in router LOGIC).
+# The live value is DI-threaded from the central Settings tree (``RouterSettings
+# .default_context_window``) by :func:`build_model_router`; a bare ``ModelRouter(...)`` (e.g. in
+# a unit test) still gets a sane, named default rather than a silent unconfigured 0/None.
 _DEFAULT_CONTEXT_WINDOW = 128_000
 
 
@@ -57,6 +59,7 @@ class ModelRouter:
         registry: ProviderModelRegistry,
         embedder: EmbeddingPort,
         degrade_emitter: DegradeEmitterPort | None = None,
+        default_context_window: int = _DEFAULT_CONTEXT_WINDOW,
     ) -> None:
         self._llm = router
         self._task_map = task_map
@@ -65,6 +68,7 @@ class ModelRouter:
         self._registry = registry
         self._embedder = embedder
         self._degrade = degrade_emitter or LoggingDegradeEmitter()
+        self._default_context_window = default_context_window
         # EmbeddingPort attrs — read from the adapter, NEVER assumed (memory-layer §8).
         self.model_name: str = embedder.model_name
         self.dimension: int = embedder.dimension
@@ -259,7 +263,7 @@ class ModelRouter:
                 return int(got)
         except Exception as exc:  # a logical group id litellm does not know
             log.debug("max_tokens_unknown_group", model_group=model_group, err=type(exc).__name__)
-        return _DEFAULT_CONTEXT_WINDOW
+        return self._default_context_window
 
     @staticmethod
     def _as_wire(messages: Sequence[Message]) -> list[dict[str, str]]:
@@ -357,4 +361,5 @@ def build_model_router(
         registry=registry,
         embedder=embedder,
         degrade_emitter=degrade_emitter,
+        default_context_window=catalog.router.default_context_window,
     )

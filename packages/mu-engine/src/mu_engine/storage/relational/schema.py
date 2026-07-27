@@ -14,6 +14,27 @@ Dialect divergence (spec §2, degrade D7): Postgres partial indexes
 (``WHERE revoked_at IS NULL``) + GIN have no portable equivalent — expressed via
 ``postgresql_where=`` / ``postgresql_using="gin"``, which SQLite/MySQL ignore
 (plain composite index). This is an index-efficiency degrade, never a correctness change.
+
+MySQL portability (owner stage 2026-07-27, adding ``mysql`` as a relational backend), confirmed
+against a REAL ``mu-dev-mysql`` container (two errors, both fixed here):
+1. Every ``String`` column now carries an explicit length — bare ``VARCHAR`` (no length) is
+   valid DDL on Postgres/SQLite but MySQL's ``CREATE TABLE`` REJECTS it (``CompileError: VARCHAR
+   requires a length on dialect mysql``). ``String(128)`` is the default for identifiers/
+   enums/hashes; wider free-form fields (``object_ref``, ``public_key``, ``payload_ref``) get
+   ``String(512)``; ``namespace_prefix`` gets ``String(384)`` — all sized so composite indexes/
+   PKs/unique constraints stay under InnoDB's 3072-byte key limit at ``utf8mb4`` (4 bytes/char)
+   (``OperationalError: Specified key was too long; max key length is 3072 bytes`` on the
+   4-column ``agent_bindings`` PK and the 4-string ``ux_synclog_occurrence`` unique constraint
+   before this fix). This is a portability fix, not a semantic change — Postgres/SQLite accept a
+   length-bound ``VARCHAR`` identically, and no realistic id/hash/enum value in this schema
+   approaches these bounds.
+2. The two GIN indexes on JSON columns (``gin_prov_meta``, ``gin_conflict_members``) are
+   POSTGRES-ONLY DDL, gated by ``DDL(...).execute_if(dialect="postgresql")`` at the bottom of
+   this module rather than declared in ``__table_args__`` — MySQL 8 cannot index a raw JSON
+   column at all (``JSON column ... cannot be used in key specification``); SQLite tolerates a
+   plain index (TEXT affinity) but gets no GIN benefit either. Both dialects still get a working,
+   correct table — only the JSON-search acceleration is Postgres-specific (degrade **D7**,
+   ``RELATIONAL_INDEX_REDUCED`` — an efficiency loss, never a correctness loss, spec §7).
 """
 
 from __future__ import annotations
@@ -22,6 +43,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    DDL,
     JSON,
     BigInteger,
     Boolean,
@@ -32,6 +54,7 @@ from sqlalchemy import (
     PrimaryKeyConstraint,
     String,
     UniqueConstraint,
+    event,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB as _PG_JSONB
@@ -63,9 +86,9 @@ def _dt_opt() -> Mapped[datetime | None]:
 class Org(Base):
     __tablename__ = "orgs"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True)  # tenant/billing/residency root
-    slug: Mapped[str] = mapped_column(String, nullable=False)  # content-free handle
-    residency_region: Mapped[str] = mapped_column(String, nullable=False, default="")  # rule 7
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)  # tenant/billing/residency root
+    slug: Mapped[str] = mapped_column(String(128), nullable=False)  # content-free handle
+    residency_region: Mapped[str] = mapped_column(String(128), nullable=False, default="")  # rule 7
     created_at: Mapped[datetime] = _dt()
 
     __table_args__ = (Index("ux_orgs_slug", "slug", unique=True),)
@@ -74,9 +97,9 @@ class Org(Base):
 class Workspace(Base):
     __tablename__ = "workspaces"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    slug: Mapped[str] = mapped_column(String, nullable=False)  # content-free handle
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    slug: Mapped[str] = mapped_column(String(128), nullable=False)  # content-free handle
     created_at: Mapped[datetime] = _dt()
 
     __table_args__ = (
@@ -88,11 +111,11 @@ class Workspace(Base):
 class Membership(Base):
     __tablename__ = "workspace_memberships"
 
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    principal_id: Mapped[str] = mapped_column(String, nullable=False)
-    role: Mapped[str] = mapped_column(String, nullable=False)  # OWNER|ADMIN|MEMBER|GUEST
-    status: Mapped[str] = mapped_column(String, nullable=False)  # active|suspended|removed
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    role: Mapped[str] = mapped_column(String(128), nullable=False)  # OWNER|ADMIN|MEMBER|GUEST
+    status: Mapped[str] = mapped_column(String(128), nullable=False)  # active|suspended|removed
     expires_at: Mapped[datetime | None] = _dt_opt()
     created_at: Mapped[datetime] = _dt()
 
@@ -105,28 +128,28 @@ class Membership(Base):
 class Principal(Base):
     __tablename__ = "principals"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True)  # pseudonymous stable id
-    kind: Mapped[str] = mapped_column(String, nullable=False)  # human|agent|service
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)  # pseudonymous stable id
+    kind: Mapped[str] = mapped_column(String(128), nullable=False)  # human|agent|service
 
 
 class NamespaceDef(Base):
     __tablename__ = "namespaces"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    owner_principal_id: Mapped[str] = mapped_column(String, nullable=False)
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    owner_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
     allowed_visibilities: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
 
 class SessionDef(Base):
     __tablename__ = "sessions"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    namespace_id: Mapped[str] = mapped_column(String, nullable=False)
-    state: Mapped[str] = mapped_column(String, nullable=False)  # open|closed
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    namespace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    state: Mapped[str] = mapped_column(String(128), nullable=False)  # open|closed
     expires_at: Mapped[datetime | None] = _dt_opt()
     created_at: Mapped[datetime] = _dt()
 
@@ -134,8 +157,9 @@ class SessionDef(Base):
 class SessionParticipant(Base):
     __tablename__ = "session_participants"
 
-    session_id: Mapped[str] = mapped_column(String, nullable=False)
-    principal_id: Mapped[str] = mapped_column(String, nullable=False)  # a PRINCIPAL id (Model A)
+    session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # a PRINCIPAL id (Model A)
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
     joined_at: Mapped[datetime] = _dt()
     left_at: Mapped[datetime | None] = _dt_opt()  # offboarding => re-stamp trigger
 
@@ -145,13 +169,13 @@ class SessionParticipant(Base):
 class AgentBinding(Base):
     __tablename__ = "agent_bindings"
 
-    agent_principal_id: Mapped[str] = mapped_column(String, nullable=False)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    namespace_id: Mapped[str | None] = mapped_column(String, default="")
-    session_id: Mapped[str | None] = mapped_column(String, default="")
+    agent_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    namespace_id: Mapped[str | None] = mapped_column(String(128), default="")
+    session_id: Mapped[str | None] = mapped_column(String(128), default="")
     allowed_tools: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
-    policy_cap: Mapped[str] = mapped_column(String, nullable=False)
+    policy_cap: Mapped[str] = mapped_column(String(128), nullable=False)
 
     __table_args__ = (
         PrimaryKeyConstraint("agent_principal_id", "workspace_id", "namespace_id", "session_id"),
@@ -162,13 +186,14 @@ class AgentBinding(Base):
 class AclEntry(Base):
     __tablename__ = "acl_entries"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    object_ref: Mapped[str] = mapped_column(String, nullable=False)  # ShareableRef id (by value)
-    subject_principal_id: Mapped[str] = mapped_column(String, nullable=False)
-    grantee_kind: Mapped[str] = mapped_column(String, nullable=False)  # user|session|role
-    grant_id: Mapped[str] = mapped_column(String, nullable=False)
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # ShareableRef id (by value)
+    object_ref: Mapped[str] = mapped_column(String(512), nullable=False)
+    subject_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    grantee_kind: Mapped[str] = mapped_column(String(128), nullable=False)  # user|session|role
+    grant_id: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = _dt()
     revoked_at: Mapped[datetime | None] = _dt_opt()  # NULL = live
 
@@ -191,15 +216,15 @@ class AclEntry(Base):
 class Grant(Base):
     __tablename__ = "grants"
 
-    id: Mapped[str] = mapped_column(String, primary_key=True)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    object_ref: Mapped[str] = mapped_column(String, nullable=False)  # SHARED objects only
-    grantor: Mapped[str] = mapped_column(String, nullable=False)
-    grantee_principal_id: Mapped[str] = mapped_column(String, nullable=False)
-    grantee_kind: Mapped[str] = mapped_column(String, nullable=False)  # user|session|role
-    direction: Mapped[str] = mapped_column(String, nullable=False)
-    parent_grant_id: Mapped[str | None] = mapped_column(String)  # revoke cascade edge
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    object_ref: Mapped[str] = mapped_column(String(512), nullable=False)  # SHARED objects only
+    grantor: Mapped[str] = mapped_column(String(128), nullable=False)
+    grantee_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    grantee_kind: Mapped[str] = mapped_column(String(128), nullable=False)  # user|session|role
+    direction: Mapped[str] = mapped_column(String(128), nullable=False)
+    parent_grant_id: Mapped[str | None] = mapped_column(String(128))  # revoke cascade edge
     created_at: Mapped[datetime] = _dt()
     revoked_at: Mapped[datetime | None] = _dt_opt()
 
@@ -223,20 +248,21 @@ class Grant(Base):
 class MemoryProvenance(Base):
     __tablename__ = "memory_provenance"
 
-    memory_id: Mapped[str] = mapped_column(String, primary_key=True)  # tier-stable id
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy/billing root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    namespace_prefix: Mapped[str] = mapped_column(String, nullable=False)  # to_prefix()
-    owner_id: Mapped[str] = mapped_column(String, nullable=False)
-    visibility: Mapped[str] = mapped_column(String, nullable=False)  # private|shared
-    kind: Mapped[str] = mapped_column(String, nullable=False)  # proposition|reference
-    content_hash: Mapped[str] = mapped_column(String, nullable=False)  # version/dedupe key
-    source: Mapped[str] = mapped_column(String, nullable=False)
-    tier: Mapped[str] = mapped_column(String, nullable=False)  # stm|mtm|ltm
-    state: Mapped[str] = mapped_column(String, nullable=False)  # active|archived|...
-    artifact_ref: Mapped[str | None] = mapped_column(String)  # first-class (CANONICAL §7.1)
-    provenance_id: Mapped[str] = mapped_column(String, nullable=False)  # required non-empty
-    superseded_by: Mapped[str | None] = mapped_column(String)
+    memory_id: Mapped[str] = mapped_column(String(128), primary_key=True)  # tier-stable id
+    # tenancy/billing root (ADR 0026)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    namespace_prefix: Mapped[str] = mapped_column(String(384), nullable=False)  # to_prefix()
+    owner_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    visibility: Mapped[str] = mapped_column(String(128), nullable=False)  # private|shared
+    kind: Mapped[str] = mapped_column(String(128), nullable=False)  # proposition|reference
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)  # version/dedupe key
+    source: Mapped[str] = mapped_column(String(128), nullable=False)
+    tier: Mapped[str] = mapped_column(String(128), nullable=False)  # stm|mtm|ltm
+    state: Mapped[str] = mapped_column(String(128), nullable=False)  # active|archived|...
+    artifact_ref: Mapped[str | None] = mapped_column(String(128))  # first-class (CANONICAL §7.1)
+    provenance_id: Mapped[str] = mapped_column(String(128), nullable=False)  # required non-empty
+    superseded_by: Mapped[str | None] = mapped_column(String(128))
     synced_at: Mapped[datetime] = _dt()
     meta: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
 
@@ -251,7 +277,10 @@ class MemoryProvenance(Base):
             "artifact_ref",
             postgresql_where=text("artifact_ref IS NOT NULL"),
         ),
-        Index("gin_prov_meta", "meta", postgresql_using="gin"),
+        # NOTE: the `meta` GIN index is Postgres-only DDL, registered via `event.listen(...)`
+        # near the bottom of this module (module docstring point 2) — NOT declared here, because
+        # MySQL cannot index a raw JSON column at all (unlike the `postgresql_where=` partial
+        # indexes above, which degrade gracefully to a plain index on every other dialect).
     )
 
 
@@ -259,19 +288,19 @@ class MemoryProvenance(Base):
 class FactProvenance(Base):
     __tablename__ = "fact_provenance"
 
-    memory_id: Mapped[str] = mapped_column(String, primary_key=True)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    namespace_prefix: Mapped[str] = mapped_column(String, nullable=False)
-    subject_entity_uid: Mapped[str] = mapped_column(String, nullable=False)  # NOT surface text
-    predicate: Mapped[str] = mapped_column(String, nullable=False)  # controlled vocab token
-    object_entity_uid: Mapped[str | None] = mapped_column(String)
-    object_value_hash: Mapped[str | None] = mapped_column(String)  # sha256 of a literal value
-    polarity: Mapped[str] = mapped_column(String, nullable=False)  # positive|negative
+    memory_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    namespace_prefix: Mapped[str] = mapped_column(String(384), nullable=False)
+    subject_entity_uid: Mapped[str] = mapped_column(String(128), nullable=False)  # NOT surface text
+    predicate: Mapped[str] = mapped_column(String(128), nullable=False)  # controlled vocab token
+    object_entity_uid: Mapped[str | None] = mapped_column(String(128))
+    object_value_hash: Mapped[str | None] = mapped_column(String(128))  # sha256 of a literal value
+    polarity: Mapped[str] = mapped_column(String(128), nullable=False)  # positive|negative
     valid_at: Mapped[datetime] = _dt()
     invalid_at: Mapped[datetime | None] = _dt_opt()  # set on supersede
     valid_at_inferred: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    state: Mapped[str] = mapped_column(String, nullable=False)  # active|superseded
+    state: Mapped[str] = mapped_column(String(128), nullable=False)  # active|superseded
     recorded_at: Mapped[datetime] = _dt()
 
     __table_args__ = (
@@ -289,15 +318,15 @@ class FactProvenance(Base):
 class ProvenanceLedgerRow(Base):
     __tablename__ = "provenance_ledger"
 
-    stream_id: Mapped[str] = mapped_column(String, nullable=False)  # provenance_id
+    stream_id: Mapped[str] = mapped_column(String(128), nullable=False)  # provenance_id
     version: Mapped[int] = mapped_column(Integer, nullable=False)  # monotonic within stream
     action: Mapped[str] = mapped_column(
-        String, nullable=False
+        String(128), nullable=False
     )  # ORIGIN|DERIVED|SUPERSEDED|COMPOSED
-    memory_id: Mapped[str] = mapped_column(String, nullable=False)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    actor_id: Mapped[str] = mapped_column(String, nullable=False)
+    memory_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
     at: Mapped[datetime] = _dt()
     meta: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
 
@@ -311,33 +340,34 @@ class ProvenanceLedgerRow(Base):
 class UsageEventRow(Base):
     __tablename__ = "usage_event"
 
-    event_id: Mapped[str] = mapped_column(String, primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     seq: Mapped[int] = mapped_column(BigInteger, nullable=False)  # per-workspace monotonic
     occurred_at: Mapped[datetime] = _dt()
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # billing/tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    namespace: Mapped[str] = mapped_column(String, nullable=False)
-    principal_id: Mapped[str] = mapped_column(String, nullable=False)
-    to_prefix: Mapped[str] = mapped_column(String, nullable=False)
-    visibility: Mapped[str] = mapped_column(String, nullable=False)
-    product: Mapped[str] = mapped_column(String, nullable=False)
-    deployment_mode: Mapped[str] = mapped_column(String, nullable=False)
-    dimension: Mapped[str] = mapped_column(String, nullable=False)  # MeterDimension
+    # billing/tenancy root (ADR 0026)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    namespace: Mapped[str] = mapped_column(String(128), nullable=False)
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    to_prefix: Mapped[str] = mapped_column(String(128), nullable=False)
+    visibility: Mapped[str] = mapped_column(String(128), nullable=False)
+    product: Mapped[str] = mapped_column(String(128), nullable=False)
+    deployment_mode: Mapped[str] = mapped_column(String(128), nullable=False)
+    dimension: Mapped[str] = mapped_column(String(128), nullable=False)  # MeterDimension
     quantity: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    unit: Mapped[str] = mapped_column(String, nullable=False)
-    op: Mapped[str | None] = mapped_column(String)
-    tier: Mapped[str | None] = mapped_column(String)
-    source: Mapped[str | None] = mapped_column(String)
-    model: Mapped[str | None] = mapped_column(String)
-    role: Mapped[str | None] = mapped_column(String)
-    engine: Mapped[str | None] = mapped_column(String)
-    device_id: Mapped[str | None] = mapped_column(String)
+    unit: Mapped[str] = mapped_column(String(128), nullable=False)
+    op: Mapped[str | None] = mapped_column(String(128))
+    tier: Mapped[str | None] = mapped_column(String(128))
+    source: Mapped[str | None] = mapped_column(String(128))
+    model: Mapped[str | None] = mapped_column(String(128))
+    role: Mapped[str | None] = mapped_column(String(128))
+    engine: Mapped[str | None] = mapped_column(String(128))
+    device_id: Mapped[str | None] = mapped_column(String(128))
     tokens_in: Mapped[int | None] = mapped_column(BigInteger)
     tokens_out: Mapped[int | None] = mapped_column(BigInteger)
     cached_input_tokens: Mapped[int | None] = mapped_column(BigInteger)
     reasoning_tokens: Mapped[int | None] = mapped_column(BigInteger)
-    prev_hash: Mapped[str | None] = mapped_column(String)  # tamper chain
-    row_hash: Mapped[str] = mapped_column(String, nullable=False)
+    prev_hash: Mapped[str | None] = mapped_column(String(128))  # tamper chain
+    row_hash: Mapped[str] = mapped_column(String(128), nullable=False)
 
     __table_args__ = (
         Index("ix_usage_ws_seq", "workspace_id", "seq"),
@@ -349,7 +379,7 @@ class UsageEventRow(Base):
 class UsageOutboxRow(Base):
     __tablename__ = "usage_outbox"
 
-    event_id: Mapped[str] = mapped_column(String, primary_key=True)
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)  # UsageEvent
     enqueued_at: Mapped[datetime] = _dt()
     drained_at: Mapped[datetime | None] = _dt_opt()
@@ -358,10 +388,11 @@ class UsageOutboxRow(Base):
 class UsageRollupRow(Base):
     __tablename__ = "usage_rollup"
 
-    bucket_key: Mapped[str] = mapped_column(String, primary_key=True)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # billing/tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    dimension: Mapped[str] = mapped_column(String, nullable=False)
+    bucket_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # billing/tenancy root (ADR 0026)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    dimension: Mapped[str] = mapped_column(String(128), nullable=False)
     hour_bucket: Mapped[datetime] = _dt()
     quantity: Mapped[int] = mapped_column(BigInteger, nullable=False)
     qualifiers: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
@@ -372,25 +403,26 @@ class UsageRollupRow(Base):
 class DeviceRow(Base):
     __tablename__ = "devices"
 
-    device_id: Mapped[str] = mapped_column(String, primary_key=True)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    principal_id: Mapped[str] = mapped_column(String, nullable=False)  # the ONE owning principal
-    public_key: Mapped[str] = mapped_column(String, nullable=False)
-    platform: Mapped[str] = mapped_column(String, nullable=False)
+    device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # the ONE owning principal
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    public_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    platform: Mapped[str] = mapped_column(String(128), nullable=False)
     label: Mapped[str] = mapped_column(
-        String, nullable=False, default=""
+        String(255), nullable=False, default=""
     )  # user-chosen, content-free
-    app_build: Mapped[str] = mapped_column(String, nullable=False, default="")
-    client_mode: Mapped[str] = mapped_column(String, nullable=False)  # thin|full_local
-    privacy_tier: Mapped[str] = mapped_column(String, nullable=False)  # server_readable
-    state: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    app_build: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    client_mode: Mapped[str] = mapped_column(String(128), nullable=False)  # thin|full_local
+    privacy_tier: Mapped[str] = mapped_column(String(128), nullable=False)  # server_readable
+    state: Mapped[str] = mapped_column(String(128), nullable=False, default="pending")
     enrolled_at: Mapped[datetime] = _dt()
     last_seen_at: Mapped[datetime | None] = _dt_opt()
     last_synced_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     last_lamport: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     revoked_at: Mapped[datetime | None] = _dt_opt()
-    revoked_by: Mapped[str | None] = mapped_column(String)
+    revoked_by: Mapped[str | None] = mapped_column(String(128))
 
     __table_args__ = (Index("ix_devices_principal", "org_id", "principal_id"),)
 
@@ -398,23 +430,23 @@ class DeviceRow(Base):
 class PrivateSyncLogRow(Base):
     __tablename__ = "private_sync_log"
 
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # sync-log key root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    principal_id: Mapped[str] = mapped_column(String, nullable=False)  # the per-user stream
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # sync-log key root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False)  # the per-user stream
     seq: Mapped[int] = mapped_column(BigInteger, nullable=False)  # hub-assigned ordering authority
-    origin_device_id: Mapped[str] = mapped_column(String, nullable=False)
-    op: Mapped[str] = mapped_column(String, nullable=False)  # upsert|supersede|tombstone|...
-    memory_id: Mapped[str] = mapped_column(String, nullable=False)
-    content_hash: Mapped[str] = mapped_column(String, nullable=False)
-    tier: Mapped[str] = mapped_column(String, nullable=False)
+    origin_device_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    op: Mapped[str] = mapped_column(String(128), nullable=False)  # upsert|supersede|tombstone|...
+    memory_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    tier: Mapped[str] = mapped_column(String(128), nullable=False)
     valid_at: Mapped[datetime] = _dt()
     valid_at_inferred: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     lamport: Mapped[int] = mapped_column(BigInteger, nullable=False)
     occurred_at: Mapped[datetime] = _dt()  # ADVISORY, never ordering authority
-    provenance_id: Mapped[str] = mapped_column(String, nullable=False)
-    winner_id: Mapped[str | None] = mapped_column(String)
-    loser_id: Mapped[str | None] = mapped_column(String)
-    payload_ref: Mapped[str | None] = mapped_column(String)
+    provenance_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    winner_id: Mapped[str | None] = mapped_column(String(128))
+    loser_id: Mapped[str | None] = mapped_column(String(128))
+    payload_ref: Mapped[str | None] = mapped_column(String(512))
 
     __table_args__ = (
         # ADR 0026: the sync-log stream key is (org_id, principal_id); seq is the hub-assigned
@@ -436,27 +468,29 @@ class PrivateSyncLogRow(Base):
 class ConflictRecordRow(Base):
     __tablename__ = "conflict_records"
 
-    conflict_id: Mapped[str] = mapped_column(String, primary_key=True)
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    namespace_prefix: Mapped[str] = mapped_column(String, nullable=False)
+    conflict_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    namespace_prefix: Mapped[str] = mapped_column(String(384), nullable=False)
     member_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)  # memory ids
-    predicate_key: Mapped[str] = mapped_column(String, nullable=False)
-    method: Mapped[str] = mapped_column(String, nullable=False)
+    predicate_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    method: Mapped[str] = mapped_column(String(128), nullable=False)
     detected_confidence: Mapped[float] = mapped_column(Float, nullable=False)
-    proposed_winner_id: Mapped[str | None] = mapped_column(String)
-    state: Mapped[str] = mapped_column(String, nullable=False)  # ConflictState
-    resolution_kind: Mapped[str | None] = mapped_column(String)
-    resolved_winner_id: Mapped[str | None] = mapped_column(String)
-    resolution_origin: Mapped[str | None] = mapped_column(String)  # auto|manual|system_degraded
-    resolved_by: Mapped[str | None] = mapped_column(String)
+    proposed_winner_id: Mapped[str | None] = mapped_column(String(128))
+    state: Mapped[str] = mapped_column(String(128), nullable=False)  # ConflictState
+    resolution_kind: Mapped[str | None] = mapped_column(String(128))
+    resolved_winner_id: Mapped[str | None] = mapped_column(String(128))
+    # auto|manual|system_degraded
+    resolution_origin: Mapped[str | None] = mapped_column(String(128))
+    resolved_by: Mapped[str | None] = mapped_column(String(128))
     policy_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     detected_at: Mapped[datetime] = _dt()
     resolved_at: Mapped[datetime | None] = _dt_opt()
 
     __table_args__ = (
         Index("ix_conflict_pending", "namespace_prefix", "state"),
-        Index("gin_conflict_members", "member_ids", postgresql_using="gin"),
+        # NOTE: the `member_ids` GIN index is Postgres-only DDL — see `gin_prov_meta` note above
+        # and the `event.listen(...)` registration near the bottom of this module.
     )
 
 
@@ -465,11 +499,11 @@ class AuditLogRow(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     ts: Mapped[datetime] = _dt()
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
-    actor_id: Mapped[str] = mapped_column(String, nullable=False)
-    action: Mapped[str] = mapped_column(String, nullable=False)
-    target_id: Mapped[str | None] = mapped_column(String)  # = MemoryItem.id BY VALUE, no FK
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    action: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_id: Mapped[str | None] = mapped_column(String(128))  # = MemoryItem.id BY VALUE, no FK
     success: Mapped[bool] = mapped_column(Boolean, nullable=False)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
@@ -484,20 +518,50 @@ class AuditLogRow(Base):
 class TrustLedgerEntryRow(Base):
     __tablename__ = "trust_ledger_entries"
 
-    org_id: Mapped[str] = mapped_column(String, nullable=False)  # tenancy root (ADR 0026)
-    workspace_id: Mapped[str] = mapped_column(String, nullable=False)
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
     seq: Mapped[int] = mapped_column(BigInteger, nullable=False)  # per-workspace monotonic
-    action: Mapped[str] = mapped_column(String, nullable=False)  # TrustLedgerAction
-    actor_principal_id: Mapped[str] = mapped_column(String, nullable=False)
-    subject_principal_id: Mapped[str | None] = mapped_column(String)
-    object_ref: Mapped[str | None] = mapped_column(String)
+    action: Mapped[str] = mapped_column(String(128), nullable=False)  # TrustLedgerAction
+    actor_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    subject_principal_id: Mapped[str | None] = mapped_column(String(128))
+    object_ref: Mapped[str | None] = mapped_column(String(512))
     at: Mapped[datetime] = _dt()
     detail: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
-    prev_hash: Mapped[str | None] = mapped_column(String)
-    entry_hash: Mapped[str] = mapped_column(String, nullable=False)  # SHA-256 linked-hash chain
+    prev_hash: Mapped[str | None] = mapped_column(String(128))
+    # SHA-256 linked-hash chain
+    entry_hash: Mapped[str] = mapped_column(String(128), nullable=False)
 
     __table_args__ = (
         PrimaryKeyConstraint("workspace_id", "seq"),
         Index("ix_trust_object", "workspace_id", "object_ref"),
         Index("ix_trust_principal", "workspace_id", "subject_principal_id"),
     )
+
+
+# ============================================================ Postgres-only GIN DDL (docstring 2)
+# MySQL 8 rejects a plain index on a raw JSON column outright (`JSON column ... cannot be used
+# in key specification`) and SQLite gets no GIN benefit from one — so these two indexes are NOT
+# portable `Index(...)` entries in `__table_args__` (unlike the `postgresql_where=` partial
+# indexes above, which degrade gracefully everywhere). `execute_if(dialect="postgresql")` makes
+# `create_all` skip them entirely on every other dialect (degrade D7, never a correctness loss).
+def _postgres_only_ddl(statement: str) -> DDL:
+    """SQLAlchemy's ``DDL.__init__`` ships no parameter annotations despite ``py.typed`` — one
+    named ``no-untyped-call`` suppression here rather than one per call site (same unstubbed-
+    boundary shape as the other suppressions in this package: pgvector_mtm.py, falkor_ltm.py)."""
+    return DDL(statement)  # type: ignore[no-untyped-call]
+
+
+event.listen(
+    MemoryProvenance.__table__,
+    "after_create",
+    _postgres_only_ddl(
+        "CREATE INDEX gin_prov_meta ON memory_provenance USING GIN (meta)"
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    ConflictRecordRow.__table__,
+    "after_create",
+    _postgres_only_ddl(
+        "CREATE INDEX gin_conflict_members ON conflict_records USING GIN (member_ids)"
+    ).execute_if(dialect="postgresql"),
+)

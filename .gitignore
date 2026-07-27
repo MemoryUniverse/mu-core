@@ -26,3 +26,11 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# --- publish-hygiene: workflow/agent artifacts + tool caches (never publish) ---
+logs/
+.trash/
+graphify-out/
+.serena/
+.claude/
+.tools-venv/
