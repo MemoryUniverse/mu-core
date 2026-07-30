@@ -1,8 +1,8 @@
 """lifecycle/ — the Memory Lifecycle Manager (MLM) subtree (mu_engine).
 
-Stage-0 (S0-01..S0-10) contracts + engine-foundation slices have landed and are re-exported
-below with an explicit ``__all__`` (mypy ``no_implicit_reexport``), mirroring
-``mu_engine.services``' pattern:
+Stage-0 (S0-01..S0-10) contracts + engine-foundation slices, PLUS Stage-1 (S1-01/S1-02/S1-03) —
+the real promotion/demotion/orchestrator services — have landed and are re-exported below with an
+explicit ``__all__`` (mypy ``no_implicit_reexport``), mirroring ``mu_engine.services``' pattern:
 
 - ``mode_gate.py``   (S0-03) — ``ManagerMode``/``ManagerModeGate``/``ManagerOwnsLifecycleError``/
                       ``ModePolicyResolver``.
@@ -15,12 +15,24 @@ below with an explicit ``__all__`` (mypy ``no_implicit_reexport``), mirroring
                       seam, disabled). ``MtmWorkingGraphSettings`` is defined ONCE here (this
                       module) and re-exported by ``settings.py`` — not redefined there (DRY,
                       integrate-phase fix: S0-07 and S0-10 independently drafted the class).
+- ``promotion.py``   (S1-01) — ``PromotionService``/``PromotionReport``/``PromotionOutcome``/
+                      ``PromotionOutcomeKind``.
+- ``demotion.py``    (S1-02) — ``DemotionService``/``DemotionReport``/``DemotionOutcome``/
+                      ``MtmRemovalPort``.
+- ``manager.py``     (S1-03) — ``MemoryLifecycleManager`` (the orchestrator) + its local seam
+                      Protocols (``RetentionServicePort``/``ConflictAdjudicatorPort``/
+                      ``WarmRecallCacheServicePort``) and ``RenderedContext``.
 
-Stage-1+ slices (``promotion.py``, ``demotion.py``, ``manager.py``, ``retention.py``,
-``conflict.py``) are NOT yet landed and are intentionally absent from this aggregate — they join
-this re-export as their own stage merges.
+Stage-2/3 slices (``retention.py``, ``conflict.py``) are NOT yet landed and are intentionally
+absent from this aggregate — they join this re-export as their own stage merges.
 """
 
+from mu_engine.lifecycle.demotion import (
+    DemotionOutcome,
+    DemotionReport,
+    DemotionService,
+    MtmRemovalPort,
+)
 from mu_engine.lifecycle.dto import (
     LifecycleStateView,
     ModelVerdict,
@@ -28,6 +40,13 @@ from mu_engine.lifecycle.dto import (
     TransitionKind,
 )
 from mu_engine.lifecycle.explain import ExplainRecord
+from mu_engine.lifecycle.manager import (
+    ConflictAdjudicatorPort,
+    MemoryLifecycleManager,
+    RenderedContext,
+    RetentionServicePort,
+    WarmRecallCacheServicePort,
+)
 from mu_engine.lifecycle.mode_gate import (
     ManagerMode,
     ManagerModeGate,
@@ -35,6 +54,12 @@ from mu_engine.lifecycle.mode_gate import (
     ModePolicyResolver,
 )
 from mu_engine.lifecycle.mtm_graph import MtmWorkingGraphService, MtmWorkingGraphSettings
+from mu_engine.lifecycle.promotion import (
+    PromotionOutcome,
+    PromotionOutcomeKind,
+    PromotionReport,
+    PromotionService,
+)
 from mu_engine.lifecycle.salience import SalienceStrategy
 from mu_engine.lifecycle.settings import (
     HostedMirrorConsent,
@@ -46,6 +71,10 @@ from mu_engine.lifecycle.settings import (
 )
 
 __all__ = [
+    "ConflictAdjudicatorPort",
+    "DemotionOutcome",
+    "DemotionReport",
+    "DemotionService",
     "ExplainRecord",
     "HostedMirrorConsent",
     "LifecycleSettings",
@@ -54,14 +83,23 @@ __all__ = [
     "ManagerModeGate",
     "ManagerModeSettings",
     "ManagerOwnsLifecycleError",
+    "MemoryLifecycleManager",
     "ModePolicyResolver",
     "ModelVerdict",
+    "MtmRemovalPort",
     "MtmWorkingGraphService",
     "MtmWorkingGraphSettings",
     "OwnershipSettings",
+    "PromotionOutcome",
+    "PromotionOutcomeKind",
+    "PromotionReport",
+    "PromotionService",
+    "RenderedContext",
+    "RetentionServicePort",
     "RetentionSettings",
     "SalienceInputs",
     "SalienceSettings",
     "SalienceStrategy",
     "TransitionKind",
+    "WarmRecallCacheServicePort",
 ]

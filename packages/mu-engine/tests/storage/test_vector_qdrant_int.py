@@ -74,7 +74,12 @@ async def test_namespace_filter(
     a = make_item(ns_a, "only in A")
     await mtm.upsert(a)
     # searching under B must not return A even though they share a collection (spec §3.2).
-    hits_b = await mtm.semantic(ns_b, a.embedding or [], limit=10)
+    # NOTE (S1-04 / BQ3 / ADR 0030): the bare default (session_scope omitted) now federates
+    # every one of the user's sessions for PRIVATE-own recall by design — that federation
+    # behavior is exhaustively covered by test_qdrant_mtm_session_scope_int.py. This test's
+    # actual intent (narrow to exactly one session) still exists and is still exercised by
+    # passing session_scope explicitly, which is unchanged from "today"'s exact-match path.
+    hits_b = await mtm.semantic(ns_b, a.embedding or [], limit=10, session_scope=ns_b.session)
     assert hits_b == []
 
 

@@ -72,6 +72,15 @@ class RecallQuery(BaseModel):
     max_tokens: int | None = None  # reserved for the DEFERRED inject budget ceiling (§2.3)
     correlation_id: str | None = None  # threads events + trace across the read
 
+    # Cross-session, per-user memory (ADR 0030; spec §1 ripple table). ``None`` (the new
+    # DEFAULT) federates every one of the user's sessions — the PRIVATE-own MTM arm resolves
+    # to the truncated user-prefix match (BQ3, ``qdrant_mtm.py:_recall_filter``); a caller
+    # that wants the OLD single-session-narrowed behavior sets this to a concrete session id
+    # (need not equal ``namespace.session`` — narrows to ANY one of the user's sessions).
+    # SHARED rooms IGNORE this field unconditionally: rooms are real walls (session-as-wall
+    # stays mandatory), never opted out via this predicate (AC-4.3, §1 S5 test obligation).
+    session_scope: str | None = None
+
     def for_namespace(self, ns: Namespace) -> RecallQuery:
         """A copy re-pointed at ``ns`` — how the service builds the SHARED-arm query from the
         PRIVATE-session query (federate-live §1.6): same text/limit/channels, shared η."""

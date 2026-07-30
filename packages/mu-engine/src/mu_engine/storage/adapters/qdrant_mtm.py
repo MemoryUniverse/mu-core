@@ -9,6 +9,19 @@ The load-bearing rule (spec §3.2, M1 authz hazard): every SHARED search evaluat
 BEFORE top-k truncation. ``invalidate`` is the id-stable cross-store supersede (spec §3.3):
 overwrite the loser's payload with ``state='superseded'`` so the ``state='active'`` filter
 drops it. Fully async (``AsyncQdrantClient``); dimension comes from the live embedder.
+
+Cross-session, per-user memory (BQ3; ADR 0030; spec §1 ripple table). CORRECTED CITATION:
+the spec's own ripple table and ``mtm-retrieval-design §1.6`` cite ``mtm_qdrant.py:349`` as
+the removable "session exact-equality post-filter" — that file/line does not exist in this
+repo. The real shape (``_recall_filter`` below, verified) has no separate ``session``
+condition at all: session isolation today is an EMERGENT property of matching the whole,
+session-included ``namespace == ns.to_prefix()`` string. Cross-session federation therefore
+cannot "drop a filter clause" — it must change the **match value** for the PRIVATE-own
+federated-recall path (``session_scope is None``) to a truncated, session-less user prefix,
+stored on write as a second indexed payload field (``_USER_PREFIX_KEY`` below) since
+``to_prefix()``'s byte-shape stays FROZEN (CANONICAL §1 rule 5) and is never itself
+truncated in storage. SHARED and any session-narrowed PRIVATE recall keep the exact, full
+``to_prefix()`` match — unconditionally for SHARED (rooms are real walls, §1 S5/AC-4.3).
 """
 
 from __future__ import annotations
@@ -34,9 +47,17 @@ __all__ = ["QdrantMtmAdapter"]
 # (e.g. in a unit test) still gets a sane, named default.
 _DEFAULT_STORE_IO_TIMEOUT_S = 10.0
 
+# The truncated, session-less user-prefix payload key (BQ3; ADR 0030 §1). Written on every
+# upsert (below) and indexed alongside ``namespace``; used ONLY to resolve the PRIVATE-own
+# federated-recall match value in ``_recall_filter`` — never a replacement for ``namespace``
+# (whose ``to_prefix()`` byte-shape stays FROZEN, CANONICAL §1 rule 5) and never surfaced on
+# ``MemoryItem``/``QdrantMapper`` (adapter-local indexing plumbing only).
+_USER_PREFIX_KEY = "namespace_user_prefix"
+
 # payload fields promoted to server-side indexes (spec §3.2).
 _KEYWORD_INDEXES = (
     "namespace",
+    _USER_PREFIX_KEY,
     "session_id",
     "state",
     "visibility",
@@ -46,6 +67,48 @@ _KEYWORD_INDEXES = (
     "content_hash",
     "artifact_ref",
 )
+
+
+def _user_prefix(ns: Namespace) -> str:
+    """``to_prefix()`` truncated BEFORE the session segment (BQ3, ADR 0030 §1).
+
+    Same five leading segments as ``to_prefix()`` (``mu/{org}/{workspace}/{visibility}/
+    {user_slot}``), session dropped — the federation grain that spans every one of the
+    user's sessions. Pure derivation from ``ns``, kept adapter-local (never persisted as
+    ``namespace``, never a second key shape)."""
+    user_slot = "*" if ns.visibility is Visibility.SHARED else ns.user
+    return "/".join(("mu", ns.org, ns.workspace, ns.visibility.value, user_slot))
+
+
+def _resolve_namespace_match(ns: Namespace, *, session_scope: str | None) -> tuple[str, str]:
+    """The ONE (payload key, match value) pair ``_recall_filter`` compiles into a
+    ``FieldCondition`` (BQ3, ADR 0030 §1) — pulled out as a pure function so the branch is
+    unit-testable without a live Qdrant connection (AC-4.3-adjacent).
+
+    * SHARED                                  -> ``("namespace", ns.to_prefix())``,
+      UNCONDITIONALLY (rooms are real walls; ``session_scope`` never relaxes SHARED).
+    * PRIVATE, ``session_scope is None``       -> ``(_USER_PREFIX_KEY, _user_prefix(ns))``
+      (federate every one of the user's sessions — the new default).
+    * PRIVATE, ``session_scope`` is a session id -> ``("namespace", <full to_prefix()>)``,
+      rebuilt with that session if it differs from ``ns.session`` (narrows to ANY one of
+      the user's sessions, not only the query's own) — "exactly like today".
+    """
+    if ns.visibility is Visibility.SHARED:
+        return "namespace", ns.to_prefix()
+    if session_scope is None:
+        return _USER_PREFIX_KEY, _user_prefix(ns)
+    scoped_ns = (
+        ns
+        if session_scope == ns.session
+        else Namespace(
+            org=ns.org,
+            workspace=ns.workspace,
+            user=ns.user,
+            session=session_scope,
+            visibility=ns.visibility,
+        )
+    )
+    return "namespace", scoped_ns.to_prefix()
 
 
 class QdrantMtmAdapter:
@@ -94,22 +157,35 @@ class QdrantMtmAdapter:
     async def _upsert_impl(self, item: MemoryItem) -> None:
         name = await self._ensure_collection(item.namespace)
         row = self._mapper.to_store(item)
+        # BQ3/ADR 0030: stamp the truncated user-prefix alongside the mapper's own
+        # ``namespace`` field — mutating the payload dict in place, never the mapper (owned
+        # elsewhere); ``QdrantPoint`` is frozen on FIELD reassignment only, not on the
+        # mutable ``dict`` a field holds.
+        row.payload[_USER_PREFIX_KEY] = _user_prefix(item.namespace)
         await self._qdrant.upsert(
             collection_name=name,
             points=[models.PointStruct(id=row.point_id, vector=row.vector, payload=row.payload)],
         )
 
     def _recall_filter(
-        self, ns: Namespace, caller_identity_set: frozenset[str] | None
+        self,
+        ns: Namespace,
+        caller_identity_set: frozenset[str] | None,
+        *,
+        session_scope: str | None = None,
     ) -> models.Filter:
+        # Resolve the ONE namespace match (key, value) pair (BQ3, ADR 0030 §1); everything
+        # below is a SINGLE code path over that pair — no second filter builder.
+        match_key, match_value = _resolve_namespace_match(ns, session_scope=session_scope)
+
         # compiled recall filter (spec §3.2), applied server-side pre-truncation.
         must: list[models.Condition] = [
-            models.FieldCondition(key="namespace", match=models.MatchValue(value=ns.to_prefix())),
+            models.FieldCondition(key=match_key, match=models.MatchValue(value=match_value)),
             models.FieldCondition(
                 key="state", match=models.MatchValue(value=MemoryState.ACTIVE.value)
             ),
         ]
-        # Model A — SHARED only; PRIVATE is isolated by to_prefix() + the plane split.
+        # Model A — SHARED only; PRIVATE is isolated by the resolved namespace match above.
         if ns.visibility is Visibility.SHARED and caller_identity_set is not None:
             must.append(
                 models.FieldCondition(
@@ -127,6 +203,7 @@ class QdrantMtmAdapter:
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
         sparse_query: SparseQuery | None = None,
+        session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]:
         return await self._retry(self._semantic_impl)(
             ns,
@@ -134,6 +211,7 @@ class QdrantMtmAdapter:
             limit=limit,
             caller_identity_set=caller_identity_set,
             sparse_query=sparse_query,
+            session_scope=session_scope,
         )
 
     async def _semantic_impl(
@@ -144,6 +222,7 @@ class QdrantMtmAdapter:
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
         sparse_query: SparseQuery | None = None,
+        session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]:
         name = collection_name(ns, self._dim)
         if not await self._qdrant.collection_exists(name):
@@ -151,7 +230,7 @@ class QdrantMtmAdapter:
         hits = await self._qdrant.query_points(
             collection_name=name,
             query=query_vector,
-            query_filter=self._recall_filter(ns, caller_identity_set),
+            query_filter=self._recall_filter(ns, caller_identity_set, session_scope=session_scope),
             limit=limit,
             with_payload=True,
             with_vectors=True,

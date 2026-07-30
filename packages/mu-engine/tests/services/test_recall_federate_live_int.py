@@ -179,8 +179,17 @@ async def test_federate_live_recall_fuses_and_isolates(
         org=org, workspace=ws, user="u1", session=session, visibility=Visibility.PRIVATE
     )
     shared = Namespace.shared(org=org, workspace=ws, session=session)
-    other = Namespace(  # a DIFFERENT session ⇒ a different to_prefix() partition (different tenant)
-        org=org, workspace=ws, user="u1", session="other", visibility=Visibility.PRIVATE
+    other = Namespace(  # a DIFFERENT user ⇒ a genuinely different tenant.
+        # NOTE (S1-04 / BQ3 / ADR 0030 integrate-phase fix): this used to be user="u1",
+        # session="other" — a different SESSION of the SAME user. That is no longer a tenant
+        # boundary: qdrant_mtm's PRIVATE-own federated-recall path (session_scope=None, the
+        # new default) intentionally matches on the truncated, session-less user prefix, so a
+        # same-user/different-session item is SUPPOSED to surface now (that federation is
+        # exhaustively covered by test_qdrant_mtm_session_scope_int.py). Genuine tenant
+        # isolation is keyed on `user` (and org/workspace), so this fixture now differs by
+        # user to keep testing the real isolation invariant instead of an assumption Stage-1
+        # intentionally overturned.
+        org=org, workspace=ws, user="u2", session=session, visibility=Visibility.PRIVATE
     )
     caller = ClientScope(
         principal_id="u1", org_id=org, workspace_id=ws, session_id=session, agent_principal_id="u1"
@@ -232,7 +241,7 @@ async def test_federate_live_recall_fuses_and_isolates(
         await mtm.upsert(s_secret)
         await mtm.upsert(s_dup)
 
-        # --- other-tenant data (different session partition) — must never surface ---
+        # --- other-tenant data (different user) — must never surface ---
         o_item = await make_item(other, "The favorite color over there is crimson")
         await mtm.upsert(o_item)
 
@@ -254,7 +263,7 @@ async def test_federate_live_recall_fuses_and_isolates(
         # isolation — state='active': a superseded item never surfaces
         assert p_old.id not in ids, "superseded item resurfaced (state filter breach)"
         # isolation — physical to_prefix partition: a different session never surfaces
-        assert o_item.id not in ids, "cross-session item leaked (tenancy breach)"
+        assert o_item.id not in ids, "cross-tenant item leaked (tenancy breach)"
         # dedup — the same body in both planes collapses to exactly one ranked item
         assert contents.count(dup_text) == 1, "content_hash dedup failed (double-count)"
         # recency floor — the STM member is present and flagged

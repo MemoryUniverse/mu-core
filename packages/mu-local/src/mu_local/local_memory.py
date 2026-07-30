@@ -31,9 +31,14 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mu_contracts.domain.model.scope import ClientScope
+from mu_contracts.ports.bus import EventBusPort
+from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
+from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
+from mu_contracts.ports.time import Clock
+from mu_engine.lifecycle.settings import LifecycleSettings
 from mu_engine.pipelines.concrete.ingest import IngestActivity
 from mu_engine.providers._contracts import Message, MessageRole
 from mu_engine.providers.catalog import Task
@@ -51,6 +56,9 @@ from mu_local.views import (
     MemoryRecordView,
     MemoryWriteResult,
 )
+
+if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a hard import-time cycle.
+    from mu_engine.lifecycle.manager import MemoryLifecycleManager
 
 __all__ = ["LocalMemory"]
 
@@ -73,10 +81,13 @@ class LocalMemory:
         workspace: str = "local",
         namespace: str = "default",
         settings: Any | None = None,
+        lifecycle: LifecycleSettings | None = None,
     ) -> None:
         self._workspace = workspace
         self._org = namespace  # the η.org slot (spec §3.2: namespace fixes org)
-        self._container = LocalContainer(storage or StorageSettings(), settings=settings)
+        self._container = LocalContainer(
+            storage or StorageSettings(), settings=settings, lifecycle=lifecycle
+        )
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> LocalMemory:
@@ -133,8 +144,16 @@ class LocalMemory:
     ) -> ConsolidateView:
         """MTM->LTM consolidation (DISTILL): extract bi-temporal SPO facts from the recent STM
         window and write them into the LTM graph, applying invalidate-don't-delete supersession.
-        Heuristic (no-LLM) extractor — real now. Daemonless: the caller drives the sweep."""
+        Heuristic (no-LLM) extractor — real now. Daemonless: the caller drives the sweep.
+
+        ADR 0031 / spec §3: a MANAGED namespace refuses this manual verb loud
+        (:class:`~mu_engine.lifecycle.mode_gate.ManagerOwnsLifecycleError`, mapped to HTTP 409 by
+        whatever surface calls this) — the engine-side :class:`ManagerModeGate` is consulted
+        BEFORE delegating to ``distill`` so the caller can never self-authorize. MANUAL/HYBRID
+        pass through unchanged (this is the ONE change ADR 0031 grows on this verb; no other verb
+        is touched)."""
         ns = self._ns(user, session)
+        self._container.mode_gate.assert_manual_allowed(ns, "consolidate")
         recent = await self._container.stm.recent(ns, limit=limit)
         window = [scored.item for scored in recent]
         report = await self._container.distill.distill(ns, window)
@@ -245,6 +264,29 @@ class LocalMemory:
         return completion.text
 
     # ----------------------------------------------------------------------------- lifecycle
+    @property
+    def bus(self) -> EventBusPort:
+        """The REAL ``InprocBus`` this facade's own ``ingest``/``distill`` publish onto
+        (integrate-phase accessor — ``mu_local.composition.LocalContainer.bus``). A caller that
+        needs to observe THIS instance's real event stream (e.g. mu-client's daemon
+        ``MaintenanceLoop``) subscribes here, never to a second, independently-constructed bus."""
+        return self._container.bus
+
+    def build_lifecycle_manager(
+        self,
+        *,
+        lease: LifecycleLeasePort | None = None,
+        runner: LifecycleWorkflowRunnerPort | None = None,
+        clock: Clock | None = None,
+    ) -> MemoryLifecycleManager:
+        """Passthrough to :meth:`mu_local.composition.LocalContainer.build_lifecycle_manager` —
+        constructs a :class:`~mu_engine.lifecycle.manager.MemoryLifecycleManager` wired against
+        THIS instance's own stores/distill/bus (never a second, independently-constructed set).
+        ``lease``/``runner``/``clock`` are optional passthrough kwargs so a caller with real
+        cross-process adapters (mu-client's ``SqliteWalLeaseAdapter``/``SqliteWalRunner``, S1-06)
+        can thread them through this SAME composition root."""
+        return self._container.build_lifecycle_manager(lease=lease, runner=runner, clock=clock)
+
     async def aclose(self) -> None:
         """Release every store connection the container opened."""
         await self._container.close()

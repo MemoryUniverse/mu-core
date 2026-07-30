@@ -48,10 +48,21 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from mu_contracts.config import Settings, get_settings
+from mu_contracts.domain.errors import MemoryUniverseError
+from mu_contracts.domain.model.memory import Namespace
+from mu_contracts.ports.bus import EventBusPort
+from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
+from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
+from mu_contracts.ports.time import Clock
+from mu_engine.lifecycle.demotion import DemotionService
+from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate
+from mu_engine.lifecycle.promotion import PromotionService
+from mu_engine.lifecycle.salience import SalienceStrategy
+from mu_engine.lifecycle.settings import LifecycleSettings, ManagerModeSettings
 from mu_engine.pipelines.distill import DistillPipeline
 from mu_engine.pipelines.ledger import InMemoryStageLedger
 from mu_engine.platform.adapters.bus_inproc import InprocBus
@@ -90,7 +101,71 @@ from mu_local.config import (
 from mu_local.errors import BackendUnavailableError
 from mu_local.shared_null import LocalNullSharedRecall
 
-__all__ = ["LocalContainer"]
+if TYPE_CHECKING:  # pragma: no cover — S1-03 sibling (mu_engine.lifecycle.manager), typing only.
+    from mu_engine.lifecycle.manager import MemoryLifecycleManager
+
+__all__ = ["LifecycleManagerUnavailableError", "LocalContainer"]
+
+
+class LifecycleManagerUnavailableError(MemoryUniverseError):
+    """Raised by :meth:`LocalContainer.build_lifecycle_manager` when the Stage-1 sibling module
+    ``mu_engine.lifecycle.manager`` (S1-03, ``MemoryLifecycleManager`` itself) has not landed yet
+    in this tree. A NAMED, fail-loud composition-root gap (DEV-STANDARDS: real deps or BLOCKED,
+    never a silently-returned ``None``/stub) — that module is built in parallel with this task and
+    this factory is coded against its CANONICAL spec'd constructor shape
+    (``memory-lifecycle-manager-spec.md`` §17) ahead of its landing."""
+
+
+class _WorkspaceDefaultModeResolver:
+    """The ONE :class:`ModePolicyResolver` mu-local composes today (spec §17a).
+
+    Resolves ONLY the workspace-default tier of the **memory ▷ namespace ▷ workspace-default**
+    order ADR 0031/spec §3 name: mu-local has no per-namespace/per-memory manager-mode override
+    store yet (a tracked, named narrowing — every namespace in one embedded process resolves to
+    the SAME configured default). Widening to the full order is a resolver-only change; it never
+    touches :class:`ManagerModeGate` itself, which stays a pure decision function over whatever
+    mode this resolver returns.
+    """
+
+    def __init__(self, settings: ManagerModeSettings) -> None:
+        self._mode = ManagerMode(settings.default_mode)
+
+    def resolve(self, ns: Namespace) -> ManagerMode:
+        return self._mode
+
+
+class _LocalMtmRemovalAdapter:
+    """A REAL ``MtmRemovalPort`` (``mu_engine.lifecycle.demotion.MtmRemovalPort``) over the SAME
+    live Qdrant client this container's ``QdrantMtmAdapter`` (``self.mtm``) already holds — the
+    integrate-phase wiring gap ``demotion.py`` itself flags: ``MtmTierRepository`` ships no
+    ``remove``/``delete`` yet ("a sibling storage task should close" it on
+    ``QdrantMtmAdapter``/``mu_engine.storage.ports.MtmTierRepository``, out of THIS task's owned
+    paths). Never a second Qdrant connection: this reaches into the SAME ``_qdrant`` client the
+    container built — the identical getattr-into-the-adapter composition-root pattern
+    :meth:`LocalContainer._register_closer` already uses for this exact adapter, above — and keys
+    the delete through the SAME ``collection_name``/``point_id`` mappers ``QdrantMtmAdapter``
+    itself upserts through (``mu_engine.storage.mappers.qdrant_mapper``), so a demotion removes
+    the identical point a promotion wrote.
+    """
+
+    def __init__(self, mtm: MtmTierRepository, *, dim: int) -> None:
+        qdrant = getattr(mtm, "_qdrant", None)
+        if qdrant is None:  # fail-loud: never silently no-op a demotion's MTM-side removal
+            raise LifecycleManagerUnavailableError(
+                f"{type(mtm).__name__!r} exposes no '_qdrant' client — "
+                "_LocalMtmRemovalAdapter cannot wire a real MtmRemovalPort over it"
+            )
+        self._qdrant = qdrant
+        self._dim = dim
+
+    async def remove(self, ns: Namespace, memory_id: str) -> None:
+        from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
+
+        await self._qdrant.delete(
+            collection_name=collection_name(ns, self._dim),
+            points_selector=[point_id(memory_id)],
+        )
+
 
 # The backends the registry ships, per role (mu_engine.storage.factories) — selecting anything
 # else is a NAMED fail-loud refusal (spec §7), never a silent fallback to a different backend.
@@ -151,6 +226,7 @@ class LocalContainer:
         *,
         settings: Settings | None = None,
         observability: ObservabilitySettings | None = None,
+        lifecycle: LifecycleSettings | None = None,
     ) -> None:
         self._settings: Settings = settings or get_settings()
         self._closers: list[Callable[[], Awaitable[None]]] = []
@@ -229,6 +305,32 @@ class LocalContainer:
         self.metrics: MetricSink = build_metrics(enabled=self._obs.metrics_enabled)
         self.audit: AuditLog = build_audit(enabled=self._obs.audit_enabled)
 
+        # (7b) lifecycle central-config + the engine-side manager-mode gate (ADR 0031; spec §3;
+        #      S0-03/S0-07). ``LocalMemory.consolidate()`` calls ``self.mode_gate.assert_manual_
+        #      allowed(ns, "consolidate")`` before delegating — this container is the ONE place
+        #      that builds it (DEV-STANDARDS rule 9), never hand-wired at the facade. Composed
+        #      against the SAME ``ModePolicyResolver`` seam (memory ▷ namespace ▷ workspace-default
+        #      resolution order, spec §17a) mu-local resolves today — see
+        #      ``_WorkspaceDefaultModeResolver`` above for the tracked per-namespace/per-memory
+        #      override narrowing.
+        #
+        #      Default narrowed to MANUAL here (not ``ManagerModeSettings()``'s bare MANAGED
+        #      default, spec §16): mu-local ships NO automatic sweep in this Stage — there is no
+        #      ``MaintenanceLoop``/daemon (that is mu-client's S1-07) — so a bare MANAGED default
+        #      would refuse every manual ``consolidate()`` with nothing running the auto sweep in
+        #      its place, silently breaking "daemonless: the caller drives the sweep" (module
+        #      docstring). A caller opts into MANAGED/HYBRID explicitly via
+        #      ``LocalContainer(..., lifecycle=LifecycleSettings(manager_mode=ManagerModeSettings(
+        #      default_mode="managed")))`` — this default is a mu-local composition-root choice,
+        #      not a re-derivation of the canonical settings default (that default is untouched).
+        self.lifecycle_settings: LifecycleSettings = lifecycle or LifecycleSettings(
+            manager_mode=ManagerModeSettings(default_mode=ManagerMode.MANUAL.value)
+        )
+        self.mode_gate: ManagerModeGate = ManagerModeGate(
+            self.lifecycle_settings.manager_mode,
+            _WorkspaceDefaultModeResolver(self.lifecycle_settings.manager_mode),
+        )
+
         # (8) application services — each facade verb delegates to exactly one of these; each gets
         #     the wired sinks so its meaningful op emits spans/metrics/audit (never silently no-op).
         self.ingest = IngestService(
@@ -282,6 +384,100 @@ class LocalContainer:
             with contextlib.suppress(Exception):  # teardown must not mask the primary error
                 await closer()
         self._closers.clear()
+
+    @property
+    def bus(self) -> EventBusPort:
+        """The SAME real ``InprocBus`` instance threaded into ``IngestService``/``DistillPipeline``
+        above (integrate-phase accessor, Stage-1 wiring) — a caller that needs to subscribe to
+        THIS container's real event stream (e.g. mu-client's daemon ``MaintenanceLoop``, S1-07)
+        must observe the identical bus captured memories publish onto, never a second,
+        independently-constructed ``InprocBus`` that never receives a real event (DEV-STANDARDS
+        rule 9: one composition root, one bus per plane)."""
+        return self._bus
+
+    # ---------------------------------------------------------------------- MLM composition (S1-05)
+    def build_lifecycle_manager(
+        self,
+        *,
+        lease: LifecycleLeasePort | None = None,
+        runner: LifecycleWorkflowRunnerPort | None = None,
+        clock: Clock | None = None,
+    ) -> MemoryLifecycleManager:
+        """Construct a :class:`~mu_engine.lifecycle.manager.MemoryLifecycleManager` wired against
+        the SAME ``stm``/``mtm``/``ltm``/``distill``/``bus``/``clock`` instances this container
+        already built (ADR 0029 mu-local half; ADR 0031 wiring half) — never a second,
+        independently-constructed set (DEV-STANDARDS rule 9: ``LocalContainer`` stays the ONE
+        place adapters bind). In particular ``distill=self.distill`` is the identical
+        :class:`~mu_engine.pipelines.distill.DistillPipeline` object
+        :meth:`mu_local.local_memory.LocalMemory.consolidate` calls — an ``id()`` identity, not a
+        second pipeline pointed at the same stores.
+
+        ``PromotionService``/``DemotionService`` (S1-01/S1-02) have landed and are imported
+        eagerly (module scope, above); ``MemoryLifecycleManager`` itself (S1-03) is the ONE
+        sibling still mid-flight in parallel with this task — this factory is coded against its
+        CANONICAL spec'd constructor shape (``memory-lifecycle-manager-spec.md`` §17) ahead of its
+        landing (dev-context: code against the spec'd interface, not a guess). Its import is
+        deferred to call time (never at module scope) so ``mu_local.composition`` stays importable
+        for every OTHER consumer of ``LocalContainer`` regardless of its merge state; still
+        missing, it fails LOUD here with :class:`LifecycleManagerUnavailableError`, never a
+        silent stub.
+
+        WIRING NOTE (integrate phase, closed): ``RetentionService``/``ConflictAdjudicator``
+        (Stage-2/3, S2-01/S3-01) remain out of scope for this daemonless embedded facade — never
+        constructed here, ``MemoryLifecycleManager`` defaults both to ``None`` (no-op). Concrete
+        ``LifecycleLeasePort``/``LifecycleWorkflowRunnerPort`` adapters (S1-06, mu-client-owned:
+        ``SqliteWalLeaseAdapter``/``SqliteWalRunner``) are now ACCEPTED as optional passthrough
+        kwargs (``lease``/``runner``/``clock``) so mu-client's daemon (the ONE caller with a real
+        cross-process runner) can thread its own durable adapters through this SAME composition
+        root instead of re-deriving ``salience``/``promotion``/``demotion`` a second time —
+        mu-local's own daemonless callers simply omit them and get the in-process defaults
+        (``MemoryLifecycleManager``'s own ``_InProcessLifecycleLease``/``_InlineLifecycleRunner``),
+        unchanged from before this parameter existed.
+        """
+        try:
+            from mu_engine.lifecycle.manager import MemoryLifecycleManager
+        except ImportError as exc:
+            raise LifecycleManagerUnavailableError(
+                "MemoryLifecycleManager composition requires mu_engine.lifecycle.manager "
+                "(S1-03) — not yet landed in this tree"
+            ) from exc
+
+        salience = SalienceStrategy(self.lifecycle_settings.salience)
+        promotion = PromotionService(
+            mtm=self.mtm,
+            distill=self.distill,  # SAME object LocalMemory.consolidate() delegates to
+            salience=salience,
+            stm=self.stm,
+            settings=self.lifecycle_settings,
+            clock=self._clock,
+            bus=self._bus,
+            tracer=self.tracer,
+            metrics=self.metrics,
+            audit=self.audit,
+        )
+        demotion = DemotionService(
+            stm=self.stm,
+            mtm_remove=_LocalMtmRemovalAdapter(self.mtm, dim=self.embedder.dimension),
+            salience=salience,
+            settings=self.lifecycle_settings,
+            clock=self._clock,
+            bus=self._bus,
+            tracer=self.tracer,
+            metrics=self.metrics,
+            audit=self.audit,
+        )
+        return MemoryLifecycleManager(
+            salience=salience,
+            promotion=promotion,
+            demotion=demotion,
+            distill=self.distill,  # SAME object LocalMemory.consolidate() delegates to
+            mode_gate=self.mode_gate,
+            bus=self._bus,
+            settings=self.lifecycle_settings,
+            lease=lease,
+            runner=runner,
+            clock=clock or self._clock,
+        )
 
     # ---------------------------------------------------------------- backend guards + resolution
     @staticmethod
