@@ -18,16 +18,67 @@ architecture grows.
 
 ```mermaid
 flowchart TB
-    A1["Person A<br/>+ Claude Code"] --> S["Sessions"]
-    A2["Person B<br/>+ Codex"] --> S
+    classDef shared fill:#2d7c78,color:#fff,stroke:#1c4d4a,stroke-width:1px
+    classDef privateCtx fill:#7567c7,color:#fff,stroke:#4d4390,stroke-width:1px
+    classDef session fill:#f4f1f7,color:#241b2f,stroke:#cfc8d7,stroke-width:1px
+    classDef person fill:#fffdfc,color:#241b2f,stroke:#241b2f,stroke-width:1px
 
-    S --> G["Governed shared context<br/>(mu-server, private beta)"]
-    S --> P["Private per-person overlay<br/>(mu-core + mu-client, local)"]
+    subgraph Team["Team: 4 people, 2 agent vendors"]
+        direction LR
+        P1["Dana - Research<br/>+ Claude Code"]:::person
+        P2["Ravi - Architecture<br/>+ Codex"]:::person
+        P3["Mei - Platform<br/>+ Claude Code"]:::person
+        P4["Sam - Review<br/>+ Codex"]:::person
+    end
 
-    G --> M["Tiered memory<br/>STM to MTM to LTM"]
-    P --> M
+    subgraph Sessions["Many concurrent, different sessions"]
+        direction LR
+        Standing["Org-wide standing room<br/>(everyone)"]:::session
+        Plan["Planning session<br/>(Dana + Ravi)"]:::session
+        Dev["Dev-team session<br/>(Mei + Sam)"]:::session
+        Cross["Cross-vendor shared room<br/>Claude Code + Codex together"]:::session
+        Priv["Each person's own<br/>private session"]:::session
+    end
 
-    M --> C["Context survives sessions,<br/>machines, and agent vendors,<br/>only as far as authorized"]
+    P1 & P2 & P3 & P4 --> Standing
+    P1 --> Plan
+    P2 --> Plan
+    P3 --> Dev
+    P4 --> Dev
+    P1 --> Cross
+    P2 --> Cross
+    P1 & P2 & P3 & P4 --> Priv
+
+    subgraph SharedPlane["Shared plane - server (mu-server)"]
+        direction TB
+        GC["Governed shared context"]:::shared
+        Tiers["Tiered memory: STM to MTM to LTM"]:::shared
+        Gov["Governance:<br/>grants only narrow - provenance - revocation"]:::shared
+        GC --> Tiers --> Gov
+    end
+
+    subgraph LocalPlanes["Per-person LOCAL planes - each on their own machine"]
+        direction LR
+        LD["Dana's private overlay + persona"]:::privateCtx
+        LR["Ravi's private overlay + persona"]:::privateCtx
+        LM["Mei's private overlay + persona"]:::privateCtx
+        LS["Sam's private overlay + persona"]:::privateCtx
+    end
+
+    Standing --> GC
+    Plan --> GC
+    Dev --> GC
+    Cross --> GC
+    Priv -.-> LD
+    Priv -.-> LR
+    Priv -.-> LM
+    Priv -.-> LS
+
+    Gov -. "governed transfer - travels only as far as authorized" .-> Plan
+    Gov -. "governed transfer" .-> Dev
+    Gov -. "governed transfer" .-> Cross
+
+    LocalPlanes -. "physically never enters the shared plane" .-x SharedPlane
 ```
 
 `mu-core` is the part of that vision that has no dependency on anyone else's server, account, or
@@ -83,8 +134,43 @@ this engine, see **`mu-client`**.
 
 ```mermaid
 flowchart LR
-    Ct["mu-contracts<br/>ports and DTOs"] --> En["mu-engine<br/>STM to MTM to LTM<br/>behind swappable ports<br/>distill / promote"]
-    En --> Lo["mu-local<br/>in-process facade"]
+    classDef contracts fill:#e5e0f5,color:#241b2f,stroke:#7567c7
+    classDef engine fill:#d6ece8,color:#241b2f,stroke:#2d7c78
+    classDef tier fill:#fffdfc,color:#241b2f,stroke:#2d7c78
+    classDef lifecycle fill:#f4f1f7,color:#241b2f,stroke:#cfc8d7
+    classDef facade fill:#241b2f,color:#fff,stroke:#000
+
+    Ct["mu-contracts<br/>ports - DTOs - events"]:::contracts
+
+    subgraph Engine["mu-engine"]
+        direction TB
+        Cap["Capture / ingest"]:::engine
+        Dist["Distill pipeline<br/>(SPO extraction)"]:::engine
+
+        subgraph Tiers["Storage tiers, behind swappable ports"]
+            direction LR
+            STM["STM - Valkey<br/>recency"]:::tier
+            MTM["MTM - Qdrant<br/>dense-vector"]:::tier
+            LTM["LTM - FalkorDB<br/>temporal graph<br/>bi-temporal, invalidate-dont-delete"]:::tier
+            STM -->|"salience-driven promotion"| MTM
+            MTM -->|"distill / promotion"| LTM
+        end
+
+        Recall["Recall<br/>(across all tiers)"]:::engine
+        LM["MemoryLifecycleManager<br/>always-on sweep:<br/>promote / demote / retain / supersede"]:::lifecycle
+        Router["ModelRouter<br/>local SLM or frontier LLM<br/>heuristic fallback"]:::lifecycle
+
+        Cap --> Dist --> STM
+        Tiers --> Recall
+        LM -.-> Tiers
+        Router -.-> Dist
+        Router -.-> Recall
+    end
+
+    Local["mu-local<br/>in-process facade:<br/>add / recall / consolidate / ask"]:::facade
+
+    Ct --> Engine
+    Engine --> Local
 ```
 
 `mu-core` implements a brain-inspired STM → MTM → LTM memory hierarchy behind clean ports, so
