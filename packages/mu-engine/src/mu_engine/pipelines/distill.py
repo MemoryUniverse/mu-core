@@ -16,13 +16,24 @@ Turns promoted MTM atomic facts into bi-temporal LTM knowledge-graph facts and a
   plus the new-edge self-expiry at ``edge_operations.py:622-639`` (if a candidate is more recent
   than the incoming fact, the INCOMING fact self-expires instead of superseding).
 
-The contradiction test is cheapest-first + no-LLM (methodology §3.2 c): the
-``PolarityCardinalityHeuristic`` — an identical triple with opposite polarity is a direct
-contradiction; a single-cardinality (functional) predicate with a different object is a
-functional supersession (PORT ``shared/stores/graph_falkor.py:505`` semantics). All writes go
-through the ``GraphStorePort`` (LTM / FalkorDB) — never a store client directly (repository
-pattern). Runs off the request path under a single writer lease (LOCAL ``InlineRunner``
-equivalent = the in-process lease here; Redis SETNX lease deferred to the SHARED plane).
+The contradiction test is cheapest-first (methodology §3.2 c): the ``PolarityCardinalityHeuristic``
+— an identical triple with opposite polarity is a direct contradiction; a single-cardinality
+(functional) predicate with a different object is a functional supersession (PORT
+``shared/stores/graph_falkor.py:505`` semantics) — is now the **candidate gate** feeding
+``mu_engine.lifecycle.conflict.ConflictAdjudicator`` (S3-01, ADR 0037, spec §8): when an
+adjudicator is wired the LLM renders the real verdict over every same-subject/predicate residue
+candidate (catching a genuine semantic contradiction the heuristic alone would miss), with the
+heuristic demoted to the degrade floor (LLM disabled/down/budget-exhausted). With NO adjudicator
+wired, the ORIGINAL heuristic-only decision applies verbatim (100% backward compatible). See
+``lifecycle/conflict.py``'s module docstring for the full placement/degrade/policy contract and
+CANONICAL §7.20's ``ReconcileConflictsStage``/``ResolveConflictStage`` split, mirrored here as
+``_reconcile``/``_resolve``. All writes go through the ``GraphStorePort`` (LTM / FalkorDB) — never
+a store client directly (repository pattern); the one exception is the narrow, NAMED translation
+of the cross-store MTM invalidate's Qdrant 404 (write-after-read visibility lag) into
+``DegradedModeEntered(reason=MTM_INVALIDATE_POINT_ABSENT)`` (spec §13.2 fix #2) — see
+``_invalidate_mtm_guarded``. Runs off the request path under a single writer lease (LOCAL
+``InlineRunner`` equivalent = the in-process lease here; Redis SETNX lease deferred to the SHARED
+plane).
 """
 
 from __future__ import annotations
@@ -33,13 +44,16 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import structlog
 from pydantic import BaseModel, ConfigDict
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from mu_contracts.domain.events import (
     ConsolidationCompleted,
+    DegradedModeEntered,
+    DegradeReason,
     DomainEvent,
     FactsExtracted,
     MemoryPromoted,
@@ -64,6 +78,26 @@ from mu_engine.storage.domain.memory import (
 )
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.ports import GraphStorePort, MtmTierRepository
+
+if TYPE_CHECKING:
+    # `mu_engine.lifecycle` package's own `__init__.py` eagerly imports `promotion.py`/`manager.py`,
+    # which import `DistillPipeline` FROM THIS MODULE (mu_engine/lifecycle/__init__.py's docstring:
+    # "Stage-3 slices (conflict.py) ... join this re-export as their own stage merges" — but the
+    # PACKAGE __init__ already unconditionally imports promotion.py/manager.py today). A top-level
+    # `from mu_engine.lifecycle.conflict import ...` HERE would therefore force-run
+    # `lifecycle/__init__.py` mid-way through this module's own top-level execution, which in turn
+    # needs `DistillPipeline` (defined at the BOTTOM of this file) — a genuine, unavoidable-by-
+    # reordering circular import. Fixed the standard way: annotations only need this under
+    # `TYPE_CHECKING` (this file has `from __future__ import annotations`, so no annotation ever
+    # evaluates these names at runtime); every actual runtime use (the `AdjudicationKind` enum
+    # comparisons + the `AdjudicationVerdict`/no-adjudicator constructor call) does its own late,
+    # function-body-local import instead (`_resolve`/`_heuristic_only_verdict` below) — by the time
+    # either is ever CALLED, both packages have long finished initializing.
+    from mu_engine.lifecycle.conflict import (
+        AdjudicationBudget,
+        AdjudicationVerdict,
+        ConflictAdjudicator,
+    )
 
 __all__ = [
     "DistillAction",
@@ -100,6 +134,12 @@ class DistillSettings(BaseModel):
     supersede_confidence: float = 0.8  # C>=0.8 -> SUPERSEDE (Φ(C,T), engine-core §7.4)
     refine_confidence: float = 0.5
     use_llm_extractor: bool = False  # MVP default = deterministic heuristic
+    # Sibling of `use_llm_extractor` (S3-01, spec §8, ADR 0037): the composition root reads this
+    # to decide whether to build a real `ConflictAdjudicator` (mirrors `use_llm_extractor` ->
+    # `build_extractor`'s own precedent — NOT read internally by `DistillPipeline`, which instead
+    # gates purely on whether an `adjudicator` instance was actually injected). Default True on a
+    # capable model; False -> heuristic-only (`build_conflict_adjudicator(use_llm=False)` -> None).
+    use_llm_adjudicator: bool = True
 
     # Single-cardinality predicates: a *different* object supersedes (functional relation).
     # Non-functional predicates (e.g. "likes") let multiple objects coexist (ADD, not supersede).
@@ -207,6 +247,70 @@ class DistillReport(BaseModel):
         return sum(a.kind is DistillActionKind.NOOP for a in self.actions)
 
 
+class _ReconcileOutcome(BaseModel):
+    """``ReconcileConflictsStage``-equivalent return value (CANONICAL §7.20) — pure detection: the
+    gathered same-subject/predicate candidate residue + the identical-match, if any. Carries NO
+    verdict and triggers NO write; ``DistillPipeline._resolve`` is the only consumer."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    winner: MemoryItem
+    identical: MemoryItem | None
+    candidates: tuple[MemoryItem, ...]
+
+
+class _PendingMtmInvalidate(BaseModel):
+    """One MTM cross-store invalidate deferred by ``_invalidate_mtm_guarded`` (spec §13.2 fix #2)
+    — a not-yet-visible Qdrant point at supersede time. Retried ONCE at the top of the next
+    ``distill()`` call for the same namespace (``_retry_pending_mtm_invalidates``)."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    ns: Namespace
+    loser_point_id: str
+    winner_point_id: str
+    at: datetime
+    reason: str
+
+
+def _heuristic_only_verdict(
+    winner: MemoryItem, candidate: MemoryItem, contradicts: bool
+) -> AdjudicationVerdict:
+    """The degrade floor used when NO ``ConflictAdjudicator`` was ever wired into this pipeline —
+    reproduces the ORIGINAL pre-ADR-0037 heuristic-only decision VERBATIM (a ``valid_at`` TIE goes
+    to the incoming winner, via the same bare ``>`` comparison the original ``more_recent`` list
+    comprehension used) so every pre-existing heuristic-only test/caller is unaffected. Deferred,
+    function-body-local import of ``mu_engine.lifecycle.conflict`` (see the ``TYPE_CHECKING`` note
+    at this module's top) — this function is never called during either module's own import, only
+    from within an actual ``distill()`` invocation, so the cycle that a top-level import would hit
+    cannot occur here."""
+    from mu_engine.lifecycle.conflict import AdjudicationKind, AdjudicationVerdict
+
+    if not contradicts:
+        return AdjudicationVerdict(
+            kind=AdjudicationKind.COEXIST,
+            apply=True,
+            used_llm=False,
+            confidence=1.0,
+            reason="no_adjudicator_heuristic_coexist",
+        )
+    if _valid_at(candidate) > _valid_at(winner):
+        return AdjudicationVerdict(
+            kind=AdjudicationKind.SELF_EXPIRE,
+            apply=True,
+            used_llm=False,
+            confidence=1.0,
+            reason="no_adjudicator_heuristic_self_expire",
+        )
+    return AdjudicationVerdict(
+        kind=AdjudicationKind.SUPERSEDE,
+        apply=True,
+        used_llm=False,
+        confidence=1.0,
+        reason="no_adjudicator_heuristic_supersede",
+    )
+
+
 # --------------------------------------------------------------------------------------- pipeline
 class DistillPipeline:
     """MTM->LTM consolidation. Fully async, cancellation-safe, repository-only writes."""
@@ -224,6 +328,7 @@ class DistillPipeline:
         tracer: Tracer | None = None,
         metrics: MetricSink | None = None,
         audit: AuditLog | None = None,
+        adjudicator: ConflictAdjudicator | None = None,
     ) -> None:
         self._ltm = ltm
         self._settings = settings or DistillSettings()
@@ -237,6 +342,15 @@ class DistillPipeline:
         self._tracer: Tracer = tracer or NoopTracer()
         self._metrics: MetricSink = metrics or NoopMetricSink()
         self._audit: AuditLog = audit or NoopAuditLog()
+        # S3-01 (spec §8, ADR 0037): optional LLM-judged supersession. `None` (the default) is
+        # 100% pre-ADR-0037 backward compatible — `_resolve`'s no-adjudicator degrade floor
+        # (`_heuristic_only_verdict`) reproduces the ORIGINAL heuristic-only decision verbatim.
+        self._adjudicator: ConflictAdjudicator | None = adjudicator
+        # Bounded MTM-invalidate retry queue (spec §13.2 fix #2): a write-after-read Qdrant 404 at
+        # supersede time is queued here and retried ONCE at the top of the NEXT `distill()` call
+        # for the SAME namespace — never a hot retry loop (`_invalidate_mtm_guarded`,
+        # `_retry_pending_mtm_invalidates`).
+        self._pending_mtm_retries: list[_PendingMtmInvalidate] = []
 
     async def distill(self, ns: Namespace, window: Sequence[MemoryItem]) -> DistillReport:
         """Consolidate a window of promoted MTM facts into LTM (the S3 pass).
@@ -278,10 +392,23 @@ class DistillPipeline:
             if self._bus is not None:
                 await self._bus.publish(FactsExtracted(namespace=ns, count=len(candidates)))
 
-            actions: list[DistillAction] = []
-            for winner in candidates:
-                action = await self._reconcile_and_apply(ns, winner)
-                actions.append(action)
+            # Bounded retry (spec §13.2 fix #2) for an MTM invalidate degraded on a PRIOR sweep
+            # tick for this namespace — attempted ONCE per tick, never a hot retry loop.
+            await self._retry_pending_mtm_invalidates(ns)
+
+            # S3-01 (spec §8 S1 / AC-3.2): one fresh per-sweep-tick budget, or None when no
+            # adjudicator is wired (the no-adjudicator degrade floor never touches a budget).
+            budget: AdjudicationBudget | None = (
+                self._adjudicator.new_budget() if self._adjudicator is not None else None
+            )
+
+            # ReconcileConflictsStage-equivalent (CANONICAL §7.20): detection ONLY, for the WHOLE
+            # window, before any resolve call is even issued — reconcile is demonstrably never
+            # blocked waiting on an adjudication (see `_reconcile`/`_resolve` docstrings).
+            reconciled = [await self._reconcile(ns, winner) for winner in candidates]
+
+            # ResolveConflictStage-equivalent: the only stage that may await the LLM / write.
+            actions = [await self._resolve(ns, outcome, budget) for outcome in reconciled]
             report = DistillReport(facts_extracted=len(candidates), actions=tuple(actions))
 
             if self._bus is not None:
@@ -354,12 +481,18 @@ class DistillPipeline:
             metadata=meta,
         )
 
-    # ---- reconcile + apply (mem0 diff loop + Graphiti bi-temporal) --------------------------
-    async def _reconcile_and_apply(self, ns: Namespace, winner: MemoryItem) -> DistillAction:
+    # ---- reconcile (detect only) + resolve (adjudicate + apply) -----------------------------
+    # CANONICAL §7.20 stage split: `_reconcile` == ReconcileConflictsStage (no model call, no
+    # write — structurally incapable of either, it never touches `self._adjudicator`).
+    # `_resolve` == ResolveConflictStage (the only place that may await the LLM / write). See
+    # `lifecycle/conflict.py`'s module docstring for the full contract.
+    async def _reconcile(self, ns: Namespace, winner: MemoryItem) -> _ReconcileOutcome:
+        """ReconcileConflictsStage-equivalent: the mem0 candidate gather (main.py:463-488, active
+        same-(subject,predicate) LTM facts) + the identical-active-fact check. Pure detection —
+        no model call, no write, ever."""
         subject = winner.subject or ""
         predicate = winner.predicate or ""
         obj = winner.object or ""
-        # mem0 candidate gather (main.py:463-488): active same-(subject,predicate) LTM facts.
         raw_candidates = await self._ltm.find_conflicts(ns, subject, predicate)
         candidates = [c for c in raw_candidates if c.id != winner.id][: self._settings.candidate_k]
 
@@ -368,28 +501,59 @@ class DistillPipeline:
             (c for c in candidates if (c.object or "") == obj and c.polarity == winner.polarity),
             None,
         )
-        if identical is not None:
-            reinforced = identical.model_copy(deep=True)
+        return _ReconcileOutcome(winner=winner, identical=identical, candidates=tuple(candidates))
+
+    async def _resolve(
+        self, ns: Namespace, outcome: _ReconcileOutcome, budget: AdjudicationBudget | None
+    ) -> DistillAction:
+        """ResolveConflictStage-equivalent: adjudicates every residue candidate (the heuristic
+        candidate GATE's full survivor set, spec §8 — not just the ones the heuristic itself would
+        flag) then applies the mem0 diff loop + Graphiti bi-temporal write for the aggregate
+        outcome. The ONLY method in this class that may await `ConflictAdjudicator.adjudicate`."""
+        from mu_engine.lifecycle.conflict import AdjudicationKind  # see TYPE_CHECKING note (top)
+
+        winner = outcome.winner
+        if outcome.identical is not None:
+            reinforced = outcome.identical.model_copy(deep=True)
             reinforced.access_count += 1
             reinforced.updated_at = self._clock.now()
             await self._ltm.upsert_fact(reinforced)
             return self._action(DistillActionKind.NOOP, reinforced, (), "identical_active_fact")
 
-        # contradiction detection, no-LLM (PolarityCardinalityHeuristic, methodology §3.2 c).
-        losers = [c for c in candidates if self._contradicts(winner, c)]
-        if not losers:
-            # ADD (no candidate at all) or COEXIST (non-functional predicate, different object).
+        residue = outcome.candidates
+        if not residue:
             await self._ltm.upsert_fact(winner)
             await self._maybe_promote_event(ns, winner)
-            kind = DistillActionKind.ADD if not candidates else DistillActionKind.COEXIST
-            reason = "new_subject_predicate" if not candidates else "non_functional_coexist"
-            return self._action(kind, winner, (), reason)
+            return self._action(DistillActionKind.ADD, winner, (), "new_subject_predicate")
 
-        # Graphiti bi-temporal interval logic (edge_operations.py:406-441 / 622-639):
-        # the incoming fact self-expires if ANY contradicting candidate is strictly more recent.
-        more_recent = [c for c in losers if _valid_at(c) > _valid_at(winner)]
-        if more_recent:
-            newest = max(more_recent, key=_valid_at)
+        # Per-candidate verdicts. Sequential within ONE winner (AC-3.2's budget/order guarantee
+        # applies per sweep-tick-per-winner residue, exactly the "N+1 candidates" shape it names).
+        self_expire: list[tuple[MemoryItem, AdjudicationVerdict]] = []
+        supersede: list[tuple[MemoryItem, AdjudicationVerdict]] = []
+        for candidate in residue:
+            heuristic_flag = self._contradicts(winner, candidate)
+            if self._adjudicator is not None and budget is not None:
+                verdict = await self._adjudicator.adjudicate(
+                    ns=ns,
+                    winner=winner,
+                    candidate=candidate,
+                    heuristic_contradicts=heuristic_flag,
+                    budget=budget,
+                )
+            else:
+                verdict = _heuristic_only_verdict(winner, candidate, heuristic_flag)
+            if not verdict.apply:
+                continue  # parked (MANUAL_PENDING) or otherwise withheld — never fabricate
+            if verdict.kind is AdjudicationKind.SELF_EXPIRE:
+                self_expire.append((candidate, verdict))
+            elif verdict.kind is AdjudicationKind.SUPERSEDE:
+                supersede.append((candidate, verdict))
+            # COEXIST -> no action; both stay active.
+
+        # Graphiti bi-temporal interval logic (edge_operations.py:406-441/622-639): the incoming
+        # fact self-expires if ANY candidate the adjudicator judged more authoritative exists.
+        if self_expire:
+            newest, _ = max(self_expire, key=lambda cv: _valid_at(cv[0]))
             winner.state = MemoryState.SUPERSEDED
             winner.invalid_at = _valid_at(newest)
             await self._ltm.upsert_fact(winner)
@@ -400,11 +564,17 @@ class DistillPipeline:
                 DistillActionKind.SELF_EXPIRE, newest, (winner.id,), "incoming_older_than_candidate"
             )
 
-        # SUPERSEDE: incoming wins, every contradicting loser is invalidated-not-deleted.
+        if not supersede:
+            # every residue candidate resolved COEXIST (or was parked) -> COEXIST, both stay live.
+            await self._ltm.upsert_fact(winner)
+            await self._maybe_promote_event(ns, winner)
+            return self._action(DistillActionKind.COEXIST, winner, (), "non_functional_coexist")
+
+        # SUPERSEDE: incoming wins, every adjudicated loser is invalidated-not-deleted.
         await self._ltm.upsert_fact(winner)
         await self._maybe_promote_event(ns, winner)
         loser_ids: list[str] = []
-        for loser in losers:
+        for loser, _ in supersede:
             at = _valid_at(winner)
             await self._ltm.invalidate(
                 ns, loser.id, winner.id, at=at, reason="functional_supersede"
@@ -416,13 +586,7 @@ class DistillPipeline:
             # metadata["derived_from"]. Passing the fact-node id here targets a non-existent Qdrant
             # point (404, the id-linkage crash); resolve the ingest id so the RIGHT MTM point flips.
             if self._mtm is not None:
-                await self._mtm.invalidate(
-                    ns,
-                    self._mtm_point_id(loser),
-                    self._mtm_point_id(winner),
-                    at=at,
-                    reason="functional_supersede",
-                )
+                await self._invalidate_mtm_guarded(ns, loser=loser, winner=winner, at=at)
             loser_ids.append(loser.id)
             if self._bus is not None:
                 await self._bus.publish(
@@ -433,6 +597,74 @@ class DistillPipeline:
         return self._action(
             DistillActionKind.SUPERSEDE, winner, tuple(loser_ids), "functional_or_polarity_conflict"
         )
+
+    # ---- MTM cross-store invalidate — NAMED degrade wrap (spec §13.2 fix #2) -----------------
+    async def _invalidate_mtm_guarded(
+        self, ns: Namespace, *, loser: MemoryItem, winner: MemoryItem, at: datetime
+    ) -> None:
+        """Wraps ``self._mtm.invalidate`` (the cross-store supersede write): a not-yet-visible
+        Qdrant point (write-after-read visibility lag — the demo-found 404) degrades to a NAMED
+        ``DegradedModeEntered(component="mtm", reason=MTM_INVALIDATE_POINT_ABSENT)`` instead of an
+        uncaught 404/500, plus a bounded retry queued for the next sweep tick. The graph-side
+        SUPERSEDED write (source of truth) has ALWAYS already succeeded by the time this runs —
+        both call sites in `_resolve` invalidate LTM before this — regardless of MTM visibility.
+        """
+        if self._mtm is None:  # guarded at both call sites; loud, not an assert (bandit S101)
+            raise RuntimeError("_invalidate_mtm_guarded called with no MtmTierRepository wired")
+        loser_point = self._mtm_point_id(loser)
+        winner_point = self._mtm_point_id(winner)
+        reason = "functional_supersede"
+        try:
+            await self._mtm.invalidate(ns, loser_point, winner_point, at=at, reason=reason)
+        except UnexpectedResponse as exc:
+            self._pending_mtm_retries.append(
+                _PendingMtmInvalidate(
+                    ns=ns,
+                    loser_point_id=loser_point,
+                    winner_point_id=winner_point,
+                    at=at,
+                    reason=reason,
+                )
+            )
+            _log.warning(
+                "mtm_invalidate_point_absent",
+                ns=ns.to_prefix(),
+                status_code=exc.status_code,
+            )
+            if self._bus is not None:
+                await self._bus.publish(
+                    DegradedModeEntered(
+                        component="mtm",
+                        mode="mtm_invalidate_deferred",
+                        reason=DegradeReason.MTM_INVALIDATE_POINT_ABSENT,
+                        detail=f"status={exc.status_code}",
+                    )
+                )
+
+    async def _retry_pending_mtm_invalidates(self, ns: Namespace) -> None:
+        """Drains this namespace's queued ``_PendingMtmInvalidate`` rows, ONCE, at the top of a
+        `distill()` call — a still-absent point is re-queued for the tick after that; never a hot
+        retry loop. A different namespace's pending rows are left untouched (this pipeline may be
+        shared across namespaces; each namespace only drains its own backlog on its own tick)."""
+        if not self._pending_mtm_retries or self._mtm is None:
+            return
+        prefix = ns.to_prefix()
+        remaining: list[_PendingMtmInvalidate] = []
+        for pending in self._pending_mtm_retries:
+            if pending.ns.to_prefix() != prefix:
+                remaining.append(pending)
+                continue
+            try:
+                await self._mtm.invalidate(
+                    pending.ns,
+                    pending.loser_point_id,
+                    pending.winner_point_id,
+                    at=pending.at,
+                    reason=pending.reason,
+                )
+            except UnexpectedResponse:
+                remaining.append(pending)  # still absent — retried again next tick
+        self._pending_mtm_retries = remaining
 
     def _contradicts(self, winner: MemoryItem, candidate: MemoryItem) -> bool:
         """PolarityCardinalityHeuristic (graph_falkor.py:505): opposite-polarity identical triple

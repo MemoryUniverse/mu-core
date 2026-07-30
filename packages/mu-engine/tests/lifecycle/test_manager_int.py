@@ -37,7 +37,7 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
-from qdrant_client import AsyncQdrantClient, models
+from qdrant_client import AsyncQdrantClient
 
 from mu_contracts.domain.errors import MemoryUniverseError
 from mu_contracts.domain.events import (
@@ -495,7 +495,7 @@ async def test_sweep_user_promotes_end_to_end_against_real_containers(
         promotion=promotion,
         demotion=DemotionService(
             stm=stm,
-            mtm_remove=_NoopMtmRemoval(),
+            mtm_remove=mtm,  # CF-2: the real MtmTierRepository.remove — no local shim
             salience=SalienceStrategy(SalienceSettings()),
             clock=clock,
             bus=bus,
@@ -538,11 +538,6 @@ def _record(sink: list[DomainEvent]) -> Callable[[DomainEvent], Awaitable[None]]
     return _handler
 
 
-class _NoopMtmRemoval:
-    async def remove(self, ns: Namespace, memory_id: str) -> None:
-        return None
-
-
 @pytest.mark.integration
 async def test_sweep_namespace_now_demotes_end_to_end_against_real_containers(
     mtm: QdrantMtmAdapter,
@@ -564,16 +559,9 @@ async def test_sweep_namespace_now_demotes_end_to_end_against_real_containers(
     seen: list[DomainEvent] = []
     bus.subscribe(MemoryDemoted, _record(seen))
 
-    class _RealMtmRemoval:
-        async def remove(self, ns: Namespace, memory_id: str) -> None:
-            await qdrant_client.delete(
-                collection_name=collection_name(ns, mtm._dim),
-                points_selector=models.PointIdsList(points=[point_id(memory_id)]),
-            )
-
     demotion = DemotionService(
         stm=stm,
-        mtm_remove=_RealMtmRemoval(),
+        mtm_remove=mtm,  # CF-2: the real MtmTierRepository.remove — no local shim
         salience=SalienceStrategy(SalienceSettings()),
         clock=clock,
         bus=bus,

@@ -222,10 +222,19 @@ class ConflictAdjudicatorPort(Protocol):
 
 @runtime_checkable
 class WarmRecallCacheServicePort(Protocol):
-    """Seam for the slice-3 ``WarmRecallCacheService`` (spec §12). Optional; ``None`` = no-op —
-    ``ready_context`` stays a documented stub until S3-02 lands (this task's acceptance)."""
+    """Seam for the slice-3 ``WarmRecallCacheService`` (spec §12). Optional; ``None`` = no-op.
+
+    Stage-3 integrate: ``mu_client.inject.recall_bridge.RecallInjectBridge`` IS this port's real
+    implementation (its own module docstring: "PROMOTED (S3-02) into the WarmRecallCacheService
+    role"). ``invalidate`` pops its courtesy-cache entry on a real MLM tier-transition event
+    (wired via the bridge's OWN bus subscription, not through this manager); ``last_rendered`` is
+    the synchronous warm read :meth:`ready_context` below now actually consults — a session with
+    no rendered body yet (cold, nothing pulled through ``GET /recall`` for it) returns ``None``,
+    never a fabricated body."""
 
     def invalidate(self, ns: Namespace) -> None: ...
+
+    def last_rendered(self, session_id: str) -> str | None: ...
 
 
 class RenderedContext(BaseModel):
@@ -383,8 +392,16 @@ class MemoryLifecycleManager:
         )
 
     def ready_context(self, session_id: str) -> RenderedContext:
-        """Instant warm read — NEVER touches the runner. Documented not-yet-wired stub until
-        S3-02 (``WarmRecallCacheService``/``LiveSessionContext``) lands (this task's acceptance)."""
+        """Instant warm read — NEVER touches the runner (spec §5/§12). Stage-3 integrate: when a
+        ``WarmRecallCacheServicePort`` (``RecallInjectBridge``, S3-02) is wired, this reads ITS
+        synchronous courtesy-cache (``last_rendered``) — no I/O, no await, just an in-memory dict
+        read the bridge's own PULL/PUSH paths keep fresh. ``None`` (no ``warm_cache`` wired, or
+        nothing rendered yet for this session — cold) falls through to the honest ``wired=False``
+        stub; never a fabricated body."""
+        if self._warm_cache is not None:
+            body = self._warm_cache.last_rendered(session_id)
+            if body is not None:
+                return RenderedContext(session_id=session_id, rendered=body, wired=True)
         return RenderedContext(session_id=session_id, rendered="", wired=False)
 
     def explain(self, ns: Namespace, memory_id: str) -> list[ExplainRecord]:

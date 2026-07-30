@@ -47,14 +47,15 @@ success, ``CancelledError`` propagates untouched (never counted as a failure).
 (``state=superseded``, ``superseded_by=<winner-id>``) — this module never calls it for demotion
 (there is no "winner" in a forgetting-curve tier-down); ``remove`` is the plain-delete sibling
 operation that IS the right shape for this move. :class:`DemotionService` now depends directly
-on the real, shared ``MtmTierRepository`` port for that capability — the ``MtmRemovalPort`` name
-below is kept ONLY as a back-compat alias (``mu_engine.lifecycle.__init__``, a shared file out of
-this task's owned-paths, still re-exports it by name) and now simply *is* ``MtmTierRepository``;
-integrate phase should retire the alias + that re-export, and migrate the remaining ad-hoc local
-shims (``mu_local/composition.py``'s ``_LocalMtmRemovalAdapter``,
+on the real, shared ``MtmTierRepository`` port for that capability.
+
+**RETIRED at Stage-3 integrate.** The ``MtmRemovalPort`` back-compat alias (this file used to
+define ``MtmRemovalPort = MtmTierRepository`` and ``mu_engine.lifecycle.__init__`` re-exported it
+by name) is gone — no caller ever imported it by name, only by docstring reference. The ad-hoc
+local shims this docstring used to flag (``mu_local/composition.py``'s ``_LocalMtmRemovalAdapter``,
 ``tests/lifecycle/test_manager_int.py``'s ``_NoopMtmRemoval``/``_RealMtmRemoval``,
-``tests/lifecycle/test_demotion_int.py``'s ``_RealQdrantRemoval``) onto passing the real
-``QdrantMtmAdapter``/``mtm`` instance directly, once those non-owned files are in scope.
+``tests/lifecycle/test_demotion_int.py``'s ``_RealQdrantRemoval``) are likewise retired — every
+call site now passes the real ``QdrantMtmAdapter``/``mtm`` instance directly as ``mtm_remove``.
 """
 
 from __future__ import annotations
@@ -89,7 +90,6 @@ __all__ = [
     "DemotionOutcome",
     "DemotionReport",
     "DemotionService",
-    "MtmRemovalPort",
 ]
 
 _log = structlog.get_logger("mu_engine.lifecycle.demotion")
@@ -97,17 +97,6 @@ _log = structlog.get_logger("mu_engine.lifecycle.demotion")
 _OP = "lifecycle.demote"
 _LATENCY_METRIC = "mu_operation_latency_seconds"
 _ERROR_METRIC = "mu_operation_errors_total"
-
-
-# BACK-COMPAT ALIAS (CF-2, MLM-STAGE2-CARRYOVER.md): this name used to be a narrow, LOCAL
-# Protocol (this file) exposing only the one `remove(ns, memory_id)` capability, because the
-# shared `MtmTierRepository` shipped no removal method. It now IS the real, shared port —
-# `MtmTierRepository` ships a genuine `remove()` (`QdrantMtmAdapter` backs it with a real
-# `AsyncQdrantClient.delete` call) — kept under the old name only because
-# `mu_engine.lifecycle.__init__` (shared, out of this task's owned-paths) still re-exports
-# `MtmRemovalPort` by name; integrate phase should retire this alias + that re-export once every
-# caller passes a real `MtmTierRepository`-conforming instance (e.g. `QdrantMtmAdapter`) directly.
-MtmRemovalPort = MtmTierRepository
 
 
 class DemotionOutcome(BaseModel):

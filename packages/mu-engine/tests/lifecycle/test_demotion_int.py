@@ -2,6 +2,11 @@
 ZERO mocks (DEV-STANDARDS non-negotiable; task packet: "write REAL component tests against
 the LIVE stack").
 
+Stage-3 integrate: the local ``_RealQdrantRemoval`` shim this file used to define is retired — the
+real ``QdrantMtmAdapter`` (``mtm`` fixture) is passed directly as ``mtm_remove`` (CF-2, the same
+real port ``tests/lifecycle/test_demotion_real_port_int.py`` already proves end-to-end). This
+file's own acceptance items are otherwise unchanged.
+
 Covers S1-02's acceptance list (``.claude/team_analysis`` plan, task id S1-02):
 
 - **AC-1.3** — an item with ``S(m) < demote_mtm`` demotes MTM->STM for real (present in Valkey
@@ -17,13 +22,6 @@ Covers S1-02's acceptance list (``.claude/team_analysis`` plan, task id S1-02):
   wall-clock read anywhere in ``demotion.py`` (spec §19 Rule 1).
 - Central observability wired exactly like ``DistillPipeline`` (span/metrics/audit — asserted
   via a simple content-free recorder, not a mock of a store).
-
-The real Qdrant removal (``MtmRemovalPort``) is backed here by a tiny adapter over the SAME
-live ``AsyncQdrantClient`` used by ``QdrantMtmAdapter`` in this suite's sibling tests
-(``tests/pipelines/test_distill_int.py`` uses the identical ``collection_name``/``point_id``
-helpers to inspect real Qdrant state) — this is the "integrate phase" wiring gap
-``demotion.py``'s module docstring flags: a future storage task should promote this shape onto
-``QdrantMtmAdapter`` itself.
 """
 
 from __future__ import annotations
@@ -35,7 +33,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
-from qdrant_client import AsyncQdrantClient, models
+from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
@@ -56,24 +54,6 @@ pytestmark = pytest.mark.integration
 
 _DIM = 8
 _EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
-
-
-class _RealQdrantRemoval:
-    """A REAL ``MtmRemovalPort`` implementation over the live ``mu-dev-qdrant`` client — the
-    integrate-phase seam ``demotion.py``'s module docstring calls for (no mock; genuine
-    ``client.delete`` against the real container, same ``collection_name``/``point_id`` mapping
-    ``QdrantMtmAdapter`` itself uses)."""
-
-    def __init__(self, client: AsyncQdrantClient, *, dim: int) -> None:
-        self._client = client
-        self._dim = dim
-
-    async def remove(self, ns: Namespace, memory_id: str) -> None:
-        name = collection_name(ns, self._dim)
-        await self._client.delete(
-            collection_name=name,
-            points_selector=models.PointIdsList(points=[point_id(memory_id)]),
-        )
 
 
 class _EventRecorder:
@@ -149,11 +129,6 @@ async def mtm(qdrant_client: AsyncQdrantClient) -> QdrantMtmAdapter:
     return QdrantMtmAdapter(qdrant_client, dim=_DIM)
 
 
-@pytest_asyncio.fixture
-async def mtm_remove(qdrant_client: AsyncQdrantClient) -> _RealQdrantRemoval:
-    return _RealQdrantRemoval(qdrant_client, dim=_DIM)
-
-
 async def _mtm_point_exists(
     client: AsyncQdrantClient, ns: Namespace, memory_id: str, *, dim: int
 ) -> bool:
@@ -168,7 +143,6 @@ async def _mtm_point_exists(
 async def test_low_salience_item_demotes_mtm_to_stm_and_emits_memory_demoted_to_tier(
     ns: Namespace,
     mtm: QdrantMtmAdapter,
-    mtm_remove: _RealQdrantRemoval,
     stm: ValkeyStmAdapter,
     qdrant_client: AsyncQdrantClient,
 ) -> None:
@@ -201,7 +175,7 @@ async def test_low_salience_item_demotes_mtm_to_stm_and_emits_memory_demoted_to_
     clock = FrozenClock(now)
     service = DemotionService(
         stm=stm,
-        mtm_remove=mtm_remove,
+        mtm_remove=mtm,  # CF-2: the real MtmTierRepository.remove — no local shim
         salience=strategy,
         settings=settings,
         clock=clock,
@@ -247,7 +221,6 @@ async def test_low_salience_item_demotes_mtm_to_stm_and_emits_memory_demoted_to_
 async def test_recalled_item_access_count_bump_rescues_it_on_next_salience_recompute(
     ns: Namespace,
     mtm: QdrantMtmAdapter,
-    mtm_remove: _RealQdrantRemoval,
     stm: ValkeyStmAdapter,
     qdrant_client: AsyncQdrantClient,
 ) -> None:
@@ -292,7 +265,7 @@ async def test_recalled_item_access_count_bump_rescues_it_on_next_salience_recom
     recorder = _EventRecorder()
     service = DemotionService(
         stm=stm,
-        mtm_remove=mtm_remove,
+        mtm_remove=mtm,  # CF-2: the real MtmTierRepository.remove — no local shim
         salience=strategy,
         settings=settings,
         clock=clock,
@@ -323,7 +296,6 @@ async def test_recalled_item_access_count_bump_rescues_it_on_next_salience_recom
 async def test_demotion_gate_is_driven_only_by_the_injected_clock(
     ns: Namespace,
     mtm: QdrantMtmAdapter,
-    mtm_remove: _RealQdrantRemoval,
     stm: ValkeyStmAdapter,
     qdrant_client: AsyncQdrantClient,
 ) -> None:
@@ -352,7 +324,7 @@ async def test_demotion_gate_is_driven_only_by_the_injected_clock(
     pinned_now = created_at  # age == 0 -> rec == 1.0 -> maximal score, regardless of wall-clock
     clock = FrozenClock(pinned_now)
     service = DemotionService(
-        stm=stm, mtm_remove=mtm_remove, salience=strategy, settings=settings, clock=clock, bus=None
+        stm=stm, mtm_remove=mtm, salience=strategy, settings=settings, clock=clock, bus=None
     )
 
     report = await service.demote(ns, [fresh])

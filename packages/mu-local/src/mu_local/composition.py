@@ -58,12 +58,17 @@ from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
 from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
 from mu_contracts.ports.time import Clock
+from mu_engine.lifecycle.conflict import (
+    ConflictAdjudicator,
+    InMemoryConflictRecordRepository,
+    build_conflict_adjudicator,
+)
 from mu_engine.lifecycle.demotion import DemotionService
 from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate
 from mu_engine.lifecycle.promotion import PromotionService
 from mu_engine.lifecycle.salience import SalienceStrategy
 from mu_engine.lifecycle.settings import LifecycleSettings, ManagerModeSettings
-from mu_engine.pipelines.distill import DistillPipeline
+from mu_engine.pipelines.distill import DistillPipeline, DistillSettings
 from mu_engine.pipelines.ledger import InMemoryStageLedger
 from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import SystemClock
@@ -102,7 +107,7 @@ from mu_local.errors import BackendUnavailableError
 from mu_local.shared_null import LocalNullSharedRecall
 
 if TYPE_CHECKING:  # pragma: no cover — S1-03 sibling (mu_engine.lifecycle.manager), typing only.
-    from mu_engine.lifecycle.manager import MemoryLifecycleManager
+    from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
 
 __all__ = ["LifecycleManagerUnavailableError", "LocalContainer"]
 
@@ -132,39 +137,6 @@ class _WorkspaceDefaultModeResolver:
 
     def resolve(self, ns: Namespace) -> ManagerMode:
         return self._mode
-
-
-class _LocalMtmRemovalAdapter:
-    """A REAL ``MtmRemovalPort`` (``mu_engine.lifecycle.demotion.MtmRemovalPort``) over the SAME
-    live Qdrant client this container's ``QdrantMtmAdapter`` (``self.mtm``) already holds — the
-    integrate-phase wiring gap ``demotion.py`` itself flags: ``MtmTierRepository`` ships no
-    ``remove``/``delete`` yet ("a sibling storage task should close" it on
-    ``QdrantMtmAdapter``/``mu_engine.storage.ports.MtmTierRepository``, out of THIS task's owned
-    paths). Never a second Qdrant connection: this reaches into the SAME ``_qdrant`` client the
-    container built — the identical getattr-into-the-adapter composition-root pattern
-    :meth:`LocalContainer._register_closer` already uses for this exact adapter, above — and keys
-    the delete through the SAME ``collection_name``/``point_id`` mappers ``QdrantMtmAdapter``
-    itself upserts through (``mu_engine.storage.mappers.qdrant_mapper``), so a demotion removes
-    the identical point a promotion wrote.
-    """
-
-    def __init__(self, mtm: MtmTierRepository, *, dim: int) -> None:
-        qdrant = getattr(mtm, "_qdrant", None)
-        if qdrant is None:  # fail-loud: never silently no-op a demotion's MTM-side removal
-            raise LifecycleManagerUnavailableError(
-                f"{type(mtm).__name__!r} exposes no '_qdrant' client — "
-                "_LocalMtmRemovalAdapter cannot wire a real MtmRemovalPort over it"
-            )
-        self._qdrant = qdrant
-        self._dim = dim
-
-    async def remove(self, ns: Namespace, memory_id: str) -> None:
-        from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
-
-        await self._qdrant.delete(
-            collection_name=collection_name(ns, self._dim),
-            points_selector=[point_id(memory_id)],
-        )
 
 
 # The backends the registry ships, per role (mu_engine.storage.factories) — selecting anything
@@ -331,6 +303,29 @@ class LocalContainer:
             _WorkspaceDefaultModeResolver(self.lifecycle_settings.manager_mode),
         )
 
+        # (7c) S3-01 (spec §8, ADR 0037): the LLM-judged conflict adjudicator, gated the SAME way
+        #      the DISTILL extractor above is (``storage.llm is not None``) — a configured model
+        #      profile gets a REAL ``ConflictAdjudicator`` over the SAME ``ModelRouter``
+        #      (``self.llm``, routes ``Task.CONFLICT_ADJUDICATION`` -> ``models.adjudicate_model``,
+        #      ADR 0037); heuristic mode (``llm=None``) builds none, and ``DistillPipeline``'s own
+        #      no-adjudicator degrade floor (``_heuristic_only_verdict``) applies verbatim — 100%
+        #      pre-ADR-0037 backward compatible. ``DistillSettings.use_llm_adjudicator`` (default
+        #      True) is the composition-root-read gate the settings' own docstring calls for
+        #      (mirrors ``use_llm_extractor`` -> ``build_extractor`` precedent) — never read
+        #      internally by ``DistillPipeline`` itself. ``InMemoryConflictRecordRepository`` is
+        #      the sanctioned LOCAL-plane conflict-inbox default (a real in-process adapter, not a
+        #      mock) for a PENDING/MANUAL-parked verdict.
+        self._distill_settings = DistillSettings()
+        self.conflict_adjudicator: ConflictAdjudicator | None = None
+        if self.llm is not None and self._distill_settings.use_llm_adjudicator:
+            self.conflict_adjudicator = build_conflict_adjudicator(
+                use_llm=True,
+                router=self.llm,
+                clock=self._clock,
+                bus=self._bus,
+                conflict_records=InMemoryConflictRecordRepository(),
+            )
+
         # (8) application services — each facade verb delegates to exactly one of these; each gets
         #     the wired sinks so its meaningful op emits spans/metrics/audit (never silently no-op).
         self.ingest = IngestService(
@@ -348,10 +343,13 @@ class LocalContainer:
             ltm=self.ltm,
             extractor=self._extractor,
             clock=self._clock,
+            settings=self._distill_settings,
             mtm=self.mtm,
+            bus=self._bus,
             tracer=self.tracer,
             metrics=self.metrics,
             audit=self.audit,
+            adjudicator=self.conflict_adjudicator,
         )
         recall_settings = RecallSettings()
         fusion = ReciprocalRankFusion()
@@ -402,6 +400,7 @@ class LocalContainer:
         lease: LifecycleLeasePort | None = None,
         runner: LifecycleWorkflowRunnerPort | None = None,
         clock: Clock | None = None,
+        warm_cache: WarmRecallCacheServicePort | None = None,
     ) -> MemoryLifecycleManager:
         """Construct a :class:`~mu_engine.lifecycle.manager.MemoryLifecycleManager` wired against
         the SAME ``stm``/``mtm``/``ltm``/``distill``/``bus``/``clock`` instances this container
@@ -422,17 +421,22 @@ class LocalContainer:
         missing, it fails LOUD here with :class:`LifecycleManagerUnavailableError`, never a
         silent stub.
 
-        WIRING NOTE (integrate phase, closed): ``RetentionService``/``ConflictAdjudicator``
-        (Stage-2/3, S2-01/S3-01) remain out of scope for this daemonless embedded facade — never
-        constructed here, ``MemoryLifecycleManager`` defaults both to ``None`` (no-op). Concrete
-        ``LifecycleLeasePort``/``LifecycleWorkflowRunnerPort`` adapters (S1-06, mu-client-owned:
-        ``SqliteWalLeaseAdapter``/``SqliteWalRunner``) are now ACCEPTED as optional passthrough
-        kwargs (``lease``/``runner``/``clock``) so mu-client's daemon (the ONE caller with a real
-        cross-process runner) can thread its own durable adapters through this SAME composition
-        root instead of re-deriving ``salience``/``promotion``/``demotion`` a second time —
-        mu-local's own daemonless callers simply omit them and get the in-process defaults
-        (``MemoryLifecycleManager``'s own ``_InProcessLifecycleLease``/``_InlineLifecycleRunner``),
-        unchanged from before this parameter existed.
+        WIRING NOTE (Stage-3 integrate, closed): ``conflict=self.conflict_adjudicator`` threads the
+        SAME ``ConflictAdjudicator`` (or ``None`` in heuristic mode) this container already built
+        for ``self.distill`` — never a second instance. ``RetentionService`` (Stage-2, S2-01)
+        remains out of scope for this daemonless embedded facade — ``retention`` stays ``None``
+        (no-op) here; a future task that wants it wired threads it the same way. ``warm_cache`` is
+        an optional passthrough kwarg (mirrors ``lease``/``runner``/``clock`` below) so mu-client's
+        daemon can thread its real ``RecallInjectBridge`` (S3-02, the ``WarmRecallCacheServicePort``
+        implementation) through this SAME composition root; mu-local's own daemonless callers omit
+        it and get the ``None`` no-op default (``ready_context`` stays the honest ``wired=False``
+        stub). Concrete ``LifecycleLeasePort``/``LifecycleWorkflowRunnerPort`` adapters (S1-06,
+        mu-client-owned: ``SqliteWalLeaseAdapter``/``SqliteWalRunner``) are ACCEPTED as optional
+        passthrough kwargs (``lease``/``runner``/``clock``) so mu-client's daemon (the ONE caller
+        with a real cross-process runner) can thread its own durable adapters through this SAME
+        composition root instead of re-deriving ``salience``/``promotion``/``demotion`` a second
+        time — mu-local's own daemonless callers simply omit them and get the in-process defaults
+        (``MemoryLifecycleManager``'s own ``_InProcessLifecycleLease``/``_InlineLifecycleRunner``).
         """
         try:
             from mu_engine.lifecycle.manager import MemoryLifecycleManager
@@ -457,7 +461,7 @@ class LocalContainer:
         )
         demotion = DemotionService(
             stm=self.stm,
-            mtm_remove=_LocalMtmRemovalAdapter(self.mtm, dim=self.embedder.dimension),
+            mtm_remove=self.mtm,  # CF-2: the real MtmTierRepository.remove — no local shim needed
             salience=salience,
             settings=self.lifecycle_settings,
             clock=self._clock,
@@ -471,12 +475,14 @@ class LocalContainer:
             promotion=promotion,
             demotion=demotion,
             distill=self.distill,  # SAME object LocalMemory.consolidate() delegates to
+            conflict=self.conflict_adjudicator,  # SAME instance self.distill was built with
             mode_gate=self.mode_gate,
             bus=self._bus,
             settings=self.lifecycle_settings,
             lease=lease,
             runner=runner,
             clock=clock or self._clock,
+            warm_cache=warm_cache,
         )
 
     # ---------------------------------------------------------------- backend guards + resolution

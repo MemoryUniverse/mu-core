@@ -26,16 +26,36 @@ explicit ``__all__`` (mypy ``no_implicit_reexport``), mirroring ``mu_engine.serv
                       slide, ADR 0035) + its local seam Protocol ``LtmRetentionStorePort`` and
                       DTOs ``RetentionOutcome``/``RetentionReport``. Satisfies ``manager.py``'s
                       ``RetentionServicePort`` seam structurally (no import of ``manager.py``).
+- ``conflict.py``    (S3-01) — ``ConflictAdjudicator`` (LLM-judged supersession, ADR 0037) +
+                      its policy/settings/verdict/port types and ``build_conflict_adjudicator``.
+                      Landed at Stage-3 integrate; re-exported here like every other slice.
 
-Stage-3 slices (``conflict.py``) are NOT yet landed and are intentionally absent from this
-aggregate — they join this re-export as their own stage merges.
+Stage-3 integrate (this same pass) also retired the ``MtmRemovalPort`` back-compat alias
+``demotion.py`` used to export (``mu_engine.lifecycle.demotion.MtmRemovalPort`` was always just
+``MtmTierRepository`` by another name, CF-2/MLM-STAGE2-CARRYOVER.md) — every caller now passes a
+real ``MtmTierRepository``-conforming instance (e.g. ``QdrantMtmAdapter``) directly, so the alias
+had no remaining importer and is gone, not merely deprecated.
 """
 
+from mu_engine.lifecycle.conflict import (
+    AdjudicationBudget,
+    AdjudicationKind,
+    AdjudicationVerdict,
+    ConflictAdjudicationPort,
+    ConflictAdjudicator,
+    ConflictAdjudicatorSettings,
+    ConflictEventPublisher,
+    ConflictResolutionPolicy,
+    InMemoryConflictRecordRepository,
+    ResolutionMode,
+    ResolutionStrategy,
+    build_conflict_adjudicator,
+    compute_conflict_id,
+)
 from mu_engine.lifecycle.demotion import (
     DemotionOutcome,
     DemotionReport,
     DemotionService,
-    MtmRemovalPort,
 )
 from mu_engine.lifecycle.dto import (
     LifecycleStateView,
@@ -81,12 +101,21 @@ from mu_engine.lifecycle.settings import (
 )
 
 __all__ = [
+    "AdjudicationBudget",
+    "AdjudicationKind",
+    "AdjudicationVerdict",
+    "ConflictAdjudicationPort",
+    "ConflictAdjudicator",
     "ConflictAdjudicatorPort",
+    "ConflictAdjudicatorSettings",
+    "ConflictEventPublisher",
+    "ConflictResolutionPolicy",
     "DemotionOutcome",
     "DemotionReport",
     "DemotionService",
     "ExplainRecord",
     "HostedMirrorConsent",
+    "InMemoryConflictRecordRepository",
     "LifecycleSettings",
     "LifecycleStateView",
     "LtmRetentionStorePort",
@@ -97,7 +126,6 @@ __all__ = [
     "MemoryLifecycleManager",
     "ModePolicyResolver",
     "ModelVerdict",
-    "MtmRemovalPort",
     "MtmWorkingGraphService",
     "MtmWorkingGraphSettings",
     "OwnershipSettings",
@@ -106,6 +134,8 @@ __all__ = [
     "PromotionReport",
     "PromotionService",
     "RenderedContext",
+    "ResolutionMode",
+    "ResolutionStrategy",
     "RetentionOutcome",
     "RetentionReport",
     "RetentionService",
@@ -116,4 +146,6 @@ __all__ = [
     "SalienceStrategy",
     "TransitionKind",
     "WarmRecallCacheServicePort",
+    "build_conflict_adjudicator",
+    "compute_conflict_id",
 ]

@@ -58,7 +58,7 @@ from mu_local.views import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a hard import-time cycle.
-    from mu_engine.lifecycle.manager import MemoryLifecycleManager
+    from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
 
 __all__ = ["LocalMemory"]
 
@@ -278,14 +278,18 @@ class LocalMemory:
         lease: LifecycleLeasePort | None = None,
         runner: LifecycleWorkflowRunnerPort | None = None,
         clock: Clock | None = None,
+        warm_cache: WarmRecallCacheServicePort | None = None,
     ) -> MemoryLifecycleManager:
         """Passthrough to :meth:`mu_local.composition.LocalContainer.build_lifecycle_manager` —
         constructs a :class:`~mu_engine.lifecycle.manager.MemoryLifecycleManager` wired against
         THIS instance's own stores/distill/bus (never a second, independently-constructed set).
-        ``lease``/``runner``/``clock`` are optional passthrough kwargs so a caller with real
-        cross-process adapters (mu-client's ``SqliteWalLeaseAdapter``/``SqliteWalRunner``, S1-06)
-        can thread them through this SAME composition root."""
-        return self._container.build_lifecycle_manager(lease=lease, runner=runner, clock=clock)
+        ``lease``/``runner``/``clock``/``warm_cache`` are optional passthrough kwargs so a caller
+        with real cross-process adapters (mu-client's ``SqliteWalLeaseAdapter``/``SqliteWalRunner``,
+        S1-06) or a real warm-cache service (mu-client's ``RecallInjectBridge``, S3-02) can thread
+        them through this SAME composition root."""
+        return self._container.build_lifecycle_manager(
+            lease=lease, runner=runner, clock=clock, warm_cache=warm_cache
+        )
 
     async def aclose(self) -> None:
         """Release every store connection the container opened."""
