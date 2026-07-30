@@ -42,6 +42,11 @@ class Task(StrEnum):
     CLASSIFY = "classify"  # -> classify_model
     RERANK = "rerank"  # -> rerank_model
     EMBED = "embed"  # -> embed_backend (EmbeddingPort seam) / embed_model
+    CONFLICT_ADJUDICATION = "conflict_adjudication"  # -> adjudicate_model (ADR 0037, HARD tier;
+    # LLM-judged "does B replace/contradict A?" over DistillPipeline.reconcile survivors; the
+    # local SLM is explicitly excluded from this task — no new adjudicator field is introduced,
+    # this routes to the SAME `ModelSettings.adjudicate_model` as Task.ADJUDICATE (CANONICAL
+    # §7.2; PROPOSED-CANONICAL-ADDITIONS-mlm.md P6; ADR 0037).
 
 
 class ProviderKind(StrEnum):

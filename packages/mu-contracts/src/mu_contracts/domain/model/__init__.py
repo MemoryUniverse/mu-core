@@ -48,6 +48,14 @@ from mu_contracts.domain.model.governance import (
     TransferClass,
     TransferState,
 )
+from mu_contracts.domain.model.lifecycle import (
+    JobHandle,
+    JobResult,
+    JobStatus,
+    LifecycleJob,
+    LifecycleJobKind,
+    UserPrefix,
+)
 from mu_contracts.domain.model.memory import (
     MemoryItem,
     MemoryKind,
@@ -126,6 +134,11 @@ __all__ = [
     "Grant",
     "GrantState",
     "HostingMode",
+    "JobHandle",
+    "JobResult",
+    "JobStatus",
+    "LifecycleJob",
+    "LifecycleJobKind",
     "MembershipStatus",
     "MemoryItem",
     "MemoryKind",
@@ -177,6 +190,7 @@ __all__ = [
     "TransferState",
     "Triple",
     "Usage",
+    "UserPrefix",
     "Validity",
     "Vector",
     "Visibility",

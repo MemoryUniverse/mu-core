@@ -14,7 +14,25 @@ provenance_id. ``content_hash`` is the version/dedupe key, DISTINCT from ``id`` 
 (spec §2.4; ``storage-models §4.3``).
 
 RE-HOME NOTE: CANONICAL pins ``MemoryItem`` into ``mu-contracts``; defined here for the
-same reason as ``namespace.py`` (mu-contracts domain is a scaffold this phase).
+same reason as ``namespace.py`` (mu-contracts domain is a scaffold this phase). This
+file and ``mu_contracts/domain/model/memory.py`` (``MemoryNode``/``State``) are two
+independent, un-reconciled definitions of the same canonical record (the mu-contracts
+domain scaffold has not been wired to replace this shipped model yet). Reconciling the
+two is OUT OF SCOPE for this task (S0-06) and is left as an explicit, flagged debt item.
+
+RETENTION FIELDS (ADR 0035; ``memory-lifecycle-manager-spec.md`` §9; CANONICAL §7.10/
+§7.26): ``retention_class``/``cold`` are additive, defaulted fields for the
+validity-first LTM retention redesign that retires the 90d-recall-inactivity archival
+rule. No ``valid_until`` field is added — EPHEMERAL end-of-validity reuses the EXISTING
+``invalid_at`` field (line ~124), matching ``facts_at(t)`` in ``falkor_ltm.py`` (F3).
+
+PIN GAP (flagged, not fixed here): CANONICAL §7.10/§7.26 describe ``pinned`` as an
+ALREADY-canonical field-group (GC-ineligibility keys off ``and not item.pinned``) that
+this task must reuse, not re-add. Grepping this shipped ``MemoryItem`` (and the parallel
+``mu_contracts/domain/model/memory.py:MemoryNode``) turns up NO ``pinned`` field on
+either model today — the canonical pin mechanism CANONICAL describes has not actually
+landed on the shipped code yet. Per this task's scope, no ``pinned`` field is invented
+here; this is an out-of-scope gap for a dedicated pin-mechanism task to close.
 """
 
 from __future__ import annotations
@@ -37,6 +55,7 @@ __all__ = [
     "MemoryState",
     "MemoryTier",
     "Polarity",
+    "RetentionClass",
 ]
 
 
@@ -58,13 +77,20 @@ class MemoryTier(StrEnum):
 
 
 class MemoryState(StrEnum):
-    """Lifecycle state (prototype models.py:60; CANONICAL §7.5 recall filters on ``active``)."""
+    """Lifecycle state (prototype models.py:60; CANONICAL §7.5 recall filters on ``active``).
+
+    ``EXPIRED`` (ADR 0035; spec §9) is the EPHEMERAL exit: a bookkeeping/GC state flip
+    driven by ``now >= invalid_at``, NOT a new recall gate — ``facts_at(t)`` already
+    excludes a fact whose ``invalid_at`` has passed via the existing bi-temporal window
+    check, so this state only feeds the archival/GC sweep, not recall correctness.
+    """
 
     ACTIVE = "active"
     ARCHIVED = "archived"
     SUPERSEDED = "superseded"
     QUARANTINED = "quarantined"
     DELETED = "deleted"
+    EXPIRED = "expired"
 
 
 class MemoryKind(StrEnum):
@@ -98,6 +124,24 @@ class Polarity(StrEnum):
     NEGATIVE = "negative"
 
 
+class RetentionClass(StrEnum):
+    """LTM retention driver (ADR 0035; spec §9): LLM-derived at extraction, user-pinnable.
+
+    - ``PERMANENT``: no ``invalid_at`` (open-ended validity) — lives forever; never
+      archived/GC'd (CANONICAL §7.10 pin-equivalent semantics; only explicit
+      supersede/delete removes it).
+    - ``DURABLE``: long-lived; the only class eligible for the optional COLD sub-tier
+      (see :attr:`MemoryItem.cold`).
+    - ``EPHEMERAL``: ``invalid_at`` is set to a known future close at extraction; the
+      existing ``facts_at(t)`` window (``falkor_ltm.py``) already excludes it once
+      expired, feeding :attr:`MemoryState.EXPIRED` on the retention sweep.
+    """
+
+    PERMANENT = "permanent"
+    DURABLE = "durable"
+    EPHEMERAL = "ephemeral"
+
+
 class MemoryItem(BaseModel):
     """Full canonical memory record for storage, APIs, and UI adaptation.
 
@@ -127,6 +171,13 @@ class MemoryItem(BaseModel):
     importance_score: float = 0.5
     relevance_score: float = 0.0
     access_count: int = 0
+
+    # validity-first LTM retention (ADR 0035; spec §9) — additive, backward-compatible
+    # defaults; NO ``valid_until`` field: EPHEMERAL end-of-validity reuses ``invalid_at``
+    # above (F3). ``cold`` is a reversible, importance-gated sub-tier flag for DURABLE
+    # facts only (never PERMANENT/pinned); reactivate-on-recall clears it.
+    retention_class: RetentionClass = RetentionClass.DURABLE
+    cold: bool = False
 
     source: MemorySource = MemorySource.USER
 

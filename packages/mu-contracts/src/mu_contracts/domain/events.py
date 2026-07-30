@@ -233,8 +233,16 @@ class DegradeReason(StrEnum):
     CONFLICT_ADJUDICATION_DEGRADED = "conflict_adjudication_degraded"
     CONFLICT_PENDING_SUPPRESSED = "conflict_pending_suppressed"
     CONFLICT_MANUAL_BACKLOG = "conflict_manual_backlog"
+    # write-after-read Qdrant point visibility lag on cross-store supersede-invalidate;
+    # bounded retry next sweep, the loser stays SUPERSEDED in the graph (source of truth)
+    MTM_INVALIDATE_POINT_ABSENT = "mtm_invalidate_point_absent"  # ADR 0037
     # --- trust-ledger (§7.25; operator) ---
     TRUST_LEDGER_UNAVAILABLE = "trust_ledger_unavailable"
+    # --- lifecycle / hosted-mirror consent (§4, §16; X4 consent gate, operator) ---
+    # server is barred from taking the user-grained lifecycle-sweep lease on an offline
+    # PRIVATE device because hosted_mirror_consent=NOT_CONSENTED; memory ages only once
+    # the device reconnects, never a silent freeze (spec §4, AC-4.4)
+    OFFLINE_FAILOVER_NOT_CONSENTED = "offline_failover_not_consented"  # ADR 0032
 
 
 # The closed set of user-visible reasons (CANONICAL §2 / platform-layer0 §12). The only way to
@@ -324,6 +332,16 @@ class MemoryDemoted(DomainEvent):
     namespace: Namespace
     id: str
     tier: Tier
+    # Additive (ADR 0034 / PROPOSED P5, R5): distinguishes an actual tier-down move
+    # (MTM->STM forgetting-curve demotion) from pure archival. ``None`` means
+    # "no tier change — this is an archival-only demotion" (the pre-existing
+    # to_state=ARCHIVED behavior); the demotion service (S1-02) sets a concrete
+    # ``Tier`` whenever the transition is a real tier-down move, so misusing
+    # to_state=ARCHIVED for a tier move is no longer necessary. Optional with a
+    # ``None`` default (not a bare additive Tier) so every existing
+    # ``MemoryDemoted(...)`` call site — which only ever modeled archival —
+    # keeps constructing without change.
+    to_tier: Tier | None = None
     to_state: State = State.ARCHIVED
     retention: float
 

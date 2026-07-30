@@ -19,6 +19,7 @@ from mu_engine.storage.domain.memory import (
     MemoryState,
     MemoryTier,
     Polarity,
+    RetentionClass,
 )
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
@@ -39,6 +40,7 @@ __all__ = [
     "Namespace",
     "Polarity",
     "RecallChannel",
+    "RetentionClass",
     "Scored",
     "SparseQuery",
     "Usage",

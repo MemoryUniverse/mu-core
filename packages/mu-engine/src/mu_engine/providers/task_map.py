@@ -36,6 +36,9 @@ class TaskClassMapper:
             Task.CLASSIFY: m.classify_model,
             Task.RERANK: m.rerank_model,
             Task.EMBED: m.embed_model,
+            # ADR 0037 / PROPOSED-CANONICAL-ADDITIONS-mlm.md P6: routes to the SAME
+            # adjudicate_model as Task.ADJUDICATE — no new ModelSettings field.
+            Task.CONFLICT_ADJUDICATION: m.adjudicate_model,
         }
 
     def group_for(self, task: Task, *, override: str | None = None) -> str:
