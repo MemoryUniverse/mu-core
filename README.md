@@ -114,13 +114,17 @@ Memory Universe is independent, early-stage work — the productization of about
 founder's graduation-thesis research into multi-user agentic memory (the brain-inspired STM/MTM/LTM
 hierarchy and namespace model here trace directly back to that research). There's no funding round,
 no company yet, no customers to point to — just an engineer building the open memory layer he
-thinks agent teams are actually going to need, in public, and applying for [GitHub
-Sponsors](https://github.com/sponsors/TRextabat) to help fund the time that goes into it.
+thinks agent teams are actually going to need, in public.
 
 If that's a project worth backing early: sponsorship goes directly toward keeping `mu-core`,
 `mu-client`, and the SDKs open, well-tested, and actively maintained while the hosted plane gets
 built out. No perks beyond a thank-you and a founder who reads every issue — this is pre-revenue,
 pre-launch work, and it's presented that way on purpose.
+
+## Contact
+
+- GitHub: [@TRextabat](https://github.com/TRextabat)
+- Email: amiramiritabat01@gmail.com
 
 ## Links
 
