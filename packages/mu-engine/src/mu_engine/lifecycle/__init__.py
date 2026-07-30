@@ -22,9 +22,13 @@ explicit ``__all__`` (mypy ``no_implicit_reexport``), mirroring ``mu_engine.serv
 - ``manager.py``     (S1-03) — ``MemoryLifecycleManager`` (the orchestrator) + its local seam
                       Protocols (``RetentionServicePort``/``ConflictAdjudicatorPort``/
                       ``WarmRecallCacheServicePort``) and ``RenderedContext``.
+- ``retention.py``   (S2-01) — ``RetentionService`` (validity-first LTM archival + GC + COLD
+                      slide, ADR 0035) + its local seam Protocol ``LtmRetentionStorePort`` and
+                      DTOs ``RetentionOutcome``/``RetentionReport``. Satisfies ``manager.py``'s
+                      ``RetentionServicePort`` seam structurally (no import of ``manager.py``).
 
-Stage-2/3 slices (``retention.py``, ``conflict.py``) are NOT yet landed and are intentionally
-absent from this aggregate — they join this re-export as their own stage merges.
+Stage-3 slices (``conflict.py``) are NOT yet landed and are intentionally absent from this
+aggregate — they join this re-export as their own stage merges.
 """
 
 from mu_engine.lifecycle.demotion import (
@@ -60,6 +64,12 @@ from mu_engine.lifecycle.promotion import (
     PromotionReport,
     PromotionService,
 )
+from mu_engine.lifecycle.retention import (
+    LtmRetentionStorePort,
+    RetentionOutcome,
+    RetentionReport,
+    RetentionService,
+)
 from mu_engine.lifecycle.salience import SalienceStrategy
 from mu_engine.lifecycle.settings import (
     HostedMirrorConsent,
@@ -79,6 +89,7 @@ __all__ = [
     "HostedMirrorConsent",
     "LifecycleSettings",
     "LifecycleStateView",
+    "LtmRetentionStorePort",
     "ManagerMode",
     "ManagerModeGate",
     "ManagerModeSettings",
@@ -95,6 +106,9 @@ __all__ = [
     "PromotionReport",
     "PromotionService",
     "RenderedContext",
+    "RetentionOutcome",
+    "RetentionReport",
+    "RetentionService",
     "RetentionServicePort",
     "RetentionSettings",
     "SalienceInputs",

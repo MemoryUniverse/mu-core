@@ -40,17 +40,21 @@ injected ``Clock`` via :meth:`SalienceStrategy.score` — this module makes no
 whole sweep, latency (always) + error (on failure) metrics, a content-free audit row on
 success, ``CancelledError`` propagates untouched (never counted as a failure).
 
-**The missing MTM-removal port (flagged, not papered over).** ``MtmTierRepository``
-(``mu_engine/storage/ports.py``, a sibling task's owned file) ships ``upsert``/``semantic``/
-``invalidate`` only. ``invalidate`` specifically models loser-*supersession*
-(``state=superseded``, ``superseded_by=<winner-id>``) — reusing it for a plain
-forgetting-curve demotion (there is no "winner") would be exactly the kind of existing-shape
-misuse this very ticket exists to retire on the event side (AC-1.3's whole point). So this
-module does NOT call ``invalidate`` for demotion, and does NOT edit the shared
-``MtmTierRepository``/``QdrantMtmAdapter`` (out of this task's owned-paths). Instead it depends
-on a narrow, LOCAL :class:`MtmRemovalPort` Protocol (this file) for exactly the one capability
-a real tier-down move needs: remove the point from MTM once its STM write-ahead has landed. See
-that Protocol's docstring for the integrate-phase wiring note.
+**The MTM-removal port (CF-2, MLM-STAGE2-CARRYOVER.md — landed).** ``MtmTierRepository``
+(``mu_engine/storage/ports.py``) now ships a genuine ``remove(ns, memory_id)`` method alongside
+``upsert``/``semantic``/``invalidate``, backed on ``QdrantMtmAdapter`` by a real
+``AsyncQdrantClient.delete`` call. ``invalidate`` still specifically models loser-*supersession*
+(``state=superseded``, ``superseded_by=<winner-id>``) — this module never calls it for demotion
+(there is no "winner" in a forgetting-curve tier-down); ``remove`` is the plain-delete sibling
+operation that IS the right shape for this move. :class:`DemotionService` now depends directly
+on the real, shared ``MtmTierRepository`` port for that capability — the ``MtmRemovalPort`` name
+below is kept ONLY as a back-compat alias (``mu_engine.lifecycle.__init__``, a shared file out of
+this task's owned-paths, still re-exports it by name) and now simply *is* ``MtmTierRepository``;
+integrate phase should retire the alias + that re-export, and migrate the remaining ad-hoc local
+shims (``mu_local/composition.py``'s ``_LocalMtmRemovalAdapter``,
+``tests/lifecycle/test_manager_int.py``'s ``_NoopMtmRemoval``/``_RealMtmRemoval``,
+``tests/lifecycle/test_demotion_int.py``'s ``_RealQdrantRemoval``) onto passing the real
+``QdrantMtmAdapter``/``mtm`` instance directly, once those non-owned files are in scope.
 """
 
 from __future__ import annotations
@@ -58,7 +62,6 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
 
 import structlog
 from pydantic import BaseModel, ConfigDict
@@ -80,7 +83,7 @@ from mu_engine.platform.observability import (
 )
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace
-from mu_engine.storage.ports import StmTierRepository
+from mu_engine.storage.ports import MtmTierRepository, StmTierRepository
 
 __all__ = [
     "DemotionOutcome",
@@ -96,22 +99,15 @@ _LATENCY_METRIC = "mu_operation_latency_seconds"
 _ERROR_METRIC = "mu_operation_errors_total"
 
 
-@runtime_checkable
-class MtmRemovalPort(Protocol):
-    """The ONE MTM-side capability :class:`DemotionService` needs: remove a point once its
-    STM write-ahead copy has landed (spec §7b demotion; ADR 0034).
-
-    Deliberately NOT part of the shared ``mu_engine.storage.ports.MtmTierRepository`` Protocol
-    (see module docstring for why reusing ``invalidate`` would misuse it). This is the
-    integrate-phase wiring gap a sibling storage task should close: add a genuine
-    ``delete``/``remove`` to ``MtmTierRepository`` + implement it on ``QdrantMtmAdapter``
-    (``AsyncQdrantClient.delete(collection_name=..., points_selector=...)`` — the real client
-    already supports point deletion; the adapter simply never exposed it). Until that lands,
-    callers construct :class:`DemotionService` with any object satisfying this narrow
-    Protocol — see this module's test file for a REAL adapter over the live ``mu-dev-qdrant``.
-    """
-
-    async def remove(self, ns: Namespace, memory_id: str) -> None: ...
+# BACK-COMPAT ALIAS (CF-2, MLM-STAGE2-CARRYOVER.md): this name used to be a narrow, LOCAL
+# Protocol (this file) exposing only the one `remove(ns, memory_id)` capability, because the
+# shared `MtmTierRepository` shipped no removal method. It now IS the real, shared port —
+# `MtmTierRepository` ships a genuine `remove()` (`QdrantMtmAdapter` backs it with a real
+# `AsyncQdrantClient.delete` call) — kept under the old name only because
+# `mu_engine.lifecycle.__init__` (shared, out of this task's owned-paths) still re-exports
+# `MtmRemovalPort` by name; integrate phase should retire this alias + that re-export once every
+# caller passes a real `MtmTierRepository`-conforming instance (e.g. `QdrantMtmAdapter`) directly.
+MtmRemovalPort = MtmTierRepository
 
 
 class DemotionOutcome(BaseModel):
@@ -155,7 +151,7 @@ class DemotionService:
         self,
         *,
         stm: StmTierRepository,
-        mtm_remove: MtmRemovalPort,
+        mtm_remove: MtmTierRepository,
         salience: SalienceStrategy | None = None,
         settings: LifecycleSettings | None = None,
         clock: Clock | None = None,
@@ -250,7 +246,8 @@ class DemotionService:
 
         Step 1 — write-ahead: add the STM-tier copy first (id-stable, ``created_at``
         preserved — CANONICAL §7.1). Step 2 — commit: remove the MTM point via the injected
-        :class:`MtmRemovalPort`. Step 3 — on a persistent removal failure: compensating
+        ``MtmTierRepository.remove`` (CF-2 — the real port, not a local shim). Step 3 — on a
+        persistent removal failure: compensating
         rollback (evict the STM write-ahead copy), leaving the item in MTM only (the
         pre-demotion state) rather than silently duplicating it across tiers. If the rollback
         ALSO fails, the item is left in both stores — a genuine, logged dup (never a silent

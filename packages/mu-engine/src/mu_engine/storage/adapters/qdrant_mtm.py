@@ -284,3 +284,19 @@ class QdrantMtmAdapter:
             },
             points=[point_id(loser_id)],
         )
+
+    async def remove(self, ns: Namespace, memory_id: str) -> None:
+        return await self._retry(self._remove_impl)(ns, memory_id)
+
+    async def _remove_impl(self, ns: Namespace, memory_id: str) -> None:
+        # Plain point deletion (CF-2, MLM-STAGE2-CARRYOVER.md) — a DIFFERENT operation from
+        # ``invalidate`` (loser-supersession: payload overwrite, point stays). This genuinely
+        # removes the point, e.g. for DemotionService's MTM->STM tier-down move (there is no
+        # "winner" to supersede in favor of). Real ``AsyncQdrantClient.delete`` — no mock.
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return
+        await self._qdrant.delete(
+            collection_name=name,
+            points_selector=models.PointIdsList(points=[point_id(memory_id)]),
+        )

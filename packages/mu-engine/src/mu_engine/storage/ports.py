@@ -134,6 +134,14 @@ class MtmTierRepository(Protocol):
         self, ns: Namespace, loser_id: str, winner_id: str, *, at: Any, reason: str
     ) -> None: ...
 
+    async def remove(self, ns: Namespace, memory_id: str) -> None:
+        """Plain point deletion — NOT supersession (spec §7b demotion; CF-2, MLM-STAGE2-
+        CARRYOVER.md). ``invalidate`` models a loser being superseded by a winner (payload
+        overwritten with ``state=superseded``, the point stays); ``remove`` genuinely deletes
+        the point (a forgetting-curve tier-down move has no "winner"). Distinct operations —
+        never substitute one for the other."""
+        ...
+
 
 class GraphStorePort(Protocol):
     """Graph / LTM tier — bi-temporal KG (``storage-pluggable §2.2``; graph MANDATORY)."""
