@@ -1,7 +1,12 @@
 # Ruff — lint + format, CI gate (DEV-STANDARDS "Ruff (lint) + ruff-format clean").
 target-version = "py312"
 line-length = 100
-src = ["packages/mu-contracts/src", "packages/mu-engine/src", "packages/mu-local/src"]
+src = [
+    "packages/mu-contracts/src",
+    "packages/mu-engine/src",
+    "packages/mu-local/src",
+    "packages/mu-engine-server/src",
+]
 # .trash is the project's mandated graveyard for removed/replaced files (never a bare `rm`) —
 # dead code by definition, never a lint target.
 exclude = [".trash"]
@@ -28,9 +33,16 @@ ignore = [
 
 [lint.per-file-ignores]
 "**/tests/**" = ["S101", "ANN"]   # asserts + loose annotations OK in tests
+# FastAPI's own DI idiom is `param: T = Depends(provider)` — bugbear's B008 ("no function calls in
+# argument defaults") is a false positive here specifically when `T` is a `Protocol` (empirically:
+# ruff's B008 exemption for `Depends(...)` does not fire when the annotated parameter type is a
+# `typing.Protocol`, mu-engine-server/src/mu_engine_server routes/ ports.py, build-plan §4 C2 —
+# `mu_engine_server.ports.MemorySurfacePort`/`LifecycleSurfacePort`); there is no alternative
+# spelling FastAPI itself supports other than `Depends(...)` as the default value.
+"packages/mu-engine-server/src/mu_engine_server/routes/**" = ["B008"]
 
 [lint.isort]
-known-first-party = ["mu_contracts", "mu_engine", "mu_local"]
+known-first-party = ["mu_contracts", "mu_engine", "mu_local", "mu_engine_server"]
 
 [format]
 docstring-code-format = true

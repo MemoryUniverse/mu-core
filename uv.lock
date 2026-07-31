@@ -6,6 +6,7 @@ requires-python = "==3.12.*"
 members = [
     "mu-contracts",
     "mu-engine",
+    "mu-engine-server",
     "mu-local",
 ]
 
@@ -1119,6 +1120,27 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0.36,<2.1" },
     { name = "structlog", specifier = ">=24.4,<25" },
     { name = "tenacity", specifier = ">=9.0,<10" },
+]
+
+[[package]]
+name = "mu-engine-server"
+version = "0.1.0"
+source = { editable = "packages/mu-engine-server" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "mu-contracts" },
+    { name = "mu-engine" },
+    { name = "redis" },
+    { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115,<1" },
+    { name = "mu-contracts", editable = "packages/mu-contracts" },
+    { name = "mu-engine", editable = "packages/mu-engine" },
+    { name = "redis", specifier = ">=5.2,<6" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32,<1" },
 ]
 
 [[package]]

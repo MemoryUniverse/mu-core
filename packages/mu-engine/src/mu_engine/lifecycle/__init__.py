@@ -29,6 +29,10 @@ explicit ``__all__`` (mypy ``no_implicit_reexport``), mirroring ``mu_engine.serv
 - ``conflict.py``    (S3-01) — ``ConflictAdjudicator`` (LLM-judged supersession, ADR 0037) +
                       its policy/settings/verdict/port types and ``build_conflict_adjudicator``.
                       Landed at Stage-3 integrate; re-exported here like every other slice.
+- ``conflict_redis.py`` (SDK build-plan §4 Stage-C C1) — ``RedisConflictRecordRepository`` +
+                      ``ConflictRedisSettings``, the durable Valkey/Redis
+                      ``ConflictRecordRepository`` adapter (the SHARED/persistent counterpart to
+                      ``conflict.py``'s ``InMemoryConflictRecordRepository``).
 
 Stage-3 integrate (this same pass) also retired the ``MtmRemovalPort`` back-compat alias
 ``demotion.py`` used to export (``mu_engine.lifecycle.demotion.MtmRemovalPort`` was always just
@@ -52,6 +56,7 @@ from mu_engine.lifecycle.conflict import (
     build_conflict_adjudicator,
     compute_conflict_id,
 )
+from mu_engine.lifecycle.conflict_redis import ConflictRedisSettings, RedisConflictRecordRepository
 from mu_engine.lifecycle.demotion import (
     DemotionOutcome,
     DemotionReport,
@@ -109,6 +114,7 @@ __all__ = [
     "ConflictAdjudicatorPort",
     "ConflictAdjudicatorSettings",
     "ConflictEventPublisher",
+    "ConflictRedisSettings",
     "ConflictResolutionPolicy",
     "DemotionOutcome",
     "DemotionReport",
@@ -133,6 +139,7 @@ __all__ = [
     "PromotionOutcomeKind",
     "PromotionReport",
     "PromotionService",
+    "RedisConflictRecordRepository",
     "RenderedContext",
     "ResolutionMode",
     "ResolutionStrategy",

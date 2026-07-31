@@ -44,12 +44,18 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
+from mu_contracts.contracts.memory import MemoryResponse
+from mu_contracts.contracts.recall import RecallItemView as CanonicalRecallItemView
+from mu_contracts.contracts.recall import RecallResult as CanonicalRecallResult
+from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
+from mu_contracts.domain.model.memory import Tier as CanonicalTier
 from mu_engine.lifecycle.mode_gate import ManagerModeGate
 from mu_engine.pipelines.concrete.ingest import IngestActivity
 from mu_engine.pipelines.distill import DistillReport
 from mu_engine.providers._contracts import Completion
 from mu_engine.services.ingest import IngestResult
 from mu_engine.services.recall.dto import RecallChannels, RecallResult
+from mu_engine.services.recall.dto import RecallItemView as EngineRecallItemView
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.surface import LlmNotConfiguredError, SurfaceFacade, SurfaceVerbNotImplementedError
@@ -130,8 +136,17 @@ async def test_add_delegates_one_ingest_call_and_passes_result_through() -> None
     assert activity.namespace.workspace == _WORKSPACE
     assert activity.namespace.user == _USER
     assert activity.namespace.session == _SESSION
-    # the engine-native IngestResult passes through unwrapped — no re-projection (DTO ruling 2).
-    assert result is container.ingest.remember.return_value
+    # Stage C re-annotation (build-plan §4 C2 item (a)): the engine-native IngestResult is now
+    # mapped onto the canonical MemoryWriteResult (Decision B), not passed through by identity —
+    # every field mirrors the fake IngestResult, plus the resolved namespace (wire parity).
+    fake = container.ingest.remember.return_value
+    assert isinstance(result, MemoryWriteResult)
+    assert result.memory_id == fake.memory_id
+    assert result.content_hash == fake.content_hash
+    assert result.promoted == fake.promoted
+    assert result.tiers_written == fake.tiers_written
+    assert result.events_emitted == fake.events_emitted
+    assert result.namespace == activity.namespace.to_prefix()
 
 
 @pytest.mark.unit
@@ -165,7 +180,13 @@ async def test_get_delegates_to_stm_with_the_right_namespace() -> None:
     (ns, memory_id), _ = container.stm.get.await_args
     assert memory_id == "mem_fake1"
     assert ns.org == _ORG and ns.workspace == _WORKSPACE and ns.user == _USER
-    assert got is item
+    # Stage C re-annotation: get() now maps the engine-native MemoryItem onto the canonical,
+    # frozen-wire-schema MemoryResponse (Decision B) rather than returning the domain object.
+    assert isinstance(got, MemoryResponse)
+    assert got.id == item.id
+    assert got.content == item.content
+    assert got.tier == item.tier.value
+    assert got.namespace == item.namespace.to_prefix()
 
 
 @pytest.mark.unit
@@ -189,7 +210,14 @@ async def test_recall_builds_query_and_scope_and_passes_result_through() -> None
     assert query.channels.mtm is True
     assert query.channels.stm is False
     assert query.channels.ltm is False
-    assert result is recall_result
+    # Stage C re-annotation: the engine-native RecallResult is mapped onto the canonical
+    # mu_contracts RecallResult (Decision B), not passed through by identity.
+    assert isinstance(result, CanonicalRecallResult)
+    assert result.namespace == recall_result.namespace
+    assert result.items == []
+    assert result.channels_run.stm == recall_result.channels_run.stm
+    assert result.degraded == recall_result.degraded
+    assert result.generated_at == recall_result.generated_at
 
 
 @pytest.mark.unit
@@ -205,7 +233,14 @@ async def test_consolidate_checks_mode_gate_before_delegating() -> None:
     assert ns_arg.user == _USER
     container.stm.recent.assert_awaited_once()
     container.distill.distill.assert_awaited_once()
-    assert report is container.distill.distill.return_value
+    # Stage C re-annotation: the engine-native DistillReport is mapped onto the canonical
+    # ConsolidateView (Decision B), not passed through by identity.
+    fake_report = container.distill.distill.return_value
+    assert isinstance(report, ConsolidateView)
+    assert report.facts_extracted == fake_report.facts_extracted
+    assert report.added == fake_report.added
+    assert report.superseded == fake_report.superseded
+    assert report.noop == 0
 
 
 @pytest.mark.unit
@@ -237,7 +272,7 @@ async def test_ask_synthesises_via_the_configured_llm() -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("verb", ["promote", "demote", "build_context", "share"])
+@pytest.mark.parametrize("verb", ["promote", "demote", "share"])
 async def test_unbuilt_verbs_raise_the_named_error_without_touching_the_container(
     verb: str,
 ) -> None:
@@ -245,9 +280,7 @@ async def test_unbuilt_verbs_raise_the_named_error_without_touching_the_containe
     facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
 
     with pytest.raises(SurfaceVerbNotImplementedError) as exc_info:
-        if verb == "build_context":
-            await facade.build_context("Ada", user=_USER, session=_SESSION)
-        elif verb == "share":
+        if verb == "share":
             await facade.share(
                 "mem_fake1", visibility=Visibility.SHARED, user=_USER, session=_SESSION
             )
@@ -258,6 +291,76 @@ async def test_unbuilt_verbs_raise_the_named_error_without_touching_the_containe
     container.recall.recall.assert_not_awaited()
     container.stm.get.assert_not_awaited()
     container.distill.distill.assert_not_awaited()
+
+
+@pytest.mark.unit
+async def test_build_context_recalls_and_renders_deterministically() -> None:
+    """``build_context`` is no longer a named 501 (build-plan §4 C2 item (a)) — proves it
+    delegates through ``recall`` and assembles a real ``ContextView`` via the ported
+    ``_render_context`` (no LLM)."""
+    container = _FakeContainer()
+    ns = _fake_ns()
+    hit = CanonicalRecallItemView(
+        memory_id="mem_1",
+        content="Ada lives in Paris",
+        tier=CanonicalTier.STM,
+        channel="stm",
+        fused_score=1.0,
+    )
+    engine_hit = EngineRecallItemView(
+        memory_id="mem_1",
+        content="Ada lives in Paris",
+        content_hash="hash1",
+        tier=MemoryTier.STM,
+        channel="stm",
+        namespace=ns,
+        fused_score=1.0,
+    )
+    container.recall.recall = AsyncMock(
+        return_value=RecallResult(
+            namespace=ns,
+            items=[engine_hit],
+            channels_run=RecallChannels(),
+            generated_at=datetime.now(UTC),
+        )
+    )
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    view = await facade.build_context("Where does Ada live?", user=_USER, session=_SESSION)
+
+    container.recall.recall.assert_awaited_once()
+    assert isinstance(view, ContextView)
+    assert view.text == "- Ada lives in Paris"
+    assert view.items == [hit]
+    assert view.degraded is None
+
+
+@pytest.mark.unit
+async def test_build_context_truncates_to_max_chars() -> None:
+    container = _FakeContainer()
+    ns = _fake_ns()
+    engine_hit = EngineRecallItemView(
+        memory_id="mem_1",
+        content="Ada lives in Paris",
+        content_hash="hash1",
+        tier=MemoryTier.STM,
+        channel="stm",
+        namespace=ns,
+        fused_score=1.0,
+    )
+    container.recall.recall = AsyncMock(
+        return_value=RecallResult(
+            namespace=ns,
+            items=[engine_hit],
+            channels_run=RecallChannels(),
+            generated_at=datetime.now(UTC),
+        )
+    )
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    view = await facade.build_context("Ada", user=_USER, session=_SESSION, max_chars=5)
+
+    assert view.text == "- Ada"
 
 
 # ============================================================================================
@@ -331,9 +434,23 @@ async def _teardown(settings: Settings, uid: str) -> None:
         await redis.aclose()
 
 
-async def _eventually(read: Callable[[], Awaitable[RecallResult]]) -> RecallResult:
+async def _eventually(
+    read: Callable[[], Awaitable[CanonicalRecallResult]],
+) -> CanonicalRecallResult:
     """PORT of the reference test's polling helper (qdrant upserts are eventually consistent —
     the store's real consistency model, not a masked bug)."""
+    last = await read()
+    for _ in range(40):  # ~8s ceiling
+        if last.items:
+            return last
+        await asyncio.sleep(0.2)
+        last = await read()
+    return last
+
+
+async def _eventually_context(read: Callable[[], Awaitable[ContextView]]) -> ContextView:
+    """Same eventual-consistency polling as :func:`_eventually`, for ``build_context``'s
+    ``ContextView`` (its ``items`` come from the same eventually-consistent qdrant recall)."""
     last = await read()
     for _ in range(40):  # ~8s ceiling
         if last.items:
@@ -365,7 +482,7 @@ async def test_facade_write_is_readable_through_local_memory(
     via_facade_itself = await facade.get(written.memory_id, user=_USER, session=_SESSION)
     assert via_facade_itself is not None
     assert via_facade_itself.content == via_local_memory.content
-    assert via_facade_itself.tier.value == via_local_memory.tier
+    assert via_facade_itself.tier == via_local_memory.tier
 
 
 @pytest.mark.integration
@@ -381,7 +498,7 @@ async def test_local_memory_write_is_readable_through_facade(
     via_facade = await facade.get(written.memory_id, user=_USER, session=_SESSION)
     assert via_facade is not None, "SurfaceFacade could not see LocalMemory's STM write"
     assert via_facade.content == "Ada works at Acme"
-    assert via_facade.tier is MemoryTier.STM
+    assert via_facade.tier == "stm"
 
 
 @pytest.mark.integration
@@ -411,12 +528,18 @@ async def test_facade_recall_consolidate_ask_and_unbuilt_verbs(
     with pytest.raises(LlmNotConfiguredError):
         await facade.ask("Where does Ada live?", user=_USER, session=_SESSION)
 
-    # (6) promote/demote/build_context/share are honest 501-shaped refusals, never a silent no-op.
+    # (6) build_context is wired to the real op now (build-plan §4 C2 item (a)) — proves it
+    # against the SAME real store data recall() just federated, not a 501 refusal anymore.
+    ctx = await _eventually_context(
+        lambda: facade.build_context("What do we know about Ada?", user=_USER, session=_SESSION)
+    )
+    assert {it.memory_id for it in ctx.items} >= {r1.memory_id, r2.memory_id}
+    assert "Ada lives in Paris" in ctx.text or "Ada works at Acme" in ctx.text
+
+    # (7) promote/demote/share are honest 501-shaped refusals, never a silent no-op.
     with pytest.raises(SurfaceVerbNotImplementedError):
         await facade.promote(r1.memory_id, user=_USER, session=_SESSION)
     with pytest.raises(SurfaceVerbNotImplementedError):
         await facade.demote(r1.memory_id, user=_USER, session=_SESSION)
-    with pytest.raises(SurfaceVerbNotImplementedError):
-        await facade.build_context("Ada", user=_USER, session=_SESSION)
     with pytest.raises(SurfaceVerbNotImplementedError):
         await facade.share(r1.memory_id, visibility=Visibility.SHARED, user=_USER, session=_SESSION)

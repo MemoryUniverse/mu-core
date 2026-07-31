@@ -8,6 +8,11 @@ root_packages =
     mu_contracts
     mu_engine
     mu_local
+    mu_engine_server
+# Required so contract-level `forbidden_modules` naming mu_server/mu_client (external — those
+# live in separate repos, not in this workspace) is still checked, not silently skipped
+# (mu-engine-server-boundary below).
+include_external_packages = True
 
 # contracts is the base; engine sits above and may not be imported downward-in.
 [importlinter:contract:core-layers]
@@ -34,4 +39,19 @@ source_modules =
     mu_contracts
 forbidden_modules =
     mu_engine
+    mu_local
+
+# mu-engine-server (design 2026-07-31-sdk-engine-server-design.md §2.2/§8, build-plan §4 C0):
+# thin single-tenant HTTP server over {mu_contracts, mu_engine} ONLY. Routes bind SurfaceFacade
+# (mu-engine), never LocalMemory (mu-local) — so mu_local is forbidden here too, not just
+# mu_server/mu_client (mu_server is COMMERCIAL/multi-tenant, mu_client is the on-device capture
+# daemon; neither lives in this repo, both named per the design's forbidden-modules list, §8).
+[importlinter:contract:mu-engine-server-boundary]
+name = mu-engine-server-boundary (contracts + engine only, never local/server/client)
+type = forbidden
+source_modules =
+    mu_engine_server
+forbidden_modules =
+    mu_server
+    mu_client
     mu_local
