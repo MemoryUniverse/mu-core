@@ -27,7 +27,7 @@ import re
 from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from mu_engine.providers._contracts import LLMProviderPort, Message, MessageRole
 from mu_engine.storage.domain.memory import FactObjectKind, Polarity
@@ -60,6 +60,13 @@ class ExtractionSettings(BaseModel):
     # fewer than this many whitespace-split tokens is dropped before pattern-matching — never a
     # bare literal at the call site (DEV-STANDARDS rule 3).
     min_tokens: int = 3
+    # CONFIG-AND-DATA-FIX-PLAN.md §1.1 Group A: the map-reduce chunk-sizing ratio
+    # (``providers/chunking.py::LongTextChunker._window_texts``'s word-budget fallback,
+    # ``approx = budget_tokens * chunk_token_ratio``, an approx-tokens-per-word factor for the
+    # tokenizer-unavailable path) used to be a bare literal (``* 3 // 4``) inline in that method —
+    # promoted here so ``MU_EXTRACTION__CHUNK_TOKEN_RATIO`` reaches it via ``EngineSettings``
+    # (``build_model_router(..., chunk_token_ratio=...)`` threads it into ``LongTextChunker``).
+    chunk_token_ratio: float = Field(default=0.75, gt=0.0, le=1.0)
 
 
 class ExtractedFact(BaseModel):

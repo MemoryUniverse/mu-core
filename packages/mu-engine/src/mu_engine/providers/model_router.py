@@ -45,6 +45,12 @@ __all__ = ["ModelRouter", "build_model_router"]
 # a unit test) still gets a sane, named default rather than a silent unconfigured 0/None.
 _DEFAULT_CONTEXT_WINDOW = 128_000
 
+# Mirrors ``chunking._DEFAULT_CHUNK_TOKEN_RATIO`` — the live value is DI-threaded from
+# ``EngineSettings.extraction.chunk_token_ratio`` (CONFIG-AND-DATA-FIX-PLAN.md §1.1 Group A) by
+# each composition root; a bare :func:`build_model_router` call (unit tests) still gets the same
+# named default :class:`~mu_engine.providers.chunking.LongTextChunker` itself falls back to.
+_DEFAULT_CHUNK_TOKEN_RATIO = 0.75
+
 
 class ModelRouter:
     """The DI façade implementing the canonical ports (model-layer-spec §2.7)."""
@@ -305,6 +311,7 @@ def build_model_router(
     catalog: ModelCatalogSettings,
     degrade_emitter: DegradeEmitterPort | None = None,
     secret_resolver: Any | None = None,
+    chunk_token_ratio: float = _DEFAULT_CHUNK_TOKEN_RATIO,
 ) -> ModelRouter:
     """Composition root (model-layer-spec §7). Constructs the whole layer from settings ONCE.
 
@@ -315,6 +322,10 @@ def build_model_router(
     NOTE the spec sketches `build_model_router(settings)`; this takes `models`+`catalog` explicitly
     because the central `Settings` tree does not yet carry those siblings (tracked seam in
     settings.py). The plane root passes `settings.models` / `settings.model_catalog` unchanged.
+
+    `chunk_token_ratio` (CONFIG-AND-DATA-FIX-PLAN.md §1.1 Group A) is the ONE knob threaded into
+    the `LongTextChunker` this factory builds; each composition root passes its wired
+    `EngineSettings.extraction.chunk_token_ratio` (`get_engine_settings()`), not a bare literal.
     """
     # L5: load warm singletons ONCE, wrap as CustomLLM handlers (one provider prefix per model_id).
     custom_handlers: list[dict[str, Any]] = []
@@ -356,7 +367,7 @@ def build_model_router(
     return ModelRouter(
         router=router,
         task_map=task_map,
-        chunker=LongTextChunker(),
+        chunker=LongTextChunker(chunk_token_ratio=chunk_token_ratio),
         models=models,
         registry=registry,
         embedder=embedder,

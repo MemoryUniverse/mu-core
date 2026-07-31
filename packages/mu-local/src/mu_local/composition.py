@@ -59,6 +59,7 @@ from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
 from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
 from mu_contracts.ports.time import Clock
+from mu_engine.config import EngineSettings, get_engine_settings
 from mu_engine.lifecycle.conflict import (
     ConflictAdjudicator,
     InMemoryConflictRecordRepository,
@@ -69,7 +70,7 @@ from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate
 from mu_engine.lifecycle.promotion import PromotionService
 from mu_engine.lifecycle.salience import SalienceStrategy
 from mu_engine.lifecycle.settings import LifecycleSettings, ManagerModeSettings
-from mu_engine.pipelines.distill import DistillPipeline, DistillSettings
+from mu_engine.pipelines.distill import DistillPipeline
 from mu_engine.pipelines.ledger import InMemoryStageLedger, StageLedger
 from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import SystemClock
@@ -80,7 +81,6 @@ from mu_engine.providers.embedding import SentenceTransformerEmbedder, build_emb
 from mu_engine.providers.model_router import ModelRouter, build_model_router
 from mu_engine.providers.settings import ModelCatalogSettings, ModelSettings, default_local_catalog
 from mu_engine.services.extract import (
-    ExtractionSettings,
     FactExtractorPort,
     HeuristicSpoExtractor,
     LlmFactExtractor,
@@ -90,7 +90,6 @@ from mu_engine.services.recall import (
     PrincipalAuthorizedIdsResolver,
     RecallAuthorizationFilter,
     RecallService,
-    RecallSettings,
     ReciprocalRankFusion,
     ThreeChannelRecallRanker,
 )
@@ -158,7 +157,19 @@ def _build_llm_catalog(profile: ModelProfileSettings) -> tuple[ModelSettings, Mo
     base (untouched offline MiniLM embedder) — the SAME shape the reference SLM integration test
     builds (``mu-engine/tests/pipelines/test_distill_llm_slm_int.py:163-196``,
     ``_build_slm_catalog``). Every ``ModelSettings`` task field points at ``profile.model_group`` so
-    the ONE deployment satisfies the registry's per-task validation (``registry.py:79-88``)."""
+    the ONE deployment satisfies the registry's per-task validation (``registry.py:79-88``).
+
+    CONFIG-AND-DATA-FIX-PLAN.md §1.2 C1: ``ModelSettings`` is now derived from the WIRED
+    ``get_engine_settings().model`` (``EngineSettings``, C0) via ``model_copy`` rather than
+    constructed bare — every per-task model-group name + ``provider`` still comes from ``profile``
+    (the ONE thing a caller must supply to point at a real SLM deployment), but
+    ``max_output_tokens``/``temperature`` — previously always clobbered by ``profile.max_tokens``/
+    ``profile.temperature`` regardless of what ``ModelSettings`` itself carried — now come from the
+    central tree, so ``MU_MODEL__MAX_OUTPUT_TOKENS``/``MU_MODEL__TEMPERATURE`` are reachable (plan
+    §1.1 Group A). ``profile.max_tokens``/``profile.temperature`` remain the SLM's own per-call
+    extraction params (threaded separately into ``ExtractionSettings`` at the ``LlmFactExtractor``
+    call site below) — a deliberately DIFFERENT knob from the general answer/adjudicate default.
+    """
     provider = ProviderRecord(
         key=profile.provider_key,
         kind=ProviderKind.LOCAL_HTTP,
@@ -173,19 +184,20 @@ def _build_llm_catalog(profile: ModelProfileSettings) -> tuple[ModelSettings, Mo
         kind=ModelKind.LLM,
         extra_params={"api_key": profile.api_key},  # passthrough seam (catalog.py:94), not a secret
     )
-    base = default_local_catalog()
-    catalog = base.model_copy(update={"providers": [provider], "deployments": [deployment]})
-    models = ModelSettings(
-        provider=profile.provider_key,
-        answer_model=profile.model_group,
-        adjudicate_model=profile.model_group,
-        hard_extract_model=profile.model_group,
-        routine_extract_model=profile.model_group,
-        summarize_model=profile.model_group,
-        classify_model=profile.model_group,
-        rerank_model=profile.model_group,
-        max_output_tokens=profile.max_tokens,
-        temperature=profile.temperature,
+    catalog_base = default_local_catalog()
+    catalog = catalog_base.model_copy(update={"providers": [provider], "deployments": [deployment]})
+    model_defaults = get_engine_settings().model
+    models = model_defaults.model_copy(
+        update={
+            "provider": profile.provider_key,
+            "answer_model": profile.model_group,
+            "adjudicate_model": profile.model_group,
+            "hard_extract_model": profile.model_group,
+            "routine_extract_model": profile.model_group,
+            "summarize_model": profile.model_group,
+            "classify_model": profile.model_group,
+            "rerank_model": profile.model_group,
+        }
     )
     return models, catalog
 
@@ -198,12 +210,20 @@ class LocalContainer:
         storage: StorageSettings,
         *,
         settings: Settings | None = None,
+        engine_settings: EngineSettings | None = None,
         observability: ObservabilitySettings | None = None,
         lifecycle: LifecycleSettings | None = None,
         stage_ledger: StageLedger | None = None,
         conflict_records: ConflictRecordRepository | None = None,
     ) -> None:
         self._settings: Settings = settings or get_settings()
+        # CONFIG-AND-DATA-FIX-PLAN.md §1.2 C1: the ONE wired ``EngineSettings`` (C0) read here —
+        # every intelligence-knob subtree below (`recall`, `distill`, `ingest`, `lifecycle`,
+        # `model`) is pulled FROM this instance instead of being constructed bare, so
+        # `MU_RECALL__…`/`MU_LIFECYCLE__…`/`MU_INGEST__…`/`MU_DISTILL__…`/`MU_MODEL__…` env
+        # overrides actually reach the composed pipelines. Injectable (mirrors `settings` above)
+        # so a caller/test can pass an already-constructed instance without touching os.environ.
+        self._engine_settings: EngineSettings = engine_settings or get_engine_settings()
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._obs: ObservabilitySettings = observability or ObservabilitySettings()
         # Injection seam (design §13 item 6a): a durable caller (e.g. mu-engine-server, Stage C)
@@ -285,11 +305,18 @@ class LocalContainer:
         self._extractor: FactExtractorPort = HeuristicSpoExtractor()
         if storage.llm is not None:
             self.llm = self._build_llm_router(storage.llm)
+            # C1: base on the WIRED `EngineSettings.extraction` (so `MU_EXTRACTION__MIN_TOKENS`/
+            # `MU_EXTRACTION__CHUNK_TOKEN_RATIO` reach this extractor too) — `max_tokens`/
+            # `temperature` still come from the SLM profile (the per-call params for THIS specific
+            # deployed model), same as before.
             self._extractor = LlmFactExtractor(
                 self.llm,
                 model_group=storage.llm.model_group,
-                settings=ExtractionSettings(
-                    max_tokens=storage.llm.max_tokens, temperature=storage.llm.temperature
+                settings=self._engine_settings.extraction.model_copy(
+                    update={
+                        "max_tokens": storage.llm.max_tokens,
+                        "temperature": storage.llm.temperature,
+                    }
                 ),
             )
 
@@ -319,8 +346,19 @@ class LocalContainer:
         #      ``LocalContainer(..., lifecycle=LifecycleSettings(manager_mode=ManagerModeSettings(
         #      default_mode="managed")))`` — this default is a mu-local composition-root choice,
         #      not a re-derivation of the canonical settings default (that default is untouched).
-        self.lifecycle_settings: LifecycleSettings = lifecycle or LifecycleSettings(
-            manager_mode=ManagerModeSettings(default_mode=ManagerMode.MANUAL.value)
+        #
+        #      C1 (CONFIG-AND-DATA-FIX-PLAN.md §1.2): every OTHER field (`salience`, `retention`,
+        #      promote/demote thresholds, cadence, adjudication budget, …) now comes from the
+        #      WIRED `EngineSettings.lifecycle` (env-overridable, e.g.
+        #      `MU_LIFECYCLE__SALIENCE__W_RECENCY`, `MU_LIFECYCLE__PROMOTE_STM_MTM`) instead of a
+        #      bare `LifecycleSettings()`; only `manager_mode` keeps this composition-root's
+        #      deliberate MANUAL narrowing (a structural fact about this daemonless container, not
+        #      an operator-tunable knob — unchanged from before this fix).
+        self.lifecycle_settings: LifecycleSettings = (
+            lifecycle
+            or self._engine_settings.lifecycle.model_copy(
+                update={"manager_mode": ManagerModeSettings(default_mode=ManagerMode.MANUAL.value)}
+            )
         )
         self.mode_gate: ManagerModeGate = ManagerModeGate(
             self.lifecycle_settings.manager_mode,
@@ -343,7 +381,10 @@ class LocalContainer:
         #      (design §13 item 6a/6b; no durable implementation exists in-tree yet, item 6b).
         #      Every daemonless/embedded caller here omits it and gets this in-process default,
         #      unchanged (AG-1).
-        self._distill_settings = DistillSettings()
+        #
+        #      C1: from the WIRED `EngineSettings.distill` (`MU_DISTILL__SUPERSEDE_CONFIDENCE`,
+        #      `MU_DISTILL__USE_LLM_ADJUDICATOR`, …) instead of a bare `DistillSettings()`.
+        self._distill_settings = self._engine_settings.distill
         self.conflict_adjudicator: ConflictAdjudicator | None = None
         if self.llm is not None and self._distill_settings.use_llm_adjudicator:
             self.conflict_adjudicator = build_conflict_adjudicator(
@@ -357,6 +398,10 @@ class LocalContainer:
 
         # (8) application services — each facade verb delegates to exactly one of these; each gets
         #     the wired sinks so its meaningful op emits spans/metrics/audit (never silently no-op).
+        # C1: `settings=` threaded from the WIRED `EngineSettings.ingest` — previously omitted
+        # entirely, so `IngestService`/`DeterministicPromoteStage` fell back to a bare
+        # `IngestSettings()` (`services/ingest.py:96`) and `importance_promote`/`mention_promote`/
+        # `stm_ttl_s` were unreachable from the environment (plan §1.1 Group A).
         self.ingest = IngestService(
             stm=self.stm,
             mtm=self.mtm,
@@ -364,6 +409,7 @@ class LocalContainer:
             bus=self._bus,
             ledger=self._ledger,
             clock=self._clock,
+            settings=self._engine_settings.ingest,
             tracer=self.tracer,
             metrics=self.metrics,
             audit=self.audit,
@@ -380,7 +426,11 @@ class LocalContainer:
             audit=self.audit,
             adjudicator=self.conflict_adjudicator,
         )
-        recall_settings = RecallSettings()
+        # C1: from the WIRED `EngineSettings.recall` (`MU_RECALL__WEIGHT_MTM`,
+        # `MU_RECALL__RRF_K`, `MU_RECALL__FLOOR_PROTECT_LIMIT`, …) — the exact class the
+        # `02fbed9` `recency_floor_limit` bug lived in, previously unreachable from bare
+        # `RecallSettings()`.
+        recall_settings = self._engine_settings.recall
         fusion = ReciprocalRankFusion()
         ranker = ThreeChannelRecallRanker(
             stm=self.stm,
@@ -546,12 +596,20 @@ class LocalContainer:
             )
         return embedder
 
-    @staticmethod
-    def _build_llm_router(profile: ModelProfileSettings) -> ModelRouter:
+    def _build_llm_router(self, profile: ModelProfileSettings) -> ModelRouter:
         """Build the REAL ``ModelRouter`` for a configured LLM profile via the ONE model-layer
-        composition entry point (``build_model_router``, model-router.py:302)."""
+        composition entry point (``build_model_router``, model-router.py:302).
+
+        C1: threads `chunk_token_ratio` from the WIRED `EngineSettings.extraction` (was a bare
+        `LongTextChunker()`/hardcoded `* 3 // 4` in `chunking.py`, plan §1.1 Group A) — no longer
+        a `@staticmethod` so it can read `self._engine_settings`.
+        """
         models, catalog = _build_llm_catalog(profile)
-        return build_model_router(models=models, catalog=catalog)
+        return build_model_router(
+            models=models,
+            catalog=catalog,
+            chunk_token_ratio=self._engine_settings.extraction.chunk_token_ratio,
+        )
 
     def _kv_cfg(self, choice: BackendChoice) -> dict[str, Any]:
         """``STORE_REGISTRY.build("kv", ...)`` kwargs (spec §3.2). Only the ``redis`` factory has

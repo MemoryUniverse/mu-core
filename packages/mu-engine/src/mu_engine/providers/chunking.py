@@ -22,15 +22,32 @@ _REDUCE_INSTRUCTION = (
     "Combine them into one coherent result that satisfies the original request."
 )
 
+# Constructor DEFAULT only (DEV-STANDARDS rule 3: no hardcoded constant lives in chunking LOGIC).
+# The live value is DI-threaded from the central Settings tree (``EngineSettings.extraction.
+# chunk_token_ratio``, CONFIG-AND-DATA-FIX-PLAN.md §1.1 Group A) by ``build_model_router`` /
+# each composition root; a bare ``LongTextChunker()`` (e.g. in a unit test) still gets this sane,
+# named default rather than a silent unconfigured 0.
+_DEFAULT_CHUNK_TOKEN_RATIO = 0.75
+
 
 class LongTextChunker:
     """Token-budgeted map-reduce over the Router's own completion path (§2.6)."""
 
-    def __init__(self, *, headroom_tokens: int = 512, count_model: str = "gpt-4o") -> None:
+    def __init__(
+        self,
+        *,
+        headroom_tokens: int = 512,
+        count_model: str = "gpt-4o",
+        chunk_token_ratio: float = _DEFAULT_CHUNK_TOKEN_RATIO,
+    ) -> None:
         # `count_model` only selects a TOKENIZER for measurement; it is never CALLED. gpt-4o's
         # tiktoken encoding is a safe measurement default and works offline.
         self._headroom = headroom_tokens
         self._count_model = count_model
+        # Approx-tokens-per-word factor for the tokenizer-unavailable word-split fallback
+        # (``_window_texts`` below) — was a bare ``* 3 // 4`` literal inline; now the ONE
+        # composition-root-DI'd knob (``MU_EXTRACTION__CHUNK_TOKEN_RATIO``).
+        self._chunk_token_ratio = chunk_token_ratio
 
     def _count(self, messages: Sequence[Message]) -> int:
         import litellm
@@ -59,9 +76,10 @@ class LongTextChunker:
             ]
             return [litellm.decode(model=self._count_model, tokens=w) for w in windows]
         except Exception:
-            # Fallback: greedy word-budget (approx 1 token ~= 0.75 words); deterministic.
+            # Fallback: greedy word-budget (approx 1 token ~= `chunk_token_ratio` words);
+            # deterministic.
             words = text.split()
-            approx = max(1, int(budget_tokens * 3 // 4))
+            approx = max(1, int(budget_tokens * self._chunk_token_ratio))
             return [" ".join(words[i : i + approx]) for i in range(0, len(words), approx)] or [""]
 
     async def map_reduce(

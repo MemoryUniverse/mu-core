@@ -63,12 +63,13 @@ from mu_contracts.domain.model.memory import Namespace as _Namespace
 from mu_contracts.domain.model.memory import Visibility as _NsVisibility
 from mu_contracts.domain.model.recall import CallerIdentitySet
 from mu_contracts.ports.time import Clock
+from mu_engine.config import EngineSettings, get_engine_settings
 from mu_engine.lifecycle.conflict import ConflictAdjudicator, build_conflict_adjudicator
 from mu_engine.lifecycle.conflict_redis import ConflictRedisSettings, RedisConflictRecordRepository
 from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate
-from mu_engine.lifecycle.settings import LifecycleSettings, ManagerModeSettings
-from mu_engine.pipelines.distill import DistillPipeline, DistillSettings
-from mu_engine.pipelines.ledger import LedgerSettings, RedisStageLedger
+from mu_engine.lifecycle.settings import ManagerModeSettings
+from mu_engine.pipelines.distill import DistillPipeline
+from mu_engine.pipelines.ledger import RedisStageLedger
 from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import SystemClock
 from mu_engine.platform.observability import build_audit, build_metrics, build_tracer
@@ -78,7 +79,6 @@ from mu_engine.providers.embedding import SentenceTransformerEmbedder, build_emb
 from mu_engine.providers.model_router import ModelRouter, build_model_router
 from mu_engine.providers.settings import ModelCatalogSettings, ModelSettings, default_local_catalog
 from mu_engine.services.extract import (
-    ExtractionSettings,
     FactExtractorPort,
     HeuristicSpoExtractor,
     LlmFactExtractor,
@@ -88,7 +88,6 @@ from mu_engine.services.recall import (
     PrincipalAuthorizedIdsResolver,
     RecallAuthorizationFilter,
     RecallService,
-    RecallSettings,
     ReciprocalRankFusion,
     ThreeChannelRecallRanker,
 )
@@ -154,7 +153,14 @@ def _build_llm_catalog(profile: SlmProfile) -> tuple[ModelSettings, ModelCatalog
     """PORT of ``mu_local.composition._build_llm_catalog`` (module-level function, no ``mu_local``
     state — reads only its ``profile`` argument), layering ONE ``ProviderKind.LOCAL_HTTP``
     deployment onto ``default_local_catalog()`` — the same shape the reference SLM integration
-    test builds (``mu-engine/tests/pipelines/test_distill_llm_slm_int.py:163-196``)."""
+    test builds (``mu-engine/tests/pipelines/test_distill_llm_slm_int.py:163-196``).
+
+    CONFIG-AND-DATA-FIX-PLAN.md §1.2 C1 (mirrors the identical fix in ``mu_local.composition``):
+    ``ModelSettings`` is derived from the WIRED ``get_engine_settings().model`` via ``model_copy``
+    instead of constructed bare, so ``MU_MODEL__MAX_OUTPUT_TOKENS``/``MU_MODEL__TEMPERATURE`` are
+    reachable — ``profile.max_tokens``/``profile.temperature`` stay the SLM's own per-call
+    extraction params (threaded into ``ExtractionSettings`` separately, unchanged).
+    """
     provider = ProviderRecord(
         key=profile.provider_key,
         kind=ProviderKind.LOCAL_HTTP,
@@ -169,19 +175,20 @@ def _build_llm_catalog(profile: SlmProfile) -> tuple[ModelSettings, ModelCatalog
         kind=ModelKind.LLM,
         extra_params={"api_key": profile.api_key},
     )
-    base = default_local_catalog()
-    catalog = base.model_copy(update={"providers": [provider], "deployments": [deployment]})
-    models = ModelSettings(
-        provider=profile.provider_key,
-        answer_model=profile.model_group,
-        adjudicate_model=profile.model_group,
-        hard_extract_model=profile.model_group,
-        routine_extract_model=profile.model_group,
-        summarize_model=profile.model_group,
-        classify_model=profile.model_group,
-        rerank_model=profile.model_group,
-        max_output_tokens=profile.max_tokens,
-        temperature=profile.temperature,
+    catalog_base = default_local_catalog()
+    catalog = catalog_base.model_copy(update={"providers": [provider], "deployments": [deployment]})
+    model_defaults = get_engine_settings().model
+    models = model_defaults.model_copy(
+        update={
+            "provider": profile.provider_key,
+            "answer_model": profile.model_group,
+            "adjudicate_model": profile.model_group,
+            "hard_extract_model": profile.model_group,
+            "routine_extract_model": profile.model_group,
+            "summarize_model": profile.model_group,
+            "classify_model": profile.model_group,
+            "rerank_model": profile.model_group,
+        }
     )
     return models, catalog
 
@@ -198,8 +205,18 @@ class EngineContainer:
     the numbered comments below are the SAME step numbers that file uses.
     """
 
-    def __init__(self, settings: EngineServerSettings) -> None:
+    def __init__(
+        self, settings: EngineServerSettings, *, engine_settings: EngineSettings | None = None
+    ) -> None:
         self._settings = settings
+        # CONFIG-AND-DATA-FIX-PLAN.md §1.2 C1: the SAME central ``EngineSettings`` root
+        # ``mu_local.composition.LocalContainer`` reads (C0) — endpoints stay on
+        # ``EngineServerSettings`` (module docstring), but every intelligence knob (`recall`,
+        # `distill`, `ingest`, `lifecycle`, `model`, `ledger`) is pulled FROM this instance below
+        # instead of being constructed bare, so the SAME `MU_RECALL__…`/`MU_LIFECYCLE__…`/
+        # `MU_INGEST__…`/`MU_DISTILL__…`/`MU_MODEL__…`/`MU_LEDGER__…` env overrides reach this
+        # deployable too. Injectable for tests, mirrors `settings` above.
+        self._engine_settings: EngineSettings = engine_settings or get_engine_settings()
         self._closers: list[Callable[[], Awaitable[None]]] = []
 
         # (0) fail-loud mandatory-role validation — this root's four backends are FIXED (module
@@ -232,8 +249,9 @@ class EngineContainer:
         #      wrapped client for reuse) — registered as its own closer below.
         self.redis: Redis = Redis.from_url(settings.valkey.url)
         self._register_closer(self.redis)
+        # C1: from the WIRED `EngineSettings.ledger` instead of a bare `LedgerSettings()`.
         self.ledger: RedisStageLedger = RedisStageLedger(
-            self.redis, key_prefix=settings.ledger_key_prefix, settings=LedgerSettings()
+            self.redis, key_prefix=settings.ledger_key_prefix, settings=self._engine_settings.ledger
         )
         self.conflict_records: RedisConflictRecordRepository = RedisConflictRecordRepository(
             self.redis, key_prefix=settings.conflict_key_prefix, settings=ConflictRedisSettings()
@@ -263,11 +281,17 @@ class EngineContainer:
         self._extractor: FactExtractorPort = HeuristicSpoExtractor()
         if settings.llm.enabled:
             self.llm = self._build_llm_router(settings.llm)
+            # C1: base on the WIRED `EngineSettings.extraction` (mirrors the identical fix in
+            # `mu_local.composition`) — `max_tokens`/`temperature` still come from the SLM
+            # profile (the per-call params for THIS deployed model), unchanged.
             self._extractor = LlmFactExtractor(
                 self.llm,
                 model_group=settings.llm.model_group,
-                settings=ExtractionSettings(
-                    max_tokens=settings.llm.max_tokens, temperature=settings.llm.temperature
+                settings=self._engine_settings.extraction.model_copy(
+                    update={
+                        "max_tokens": settings.llm.max_tokens,
+                        "temperature": settings.llm.temperature,
+                    }
                 ),
             )
 
@@ -281,8 +305,12 @@ class EngineContainer:
 
         # (7b) manager-mode gate — MANUAL default (mirrors LocalContainer's own narrowing:
         #      no MaintenanceLoop/daemon runs the auto sweep here either).
-        self.lifecycle_settings = LifecycleSettings(
-            manager_mode=ManagerModeSettings(default_mode=ManagerMode.MANUAL.value)
+        # C1: every OTHER lifecycle field wired from the WIRED `EngineSettings.lifecycle`
+        # (`MU_LIFECYCLE__SALIENCE__W_RECENCY`, `MU_LIFECYCLE__PROMOTE_STM_MTM`, …); only
+        # `manager_mode` keeps this composition root's deliberate MANUAL narrowing (structural,
+        # not operator-tunable — mirrors `mu_local.composition.LocalContainer`, unchanged).
+        self.lifecycle_settings = self._engine_settings.lifecycle.model_copy(
+            update={"manager_mode": ManagerModeSettings(default_mode=ManagerMode.MANUAL.value)}
         )
         self.mode_gate: ManagerModeGate = ManagerModeGate(
             self.lifecycle_settings.manager_mode,
@@ -292,7 +320,8 @@ class EngineContainer:
         # (7c) LLM-judged conflict adjudicator, gated the same way DISTILL's extractor is — wired
         #      against C1's DURABLE RedisConflictRecordRepository (item 6c), never the in-process
         #      InMemoryConflictRecordRepository LocalContainer defaults to.
-        self._distill_settings = DistillSettings()
+        # C1: from the WIRED `EngineSettings.distill` instead of a bare `DistillSettings()`.
+        self._distill_settings = self._engine_settings.distill
         self.conflict_adjudicator: ConflictAdjudicator | None = None
         if self.llm is not None and self._distill_settings.use_llm_adjudicator:
             self.conflict_adjudicator = build_conflict_adjudicator(
@@ -304,6 +333,9 @@ class EngineContainer:
             )
 
         # (8) application services — each SurfaceFacade verb delegates to exactly one of these.
+        # C1: `settings=` threaded from the WIRED `EngineSettings.ingest` — previously omitted
+        # entirely (same gap as `mu_local.composition`), so `importance_promote`/
+        # `mention_promote`/`stm_ttl_s` were unreachable from the environment.
         self.ingest = IngestService(
             stm=self.stm,
             mtm=self.mtm,
@@ -311,6 +343,7 @@ class EngineContainer:
             bus=self._bus,
             ledger=self.ledger,
             clock=self._clock,
+            settings=self._engine_settings.ingest,
             tracer=self.tracer,
             metrics=self.metrics,
             audit=self.audit,
@@ -327,7 +360,9 @@ class EngineContainer:
             audit=self.audit,
             adjudicator=self.conflict_adjudicator,
         )
-        recall_settings = RecallSettings()
+        # C1: from the WIRED `EngineSettings.recall` instead of a bare `RecallSettings()` — the
+        # exact class the `02fbed9` `recency_floor_limit` bug lived in.
+        recall_settings = self._engine_settings.recall
         fusion = ReciprocalRankFusion()
         ranker = ThreeChannelRecallRanker(
             stm=self.stm,
@@ -389,10 +424,16 @@ class EngineContainer:
             )
         return embedder
 
-    @staticmethod
-    def _build_llm_router(profile: SlmProfile) -> ModelRouter:
+    def _build_llm_router(self, profile: SlmProfile) -> ModelRouter:
+        """C1: threads `chunk_token_ratio` from the WIRED `EngineSettings.extraction` (mirrors
+        the identical fix in `mu_local.composition`) — no longer a `@staticmethod` so it can read
+        `self._engine_settings`."""
         models, catalog = _build_llm_catalog(profile)
-        return build_model_router(models=models, catalog=catalog)
+        return build_model_router(
+            models=models,
+            catalog=catalog,
+            chunk_token_ratio=self._engine_settings.extraction.chunk_token_ratio,
+        )
 
     def _register_closer(self, adapter: object, *client_paths: str) -> None:
         closer = self._resolve_closer(adapter, *client_paths)
