@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from mu_contracts.domain.model.recall import CallerIdentitySet, Vector
+from mu_contracts.domain.model.recall import Vector
 from mu_engine.platform.clock import FrozenClock
 from mu_engine.services.recall.dto import RecallChannels, RecallSettings
 from mu_engine.services.recall.fusion import ReciprocalRankFusion
