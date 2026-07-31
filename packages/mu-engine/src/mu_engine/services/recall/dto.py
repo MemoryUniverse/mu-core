@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -171,3 +172,24 @@ class RecallSettings(BaseModel):
     # override: ``MU_RECALL__CROSS_TIER_DEDUP=false`` reverts to the pre-fix behavior (duplicates
     # allowed through) for A/B comparison (DEV-STANDARDS rule 3).
     cross_tier_dedup: bool = Field(default=True)
+
+    # D1 STM relevance scoring (DATA-QUALITY-ASSESSMENT.md §3.1, floor-fix follow-up to 02fbed9):
+    # ``recency_floor_limit``/``floor_protect_limit`` bound HOW MANY STM candidates enter the fuse
+    # and HOW MANY are unconditionally protected — but the candidates themselves still carried NO
+    # relevance signal of their own; the STM channel entered RRF ordered by RECENCY RANK ONLY
+    # (``StmTierRepository.recent`` newest-first). Within one session a targeted query and a
+    # nonsense query therefore still surfaced a near-identical STM-dominated list: the floor
+    # protected the right COUNT of items but always the same (most-recent) ones, in the same
+    # order, regardless of query. ``stm_scoring`` selects the per-candidate relevance mechanism
+    # ``ThreeChannelRecallRanker`` applies BEFORE fusing/protecting the STM channel:
+    #   * "embed" (DEFAULT) — cosine-rank STM candidate content against the query vector using the
+    #     SAME ``EmbeddingPort`` (MiniLM) the MTM channel is already embedded with (embedded once
+    #     at the ``RecallService`` façade boundary, §6-P2/m4) — cheapest-correct, no separate model.
+    #   * "lexical" — token-overlap score against the raw query text; minimum-viable fallback that
+    #     needs no embedder wired (e.g. an embedder-less composition root).
+    #   * "recency" — explicit opt-out: PRE-fix behavior, list order stays the adapter's recency
+    #     order with no relevance signal (A/B comparison / rollback, DEV-STANDARDS rule 3).
+    # Env override: ``MU_RECALL__STM_SCORING=lexical`` (or ``recency``). Selecting "embed" with no
+    # embedder injected into the ranker is a FAIL-LOUD misconfiguration (``StmScoringConfigError``),
+    # never a silent recency fallback (§5 "re-raise loud, not a silent partial").
+    stm_scoring: Literal["embed", "lexical", "recency"] = "embed"

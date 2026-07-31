@@ -150,13 +150,21 @@ async def test_functional_supersession_invalidates_loser_across_ltm_and_mtm(
     t_now = datetime(2024, 1, 1, tzinfo=UTC)
 
     # (1) loser: an MTM-resident raw memory, distilled into an LTM fact (derived_from == its id).
-    loser_src = make_item(ns, "Ada works at Acme", valid_at=t_old, tier=MemoryTier.MTM)
+    # `created_at=t_old` (Rank 5 same-batch chronology fix): this is UNSTRUCTURED content, so the
+    # extracted fact's `valid_at` now anchors on `loser_src.created_at` (real source-message
+    # timestamp), not the raw item's own `valid_at` field (never read by `_fact_to_item`) nor the
+    # pipeline clock — pin it explicitly so `facts_at(ns, t_old, ...)` below still finds it.
+    loser_src = make_item(
+        ns, "Ada works at Acme", valid_at=t_old, tier=MemoryTier.MTM, created_at=t_old
+    )
     await mtm.upsert(loser_src)
     await _pipeline(ltm, now=t_old, mtm=mtm).distill(ns, [loser_src])
     assert await _mtm_point_state(qdrant_client, ns, loser_src.id, dim=dim) == "active"
 
     # (2) a later contradicting raw memory supersedes it (functional predicate, different object).
-    winner_src = make_item(ns, "Ada works at Globex", valid_at=t_now, tier=MemoryTier.MTM)
+    winner_src = make_item(
+        ns, "Ada works at Globex", valid_at=t_now, tier=MemoryTier.MTM, created_at=t_now
+    )
     await mtm.upsert(winner_src)
     report = await _pipeline(ltm, now=t_now, mtm=mtm).distill(ns, [winner_src])
 
@@ -309,12 +317,23 @@ async def test_distill_change_verb_v2_supersedes_v1_gold_flight_pair(
     t_old = datetime(2019, 1, 1, tzinfo=UTC)
     t_now = datetime(2024, 1, 1, tzinfo=UTC)
 
-    v1 = make_item(ns, "Ada's flight to the Denver offsite is on Tuesday.", valid_at=t_old)
+    # `created_at=t_old`/`t_now` (Rank 5 same-batch chronology fix): UNSTRUCTURED content, so
+    # each extracted fact's `valid_at` now anchors on the source message's OWN `created_at`
+    # (real STM timestamp), not the pipeline clock — pin it explicitly so `facts_at(ns, t_old,
+    # ...)` below still finds v1's fact exactly at `t_old`.
+    v1 = make_item(
+        ns, "Ada's flight to the Denver offsite is on Tuesday.", valid_at=t_old, created_at=t_old
+    )
     report_v1 = await _pipeline(ltm, now=t_old).distill(ns, [v1])
     assert report_v1.facts_extracted == 1
     assert report_v1.added == 1
 
-    v2 = make_item(ns, "Ada moved her flight to the Denver offsite to Thursday.", valid_at=t_now)
+    v2 = make_item(
+        ns,
+        "Ada moved her flight to the Denver offsite to Thursday.",
+        valid_at=t_now,
+        created_at=t_now,
+    )
     report_v2 = await _pipeline(ltm, now=t_now).distill(ns, [v2])
 
     assert report_v2.facts_extracted == 1
@@ -450,3 +469,126 @@ async def test_distill_noop_reinforce_of_stale_message_does_not_undo_same_batch_
     live = await ltm.graph_recall(ns, subject="Ada", limit=10)
     assert {h.item.object for h in live} == {"Globex"}
     assert len(live) == 1
+
+
+# --------------------------------------------------------------------------------------------
+# Rank 5 (data-quality) SAME-BATCH CHRONOLOGY: root-cause was `_collect_facts` stamping ONE
+# shared window `now` as every extracted fact's `valid_at` fallback — two same-(subject,
+# predicate) facts from two DIFFERENT source messages landing in the SAME `distill()` window
+# collided on an IDENTICAL `valid_at`, a tie `_heuristic_only_verdict`'s bare `>` comparison
+# silently broke toward whichever fact happened to be resolved LAST (window order), not
+# whichever was genuinely more recent. Fixed: each fact now anchors on ITS OWN source
+# message's real `item.created_at` (mirrors the real STM `add()` timestamp — the same value
+# STM's own recency ZSET already scores by, `redis_stm.py::_put_impl`). The three pairs below
+# are the exact D5-quick gold pairs (`test_extract_change_verbs_unit.py`), each genuinely
+# single-cardinality (all three predicates are in `DistillSettings.functional_predicates`).
+# --------------------------------------------------------------------------------------------
+
+_GOLD_PAIRS = (
+    # (subject, predicate, v1_text, v1_object, v2_text, v2_object)
+    # NOTE: "Ada" is the subject of BOTH the flight and hotel pairs (deliberately, matching the
+    # real gold set) — `predicate` is carried alongside so assertions below can filter on
+    # (subject, predicate) and never conflate the two same-subject facts with each other.
+    (
+        "Ada",
+        "flight",
+        "Ada's flight to the Denver offsite is on Tuesday.",
+        "Tuesday",
+        "Ada moved her flight to the Denver offsite to Thursday.",
+        "Thursday",
+    ),
+    (
+        "The Q3 planning meeting",
+        "is",
+        "The Q3 planning meeting is in Room A.",
+        "Room A",
+        "The Q3 planning meeting was moved to Room B.",
+        "Room B",
+    ),
+    (
+        "Ada",
+        "hotel",
+        "Ada's hotel in Tokyo is the Park Hyatt.",
+        "Park Hyatt",
+        "Ada's hotel booking changed to the Aman Tokyo.",
+        "Aman Tokyo",
+    ),
+)
+
+
+async def test_distill_same_batch_newer_wins_all_three_gold_pairs_recency_first_order(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """SAME-BATCH, recency-first window order (the real ``stm.recent()`` shape, ``zrevrange`` ->
+    newest member first): a SINGLE ``distill()`` call sees BOTH v1 and v2 of all three gold
+    pairs at once, v2 (the genuinely newer source message, later ``created_at``) listed FIRST in
+    the window. Before the fix this order made v2 resolve FIRST (a clean ADD, no live candidate
+    yet) then v1 resolve SECOND against v2's now-active node with a TIED ``valid_at`` — the tie
+    defaulted to SUPERSEDE in v1's (the currently-resolving incoming fact's) favour, i.e.
+    BACKWARDS. After the fix v1's later resolve correctly SELF_EXPIREs against the genuinely
+    more-recent v2 candidate instead."""
+    ns = make_ns()
+    t_old = datetime(2019, 1, 1, tzinfo=UTC)
+    t_now = datetime(2024, 1, 1, tzinfo=UTC)
+
+    window = []
+    for _subject, _predicate, v1_text, _v1_obj, v2_text, _v2_obj in _GOLD_PAIRS:
+        window.append(make_item(ns, v2_text, created_at=t_now))  # newer FIRST (recency-first)
+        window.append(make_item(ns, v1_text, created_at=t_old))  # older SECOND
+
+    report = await _pipeline(ltm, now=t_now).distill(ns, window)
+
+    assert report.facts_extracted == 6
+    assert report.superseded == 3
+
+    for subject, predicate, _v1_text, v1_obj, _v2_text, v2_obj in _GOLD_PAIRS:
+        live = {
+            h.item.object
+            for h in await ltm.graph_recall(ns, subject=subject, predicate=predicate, limit=10)
+        }
+        assert live == {v2_obj}, f"{subject}/{predicate}: expected active={v2_obj!r}, got {live!r}"
+        hist = {
+            f.object
+            for f in await ltm.facts_at(ns, t_old, subject=subject)
+            if f.predicate == predicate
+        }
+        assert hist == {v1_obj}, f"{subject}/{predicate}: expected history={v1_obj!r}, got {hist!r}"
+
+
+async def test_distill_same_batch_newer_wins_all_three_gold_pairs_reverse_order(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """Same SAME-BATCH setup, window order REVERSED (v1 listed first, v2 second) — proves the
+    fix is direction-independent (the task's "regardless of resolve order" requirement), not an
+    accidental side effect of one particular iteration order. Now v1 resolves first (clean ADD)
+    and v2 resolves second, correctly SUPERSEDING v1 (v2's own `valid_at` is genuinely later)."""
+    ns = make_ns()
+    t_old = datetime(2019, 1, 1, tzinfo=UTC)
+    t_now = datetime(2024, 1, 1, tzinfo=UTC)
+
+    window = []
+    for _subject, _predicate, v1_text, _v1_obj, v2_text, _v2_obj in _GOLD_PAIRS:
+        window.append(make_item(ns, v1_text, created_at=t_old))  # older FIRST (reversed order)
+        window.append(make_item(ns, v2_text, created_at=t_now))  # newer SECOND
+
+    report = await _pipeline(ltm, now=t_now).distill(ns, window)
+
+    assert report.facts_extracted == 6
+    assert report.superseded == 3
+
+    for subject, predicate, _v1_text, v1_obj, _v2_text, v2_obj in _GOLD_PAIRS:
+        live = {
+            h.item.object
+            for h in await ltm.graph_recall(ns, subject=subject, predicate=predicate, limit=10)
+        }
+        assert live == {v2_obj}, f"{subject}/{predicate}: expected active={v2_obj!r}, got {live!r}"
+        hist = {
+            f.object
+            for f in await ltm.facts_at(ns, t_old, subject=subject)
+            if f.predicate == predicate
+        }
+        assert hist == {v1_obj}, f"{subject}/{predicate}: expected history={v1_obj!r}, got {hist!r}"

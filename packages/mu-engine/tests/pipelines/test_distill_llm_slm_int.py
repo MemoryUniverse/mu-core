@@ -207,9 +207,7 @@ def _build_slm_catalog(cfg: SlmTestSettings) -> tuple[ModelSettings, ModelCatalo
 def embedder() -> SentenceTransformerEmbedder:
     # REAL MiniLM, loaded ONCE per module (heavy) — same config shape as tests/services/conftest.py.
     return SentenceTransformerEmbedder(
-        WarmLocalConfig(
-            model_id="minilm_local", kind=ModelKind.EMBED, model_load_path=_MINILM
-        )
+        WarmLocalConfig(model_id="minilm_local", kind=ModelKind.EMBED, model_load_path=_MINILM)
     )
 
 
@@ -299,6 +297,9 @@ def recall_service(
         fusion=fusion,
         settings=recall_settings,
         clock=clock,
+        # D1: wire the REAL MiniLM embedder already available in this fixture so
+        # `settings.stm_scoring="embed"` (the default) works exactly as it does in production.
+        embedder=embedder,
     )
     authz = RecallAuthorizationFilter(
         tenancy=DefaultTenancyGuard(), authorized_ids=PrincipalAuthorizedIdsResolver()

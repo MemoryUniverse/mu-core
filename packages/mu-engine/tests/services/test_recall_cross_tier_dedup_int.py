@@ -63,7 +63,10 @@ def uid() -> str:
 
 def _ns(uid: str) -> Namespace:
     return Namespace(
-        org=f"org{uid}", workspace=f"ws{uid}", user=_USER, session=_SESSION,
+        org=f"org{uid}",
+        workspace=f"ws{uid}",
+        user=_USER,
+        session=_SESSION,
         visibility=Visibility.PRIVATE,
     )
 
@@ -98,8 +101,12 @@ def _duplicate_pair(ns: Namespace, text: str) -> tuple[MemoryItem, MemoryItem]:
 
 
 async def _teardown_stores(
-    settings: Settings, redis_client: Redis, qdrant_client: AsyncQdrantClient, falkor_db: FalkorDB,
-    *, uid: str,
+    settings: Settings,
+    redis_client: Redis,
+    qdrant_client: AsyncQdrantClient,
+    falkor_db: FalkorDB,
+    *,
+    uid: str,
 ) -> None:
     keys = [k async for k in redis_client.scan_iter(match=f"*{uid}*".encode())]
     if keys:
@@ -138,14 +145,25 @@ async def _rank_with(
         await ltm.upsert_fact(ltm_item)
 
         ranker = ThreeChannelRecallRanker(
-            stm=stm, mtm=mtm, ltm=ltm,
+            stm=stm,
+            mtm=mtm,
+            ltm=ltm,
             fusion=ReciprocalRankFusion(),
-            settings=RecallSettings(cross_tier_dedup=cross_tier_dedup),
+            # D1 (§3.1 follow-up): this tier proves the D4 content_hash dedup ONLY — pin
+            # `stm_scoring="recency"` so a bare `ThreeChannelRecallRanker(...)` with no injected
+            # embedder (this test constructs the ranker directly, bypassing the composition root
+            # that wires one) doesn't fail-loud on the "embed" default; D1 has its own dedicated
+            # coverage in `test_recall_ranker_unit.py`.
+            settings=RecallSettings(cross_tier_dedup=cross_tier_dedup, stm_scoring="recency"),
             clock=SystemClock(),
         )
         result = await ranker.rank(
-            ns, "irrelevant this phase", [0.0] * _DIM, limit=10,
-            channels=RecallChannels(), caller_identity_set=frozenset(),
+            ns,
+            "irrelevant this phase",
+            [0.0] * _DIM,
+            limit=10,
+            channels=RecallChannels(),
+            caller_identity_set=frozenset(),
         )
         return [it.content for it in result.items if it.content == text], stm_item, ltm_item
     finally:

@@ -95,7 +95,12 @@ from mu_engine.services.recall import (
 )
 from mu_engine.storage.domain.namespace import Visibility
 from mu_engine.storage.factories import STORE_REGISTRY
-from mu_engine.storage.ports import GraphStorePort, MtmTierRepository, StmTierRepository
+from mu_engine.storage.ports import (
+    ContextRepository,
+    GraphStorePort,
+    MtmTierRepository,
+    StmTierRepository,
+)
 from mu_engine.storage.registry import assert_mandatory_roles
 from mu_local.config import (
     BackendChoice,
@@ -299,6 +304,14 @@ class LocalContainer:
         )
         self._register_closer(self.control, "_engine")
 
+        # (5b) ContextRepository (NEW — software-arch spec §5/§6, l.260-263/l.340): the artifact
+        #      provenance-root store `PersistRawArtifactStage` writes through. Built through the
+        #      SAME STORE_REGISTRY seam as every other role (factories.py's new `artifact` role,
+        #      not one of `MANDATORY_ROLES` — a filesystem adapter, no network client to close).
+        self.artifacts: ContextRepository = STORE_REGISTRY.build(
+            "artifact", storage.artifact.backend, **self._artifact_cfg(storage.artifact)
+        )
+
         # (6) LLM: None (default) ⇒ heuristic mode, unchanged; configured ⇒ a REAL ModelRouter
         #     (the reference SLM-integration catalog shape) + the LlmFactExtractor it feeds DISTILL.
         self.llm: ModelRouter | None = None
@@ -439,6 +452,10 @@ class LocalContainer:
             fusion=fusion,
             settings=recall_settings,
             clock=self._clock,
+            # D1 (data-quality assessment §3.1): the SAME embedder the query is embedded with at
+            # the RecallService façade — the ranker reuses it to score STM candidate content
+            # against the query vector (`recall_settings.stm_scoring`, default "embed").
+            embedder=self.embedder,
         )
         authz = RecallAuthorizationFilter(
             tenancy=DefaultTenancyGuard(), authorized_ids=PrincipalAuthorizedIdsResolver()
@@ -649,6 +666,13 @@ class LocalContainer:
         host = choice.config.get("host") or self._settings.storage.graph.host
         port = choice.config.get("port") or self._settings.storage.graph.port
         return str(host), int(port)
+
+    def _artifact_cfg(self, choice: BackendChoice) -> dict[str, Any]:
+        """``STORE_REGISTRY.build("artifact", ...)`` kwargs — the ``filesystem`` factory
+        (``mu_engine.storage.factories._build_artifact_fs``) already falls back to the central
+        ``ArtifactFsSettings.content_root`` when ``cfg`` doesn't supply one, same pattern as
+        ``valkey``/``chroma`` above, so an empty override dict is the common case."""
+        return dict(choice.config)
 
     def _relational_cfg(self, choice: BackendChoice) -> dict[str, str]:
         if "dsn" in choice.config:

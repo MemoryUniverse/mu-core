@@ -41,17 +41,34 @@ dedup_by_content_hash` over the floor-protected + fused candidate pool BEFORE th
 (``settings.cross_tier_dedup``, default on) — the SAME primitive ``RecallService.recall`` already
 runs one layer up at the private⊕shared federation seam, applied here to the per-arm candidate set
 so a duplicate never occupies one of the ``limit`` result slots in the first place.
+
+D1 STM relevance scoring (data-quality assessment §3.1, floor-fix follow-up to 02fbed9, 2026-07-31):
+the ``recency_floor_limit``/``floor_protect_limit`` bound above fixed HOW MANY STM candidates enter
+the fuse and HOW MANY are unconditionally protected — but every STM candidate still entered RRF
+ordered by RECENCY RANK ONLY (``StmTierRepository.recent`` newest-first), so a targeted query and
+a nonsense query in the same session still returned near-identical, STM-dominated lists.
+``_score_stm`` now attaches a REAL per-candidate relevance score BEFORE fusion (``stm_scoring``,
+"embed": cosine-rank against the SAME query vector the MTM channel already uses; "lexical":
+token-overlap fallback needing no embedder; "recency": explicit pre-fix opt-out). The relevance-
+ordered list feeds BOTH the RRF fusion channel input (fused rank now reflects relevance, not just
+recency) AND the protected-floor DISPLAY order — protection membership (WHICH items can never be
+evicted) stays recency-selected (the "never evict a just-said fact" guarantee is unchanged), but the
+protected block is now reorderable BY RELEVANCE within itself so a just-said, irrelevant fact no
+longer sits at rank 1 ahead of the actual answer.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
 from mu_contracts.domain.errors import StoreUnavailableError
 from mu_contracts.domain.events import DegradeReason
 from mu_contracts.domain.model.recall import CallerIdentitySet, Vector
 from mu_contracts.ports.time import Clock
+from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.services.recall.dto import (
     RecallChannels,
     RecallItemView,
@@ -64,7 +81,15 @@ from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.domain.recall import RecallChannel, Scored
 from mu_engine.storage.ports import LtmTierRepository, MtmTierRepository, StmTierRepository
 
-__all__ = ["RecallRanker", "ThreeChannelRecallRanker"]
+__all__ = ["RecallRanker", "StmScoringConfigError", "ThreeChannelRecallRanker"]
+
+
+class StmScoringConfigError(ValueError):
+    """``settings.stm_scoring="embed"`` with no ``EmbeddingPort`` injected into the ranker (§D1).
+
+    Fail-loud misconfiguration — mirrors ``EmbedderConfigError`` (providers/embedding.py): an
+    unusable relevance mode never silently degrades to recency-only ordering.
+    """
 
 
 @runtime_checkable
@@ -115,6 +140,7 @@ class ThreeChannelRecallRanker:
         fusion: FusionStrategy,
         settings: RecallSettings,
         clock: Clock,
+        embedder: EmbeddingPort | None = None,
     ) -> None:
         self._stm = stm
         self._mtm = mtm
@@ -122,6 +148,11 @@ class ThreeChannelRecallRanker:
         self._fusion = fusion
         self._settings = settings
         self._clock = clock
+        # D1: required only when ``settings.stm_scoring == "embed"`` (the default) — the SAME
+        # ``EmbeddingPort`` the composition root already wires into ``RecallService`` (the query is
+        # embedded once at that façade boundary, §6-P2/m4); the ranker reuses it to embed STM
+        # candidate CONTENT so a cosine score can be computed against the already-embedded query.
+        self._embedder = embedder
 
     async def rank(
         self,
@@ -133,7 +164,9 @@ class ThreeChannelRecallRanker:
         channels: RecallChannels,
         caller_identity_set: CallerIdentitySet | None,
     ) -> RecallResult:
-        del query  # deterministic graph seed this phase (no LLM entity resolution — see docstring)
+        # `query` (raw text) is used ONLY by the D1 STM relevance scorer below ("lexical" mode) —
+        # the LTM graph arm remains the deterministic recency seed this phase (no LLM entity
+        # resolution — see docstring); it never reads `query`.
         pool = self._settings.channel_pool_size
         floor_limit = self._settings.recency_floor_limit
 
@@ -169,15 +202,23 @@ class ThreeChannelRecallRanker:
         mtm_hits = mtm_t.result()
         ltm_hits, ltm_degraded = ltm_t.result()
 
+        # D1 (§3.1 follow-up to 02fbed9): attach a REAL relevance score to every STM candidate
+        # BEFORE fusion — `floor` arrives recency-ordered only (the adapter's ZREVRANGE order);
+        # `floor_scored` is the SAME set of candidates re-ordered by `settings.stm_scoring`
+        # relevance (embed cosine / lexical overlap / recency no-op). This is what makes the STM
+        # channel's RRF rank (below) reflect the QUERY, not just insertion order.
+        floor_scored = await self._score_stm(floor, query, query_vec)
+
         # Fuse STM ⊕ MTM ⊕ LTM by tier-stable id; a recency rank, a cosine score, and a graph-hop
         # count fuse by RANK only (§1.3 "one fuse implementation"). BUG FIX (§3.1/#1): the STM
         # candidate pool used to be excluded from this fusion and force-prepended WHOLE ahead of it
         # (see module docstring) — that made the query-relevant MTM/LTM channels invisible whenever
         # the session held >= `limit` STM items. It now competes on fused rank like any other
-        # channel; only a small, bounded prefix is still unconditionally protected below.
+        # channel (by RELEVANCE rank since D1, not recency rank); only a small, bounded prefix is
+        # still unconditionally protected below.
         settings = self._settings
         fused_pairs = self._fusion.fuse(
-            [floor, mtm_hits, ltm_hits],
+            [floor_scored, mtm_hits, ltm_hits],
             id_of=lambda s: s.item.id,
             weights=[settings.weight_stm, settings.weight_mtm, settings.weight_ltm],
             k=settings.rrf_k,
@@ -191,8 +232,18 @@ class ThreeChannelRecallRanker:
             for scored, _score in fused_pairs
         ]
 
+        # D1 (b): WHICH items are unconditionally protected stays RECENCY-selected — `floor` (not
+        # `floor_scored`) picks the `floor_protect_limit` most-recent candidates, preserving the
+        # "never evict a just-said fact" guarantee unchanged. But the block is now REORDERABLE
+        # within itself BY RELEVANCE: `floor_scored` is already sorted by relevance desc over the
+        # WHOLE STM pool, so filtering it down to the protected ids yields the protected members in
+        # relevance order — a just-said, irrelevant fact no longer sits at rank 1 ahead of the
+        # actual answer merely because it was said last.
         protect_n = self._settings.floor_protect_limit
-        protected_floor_views = [_to_view(s, "stm") for s in floor[:protect_n]]
+        protected_ids = {s.item.id for s in floor[:protect_n]}
+        protected_floor_views = [
+            _to_view(s, "stm") for s in floor_scored if s.item.id in protected_ids
+        ]
 
         items = _merge_floor(
             floor_views=protected_floor_views,
@@ -224,6 +275,76 @@ class ThreeChannelRecallRanker:
         except StoreUnavailableError:
             return [], True
         return hits, False
+
+    async def _score_stm(
+        self, floor: list[Scored[MemoryItem]], query: str, query_vec: Vector
+    ) -> list[Scored[MemoryItem]]:
+        """D1 (§3.1): attach a REAL relevance score to every STM candidate, sorted best-first.
+
+        ``floor`` arrives recency-ordered (the adapter's ``recent()``), every item carrying a
+        constant channel-native ``.score`` (§1.3 "STM floor" — no relevance signal). This method
+        replaces that constant with an actual query-relevance score per ``settings.stm_scoring``
+        and returns the SAME candidates re-sorted by it (``.is_floor``/``.channel`` unchanged, only
+        ``.score`` + list order differ) — the result both feeds the RRF channel input and the
+        protected-floor display order in :meth:`rank`.
+
+          * "recency" — no-op: returns ``floor`` unchanged (explicit pre-fix opt-out, §D1).
+          * "lexical" — token-overlap score against the raw ``query`` text; needs no embedder.
+          * "embed" (default) — cosine similarity between ``query_vec`` (already embedded once at
+            the ``RecallService`` façade, §6-P2/m4) and a fresh embedding of each candidate's
+            content, via the SAME ``EmbeddingPort`` the MTM channel is embedded with. Requires an
+            embedder injected at construction; ``StmScoringConfigError`` otherwise — a fail-loud
+            misconfiguration, never a silent recency fallback.
+        """
+        if not floor:
+            return floor
+
+        mode = self._settings.stm_scoring
+        if mode == "recency":
+            return floor
+
+        scored: list[tuple[Scored[MemoryItem], float]]
+        if mode == "lexical":
+            scored = [(s, _lexical_overlap(query, s.item.content)) for s in floor]
+        elif mode == "embed":
+            if self._embedder is None:
+                raise StmScoringConfigError(
+                    "RecallSettings.stm_scoring='embed' (the default) requires an EmbeddingPort "
+                    "injected into ThreeChannelRecallRanker(embedder=...) at the composition root "
+                    "— set stm_scoring='lexical' (no embedder needed) or wire one; this never "
+                    "silently falls back to recency-only ordering (DEV-STANDARDS: no silent stubs)."
+                )
+            vectors = await self._embedder.embed([s.item.content for s in floor])
+            scored = [(s, _cosine(query_vec, v)) for s, v in zip(floor, vectors, strict=True)]
+        else:  # pragma: no cover - Literal["embed", "lexical", "recency"] makes this unreachable
+            raise StmScoringConfigError(f"unknown RecallSettings.stm_scoring {mode!r}")
+
+        ranked = sorted(scored, key=lambda pair: pair[1], reverse=True)
+        return [s.model_copy(update={"score": relevance}) for s, relevance in ranked]
+
+
+def _lexical_overlap(query: str, content: str) -> float:
+    """D1 "lexical" STM relevance score: ``|query_tokens ∩ content_tokens| / |query_tokens|``,
+    case-insensitive whitespace tokenization. The minimum-viable fallback (no embedder needed) —
+    cheap, deterministic, and enough to make a targeted query diverge from a nonsense one."""
+    q_tokens = {t for t in query.lower().split() if t}
+    if not q_tokens:
+        return 0.0
+    c_tokens = {t for t in content.lower().split() if t}
+    if not c_tokens:
+        return 0.0
+    return len(q_tokens & c_tokens) / len(q_tokens)
+
+
+def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    """D1 "embed" STM relevance score: cosine similarity, 0.0 for either zero-norm vector (never
+    divides by zero) — the SAME comparison the MTM channel's dense search is built on."""
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 async def _empty_scored() -> list[Scored[MemoryItem]]:

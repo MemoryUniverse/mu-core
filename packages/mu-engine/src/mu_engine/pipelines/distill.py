@@ -445,15 +445,40 @@ class DistillPipeline:
 
     # ---- extraction -------------------------------------------------------------------------
     async def _collect_facts(self, ns: Namespace, window: Sequence[MemoryItem]) -> list[MemoryItem]:
-        """Build the candidate LTM winner items from the window (structured pass + extractor)."""
+        """Build the candidate LTM winner items from the window (structured pass + extractor).
+
+        SAME-BATCH CHRONOLOGY FIX (Rank 5): ``now`` used to be the ONE value handed to every
+        item in the window as its ``valid_at`` fallback (below, and in ``_fact_to_item``) — two
+        same-(subject,predicate) facts extracted from two DIFFERENT source messages in the SAME
+        ``distill()`` window landed with an IDENTICAL ``valid_at``, a tie that
+        ``_heuristic_only_verdict``'s (and ``ConflictAdjudicator``'s own degrade-floor) bare
+        ``>`` comparison silently broke toward whichever fact happened to be resolved LAST
+        (``_distill``'s window-order-preserving ``actions = [... for outcome in reconciled]``)
+        — NOT whichever was actually more recent (the backwards-supersession defect this fixes).
+        ``now`` is kept ONLY for ``_promote_structured``'s ``updated_at`` bookkeeping stamp (an
+        administrative "when this promotion write happened" field, not the world-time
+        ``valid_at`` that drives supersession ordering) and is no longer threaded into either
+        fallback-``valid_at`` computation: each extracted fact instead anchors on ITS OWN source
+        message's real ``item.created_at`` (see ``_fact_to_item``) — the same real add()-time
+        instant STM's own recency ``ZSET`` already scores by
+        (``redis_stm.py::_put_impl``: ``zadd(recency, {item.id: item.created_at.timestamp()})``),
+        so no new timestamp source needed, just no longer discarding the one that already exists
+        per item in favour of one shared instant for the whole window.
+        """
         now = self._clock.now()
         out: list[MemoryItem] = []
         for item in window:
             if item.subject and item.predicate and item.object:
                 out.append(self._promote_structured(item, now))
             else:
-                facts = await self._extractor.extract(item.content, now=now)
-                out.extend(self._fact_to_item(ns, item, f, now) for f in facts)
+                # `now=item.created_at`: the extractor's `now` param is accepted only "for
+                # signature symmetry with the port" (services/extract.py's `decompose_to_spo`
+                # docstring — "dates come only from the text itself", never read in the body), so
+                # threading this message's OWN real timestamp here instead of the shared window
+                # `now` is a no-op for today's deterministic heuristic but is the honest per-item
+                # reference instant for any future extractor that DOES resolve relative dates.
+                facts = await self._extractor.extract(item.content, now=item.created_at)
+                out.extend(self._fact_to_item(ns, item, f) for f in facts)
         return out
 
     @staticmethod
@@ -471,10 +496,16 @@ class DistillPipeline:
         return winner
 
     @staticmethod
-    def _fact_to_item(
-        ns: Namespace, source: MemoryItem, fact: ExtractedFact, now: datetime
-    ) -> MemoryItem:
-        valid_at = fact.valid_at if fact.valid_at is not None else now
+    def _fact_to_item(ns: Namespace, source: MemoryItem, fact: ExtractedFact) -> MemoryItem:
+        # SAME-BATCH CHRONOLOGY FIX (Rank 5, see `_collect_facts`'s docstring): fall back to
+        # THIS message's own real STM timestamp (`source.created_at`) rather than the shared
+        # per-distill()-call clock `now` a prior revision passed in here. Two same-(subject,
+        # predicate) facts extracted from two DIFFERENT source messages in ONE window now get
+        # two genuinely distinct `valid_at` stamps (mirroring their real STM insert order)
+        # instead of colliding on one shared instant — `fact.valid_at_inferred` (set True by the
+        # extractor whenever `fact.valid_at is None`, `services/extract.py:383`) already flags
+        # this LOUDLY below, unaffected by this change.
+        valid_at = fact.valid_at if fact.valid_at is not None else source.created_at
         meta: dict[str, Any] = {"derived_from": source.id, "extractor_span": fact.source_span}
         if fact.valid_at_inferred:
             meta["valid_at_inferred"] = True

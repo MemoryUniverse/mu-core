@@ -70,8 +70,18 @@ def make_item() -> Callable[..., MemoryItem]:
         polarity: Polarity = Polarity.POSITIVE,
         tier: MemoryTier = MemoryTier.MTM,
         memory_id: str | None = None,
+        created_at: datetime | None = None,
     ) -> MemoryItem:
-        kwargs = {"id": memory_id} if memory_id is not None else {}
+        # `created_at` (Rank 5 same-batch chronology fix): lets a test pin the SOURCE STM
+        # message's real timestamp explicitly — the value `DistillPipeline._fact_to_item` now
+        # anchors an extracted fact's `valid_at` fallback on — instead of relying on real
+        # wall-clock jitter between two `make_item(...)` calls in a Python list literal to
+        # establish which of two same-batch messages is genuinely "later" (real, but
+        # unspecified-and-fragile ordering). Omitted -> the model's own default_factory
+        # (real `datetime.now(UTC)` at construction time), unchanged from before.
+        kwargs: dict[str, object] = {"id": memory_id} if memory_id is not None else {}
+        if created_at is not None:
+            kwargs["created_at"] = created_at
         return MemoryItem(
             content=content,
             kind=MemoryKind.PROPOSITION,

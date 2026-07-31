@@ -371,6 +371,10 @@ class EngineContainer:
             fusion=fusion,
             settings=recall_settings,
             clock=self._clock,
+            # D1 (data-quality assessment §3.1): the SAME embedder the query is embedded with at
+            # the RecallService façade — the ranker reuses it to score STM candidate content
+            # against the query vector (`recall_settings.stm_scoring`, default "embed").
+            embedder=self.embedder,
         )
         authz = RecallAuthorizationFilter(
             tenancy=DefaultTenancyGuard(), authorized_ids=PrincipalAuthorizedIdsResolver()

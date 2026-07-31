@@ -128,7 +128,16 @@ def _build_service(
     settings = RecallSettings()
     clock = SystemClock()
     ranker = ThreeChannelRecallRanker(
-        stm=stm, mtm=mtm, ltm=ltm, fusion=fusion, settings=settings, clock=clock
+        # D1: the REAL MiniLM embedder is already threaded through this helper — wire it into the
+        # ranker so `settings.stm_scoring="embed"` (the default) works exactly as it does through
+        # the real composition roots, instead of fail-loud on a missing embedder.
+        stm=stm,
+        mtm=mtm,
+        ltm=ltm,
+        fusion=fusion,
+        settings=settings,
+        clock=clock,
+        embedder=embedder,
     )
     shared = shared_recall or InProcessSharedRecall(ranker=ranker, embedder=embedder)
     authz = RecallAuthorizationFilter(
@@ -189,7 +198,11 @@ async def test_federate_live_recall_fuses_and_isolates(
         # isolation is keyed on `user` (and org/workspace), so this fixture now differs by
         # user to keep testing the real isolation invariant instead of an assumption Stage-1
         # intentionally overturned.
-        org=org, workspace=ws, user="u2", session=session, visibility=Visibility.PRIVATE
+        org=org,
+        workspace=ws,
+        user="u2",
+        session=session,
+        visibility=Visibility.PRIVATE,
     )
     caller = ClientScope(
         principal_id="u1", org_id=org, workspace_id=ws, session_id=session, agent_principal_id="u1"

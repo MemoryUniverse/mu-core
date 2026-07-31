@@ -11,6 +11,7 @@ fuse/protect logic is exercised in isolation, deterministically, in milliseconds
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -128,16 +129,38 @@ class _EmptyLtm:
         raise NotImplementedError
 
 
+class _FakeEmbedder:
+    """D1 test double for ``EmbeddingPort``: returns a caller-supplied vector per exact content
+    string (no real model) so STM "embed" scoring can be exercised deterministically."""
+
+    def __init__(self, vectors_by_content: dict[str, list[float]]) -> None:
+        self._vectors_by_content = vectors_by_content
+        self.model_name = "fake-embedder"
+        self.dimension = 2
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        return [self._vectors_by_content.get(t, [0.0, 0.0]) for t in texts]
+
+
 def _build_ranker(
-    *, stm_items: list[MemoryItem], mtm_hits_by_query: dict[tuple[float, ...], list[MemoryItem]]
+    *,
+    stm_items: list[MemoryItem],
+    mtm_hits_by_query: dict[tuple[float, ...], list[MemoryItem]],
+    settings: RecallSettings | None = None,
+    embedder: _FakeEmbedder | None = None,
 ) -> ThreeChannelRecallRanker:
+    # D1 (§3.1 follow-up): these pre-existing floor/dedup tests target the §3.1/#1 fuse-swamping
+    # fix and the D4 cross-tier-dedup fix, NOT the D1 relevance scorer — pin `stm_scoring="recency"`
+    # (the pre-D1 behavior) so they keep testing those mechanisms in isolation. D1's OWN behavior
+    # (embed/lexical scoring, floor reorder-by-relevance) gets its own tests below.
     return ThreeChannelRecallRanker(
-        stm=_FakeStm(stm_items),  # type: ignore[arg-type]
-        mtm=_FakeMtm(mtm_hits_by_query),  # type: ignore[arg-type]
+        stm=_FakeStm(stm_items),
+        mtm=_FakeMtm(mtm_hits_by_query),
         ltm=_EmptyLtm(),  # type: ignore[arg-type]
         fusion=ReciprocalRankFusion(),
-        settings=RecallSettings(),
+        settings=settings or RecallSettings(stm_scoring="recency"),
         clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+        embedder=embedder,
     )
 
 
@@ -226,6 +249,152 @@ async def test_most_recent_facts_are_still_unconditionally_protected() -> None:
     floor_ids = {it.memory_id for it in result.items if it.is_floor}
     assert just_said.id in floor_ids, "the just-said fact is no longer protected from eviction"
     settings = RecallSettings()
-    assert len(floor_ids) <= settings.floor_protect_limit, (
-        "protection is no longer bounded — the floor is swamping the result again"
+    assert (
+        len(floor_ids) <= settings.floor_protect_limit
+    ), "protection is no longer bounded — the floor is swamping the result again"
+
+
+# ---------------------------------------------------------------------------------------------
+# D1 — STM relevance scoring (DATA-QUALITY-ASSESSMENT.md §3.1, floor-fix follow-up to 02fbed9).
+# The tests above prove the STM channel no longer SWAMPS the fused result by count/insertion
+# order; these prove it now carries a REAL per-candidate relevance signal of its own, and that
+# the unconditionally-protected floor block is reorderable by that signal.
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_embed_scoring_ranks_the_relevant_stm_item_above_recency() -> None:
+    """ "embed" mode (the default): an STM item said LONG AGO but semantically close to the query
+    must outrank STM items said MORE RECENTLY but irrelevant — pure recency rank could never do
+    this; only a real per-candidate relevance score can."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    relevant = _item(
+        "Ada's flight to Denver is on Thursday", tier=MemoryTier.STM, at=base
+    )  # oldest -> recency rank LAST
+    filler = [
+        _item(f"session chatter #{n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n + 1))
+        for n in range(9)
+    ]
+    stm_items = [relevant, *filler]  # relevant is oldest -> recency-last, embed-first
+    query_vec = [0.9, 0.1]
+    embedder = _FakeEmbedder(
+        {
+            relevant.content: [0.9, 0.1],  # near-identical to the query
+            **{f.content: [0.0, 1.0] for f in filler},  # orthogonal -> irrelevant
+        }
+    )
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={},
+        settings=RecallSettings(stm_scoring="embed"),
+        embedder=embedder,
+    )
+
+    ids = await _rank(ranker, query_vec)
+
+    assert ids.index(relevant.id) < ids.index(
+        filler[0].id
+    ), "embed-scored STM relevance did not outrank a merely-more-recent irrelevant item"
+
+
+@pytest.mark.asyncio
+async def test_embed_scoring_without_an_injected_embedder_fails_loud() -> None:
+    """ "embed" is the DEFAULT ``stm_scoring`` — a ranker built with no embedder must raise, never
+    silently fall back to recency ordering (DEV-STANDARDS: no silent stubs)."""
+    from mu_engine.services.recall.ranker import StmScoringConfigError
+
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    stm_items = [_item("session chatter", tier=MemoryTier.STM, at=base)]
+    ranker = _build_ranker(
+        stm_items=stm_items, mtm_hits_by_query={}, settings=RecallSettings(), embedder=None
+    )
+
+    with pytest.raises(StmScoringConfigError):
+        await _rank(ranker, [0.1, 0.1])
+
+
+@pytest.mark.asyncio
+async def test_lexical_scoring_ranks_token_overlap_above_recency_with_no_embedder() -> None:
+    """ "lexical" mode: the minimum-viable fallback needs no embedder at all — token overlap
+    against the raw query text is enough to outrank a merely-more-recent irrelevant item."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    relevant = _item("denver flight thursday", tier=MemoryTier.STM, at=base)
+    filler = [
+        _item(f"chatter number {n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n + 1))
+        for n in range(9)
+    ]
+    stm_items = [relevant, *filler]
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={},
+        settings=RecallSettings(stm_scoring="lexical"),
+    )
+
+    # `_rank` hardcodes a fixed query text; lexical scoring needs the REAL query text, so call
+    # `rank()` directly here instead.
+    result = await ranker.rank(
+        _NS,
+        "denver flight thursday",
+        [0.0, 0.0],
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+    ids = [it.memory_id for it in result.items]
+
+    assert ids.index(relevant.id) < ids.index(
+        filler[0].id
+    ), "lexical overlap did not outrank a merely-more-recent, unrelated item"
+
+
+@pytest.mark.asyncio
+async def test_protected_floor_is_reordered_by_relevance_not_recency() -> None:
+    """D1 (b): the PROTECTED floor block (never evicted) must still contain the same
+    recency-selected members, but a just-said IRRELEVANT fact must no longer occupy rank 1
+    ahead of an older, but query-relevant, protected member."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    # Two items inside the protected window (floor_protect_limit=3 default): an older-but-relevant
+    # fact and a just-said-but-irrelevant one. A third filler keeps the window non-trivial.
+    relevant = _item(
+        "Ada's flight to Denver is on Thursday", tier=MemoryTier.STM, at=base + timedelta(minutes=8)
+    )
+    just_said_irrelevant = _item(
+        "ok cool", tier=MemoryTier.STM, at=base + timedelta(minutes=9)
+    )  # most recent -> would be recency-rank-0 pre-D1
+    older_filler = [
+        _item(f"chatter #{n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n))
+        for n in range(8)
+    ]
+    stm_items = [*older_filler, relevant, just_said_irrelevant]
+    query_vec = [0.9, 0.1]
+    embedder = _FakeEmbedder(
+        {
+            relevant.content: [0.9, 0.1],
+            just_said_irrelevant.content: [0.0, 1.0],
+            **{f.content: [0.0, 1.0] for f in older_filler},
+        }
+    )
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={},
+        settings=RecallSettings(stm_scoring="embed"),
+        embedder=embedder,
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "irrelevant",
+        query_vec,
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    floor_views = [it for it in result.items if it.is_floor]
+    floor_ids = {v.memory_id for v in floor_views}
+    assert just_said_irrelevant.id in floor_ids, "recency-selected protection membership changed"
+    assert relevant.id in floor_ids, "recency-selected protection membership changed"
+    assert floor_views[0].memory_id == relevant.id, (
+        "the just-said-but-irrelevant fact still leads the protected block over the "
+        "older-but-relevant one — floor is not reorderable by relevance"
     )
