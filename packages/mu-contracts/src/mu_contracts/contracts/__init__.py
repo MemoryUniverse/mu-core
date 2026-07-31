@@ -15,6 +15,11 @@ OpenAPI + JSON-Schema the TS SDK and community/conformant servers generate from.
 
 from __future__ import annotations
 
+from mu_contracts.contracts.defaults import (
+    DEFAULT_CONSOLIDATE_LIMIT,
+    DEFAULT_RECALL_LIMIT,
+    RecallDefaults,
+)
 from mu_contracts.contracts.memory import (
     ContentType,
     MemoryResponse,
@@ -32,6 +37,8 @@ from mu_contracts.contracts.requests import (
 from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
 
 __all__ = [
+    "DEFAULT_CONSOLIDATE_LIMIT",
+    "DEFAULT_RECALL_LIMIT",
     "AddRequest",
     "ConsolidateRequest",
     "ConsolidateView",
@@ -44,6 +51,7 @@ __all__ = [
     "MemoryWriteResult",
     "PolarityLiteral",
     "RecallChannels",
+    "RecallDefaults",
     "RecallItemView",
     "RecallMode",
     "RecallRequest",
