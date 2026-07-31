@@ -1,0 +1,41 @@
+# Build-context ignore file for `docker build`/`docker compose build` invocations that use
+# mu-core/ as their context (e.g. packages/mu-engine-server/Dockerfile — see that file's own
+# header comment for why its context is the workspace root, not its own directory).
+#
+# ADDED BY: Stage E (mu-engine-server docker/compose/Makefile build agent, build-plan §4 Stage E,
+# E1). NOTE ON SCOPE: this task's file ownership is scoped to packages/mu-engine-server/*; this
+# root-level file is the one necessary exception, added only because it is load-bearing for
+# correctness/practicality, not style. Rationale, verified empirically in this environment:
+# `packages/mu-engine-server/Dockerfile.dockerignore` (the per-Dockerfile ignore-file convention,
+# which WOULD have kept this entirely inside that package's own directory) is a BuildKit-only
+# feature — this host's Docker CLI has no `buildx` plugin installed (`docker buildx version` ->
+# "unknown command"), so `docker build`/`docker compose build` here fall back to the classic
+# builder, which only ever reads a `.dockerignore` at the CONTEXT ROOT. Without this file, every
+# build tars/streams this entire directory to the daemon verbatim — observed directly: `docker
+# compose up -d --build` never even reached container creation after 5+ minutes with this file
+# absent, because `.venv` alone is 5.4G of mostly-tiny site-packages files (`du -sh
+# mu-core/.venv` = 5.4G, `.mypy_cache` = 170M) that classic `docker build` has no other way to
+# skip. None of the excluded paths below are referenced by any `COPY` in that Dockerfile.
+
+# Local dev virtualenv / caches — never needed in the image; the Dockerfile's own builder stage
+# creates a fresh `.venv` via `uv sync --no-editable`.
+.venv
+**/.venv
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.import_linter_cache
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+
+# VCS / editor / misc repo furniture not needed to build or run the image
+.git
+.gitignore
+.trash
+logs
+graphify-out
+.claude
+
+# Test trees — exercised by CI against source directly, not needed inside the built image
+packages/*/tests

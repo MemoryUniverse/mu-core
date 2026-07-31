@@ -1,0 +1,53 @@
+# Build-context ignore file for packages/mu-engine-server/Dockerfile.
+#
+# Named `Dockerfile.dockerignore` (not the bare `.dockerignore`) deliberately: this Dockerfile's
+# build CONTEXT is the mu-core workspace ROOT (../.. from this directory — see the Dockerfile's
+# own header comment for why), not this package directory. BuildKit's per-Dockerfile ignore-file
+# convention — "<dockerfile-path>.dockerignore", resolved relative to the context root, takes
+# precedence over a root-level `.dockerignore` when present" (Docker docs, "Dockerfile-specific
+# ignore files") — would let this ignore file live entirely inside packages/mu-engine-server/
+# (this task's own owned directory) while still applying to the mu-core-root build context.
+#
+# VERIFIED NOT ACTIVE IN THIS ENVIRONMENT: that convention is BuildKit-only, and this host's
+# Docker has no `buildx` plugin installed (`docker buildx version` -> "unknown command: docker
+# buildx"), so `docker build`/`docker compose build` here use the classic (non-BuildKit) builder,
+# which reads ONLY a `.dockerignore` at the context root. The actually-functional ignore file for
+# this environment is therefore `../../.dockerignore` (mu-core/.dockerignore) — a small,
+# necessary exception to this task's own directory-scoped file ownership, documented there with
+# the same rationale. This file is kept (a) as the correct mechanism per Docker's own docs, in
+# case `buildx` is installed later, and (b) so a reader diffing this directory sees the intended
+# design, not just the environment-specific workaround.
+#
+# Everything below is relative to the mu-core/ context root.
+
+# VCS / editor
+.git
+.gitignore
+**/.DS_Store
+
+# Python bytecode / caches — never needed in the image, `uv sync --no-editable` builds fresh wheels
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Pre-existing local virtualenvs on the host — never copied in; the builder stage creates its own
+**/.venv
+**/venv
+
+# Test trees — not needed to build or run the image (they run in CI against source, not the image)
+packages/*/tests
+
+# This package's own Docker deliverables that don't need to be in the context twice / aren't
+# referenced by any COPY instruction in the Dockerfile
+packages/mu-engine-server/docker-compose*.yml
+packages/mu-engine-server/Makefile
+packages/mu-engine-server/README.md
+
+# Docs / non-build-relevant repo furniture some checkouts may have alongside mu-core/
+**/*.md
+!packages/mu-contracts/README.md
+!packages/mu-engine/README.md
+!packages/mu-engine-server/README.md

@@ -1,0 +1,132 @@
+# mu-engine-server — real-stores compose profile (RECOMMENDED DEFAULT per owner point 4 / design
+# §7.2). `make up` (this directory's Makefile) is the one-command entrypoint; this file can also be
+# driven directly with `docker compose -f docker-compose.yml up -d`.
+#
+# GROUNDED IN THE LANDED CODE, not the design doc's illustrative §7.2 snippet — two corrections:
+#   1. §7.2's illustrative yaml lists a `postgres` service + `MU_STORAGE__RELATIONAL__BACKEND:
+#      postgres`. The REAL, landed `EngineContainer` (composition.py:113,254-256) hardcodes its
+#      relational/control-plane store to in-process sqlite ("off the ingest/recall critical path,
+#      same default LocalContainer itself ships") and `EngineServerSettings` (settings.py) has NO
+#      relational/postgres field at all — there is nothing for a postgres service to plug into.
+#      This compose file ships valkey + qdrant + falkordb only, matching the real settings tree.
+#   2. Env vars are `MU_ENGINE_SERVER_<FIELD>__<SUBFIELD>` (settings.py's own
+#      `env_prefix="MU_ENGINE_SERVER_"`, `env_nested_delimiter="__"`), not the design doc's
+#      `MU_STORAGE__*` illustrative names (those belong to the CENTRAL `mu_contracts.config.Settings`
+#      tree this server deliberately does NOT use for store endpoints — settings.py's own module
+#      docstring explains why).
+#
+# Host-side port publish (design §7.2, REVIEW-2 FIX 5 — LOAD-BEARING, do not "fix" either half
+# independently):
+#   * ONLY `engine` publishes a host port, and it is LOOPBACK-bound: "127.0.0.1:8300:8300", never
+#     the bare "8300:8300" short form (that resolves to 0.0.0.0 on the host — every interface).
+#   * uvicorn binds 0.0.0.0 INSIDE the container (this package's Dockerfile CMD) — bridge-network
+#     NAT reaches the container's eth0, never its lo; binding 127.0.0.1 in-container would make the
+#     host-side loopback publish above unreachable, not merely redundant with it.
+#   * valkey/qdrant/falkordb publish NO host ports here — internal-compose-network-only, reachable
+#     from `engine` by service name, never from the host (unlike the separate, ALREADY-RUNNING
+#     mu-dev-* stack this project's dev CLAUDE.md protects — this stack is fully independent of
+#     that one: distinct compose project name, distinct container names, distinct volumes, never
+#     the same containers).
+#
+# Token: `make up` mints ~/.memory-universe/engine-server.token (host, mode 0600) before starting
+# this stack if absent, then bind-mounts that directory read-only into the container at the SAME
+# path auth.py's DEFAULT_TOKEN_PATH/`Path.home()` resolves to for the `mu-engine-server` container
+# user (`/home/mu-engine-server/.memory-universe`) — `MU_ENGINE_SERVER_TOKEN_PATH` below pins the
+# exact path explicitly rather than relying on HOME-based resolution agreeing by accident.
+
+name: mu-engine-server
+
+services:
+  engine:
+    build:
+      context: ../..
+      dockerfile: packages/mu-engine-server/Dockerfile
+    image: mu-engine-server:latest
+    container_name: mu-engine-server
+    ports:
+      - "127.0.0.1:8300:8300"          # LOOPBACK-bound host-side publish — NOT "8300:8300" (§7.2 FIX 5)
+    environment:
+      MU_ENGINE_SERVER_VALKEY__HOST: valkey
+      MU_ENGINE_SERVER_VALKEY__PORT: "6379"
+      MU_ENGINE_SERVER_QDRANT__HOST: qdrant
+      MU_ENGINE_SERVER_QDRANT__HTTP_PORT: "6333"
+      MU_ENGINE_SERVER_FALKORDB__HOST: falkordb
+      MU_ENGINE_SERVER_FALKORDB__PORT: "6379"
+      # No SLM container ships in this compose file (that's the separate, protected mu-dev-slm /
+      # docker-compose.slm.yml stack). Disabled here -> EngineContainer.__init__ stays in
+      # heuristic-extraction mode, byte-identical to LocalContainer's own `llm=None` default
+      # (settings.py's SlmProfile docstring). Point these three at a reachable OpenAI-compatible
+      # endpoint (e.g. a host SLM via `host.docker.internal`, Linux: add `extra_hosts` below) to
+      # enable real LLM-backed extraction/adjudication instead.
+      MU_ENGINE_SERVER_LLM__ENABLED: "false"
+      # Pinned explicitly (not left to Path.home() resolution) so the bind mount below and the
+      # server's own token lookup are provably the same path regardless of container HOME plumbing.
+      MU_ENGINE_SERVER_TOKEN_PATH: /home/mu-engine-server/.memory-universe/engine-server.token
+      MU_ENGINE_SERVER_WORKSPACE: local
+      MU_ENGINE_SERVER_NAMESPACE: default
+    volumes:
+      # `make up` mints this file on the HOST at ~/.memory-universe/engine-server.token, 0600,
+      # before bringing this stack up. Read-only: the container only ever verifies, never mints.
+      - ${HOME}/.memory-universe:/home/mu-engine-server/.memory-universe:ro
+      # Persists the offline MiniLM embedder's HuggingFace download across container restarts —
+      # EngineContainer._build_embedder() runs eagerly at construction (composition.py step 1),
+      # not lazily on first request, so an empty cache costs one real download on first `make up`.
+      - mu-engine-server-hf-cache:/home/mu-engine-server/.cache/huggingface
+    depends_on:
+      valkey:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8300/health', timeout=3).status == 200 else 1)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s          # first-run MiniLM download can take a while on a cold HF cache
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: mu-engine-server-valkey
+    command: ["valkey-server", "--appendonly", "yes"]
+    volumes:
+      - mu-engine-server-valkey-data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: mu-engine-server-qdrant
+    volumes:
+      - mu-engine-server-qdrant-data:/qdrant/storage
+    healthcheck:
+      # qdrant image ships no curl/wget; bash /dev/tcp is the dependency-free readiness probe
+      # (same pattern mu-core/docker-compose.dev.yml's own qdrant service already uses).
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333' 2>/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  falkordb:
+    image: falkordb/falkordb:v4.20.1
+    container_name: mu-engine-server-falkordb
+    volumes:
+      - mu-engine-server-falkordb-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  mu-engine-server-hf-cache:
+  mu-engine-server-valkey-data:
+  mu-engine-server-qdrant-data:
+  mu-engine-server-falkordb-data:

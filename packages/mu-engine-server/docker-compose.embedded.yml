@@ -1,0 +1,108 @@
+# mu-engine-server — "embedded" compose profile. OPTION, NOT RECOMMENDED (design §7.2/owner point
+# 4: real stores are the recommended default in every mode; this is the alternative, not the
+# headline path — see docker-compose.yml for the recommended default).
+#
+# HONESTY NOTE, grounded in the landed code (not the design doc's aspiration for this file):
+# `EngineContainer` (mu_engine_server/composition.py) has NO backend-choice knob at all — its KV/
+# vector/graph backends are hardcoded module constants (`_KV_BACKEND = "valkey"`,
+# `_VECTOR_BACKEND = "qdrant"`, `_GRAPH_BACKEND = "falkordb"`, composition.py:110-112), and its own
+# docstring is explicit that this is deliberate: "this composition root always binds EXACTLY
+# Valkey (kv) + Qdrant (vector) + FalkorDB (graph) + sqlite (relational) ... never a config-
+# selected alternative backend" (composition.py, "The one deliberate narrowing vs. LocalContainer").
+# `EngineServerSettings` (settings.py) likewise only exposes each store's HOST/PORT, never a
+# backend CHOICE — unlike `mu_local.config.StorageSettings`'s `BackendChoice`-driven upgrade ladder
+# (storage-pluggable-spec.md §4.1/§4.4) that the design's §7.2 "embedded, all-in-process profile
+# (SQLite/Chroma/FalkorDBLite)" language describes. `mu_engine_server` cannot import that ladder's
+# machinery anyway (design §2.2/§8: mu_engine_server -> {mu_contracts, mu_engine} ONLY, mu_local
+# forbidden) — so a literal in-process/zero-container embedded profile for THIS component is a
+# build gap upstream of Stage E, not something this compose file can honestly fake into existing.
+#
+# What this file actually ships, so "option, not recommended" stays a true label rather than a
+# silent no-op: the SAME real stores as docker-compose.yml (valkey/qdrant/falkordb — there is no
+# other backend this server can be pointed at today), but with EPHEMERAL, non-persistent storage
+# (tmpfs, no named volumes) — the closest honest analog to "zero lasting infra footprint" available
+# given the real composition root. Every store is wiped on `docker compose down`; there is nothing
+# here that swaps Qdrant for an in-process vector index, because `mu_engine_server` has no such
+# adapter to swap in. If/when composition.py grows a real backend-choice seam, this file is where
+# that would land.
+#
+# Same loopback-only host-side publish as docker-compose.yml (design §7.2 FIX 5) — see that file's
+# header comment for the full rationale; not repeated here.
+
+name: mu-engine-server-embedded
+
+services:
+  engine:
+    build:
+      context: ../..
+      dockerfile: packages/mu-engine-server/Dockerfile
+    image: mu-engine-server:latest
+    container_name: mu-engine-server-embedded
+    ports:
+      - "127.0.0.1:8300:8300"          # LOOPBACK-bound host-side publish — same FIX 5 rule as docker-compose.yml
+    environment:
+      MU_ENGINE_SERVER_VALKEY__HOST: valkey
+      MU_ENGINE_SERVER_VALKEY__PORT: "6379"
+      MU_ENGINE_SERVER_QDRANT__HOST: qdrant
+      MU_ENGINE_SERVER_QDRANT__HTTP_PORT: "6333"
+      MU_ENGINE_SERVER_FALKORDB__HOST: falkordb
+      MU_ENGINE_SERVER_FALKORDB__PORT: "6379"
+      MU_ENGINE_SERVER_LLM__ENABLED: "false"          # heuristic mode — no SLM container in this profile either
+      MU_ENGINE_SERVER_TOKEN_PATH: /home/mu-engine-server/.memory-universe/engine-server.token
+      MU_ENGINE_SERVER_WORKSPACE: local
+      MU_ENGINE_SERVER_NAMESPACE: default
+    volumes:
+      - ${HOME}/.memory-universe:/home/mu-engine-server/.memory-universe:ro
+      - mu-engine-server-hf-cache:/home/mu-engine-server/.cache/huggingface   # embedder download cache only — not "store" state
+    depends_on:
+      valkey:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8300/health', timeout=3).status == 200 else 1)\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: mu-engine-server-embedded-valkey
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: mu-engine-server-embedded-qdrant
+    tmpfs:
+      - /qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333' 2>/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  falkordb:
+    image: falkordb/falkordb:v4.20.1
+    container_name: mu-engine-server-embedded-falkordb
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  mu-engine-server-hf-cache:
