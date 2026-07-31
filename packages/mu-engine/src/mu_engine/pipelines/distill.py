@@ -158,6 +158,22 @@ class DistillSettings(BaseModel):
             "moved_to",
             "relocated_to",
             "reports_to",
+            # D5-quick (predicate/functional-predicate side ONLY — reconcile/supersede ROUTING
+            # is untouched, Rank 3 D2's territory): the extractor's new D-7 canonical predicates
+            # (``services/extract.py::ExtractionSettings.canonical_predicate_map`` +
+            # ``_canonicalize_predicate``'s head-initial-preposition rule) collapse each of these
+            # sentences' v1/v2 surface predicates onto ONE stable string per subject — and every
+            # one names a single-cardinality real-world relation (one current flight day, one
+            # current project deadline, one laptop, one current hotel, one team standup time),
+            # so a different object for the SAME (subject, predicate) is a genuine supersession,
+            # not a coexisting second value. Without this entry the now-colliding v1/v2 pair
+            # would fall through ``_contradicts`` to COEXIST (both facts staying active) even
+            # though they now correctly reach the SAME reconcile candidate set.
+            "flight",
+            "project_deadline",
+            "laptop",
+            "hotel",
+            "team_standup",
         }
     )
 
@@ -514,7 +530,34 @@ class DistillPipeline:
 
         winner = outcome.winner
         if outcome.identical is not None:
-            reinforced = outcome.identical.model_copy(deep=True)
+            # DEFECT-2 FIX (real-path verify gate, live-reproduced twice: deterministic + real-SLM
+            # public path): `outcome.identical` is a `_reconcile`-time SNAPSHOT taken for the WHOLE
+            # window BEFORE any `_resolve` call writes (module docstring / `_distill` — reconcile
+            # is "detection ONLY ... before any resolve call is even issued"). When the SAME
+            # `stm.recent()` window carries both the OLD raw message and its NEW contradicting
+            # replacement, that OLD message's own reconcile outcome resolves to this
+            # NOOP-reinforce branch holding a STALE pre-write copy of the very node the NEW
+            # message's SUPERSEDE action invalidates earlier in this SAME batch (`_distill`'s
+            # `actions = [... for outcome in reconciled]` runs every `_resolve` in window order,
+            # sequentially, over a snapshot list built entirely up-front). Blindly
+            # `model_copy`-ing that stale snapshot and `upsert_fact`-ing it back (the pre-fix
+            # behaviour) re-SET `state`/`invalid_at` to the snapshot's active/'' values, silently
+            # UNDOING the same-batch supersession — the exact semantic-shadowing defect (both
+            # versions end up `state=active` in the graph). Fix: re-read the node's CURRENT
+            # present-tense reality from the store immediately before writing, never trust the
+            # reconcile-time snapshot for a write. If a same-batch action already superseded it,
+            # `_current_node` returns `None` (the bi-temporal `facts_at` filter now excludes it)
+            # and the reinforce is skipped outright — reinforcing a dead node is meaningless, and
+            # skipping (rather than writing) is the only way that can never re-activate it.
+            current = await self._current_node(ns, outcome.identical, at=self._clock.now())
+            if current is None:
+                return self._action(
+                    DistillActionKind.NOOP,
+                    outcome.identical,
+                    (),
+                    "identical_superseded_same_batch_skip_reinforce",
+                )
+            reinforced = current.model_copy(deep=True)
             reinforced.access_count += 1
             reinforced.updated_at = self._clock.now()
             await self._ltm.upsert_fact(reinforced)
@@ -597,6 +640,22 @@ class DistillPipeline:
         return self._action(
             DistillActionKind.SUPERSEDE, winner, tuple(loser_ids), "functional_or_polarity_conflict"
         )
+
+    async def _current_node(
+        self, ns: Namespace, stale: MemoryItem, *, at: datetime
+    ) -> MemoryItem | None:
+        """Fresh present-tense re-read of ``stale.id`` (DEFECT-2 FIX helper) — the ONLY safeguard
+        between a reconcile-time snapshot and a write in `_resolve`'s NOOP branch. Uses
+        `GraphStorePort.facts_at` (bi-temporal `valid_at <= at AND (invalid_at = '' OR
+        invalid_at > at)`, no port-interface change needed) filtered by the node's OWN stored
+        `subject` string — never the winner's freshly-extracted subject, so this re-read carries
+        NO casing-collision risk of its own (DEFECT-1's concern), it is comparing the node against
+        itself. Returns `None` when `stale.id` no longer satisfies the present-tense filter — i.e.
+        an earlier action in THIS SAME `_distill` batch already invalidated it (or it lapsed on its
+        own bi-temporal window) — the caller's cue to skip the reinforce rather than resurrect it.
+        """
+        fresh = await self._ltm.facts_at(ns, at, subject=stale.subject)
+        return next((f for f in fresh if f.id == stale.id), None)
 
     # ---- MTM cross-store invalidate — NAMED degrade wrap (spec §13.2 fix #2) -----------------
     async def _invalidate_mtm_guarded(

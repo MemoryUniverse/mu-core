@@ -235,8 +235,25 @@ class FalkorLtmAdapter:
     ) -> list[MemoryItem]:
         # active facts sharing (subject, predicate) — the conflict access pattern
         # (graph_falkor.py find_conflicts; spec §2.5 ix_fact_conflict mirror).
+        #
+        # DEFECT-1 FIX (real-path verify gate, live-reproduced): the collision match is
+        # case-INSENSITIVE on subject (`toLower(m.subject) = toLower($subject)`), matching
+        # `resolve_entity`'s own `name.strip().casefold()` precedent two methods below — a real
+        # SLM extraction of the SAME entity across two turns is NOT guaranteed to return the same
+        # surface casing (observed: "ada"/"tuesday" on v1, "Ada"/"Thursday" on v2 for the SAME
+        # flight fact), and an exact-string `m.subject = $subject` silently drops the collision,
+        # so the v2 fact is treated as a brand-new (subject, predicate) pair (ADD) instead of a
+        # functional-supersession candidate — the exact defect this fixes. `predicate` is left
+        # exact: predicate canonicalization is `extract.py`'s job (D-7's canonical_predicate_map)
+        # and is out of scope here — this is subject-collision only (full entity normalization is
+        # D6/later, per the remediation scope). `toLower()` on both sides (not just one) so an
+        # already-lowercased stored subject still matches a differently-cased query subject and
+        # vice versa; leaves entity identity (the stored `m.subject` value itself, used by
+        # `graph_recall`/`facts_at` and returned in `memory_json`) untouched — this only widens
+        # the MATCH predicate for collision detection, it never rewrites what's stored.
         cypher = (
-            "MATCH (m:Memory) WHERE m.namespace = $ns AND m.subject = $subject "
+            "MATCH (m:Memory) WHERE m.namespace = $ns "
+            "AND toLower(m.subject) = toLower($subject) "
             "AND m.predicate = $predicate AND m.state = $active "
             "AND (m.invalid_at = '' OR m.invalid_at > $now) RETURN m.memory_json AS mj"
         )

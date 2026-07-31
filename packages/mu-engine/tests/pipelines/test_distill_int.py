@@ -274,6 +274,61 @@ async def test_distill_extracts_spo_from_raw_text(
     assert triples == {("Ada", "uses", "Postgres"), ("Ada", "works_at", "Acme")}
 
 
+async def test_distill_change_verb_sentence_now_reaches_ltm(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """D5-quick unblocker, end-to-end: an UNSTRUCTURED change-of-value sentence that used to
+    extract to ZERO facts (PIPELINE-TRACE-DIAGNOSIS.md §1, `ada_flight_v2`) now reaches the real
+    LTM graph through the full DISTILL pass (extractor -> reconcile -> resolve -> write)."""
+    ns = make_ns()
+    t1 = datetime(2024, 1, 1, tzinfo=UTC)
+    raw = make_item(ns, "Ada moved her flight to the Denver offsite to Thursday.", valid_at=t1)
+
+    report = await _pipeline(ltm, now=t1).distill(ns, [raw])
+
+    assert report.facts_extracted == 1  # BEFORE the D5-quick fix this was 0.
+    assert report.added == 1
+    hits = await ltm.graph_recall(ns, subject="Ada", limit=10)
+    assert {(h.item.predicate, h.item.object) for h in hits} == {("flight", "Thursday")}
+
+
+async def test_distill_change_verb_v2_supersedes_v1_gold_flight_pair(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """The exact `ada_flight_v1`/`ada_flight_v2` gold pair (`demos/pipeline_trace/gold_items.py`)
+    run end-to-end, raw-text in, through the extractor AND the reconcile/resolve stages: v1 and
+    v2 now COLLIDE on (subject, predicate) (D-7 canonicalization) and the newly-canonical
+    ``flight`` predicate is in ``functional_predicates`` (single-cardinality), so v2 genuinely
+    SUPERSEDES v1 in the live graph — the exact "current fact absent" defect
+    (DATA-QUALITY-ASSESSMENT.md §3.2) closed."""
+    ns = make_ns()
+    t_old = datetime(2019, 1, 1, tzinfo=UTC)
+    t_now = datetime(2024, 1, 1, tzinfo=UTC)
+
+    v1 = make_item(ns, "Ada's flight to the Denver offsite is on Tuesday.", valid_at=t_old)
+    report_v1 = await _pipeline(ltm, now=t_old).distill(ns, [v1])
+    assert report_v1.facts_extracted == 1
+    assert report_v1.added == 1
+
+    v2 = make_item(ns, "Ada moved her flight to the Denver offsite to Thursday.", valid_at=t_now)
+    report_v2 = await _pipeline(ltm, now=t_now).distill(ns, [v2])
+
+    assert report_v2.facts_extracted == 1
+    assert report_v2.superseded == 1  # v2 genuinely superseded v1, not a silent-drop or a dup.
+    assert report_v2.actions[0].kind is DistillActionKind.SUPERSEDE
+
+    # present-tense recall now holds Thursday (the "current fact absent" bug is fixed) ...
+    now_recall = {h.item.object for h in await ltm.graph_recall(ns, subject="Ada", limit=10)}
+    assert now_recall == {"Thursday"}
+    # ... and Tuesday survives in HISTORY (invalidate-don't-delete, never a hard drop).
+    hist = await ltm.facts_at(ns, t_old, subject="Ada")
+    assert {f.object for f in hist} == {"Tuesday"}
+
+
 async def test_distill_negation_supersedes_opposite_polarity(
     ltm: FalkorLtmAdapter,
     make_ns: Callable[..., Namespace],
@@ -318,3 +373,80 @@ async def test_distill_negation_supersedes_opposite_polarity(
     # the positive assertion survives historically (never deleted, just invalidated).
     hist = await ltm.facts_at(ns, t_old, subject="Ada")
     assert any(f.polarity is Polarity.POSITIVE for f in hist)
+
+
+async def test_find_conflicts_collides_across_subject_casing(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """DEFECT-1 regression (real-path verify gate, live-reproduced on the REAL SLM path): the SAME
+    entity extracted with a DIFFERENT surface casing across two turns ("ada"/tuesday vs
+    "Ada"/Thursday, the gold flight pair) must still collide on `(subject, predicate)` — an
+    exact-string `m.subject = $subject` silently drops the collision and the v2 fact lands as a
+    brand-new (subject, predicate) pair (ADD) instead of superseding v1, the exact defect."""
+    ns = make_ns()
+    t_old = datetime(2019, 1, 1, tzinfo=UTC)
+    t_now = datetime(2024, 1, 1, tzinfo=UTC)
+    v1 = make_item(
+        ns, "ada flight tuesday", subject="ada", predicate="flight", obj="tuesday", valid_at=t_old
+    )
+    v2 = make_item(
+        ns, "Ada flight Thursday", subject="Ada", predicate="flight", obj="Thursday", valid_at=t_now
+    )
+    await _pipeline(ltm, now=t_old).distill(ns, [v1])
+    report = await _pipeline(ltm, now=t_now).distill(ns, [v2])
+
+    # v2 genuinely SUPERSEDES v1 despite the casing mismatch — not a silent ADD-as-new-pair.
+    assert report.superseded == 1
+    assert report.actions[0].kind is DistillActionKind.SUPERSEDE
+
+    live = {h.item.object for h in await ltm.graph_recall(ns, subject="Ada", limit=10)}
+    assert live == {"Thursday"}
+    hist = {f.object for f in await ltm.facts_at(ns, t_old, subject="ada")}
+    assert hist == {"tuesday"}  # the lower-cased v1 survives historically, never dropped.
+
+
+async def test_distill_noop_reinforce_of_stale_message_does_not_undo_same_batch_supersede(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """DEFECT-2 regression (real-path verify gate, live-reproduced twice on the real
+    ``LocalMemory.consolidate()`` path — deterministic + real-SLM): ``stm.recent()`` naturally
+    returns BOTH the old raw message and its new contradicting replacement in the SAME window once
+    the old message hasn't expired from STM yet. Reproduced here directly against
+    ``DistillPipeline`` (no STM/LocalMemory dependency needed — the defect lives entirely in
+    ``_resolve``'s NOOP branch): tick 1 consolidates ONLY the old raw text (writes it active); tick
+    2 consolidates a window containing the NEW contradicting raw text FIRST and the (still
+    un-expired) OLD raw text AGAIN SECOND — the exact shape/order that exposed the bug: the new
+    message's SUPERSEDE action writes first, then the old message's own NOOP-reinforce action (a
+    RECONCILE-time snapshot fixed before either write in this batch happened) used to blindly
+    ``upsert_fact`` that stale snapshot back, resetting ``state``/``invalid_at`` to active/'' and
+    silently undoing the just-applied supersession — both versions ending up active (the exact
+    semantic-shadowing defect). After the fix, exactly one version is active regardless of order."""
+    ns = make_ns()
+    t_old = datetime(2019, 1, 1, tzinfo=UTC)
+    t_now = datetime(2024, 1, 1, tzinfo=UTC)
+    old_text = "Ada works at Acme"
+    new_text = "Ada works at Globex"
+
+    await _pipeline(ltm, now=t_old).distill(ns, [make_item(ns, old_text, valid_at=t_old)])
+
+    # tick 2's window: NEW first, stale OLD (re-extracted -> a FRESH LTM node id, unlike a
+    # structured item) second — the order that exposed the pre-fix resurrection.
+    report = await _pipeline(ltm, now=t_now).distill(
+        ns,
+        [
+            make_item(ns, new_text, valid_at=t_now),
+            make_item(ns, old_text, valid_at=t_old),
+        ],
+    )
+
+    assert DistillActionKind.SUPERSEDE in {a.kind for a in report.actions}
+    assert DistillActionKind.NOOP in {a.kind for a in report.actions}
+
+    # present-tense: EXACTLY one version active — the resurrection defect is fixed.
+    live = await ltm.graph_recall(ns, subject="Ada", limit=10)
+    assert {h.item.object for h in live} == {"Globex"}
+    assert len(live) == 1
