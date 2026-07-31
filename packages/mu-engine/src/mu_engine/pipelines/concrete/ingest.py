@@ -209,7 +209,17 @@ class DeterministicPromoteStage(BaseStage):
             ctx.state.get("content_hash")
             or _build_memory_item(activity, at=self._clock.now()).content_hash
         )
-        return content_hash
+        # NAMESPACE-SCOPED (AG-2 / design §13 item 6d): the bare content_hash collides across
+        # tenants — two DIFFERENT users adding identical content+triple into one instance would
+        # share one ledger key, so the second user's promote SKIPPED("ledger-hit") and silently
+        # never upserted under their own namespace. Prefix with the full η partition
+        # (Namespace.to_prefix(), CANONICAL §1 rule 5) so the ledger key is per-tenant, matching
+        # the physical MTM key-space every store adapter already partitions on. Chosen over
+        # folding η into ``compute_content_hash`` (storage/domain/memory.py) because that basis is
+        # also the STORED ``content_hash`` field (dedupe/version key across the whole record, spec
+        # §2.4) — widening it would change the on-disk hash for every existing item, whereas the
+        # ledger key is a private, throwaway idempotency token local to this stage.
+        return f"{activity.namespace.to_prefix()}:{content_hash}"
 
     async def _resolve_item(self, ctx: PipelineContext, activity: IngestActivity) -> MemoryItem:
         # Fast path: the STM stage handed the item over in-process. Recovery path (a crash between

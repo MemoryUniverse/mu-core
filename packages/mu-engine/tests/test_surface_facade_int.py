@@ -1,0 +1,422 @@
+"""``SurfaceFacade`` unit + REAL integration (AG-3, sdk-build-plan.md §2 Stage A / build-queue §13
+item 1).
+
+Two tiers:
+
+* ``unit`` — pure delegation logic against a fake :class:`~mu_engine.surface.LocalContainerLike`
+  (mocks permitted per this repo's ``unit`` marker discipline, ``pyproject.toml:75``): proves each
+  verb calls the RIGHT sub-service with the RIGHT arguments and passes its result straight through
+  (no re-wrapping), with zero real infra.
+* ``integration`` — mu-dev-cache + mu-dev-qdrant + mu-dev-falkordb, REAL offline MiniLM embedder,
+  ZERO mocks (DEV-STANDARDS: non-negotiable). Proves ``SurfaceFacade`` is a PURE surface over a
+  real ``mu_local.composition.LocalContainer`` by round-tripping data written through ONE surface
+  (``SurfaceFacade`` or ``mu_local.local_memory.LocalMemory``) back out through the OTHER: if both
+  land in the identical η partition with field-equal content, the facade's namespace/scope
+  construction — not merely its call shape — matches ``LocalMemory``'s exactly (module docstring
+  of ``mu_engine/surface/facade.py``: this facade RE-DERIVES that construction, it does not import
+  it). ``promote``/``demote``/``build_context``/``share`` are proven to raise the named
+  ``SurfaceVerbNotImplementedError`` (build-queue §13 items 3/5) rather than silently no-op.
+
+``mu_local`` is imported HERE — test-only — to build the real composition root the facade wraps
+and to provide the parity oracle (``LocalMemory``). ``mu_engine``'s PRODUCTION code
+(``mu_engine/surface/facade.py``) never imports it: confirmed separately by ``uv run lint-imports``
+(the ``core-layers``/``mu-local-layers`` import-linter contracts, ``.importlinter:13-27``) and by
+``grep -rn 'mu_local' packages/mu-engine/src/mu_engine/surface/*.py`` returning prose-only hits
+(no ``import``/``from`` statement). Test code sits outside that production boundary the same way
+``mu-local``'s own tests already import ``mu_engine`` directly (``mu-local/tests/
+test_local_roundtrip_int.py``).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+import pytest_asyncio
+from falkordb.asyncio import FalkorDB
+from qdrant_client import AsyncQdrantClient
+from redis.asyncio import Redis
+
+from mu_contracts.config import Settings
+from mu_engine.lifecycle.mode_gate import ManagerModeGate
+from mu_engine.pipelines.concrete.ingest import IngestActivity
+from mu_engine.pipelines.distill import DistillReport
+from mu_engine.providers._contracts import Completion
+from mu_engine.services.ingest import IngestResult
+from mu_engine.services.recall.dto import RecallChannels, RecallResult
+from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, MemoryTier
+from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.surface import LlmNotConfiguredError, SurfaceFacade, SurfaceVerbNotImplementedError
+from mu_local import LocalContainer, LocalMemory
+from mu_local.config import StorageSettings
+
+_USER = "u1"
+_SESSION = "s1"
+_WORKSPACE = "ws-surface"
+_ORG = "org-surface"
+
+
+# ============================================================================================
+# unit tier — fake LocalContainerLike, zero real infra (mocks permitted, "unit" marker)
+# ============================================================================================
+
+
+def _fake_ns() -> Namespace:
+    return Namespace(
+        org=_ORG, workspace=_WORKSPACE, user=_USER, session=_SESSION, visibility=Visibility.PRIVATE
+    )
+
+
+def _fake_ingest_result() -> IngestResult:
+    return IngestResult(
+        memory_id="mem_fake1",
+        content_hash="hash_fake1",
+        promoted=True,
+        tiers_written=("stm", "mtm"),
+        events_emitted=("MemoryCaptured", "MemoryPromoted"),
+    )
+
+
+def _fake_recall_result() -> RecallResult:
+    return RecallResult(
+        namespace=_fake_ns(),
+        items=[],
+        channels_run=RecallChannels(),
+        generated_at=datetime.now(UTC),
+    )
+
+
+class _FakeContainer:
+    """A minimal, hand-built double satisfying ``LocalContainerLike`` structurally — every
+    attribute is an ``AsyncMock``/``MagicMock`` so a unit test can assert exactly what
+    ``SurfaceFacade`` called it with, with zero network/store I/O."""
+
+    def __init__(self) -> None:
+        self.ingest = MagicMock()
+        self.ingest.remember = AsyncMock(return_value=_fake_ingest_result())
+        self.stm = MagicMock()
+        self.stm.get = AsyncMock(return_value=None)
+        self.stm.recent = AsyncMock(return_value=[])
+        self.recall = MagicMock()
+        self.recall.recall = AsyncMock()
+        self.distill = MagicMock()
+        self.distill.distill = AsyncMock(return_value=DistillReport(facts_extracted=0, actions=()))
+        # ``spec=ManagerModeGate``: unittest.mock treats bare ``assert_*``-named attributes as
+        # (mistyped) assertion calls and refuses them on a plain MagicMock; ``spec`` opts this
+        # attribute back in as a real, spec-checked method double.
+        self.mode_gate = MagicMock(spec=ManagerModeGate)
+        self.llm: Any = None
+
+
+@pytest.mark.unit
+async def test_add_delegates_one_ingest_call_and_passes_result_through() -> None:
+    container = _FakeContainer()
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    result = await facade.add("Ada lives in Paris", user=_USER, session=_SESSION)
+
+    container.ingest.remember.assert_awaited_once()
+    (activity,), _kwargs = container.ingest.remember.await_args
+    assert isinstance(activity, IngestActivity)
+    assert activity.text == "Ada lives in Paris"
+    assert activity.promote is True
+    assert activity.namespace.org == _ORG
+    assert activity.namespace.workspace == _WORKSPACE
+    assert activity.namespace.user == _USER
+    assert activity.namespace.session == _SESSION
+    # the engine-native IngestResult passes through unwrapped — no re-projection (DTO ruling 2).
+    assert result is container.ingest.remember.return_value
+
+
+@pytest.mark.unit
+async def test_add_rejects_empty_message_list_loud() -> None:
+    container = _FakeContainer()
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="no content"):
+        await facade.add([], user=_USER, session=_SESSION)
+    container.ingest.remember.assert_not_awaited()
+
+
+@pytest.mark.unit
+async def test_get_delegates_to_stm_with_the_right_namespace() -> None:
+    container = _FakeContainer()
+    item = MemoryItem(
+        content="Ada lives in Paris",
+        kind=MemoryKind.PROPOSITION,
+        namespace=_fake_ns(),
+        owner_id=_USER,
+        workspace_id=_WORKSPACE,
+        session_id=_SESSION,
+        tier=MemoryTier.STM,
+    )
+    container.stm.get = AsyncMock(return_value=item)
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    got = await facade.get("mem_fake1", user=_USER, session=_SESSION)
+
+    container.stm.get.assert_awaited_once()
+    (ns, memory_id), _ = container.stm.get.await_args
+    assert memory_id == "mem_fake1"
+    assert ns.org == _ORG and ns.workspace == _WORKSPACE and ns.user == _USER
+    assert got is item
+
+
+@pytest.mark.unit
+async def test_recall_builds_query_and_scope_and_passes_result_through() -> None:
+    container = _FakeContainer()
+    recall_result = _fake_recall_result()
+    container.recall.recall = AsyncMock(return_value=recall_result)
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    result = await facade.recall(
+        "Where does Ada live?", user=_USER, session=_SESSION, tier=MemoryTier.MTM, limit=3
+    )
+
+    container.recall.recall.assert_awaited_once()
+    (scope, query), _ = container.recall.recall.await_args
+    assert scope.principal_id == _USER
+    assert scope.org_id == _ORG
+    assert scope.workspace_id == _WORKSPACE
+    assert query.text == "Where does Ada live?"
+    assert query.limit == 3
+    assert query.channels.mtm is True
+    assert query.channels.stm is False
+    assert query.channels.ltm is False
+    assert result is recall_result
+
+
+@pytest.mark.unit
+async def test_consolidate_checks_mode_gate_before_delegating() -> None:
+    container = _FakeContainer()
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    report = await facade.consolidate(user=_USER, session=_SESSION, limit=7)
+
+    container.mode_gate.assert_manual_allowed.assert_called_once()
+    ns_arg, verb_arg = container.mode_gate.assert_manual_allowed.call_args.args
+    assert verb_arg == "consolidate"
+    assert ns_arg.user == _USER
+    container.stm.recent.assert_awaited_once()
+    container.distill.distill.assert_awaited_once()
+    assert report is container.distill.distill.return_value
+
+
+@pytest.mark.unit
+async def test_ask_refuses_loud_when_llm_not_configured_without_touching_recall() -> None:
+    container = _FakeContainer()
+    assert container.llm is None
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    with pytest.raises(LlmNotConfiguredError):
+        await facade.ask("Where does Ada live?", user=_USER, session=_SESSION)
+    container.recall.recall.assert_not_awaited()
+
+
+@pytest.mark.unit
+async def test_ask_synthesises_via_the_configured_llm() -> None:
+    container = _FakeContainer()
+    recall_result = _fake_recall_result()
+    container.recall.recall = AsyncMock(return_value=recall_result)
+    container.llm = MagicMock()
+    container.llm.generate = AsyncMock(
+        return_value=Completion(text="Paris", model_group="mu-local-llm", model_id="mu-local-llm/x")
+    )
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    answer = await facade.ask("Where does Ada live?", user=_USER, session=_SESSION)
+
+    assert answer == "Paris"
+    container.llm.generate.assert_awaited_once()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("verb", ["promote", "demote", "build_context", "share"])
+async def test_unbuilt_verbs_raise_the_named_error_without_touching_the_container(
+    verb: str,
+) -> None:
+    container = _FakeContainer()
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    with pytest.raises(SurfaceVerbNotImplementedError) as exc_info:
+        if verb == "build_context":
+            await facade.build_context("Ada", user=_USER, session=_SESSION)
+        elif verb == "share":
+            await facade.share(
+                "mem_fake1", visibility=Visibility.SHARED, user=_USER, session=_SESSION
+            )
+        else:
+            await getattr(facade, verb)("mem_fake1", user=_USER, session=_SESSION)
+    assert exc_info.value.verb == verb
+    container.ingest.remember.assert_not_awaited()
+    container.recall.recall.assert_not_awaited()
+    container.stm.get.assert_not_awaited()
+    container.distill.distill.assert_not_awaited()
+
+
+# ============================================================================================
+# integration tier — REAL mu-dev-cache + mu-dev-qdrant + mu-dev-falkordb, ZERO mocks
+# ============================================================================================
+
+
+@pytest.fixture(scope="session")
+def settings() -> Settings:
+    return Settings()
+
+
+@pytest.fixture
+def uid() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+@pytest_asyncio.fixture
+async def container(settings: Settings) -> AsyncIterator[LocalContainer]:
+    c = LocalContainer(StorageSettings(), settings=settings)
+    try:
+        yield c
+    finally:
+        await c.close()
+
+
+@pytest_asyncio.fixture
+async def mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+    """A LocalMemory bound to the SAME (workspace, org) the ``container``-backed facade under
+    test uses (module-level ``_WORKSPACE``/``_ORG``, tagged with ``uid`` so parallel test runs
+    don't collide) — the shared η partition proving the parity claim above."""
+    memory = LocalMemory(
+        workspace=f"{_WORKSPACE}{uid}", namespace=f"{_ORG}{uid}", settings=settings
+    )
+    try:
+        yield memory
+    finally:
+        await _teardown(settings, uid)
+        await memory.aclose()
+
+
+async def _teardown(settings: Settings, uid: str) -> None:
+    """PORT of ``mu-local/tests/test_local_roundtrip_int.py``'s ``_teardown`` (duplicated, not
+    imported — test-tree-local helper in a package this test file has no import access to)."""
+    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
+    try:
+        for coll in (await qdrant.get_collections()).collections:
+            if uid in coll.name:
+                with contextlib.suppress(Exception):
+                    await qdrant.delete_collection(coll.name)
+    finally:
+        await qdrant.close()
+
+    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
+    try:
+        for g in await db.list_graphs():
+            name = g.decode() if isinstance(g, bytes) else g
+            if uid in name:
+                with contextlib.suppress(Exception):
+                    await db.select_graph(name).delete()
+    finally:
+        with contextlib.suppress(Exception):
+            await db.connection.aclose()
+
+    redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
+    try:
+        keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]
+        if keys:
+            await redis.delete(*keys)
+    finally:
+        await redis.aclose()
+
+
+async def _eventually(read: Callable[[], Awaitable[RecallResult]]) -> RecallResult:
+    """PORT of the reference test's polling helper (qdrant upserts are eventually consistent —
+    the store's real consistency model, not a masked bug)."""
+    last = await read()
+    for _ in range(40):  # ~8s ceiling
+        if last.items:
+            return last
+        await asyncio.sleep(0.2)
+        last = await read()
+    return last
+
+
+@pytest.mark.integration
+async def test_facade_write_is_readable_through_local_memory(
+    container: LocalContainer, mem: LocalMemory, uid: str
+) -> None:
+    """(1) facade WRITES; ``LocalMemory.get`` (a completely independent container instance
+    pointed at the SAME redis/qdrant/falkordb) reads it back field-equal — proving the facade's
+    η math, not just its call shape, matches ``LocalMemory``'s."""
+    facade = SurfaceFacade(container, workspace=f"{_WORKSPACE}{uid}", namespace=f"{_ORG}{uid}")
+
+    written = await facade.add("Ada lives in Paris", user=_USER, session=_SESSION)
+    assert written.promoted
+    assert "mtm" in written.tiers_written
+    assert written.content_hash and written.memory_id
+
+    via_local_memory = await mem.get(written.memory_id, user=_USER, session=_SESSION)
+    assert via_local_memory is not None, "LocalMemory could not see the facade's STM write"
+    assert via_local_memory.content == "Ada lives in Paris"
+    assert via_local_memory.tier == "stm"
+
+    via_facade_itself = await facade.get(written.memory_id, user=_USER, session=_SESSION)
+    assert via_facade_itself is not None
+    assert via_facade_itself.content == via_local_memory.content
+    assert via_facade_itself.tier.value == via_local_memory.tier
+
+
+@pytest.mark.integration
+async def test_local_memory_write_is_readable_through_facade(
+    container: LocalContainer, mem: LocalMemory, uid: str
+) -> None:
+    """(2) the REVERSE direction — ``LocalMemory`` WRITES; the facade reads it back."""
+    facade = SurfaceFacade(container, workspace=f"{_WORKSPACE}{uid}", namespace=f"{_ORG}{uid}")
+
+    written = await mem.add("Ada works at Acme", user=_USER, session=_SESSION)
+    assert written.promoted
+
+    via_facade = await facade.get(written.memory_id, user=_USER, session=_SESSION)
+    assert via_facade is not None, "SurfaceFacade could not see LocalMemory's STM write"
+    assert via_facade.content == "Ada works at Acme"
+    assert via_facade.tier is MemoryTier.STM
+
+
+@pytest.mark.integration
+async def test_facade_recall_consolidate_ask_and_unbuilt_verbs(
+    container: LocalContainer, mem: LocalMemory, uid: str
+) -> None:
+    facade = SurfaceFacade(container, workspace=f"{_WORKSPACE}{uid}", namespace=f"{_ORG}{uid}")
+
+    r1 = await facade.add("Ada lives in Paris", user=_USER, session=_SESSION)
+    r2 = await mem.add("Ada works at Acme", user=_USER, session=_SESSION)
+
+    # (3) recall parity — both surfaces federate the SAME two memories.
+    facade_hits = await _eventually(
+        lambda: facade.recall("What do we know about Ada?", user=_USER, session=_SESSION)
+    )
+    mem_hits = await mem.recall("What do we know about Ada?", user=_USER, session=_SESSION)
+    facade_ids = {it.memory_id for it in facade_hits.items}
+    assert {r1.memory_id, r2.memory_id} <= facade_ids
+    assert set(mem_hits.memory_ids) == facade_ids, "facade/LocalMemory recall diverged on hits"
+
+    # (4) consolidate — facade drives the SAME MTM->LTM distill LocalMemory.consolidate() does.
+    report = await facade.consolidate(user=_USER, session=_SESSION)
+    assert report.facts_extracted >= 2, "heuristic extractor found no SPO facts to consolidate"
+    assert report.added >= 2, "no facts landed in the LTM graph"
+
+    # (5) ask() refuses loudly in heuristic mode — never a silent empty synthesis (spec §7, T7).
+    with pytest.raises(LlmNotConfiguredError):
+        await facade.ask("Where does Ada live?", user=_USER, session=_SESSION)
+
+    # (6) promote/demote/build_context/share are honest 501-shaped refusals, never a silent no-op.
+    with pytest.raises(SurfaceVerbNotImplementedError):
+        await facade.promote(r1.memory_id, user=_USER, session=_SESSION)
+    with pytest.raises(SurfaceVerbNotImplementedError):
+        await facade.demote(r1.memory_id, user=_USER, session=_SESSION)
+    with pytest.raises(SurfaceVerbNotImplementedError):
+        await facade.build_context("Ada", user=_USER, session=_SESSION)
+    with pytest.raises(SurfaceVerbNotImplementedError):
+        await facade.share(r1.memory_id, visibility=Visibility.SHARED, user=_USER, session=_SESSION)

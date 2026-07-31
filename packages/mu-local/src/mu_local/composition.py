@@ -54,6 +54,7 @@ from mu_contracts.config import Settings, get_settings
 from mu_contracts.domain.errors import MemoryUniverseError
 from mu_contracts.domain.model.memory import Namespace
 from mu_contracts.ports.bus import EventBusPort
+from mu_contracts.ports.governance import ConflictRecordRepository
 from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
 from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
@@ -69,7 +70,7 @@ from mu_engine.lifecycle.promotion import PromotionService
 from mu_engine.lifecycle.salience import SalienceStrategy
 from mu_engine.lifecycle.settings import LifecycleSettings, ManagerModeSettings
 from mu_engine.pipelines.distill import DistillPipeline, DistillSettings
-from mu_engine.pipelines.ledger import InMemoryStageLedger
+from mu_engine.pipelines.ledger import InMemoryStageLedger, StageLedger
 from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import SystemClock
 from mu_engine.platform.observability import build_audit, build_metrics, build_tracer
@@ -199,10 +200,19 @@ class LocalContainer:
         settings: Settings | None = None,
         observability: ObservabilitySettings | None = None,
         lifecycle: LifecycleSettings | None = None,
+        stage_ledger: StageLedger | None = None,
+        conflict_records: ConflictRecordRepository | None = None,
     ) -> None:
         self._settings: Settings = settings or get_settings()
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._obs: ObservabilitySettings = observability or ObservabilitySettings()
+        # Injection seam (design §13 item 6a): a durable caller (e.g. mu-engine-server, Stage C)
+        # threads its own RedisStageLedger / durable ConflictRecordRepository through here; every
+        # daemonless/embedded caller (mu-local's own callers, all tests) omits both and gets the
+        # SAME in-process defaults constructed below (:2 and :7c) — byte-identical embedded
+        # behavior, unchanged (AG-1).
+        self._injected_stage_ledger: StageLedger | None = stage_ledger
+        self._injected_conflict_records: ConflictRecordRepository | None = conflict_records
 
         # (0) fail-loud mandatory-role + graph-not-folded validation (reuse the engine registry).
         assert_mandatory_roles(
@@ -221,16 +231,30 @@ class LocalContainer:
 
         # (2) STM (kv role: redis by default) — built through the STORE_REGISTRY seam, exactly
         #     like every other role (spec §4.2). The durable KV write is the facade's durability
-        #     floor; the pipeline ledger is IN-PROCESS (InMemoryStageLedger) — a cross-PROCESS
-        #     durable ledger is a daemon concern (mu-client), not this daemonless single-session
-        #     facade. An in-process ledger also keeps promote idempotency scoped to THIS instance,
-        #     so a content_hash (which the engine keys content-only, not per-η) never collides
-        #     across tenants/runs.
+        #     floor; the pipeline ledger defaults to IN-PROCESS (InMemoryStageLedger) — a
+        #     cross-PROCESS durable ledger (RedisStageLedger, mu-engine/pipelines/ledger.py:117)
+        #     is a caller-supplied concern via the ``stage_ledger`` ctor param (design §13 item
+        #     6a): mu-engine-server (Stage C) injects its own; every daemonless/embedded caller
+        #     here gets this in-process default, unchanged (AG-1).
+        #
+        #     TRUTH (repaired 2026-07-31, design §13 item 6d — REVIEW-3 C2; was falsely "never
+        #     collides across tenants/runs"): the promote idempotency key the ledger stores is
+        #     keyed off ``content_hash`` alone (content-only, no η/namespace component,
+        #     ``mu_engine.storage.domain.memory.compute_content_hash``). That IS collision-safe
+        #     ACROSS separate ``LocalContainer``/process instances (each has its own ledger
+        #     keyspace — an in-process ``InMemoryStageLedger`` or a distinct Redis prefix). It was
+        #     NOT safe cross-USER within ONE multi-tenant instance: two different namespaces
+        #     writing identical content would collide on the same bare content_hash key and the
+        #     second promote would be silently skipped as a ledger hit. This is now fixed at the
+        #     source by A3 (design §13 item 6d): ``DeterministicPromoteStage.idempotency_key``
+        #     (``mu-engine/pipelines/concrete/ingest.py``) namespace-scopes the key so distinct
+        #     namespaces never share a ledger entry, regardless of which ``StageLedger``
+        #     implementation is injected here.
         self.stm: StmTierRepository = STORE_REGISTRY.build(
             "kv", storage.kv.backend, **self._kv_cfg(storage.kv)
         )
         self._register_closer(self.stm, "_redis", "_mc")
-        self._ledger = InMemoryStageLedger()
+        self._ledger: StageLedger = self._injected_stage_ledger or InMemoryStageLedger()
 
         # (3) MTM (vector role: qdrant by default) — dim from the LIVE embedder, built through
         #     the same STORE_REGISTRY seam.
@@ -314,7 +338,11 @@ class LocalContainer:
         #      (mirrors ``use_llm_extractor`` -> ``build_extractor`` precedent) — never read
         #      internally by ``DistillPipeline`` itself. ``InMemoryConflictRecordRepository`` is
         #      the sanctioned LOCAL-plane conflict-inbox default (a real in-process adapter, not a
-        #      mock) for a PENDING/MANUAL-parked verdict.
+        #      mock) for a PENDING/MANUAL-parked verdict — used unless a durable
+        #      ``ConflictRecordRepository`` was injected via the ``conflict_records`` ctor param
+        #      (design §13 item 6a/6b; no durable implementation exists in-tree yet, item 6b).
+        #      Every daemonless/embedded caller here omits it and gets this in-process default,
+        #      unchanged (AG-1).
         self._distill_settings = DistillSettings()
         self.conflict_adjudicator: ConflictAdjudicator | None = None
         if self.llm is not None and self._distill_settings.use_llm_adjudicator:
@@ -323,7 +351,8 @@ class LocalContainer:
                 router=self.llm,
                 clock=self._clock,
                 bus=self._bus,
-                conflict_records=InMemoryConflictRecordRepository(),
+                conflict_records=self._injected_conflict_records
+                or InMemoryConflictRecordRepository(),
             )
 
         # (8) application services — each facade verb delegates to exactly one of these; each gets
