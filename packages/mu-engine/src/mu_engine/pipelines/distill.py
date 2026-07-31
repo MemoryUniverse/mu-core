@@ -310,7 +310,13 @@ def _heuristic_only_verdict(
             confidence=1.0,
             reason="no_adjudicator_heuristic_coexist",
         )
-    if _valid_at(candidate) > _valid_at(winner):
+    # BUG1 FIX: ASSERTION recency (`created_at`), never `valid_at` — see `_resolve`'s own
+    # winner-selection comment above for the full rationale. This no-adjudicator degrade floor
+    # picks the SAME kind label `_resolve` would end up applying via `_asserted_later` regardless
+    # (that override runs unconditionally on the returned kind too), kept here so the `reason`
+    # string and the pre-existing "tie goes to the incoming winner" bare-`>` convention stay
+    # accurate for a caller inspecting THIS function's return value directly.
+    if _asserted_later(candidate, winner):
         return AdjudicationVerdict(
             kind=AdjudicationKind.SELF_EXPIRE,
             apply=True,
@@ -325,6 +331,19 @@ def _heuristic_only_verdict(
         confidence=1.0,
         reason="no_adjudicator_heuristic_supersede",
     )
+
+
+def _asserted_later(candidate: MemoryItem, winner: MemoryItem) -> bool:
+    """BUG1 FIX (data-quality re-assessment §2): True iff ``candidate`` was ASSERTED (its source
+    STM message's real ``created_at`` — STM insertion order) strictly after ``winner``. This is
+    the ONE predicate that decides supersession direction throughout this module — NEVER a
+    ``valid_at`` comparison (the extracted bi-temporal world-time, unreliable from the real 0.5B
+    SLM path: it can be garbled/mis-parsed, or simply reflect a different real-world event date
+    than assertion order would suggest). A tie (identical ``created_at``, e.g. two same-batch
+    structured items minted at the exact same instant) goes to ``winner`` — i.e. returns False —
+    the same "tie goes to the incoming winner" convention every pre-existing caller already
+    depends on."""
+    return candidate.created_at > winner.created_at
 
 
 # --------------------------------------------------------------------------------------- pipeline
@@ -515,6 +534,17 @@ class DistillPipeline:
             owner_id=source.owner_id,
             workspace_id=source.workspace_id,
             session_id=source.session_id,
+            # BUG1 FIX (data-quality re-assessment §2 "SUPERSESSION WINNER INVERTED", real-SLM
+            # path): `created_at` is the ASSERTION time this node's supersession-direction
+            # decision now authoritatively keys on (see `_resolve`'s `_asserted_later` below) — it
+            # must reflect the SOURCE STM message's real capture instant, never the wall-clock
+            # instant this extracted-fact object happens to be CONSTRUCTED at (which follows
+            # extraction/window-iteration order, not real assertion order — see `_collect_facts`'s
+            # SAME-BATCH CHRONOLOGY docstring). Before this fix `created_at` was left at its
+            # `MemoryItem` field default (`_utcnow()` at construction time); `_promote_structured`
+            # (the OTHER `_collect_facts` branch, for already-structured items) already preserves
+            # the source's real `created_at` via `model_copy` — this makes both paths consistent.
+            created_at=source.created_at,
             subject=fact.subject,
             predicate=fact.predicate,
             object=fact.object,
@@ -649,16 +679,35 @@ class DistillPipeline:
                     # two bare, silently-unrelated active facts.
                     await self._ltm.mark_conflict(ns, winner.id, candidate.id, at=self._clock.now())
                 continue  # parked (MANUAL_PENDING) or otherwise withheld — never fabricate
-            if verdict.kind is AdjudicationKind.SELF_EXPIRE:
-                self_expire.append((candidate, verdict))
-            elif verdict.kind is AdjudicationKind.SUPERSEDE:
-                supersede.append((candidate, verdict))
+            if verdict.kind in (AdjudicationKind.SELF_EXPIRE, AdjudicationKind.SUPERSEDE):
+                # BUG1 FIX (data-quality re-assessment §2 "SUPERSESSION WINNER INVERTED", the top
+                # defect): the adjudicator (LLM OR the heuristic degrade floor) only tells us THAT
+                # `winner`/`candidate` genuinely conflict — its own SELF_EXPIRE-vs-SUPERSEDE
+                # *polarity* is never trusted to decide WHICH ONE actually wins. Two independent,
+                # live-reproduced failure modes fed a wrong polarity into this exact branch before
+                # the fix: (1) a real-SLM extraction garbles/mis-parses a date span into `valid_at`
+                # (the assessment's literal repro: an "extended to October 24th" fact whose object
+                # extraction failed landed with a `valid_at` that read EARLIER than the fact it was
+                # meant to supersede); (2) even when `valid_at` is honest, the tiny 0.5B adjudicator
+                # model itself answers the EXISTING-vs-NEW framing backwards often enough to invert
+                # the winner on a plain "October 10th" -> "extended to October 24th" pair (live-
+                # reproduced against the real `mu-dev-slm` — see `diag_bug1b.py`). Both failure
+                # modes are eliminated the same way: ASSERTION recency (`MemoryItem.created_at` —
+                # the source STM message's real capture instant / STM insertion order, NEVER the
+                # extracted bi-temporal `valid_at`) is the ONLY signal that decides direction here.
+                # `valid_at` is still stamped on every node (`_action`/`upsert_fact` below) as the
+                # bi-temporal WORLD-time validity — it is simply never consulted to pick a winner.
+                if _asserted_later(candidate, winner):
+                    self_expire.append((candidate, verdict))
+                else:
+                    supersede.append((candidate, verdict))
             # COEXIST -> no action; both stay active.
 
         # Graphiti bi-temporal interval logic (edge_operations.py:406-441/622-639): the incoming
         # fact self-expires if ANY candidate the adjudicator judged more authoritative exists.
+        # `newest` (BUG1 fix) is picked by ASSERTION recency too, for the same reason as above.
         if self_expire:
-            newest, _ = max(self_expire, key=lambda cv: _valid_at(cv[0]))
+            newest, _ = max(self_expire, key=lambda cv: cv[0].created_at)
             winner.state = MemoryState.SUPERSEDED
             winner.invalid_at = _valid_at(newest)
             await self._ltm.upsert_fact(winner)

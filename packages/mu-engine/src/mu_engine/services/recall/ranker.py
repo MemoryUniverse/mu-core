@@ -298,11 +298,19 @@ class ThreeChannelRecallRanker:
             # named LTM_UNAVAILABLE degrade, which is reserved for the flat seed itself).
             return hits, False
         seen = {s.item.id for s in hits}
-        merged = list(hits)
-        for s in traversal_hits:
-            if s.item.id not in seen:
-                seen.add(s.item.id)
-                merged.append(s)
+        extra = [s for s in traversal_hits if s.item.id not in seen]
+        # BUG2 FIX (data-quality re-assessment §3, "fix the ranker LTM arm so traversal hits
+        # outrank unrelated same-subject attributes"): RRF fuses channels by RANK (position in
+        # this returned list), never by raw `.score` — so unconditionally appending EVERY
+        # traversal-only hit AFTER the entire flat seed (the pre-fix code) gave a traversal hit
+        # the worst possible rank in this channel no matter how relevant it was, directly
+        # contradicting this method's own docstring ("competes on equal footing with every other
+        # LTM hit"). Re-sorting the combined list by `.score` — the flat seed's recency-rank score
+        # and the traversal arm's hop+predicate-relevance score (`FalkorLtmAdapter.
+        # _traverse_entities_impl`) are both already comparable relevance signals — lets a
+        # genuinely on-topic traversal hit (e.g. "Ada manages Bo" for "who is Bo's manager?") earn
+        # the rank its relevance deserves instead of being structurally buried.
+        merged = sorted([*hits, *extra], key=lambda s: -s.score)
         return merged, False
 
     async def _score_stm(

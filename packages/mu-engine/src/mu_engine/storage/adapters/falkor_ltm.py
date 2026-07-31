@@ -80,6 +80,27 @@ class EntityUidsSink(Protocol):
     ) -> None: ...
 
 
+def _user_scope_prefix(ns: Namespace) -> str:
+    """BUG2 FIX (data-quality re-assessment §3 "MULTI-HOP TRAVERSAL DOES NOT WALK", scoping
+    caveat): the USER-level scope key for the ``:Entity`` sub-graph (subject/object nodes +
+    entity-entity edges, B5/B6) — the SAME shape as ``Namespace.to_prefix()`` MINUS the trailing
+    ``session`` segment, deliberately. A real-world entity ("Ada", "Bo") and the relation between
+    two of them are USER-level concepts, not session-scoped ones: the same person is the same
+    graph node regardless of which conversation turn — and which SESSION — mentioned them. Before
+    this fix every ``:Entity``/entity-edge was tagged with the FULL session-included
+    ``ns.to_prefix()``, so the SAME person mentioned in two different sessions minted TWO
+    disconnected entity nodes, and a query issued from session B could never walk an edge
+    materialized while the caller was in session A — even though the PHYSICAL FalkorDB graph
+    (``graph_name_for``, keyed on (org, workspace, visibility, user) — no session) already holds
+    both sessions' facts in the exact same partition. This is exactly the re-assessment's
+    "traversal filters on the FULL η-prefix INCLUDING session" caveat: physical isolation was
+    already per-user; the property-level scope just hadn't caught up. ``:Memory`` nodes
+    (``graph_recall``/``facts_at``/``find_conflicts``/session-scoped reads) are UNCHANGED — this
+    narrower scope applies ONLY to the entity sub-graph the multi-hop traversal arm walks."""
+    user_slot = "*" if ns.visibility is Visibility.SHARED else ns.user
+    return "/".join(("mu", ns.org, ns.workspace, ns.visibility.value, user_slot))
+
+
 def _sanitize_rel_type(predicate: str) -> str:
     """A canonicalized predicate (D5, ``services/extract.py::_canonicalize_predicate``) -> a
     SAFE openCypher relationship-type token. Cypher has no parameterized relationship type
@@ -234,7 +255,11 @@ class FalkorLtmAdapter:
         if not subj_uid or not obj_uid:
             return
         rel_type = _sanitize_rel_type(item.predicate)
-        ns_prefix = props["namespace"]
+        # BUG2 FIX: the entity-edge MATCH scopes on the USER-level prefix (see
+        # `_user_scope_prefix`'s docstring) — NOT `props["namespace"]` (the `:Memory` node's own
+        # FULL session-included prefix) — matching the scope `_merge_entity` just MERGEd `s`/`o`
+        # under, two lines up.
+        ns_prefix = _user_scope_prefix(item.namespace)
         # MERGE keyed on (subj entity, obj entity, rel TYPE) — idempotent re-upsert of the SAME
         # fact refreshes this SAME edge's timestamps/memory_id; a functional-supersession
         # (different object -> different `obj_uid`) lands on a DIFFERENT edge instead of
@@ -291,8 +316,11 @@ class FalkorLtmAdapter:
             "CASE WHEN $raw IN e.aliases THEN e.aliases ELSE e.aliases + $raw END "
             "RETURN e.entity_uid AS uid"
         )
+        # BUG2 FIX: USER-level scope (see `_user_scope_prefix`), not `ns.to_prefix()` — an entity
+        # is a per-USER concept, deduped across every session that user has, not re-minted per
+        # session.
         rows = await g_query(
-            g, cypher, {"ns": ns.to_prefix(), "canon": canonical, "uid": uid, "raw": name}
+            g, cypher, {"ns": _user_scope_prefix(ns), "canon": canonical, "uid": uid, "raw": name}
         )
         return str(rows[0][0]) if rows else uid
 
@@ -501,10 +529,13 @@ class FalkorLtmAdapter:
         functional supersession (different object -> a genuinely DIFFERENT edge) still carries
         `memory_id = loser_id` untouched, so this correctly closes THAT edge.
         """
+        # BUG2 FIX: USER-level scope (see `_user_scope_prefix`) — matches the scope the edge was
+        # MERGEd under in `_materialize_entity_edge`, not the `:Memory` node's session-scoped
+        # `ns.to_prefix()`.
         await g.query(
             "MATCH (:Entity {namespace: $ns})-[r {memory_id: $loser_id}]->"
             "(:Entity {namespace: $ns}) SET r.invalid_at = $at",
-            params={"ns": ns.to_prefix(), "loser_id": loser_id, "at": at_iso},
+            params={"ns": _user_scope_prefix(ns), "loser_id": loser_id, "at": at_iso},
         )
 
     async def mark_conflict(self, ns: Namespace, a_id: str, b_id: str, *, at: datetime) -> None:
@@ -541,10 +572,12 @@ class FalkorLtmAdapter:
             "(e.canonical_name = $canon OR $canon IN e.alias_keys) "
             "RETURN e.entity_uid AS uid, e.canonical_name AS cn, e.aliases AS al LIMIT $k"
         )
+        # BUG2 FIX: USER-level scope (see `_user_scope_prefix`) — must match `_merge_entity`'s OWN
+        # write scope, or every resolve MERGE-mints a duplicate entity node per session.
         res = await g_query(
             self._graph(ns),
             cypher,
-            {"ns": ns.to_prefix(), "canon": canonical, "k": self._shortlist_size},
+            {"ns": _user_scope_prefix(ns), "canon": canonical, "k": self._shortlist_size},
         )
         candidates = tuple(
             EntityCandidate(
@@ -614,13 +647,22 @@ class FalkorLtmAdapter:
         if not tokens:
             return []
         g = self._graph(ns)
-        ns_prefix = ns.to_prefix()
+        # BUG2 FIX (scoping): the entity/edge frontier walk scopes on the USER-level prefix (see
+        # `_user_scope_prefix`'s docstring), not the session-included `ns.to_prefix()` — so a
+        # relational query issued from ANY session for this user walks entity edges materialized
+        # from EVERY session, not just the one the query happens to be running in.
+        user_ns_prefix = _user_scope_prefix(ns)
         now_iso = self._clock.now().isoformat()
         hops = max(1, min(max_hops, 2))
+        query_stems = {_stem(t) for t in tokens}
 
         frontier = sorted(tokens)
         seen_entities: set[str] = set(frontier)
-        memory_hop: dict[str, int] = {}  # memory_id -> smallest hop distance it was found at
+        # memory_id -> (smallest hop distance, whether ITS predicate lexically matches a query
+        # word) — BUG2 FIX (c): the predicate-relevance signal below lets a genuinely on-topic
+        # 2-hop relation ("owns", for "what does Bo own?") outrank an unrelated 1-hop same-subject
+        # attribute (e.g. Ada's own favorite-coffee edge), which pure hop-distance alone cannot.
+        memory_hop: dict[str, int] = {}
         for depth in range(1, hops + 1):
             if not frontier:
                 break
@@ -631,7 +673,7 @@ class FalkorLtmAdapter:
                 "RETURN DISTINCT r.memory_id AS mid, other.canonical_name AS ocn"
             )
             rows = await g_query(
-                g, cypher, {"ns": ns_prefix, "frontier": frontier, "now": now_iso}
+                g, cypher, {"ns": user_ns_prefix, "frontier": frontier, "now": now_iso}
             )
             next_frontier: list[str] = []
             for mid, ocn in rows:
@@ -646,32 +688,83 @@ class FalkorLtmAdapter:
 
         if not memory_hop:
             return []
+        # BUG2 FIX (scoping): NO `:Memory`-namespace filter here — the ids above already came ONLY
+        # from entity edges inside THIS SAME physical per-user graph (`self._graph(ns)`, keyed on
+        # org/workspace/visibility/user — never crosses a tenant boundary), so re-imposing the
+        # session-scoped `m.namespace = $ns` equality here would silently drop every hit whose
+        # source fact was captured in a DIFFERENT session than the one the caller happens to be
+        # querying from — exactly the re-assessment's "a query from another session returns 0"
+        # caveat, even though the physical partition already holds it.
         fetch_cypher = (
-            "MATCH (m:Memory {namespace: $ns}) WHERE m.id IN $ids "
+            "MATCH (m:Memory) WHERE m.id IN $ids "
             "AND m.state = $active AND (m.invalid_at = '' OR m.invalid_at > $now) "
             "RETURN m.id AS id, m.memory_json AS mj"
         )
         rows = await g_query(
             g,
             fetch_cypher,
-            {
-                "ns": ns_prefix,
-                "ids": list(memory_hop),
-                "active": MemoryState.ACTIVE.value,
-                "now": now_iso,
-            },
+            {"ids": list(memory_hop), "active": MemoryState.ACTIVE.value, "now": now_iso},
         )
         scored: list[Scored[MemoryItem]] = []
         for mid, mj in rows:
             hop = memory_hop.get(str(mid), hops)
             item = MemoryItem.model_validate_json(mj)
+            # BUG2 FIX (a)/(c): a flat `1/hop` score alone ranks any 1-hop same-subject attribute
+            # (e.g. Ada's OWN favorite-coffee edge) above a genuinely on-topic 2-hop relation, and
+            # ties every 1-hop hit together regardless of whether it actually answers the query's
+            # relation ("manager"/"owns"/...). `_predicate_matches_query` adds a flat bonus when
+            # the fact's OWN predicate lexically relates to a query word — this is what makes the
+            # genuinely-asked-about relation ("Ada MANAGES Bo" for "who is Bo's manager?") rank
+            # above noise at the SAME hop distance, and even above a CLOSER but irrelevant hop.
+            relevance_bonus = 1.0 if _predicate_matches_query(item.predicate, query_stems) else 0.0
             scored.append(
-                Scored(item=item, score=1.0 / hop, channel=RecallChannel.LTM_GRAPH, rank=0)
+                Scored(
+                    item=item,
+                    score=(1.0 / hop) + relevance_bonus,
+                    channel=RecallChannel.LTM_GRAPH,
+                    rank=0,
+                )
             )
         scored.sort(key=lambda s: -s.score)
-        return [
-            s.model_copy(update={"rank": rank}) for rank, s in enumerate(scored[:limit])
-        ]
+        return [s.model_copy(update={"rank": rank}) for rank, s in enumerate(scored[:limit])]
+
+
+_STEM_SUFFIXES = ("ing", "ers", "er", "es", "ed", "s")
+
+
+def _stem(word: str) -> str:
+    """BUG2 FIX (data-quality re-assessment §3, ranking item (c)): a crude common-suffix strip —
+    NOT a real stemmer, no NLP dependency — just enough to equate a query's natural-language
+    relation word with the canonicalized predicate string it maps to ("manager"/"manages"/
+    "managed" -> "manag"; "owns"/"owner"/"owning" -> "own"). Only strips when the remainder is
+    still at least 3 characters (``len(w) > len(suffix) + 2``) so short/unrelated words never
+    over-strip into an accidental collision (e.g. "is" is returned unchanged)."""
+    for suffix in _STEM_SUFFIXES:
+        if len(word) > len(suffix) + 2 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
+def _predicate_matches_query(predicate: str | None, query_stems: set[str]) -> bool:
+    """BUG2 FIX (c): True iff this fact's OWN predicate lexically relates to a word actually
+    typed in the query (via :func:`_stem`) — the traversal-relevance signal that lets "Ada MANAGES
+    Bo" outrank an unrelated same-subject attribute for "who is Bo's MANAGER?", and "Bo OWNS Q3
+    report" outrank one for "what does Bo OWN?". A canonicalized predicate can be multi-word
+    (``project_deadline``, ``lives_in``) — every underscore-segment is stemmed and checked
+    independently so a compound predicate still matches on its meaningful segment."""
+    if not predicate:
+        return False
+    for segment in re.split(r"[_\s]+", predicate.casefold()):
+        if len(segment) < 3:
+            continue
+        seg_stem = _stem(segment)
+        if any(
+            seg_stem == qs or seg_stem.startswith(qs) or qs.startswith(seg_stem)
+            for qs in query_stems
+            if len(qs) >= 3
+        ):
+            return True
+    return False
 
 
 async def g_query(graph: Any, cypher: str, params: dict[str, Any]) -> list[list[Any]]:

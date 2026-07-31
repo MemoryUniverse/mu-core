@@ -375,8 +375,21 @@ async def test_validity_tie_parks_manual_pending_never_fabricates(
 ) -> None:
     ns = make_ns()
     t_same = datetime(2022, 6, 15, tzinfo=UTC)
+    # BUG1 FIX (data-quality re-assessment §2): the tie this test exercises is now an ASSERTION-
+    # recency tie (`created_at`), never a `valid_at` tie — `distill.py::_asserted_later` (via
+    # `_heuristic_verdict`, `conflict.py`) is the ONE predicate that decides direction throughout
+    # the pipeline post-fix, so an identical `created_at` (pinned explicitly here — real wall-clock
+    # `make_item()` calls would never tie at datetime-microsecond resolution) is the genuine
+    # "even the heuristic can't decide" case. `valid_at` is still set (bi-temporal world-time) but
+    # deliberately NOT tied — proving the tie-detection no longer keys on it at all.
     existing = make_item(
-        ns, "Ada works at Acme", subject="Ada", predicate="works_at", obj="Acme", valid_at=t_same
+        ns,
+        "Ada works at Acme",
+        subject="Ada",
+        predicate="works_at",
+        obj="Acme",
+        valid_at=t_same,
+        created_at=t_same,
     )
     incoming = make_item(
         ns,
@@ -384,8 +397,9 @@ async def test_validity_tie_parks_manual_pending_never_fabricates(
         subject="Ada",
         predicate="works_at",
         obj="Globex",
-        valid_at=t_same,  # EXACT tie with `existing` — the heuristic floor can flag a conflict
-    )  # (functional predicate) but cannot break the tie without a guess.
+        valid_at=datetime(2030, 1, 1, tzinfo=UTC),  # deliberately NOT tied — must not matter
+        created_at=t_same,  # EXACT assertion-time tie with `existing`
+    )
 
     records = InMemoryConflictRecordRepository()
     bus = _RecordingBus()

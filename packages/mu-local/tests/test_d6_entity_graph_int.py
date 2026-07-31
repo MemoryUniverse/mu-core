@@ -30,6 +30,7 @@ from falkordb.asyncio import FalkorDB
 from qdrant_client import AsyncQdrantClient
 
 from mu_contracts.config import Settings
+from mu_engine.storage.adapters.falkor_ltm import _user_scope_prefix
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
 from mu_local import LocalMemory
@@ -76,10 +77,16 @@ async def test_entities_and_edge_materialize_and_multihop_traversal(
         graph_name = container.ltm.graph_name_for(ns)  # type: ignore[attr-defined]
         g = falkor.select_graph(graph_name)
 
+        # BUG2 FIX (data-quality re-assessment §3): `:Entity` nodes + entity-entity edges are now
+        # scoped on the USER-level prefix (`_user_scope_prefix`), not the session-included
+        # `ns.to_prefix()` — an entity is a per-USER concept, deduped across every session, so
+        # these ground-truth GRAPH.QUERY assertions must key on the SAME scope the adapter writes.
+        user_ns = _user_scope_prefix(ns)
+
         # (a) :Entity nodes exist for Ada + Bo (direct GRAPH.QUERY, bypassing every port filter).
         ent_res = await g.query(
             "MATCH (e:Entity) WHERE e.namespace = $ns RETURN e.canonical_name, e.entity_uid",
-            params={"ns": ns.to_prefix()},
+            params={"ns": user_ns},
         )
         entities = {row[0]: row[1] for row in ent_res.result_set}
         print(f"\n[D6-VERIFY] :Entity nodes: {entities}")  # noqa: T201
@@ -91,7 +98,7 @@ async def test_entities_and_edge_materialize_and_multihop_traversal(
             "MATCH (s:Entity {namespace: $ns, canonical_name: 'ada'})"
             "-[r]->(o:Entity {namespace: $ns, canonical_name: 'bo'}) "
             "RETURN type(r), r.valid_at, r.invalid_at, r.memory_id",
-            params={"ns": ns.to_prefix()},
+            params={"ns": user_ns},
         )
         edges = edge_res.result_set
         print(f"[D6-VERIFY] Ada->Bo edges: {edges}")  # noqa: T201
@@ -156,6 +163,7 @@ async def test_functional_supersede_invalidates_entity_edge(
     try:
         graph_name = container.ltm.graph_name_for(ns)  # type: ignore[attr-defined]
         g = falkor.select_graph(graph_name)
+        user_ns = _user_scope_prefix(ns)  # BUG2 FIX — see the other test's comment above
 
         await mem.add("Ada works at Acme", user=_USER, session=_SESSION, importance_score=0.9)
         report1 = await mem.consolidate(user=_USER, session=_SESSION)
@@ -165,7 +173,7 @@ async def test_functional_supersede_invalidates_entity_edge(
             "MATCH (s:Entity {namespace: $ns, canonical_name: 'ada'})"
             "-[r:WORKS_AT]->(o:Entity {namespace: $ns, canonical_name: 'acme'}) "
             "RETURN r.invalid_at",
-            params={"ns": ns.to_prefix()},
+            params={"ns": user_ns},
         )
         assert before.result_set and before.result_set[0][0] == "", (
             "Ada/Acme entity edge must be ACTIVE before the superseding add"
@@ -180,13 +188,13 @@ async def test_functional_supersede_invalidates_entity_edge(
             "MATCH (s:Entity {namespace: $ns, canonical_name: 'ada'})"
             "-[r:WORKS_AT]->(o:Entity {namespace: $ns, canonical_name: 'acme'}) "
             "RETURN r.invalid_at",
-            params={"ns": ns.to_prefix()},
+            params={"ns": user_ns},
         )
         after_winner = await g.query(
             "MATCH (s:Entity {namespace: $ns, canonical_name: 'ada'})"
             "-[r:WORKS_AT]->(o:Entity {namespace: $ns, canonical_name: 'globex'}) "
             "RETURN r.invalid_at",
-            params={"ns": ns.to_prefix()},
+            params={"ns": user_ns},
         )
         print(f"[D6-VERIFY supersede] Ada->Acme (loser) invalid_at rows: {after_loser.result_set}")  # noqa: T201
         print(f"[D6-VERIFY supersede] Ada->Globex (winner) invalid_at rows: {after_winner.result_set}")  # noqa: T201, E501

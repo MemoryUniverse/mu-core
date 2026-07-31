@@ -454,12 +454,21 @@ class ConflictAdjudicator:
         self, winner: MemoryItem, candidate: MemoryItem, contradicts: bool
     ) -> tuple[AdjudicationKind, float, str]:
         """The deterministic degrade floor (``PolarityCardinalityHeuristic``'s OLD final-verdict
-        role, spec §8). Unlike the pre-ADR-0037 code (which broke a ``valid_at`` tie toward the
-        winner via a bare ``>`` comparison), a genuine tie here is PENDING — "even the heuristic
-        can't decide" (spec §8) — never a silent default winner."""
+        role, spec §8). Unlike the pre-ADR-0037 code (which broke a tie toward the winner via a
+        bare ``>`` comparison), a genuine tie here is PENDING — "even the heuristic can't decide"
+        (spec §8) — never a silent default winner.
+
+        BUG1 FIX (data-quality re-assessment §2 "SUPERSESSION WINNER INVERTED"): compares
+        ``created_at`` (ASSERTION recency — the source STM message's real capture instant), NEVER
+        ``valid_at`` (the extracted bi-temporal world-time). ``distill.py``'s own ``_resolve``
+        re-derives this SAME direction from ``created_at`` unconditionally regardless of what this
+        method returns (never trusts this method's SELF_EXPIRE/SUPERSEDE polarity blind) — this
+        method is kept consistent with that authoritative rule so its OWN return value (``kind``,
+        used for e.g. the parked ``ConflictRecord``'s ``proposed_winner_id``) is never itself a
+        second, diverging source of truth."""
         if not contradicts:
             return AdjudicationKind.COEXIST, 1.0, "heuristic_no_contradiction"
-        c_at, w_at = _valid_at(candidate), _valid_at(winner)
+        c_at, w_at = candidate.created_at, winner.created_at
         if c_at > w_at:
             return AdjudicationKind.SELF_EXPIRE, 1.0, "heuristic_candidate_more_recent"
         if w_at > c_at:

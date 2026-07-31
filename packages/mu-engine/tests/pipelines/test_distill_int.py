@@ -184,30 +184,56 @@ async def test_functional_supersession_invalidates_loser_across_ltm_and_mtm(
     assert await _mtm_point_state(qdrant_client, ns, winner_src.id, dim=dim) == "active"
 
 
-async def test_distill_new_edge_self_expires_when_candidate_more_recent(
+async def test_distill_assertion_recency_decides_winner_not_valid_at(
     ltm: FalkorLtmAdapter,
     make_ns: Callable[..., Namespace],
     make_item: Callable[..., MemoryItem],
 ) -> None:
-    # Graphiti new-edge self-expiry (edge_operations.py:622-639): a LATE-arriving OLDER fact loses.
+    """BUG1 FIX regression (data-quality re-assessment §2 "SUPERSESSION WINNER INVERTED",
+    2026-07-31): supersedes the OLD ``test_distill_new_edge_self_expires_when_candidate_more_
+    recent`` test, which asserted the OPPOSITE (pre-fix) semantics — that a LATE-ASSERTED fact
+    loses to an earlier-asserted one whenever its bi-temporal ``valid_at`` reads "older". That was
+    exactly the defect the real-path re-assessment caught: the real 0.5B-SLM extractor garbles/
+    mis-parses ``valid_at`` (an event date parsed from free text) often enough that trusting it to
+    pick the supersession winner regularly inverts the outcome — the CURRENT fact ends up
+    ``superseded`` and the STALE one stays ``active``. The fix (``distill.py::_asserted_later``):
+    the fact whose SOURCE STM message was captured (``created_at``) LATER always wins, REGARDLESS
+    of what its ``valid_at`` says. Reproduced here with ``valid_at`` deliberately reversed
+    relative to assertion order — the first-asserted fact carries the LATER world-time ``valid_at``
+    (2030); the second-asserted fact carries the EARLIER one (2000) — proving the decision no
+    longer keys on ``valid_at`` at all.
+    """
     ns = make_ns()
-    t_old = datetime(2019, 1, 1, tzinfo=UTC)
-    t_new = datetime(2024, 1, 1, tzinfo=UTC)
+    t_first_assert = datetime(2019, 1, 1, tzinfo=UTC)  # asserted (created) FIRST
+    t_second_assert = datetime(2024, 1, 1, tzinfo=UTC)  # asserted (created) SECOND
 
-    recent = make_item(
-        ns, "Ada works at Globex", subject="Ada", predicate="works_at", obj="Globex", valid_at=t_new
+    first = make_item(
+        ns,
+        "Ada works at Globex",
+        subject="Ada",
+        predicate="works_at",
+        obj="Globex",
+        valid_at=datetime(2030, 1, 1, tzinfo=UTC),  # world-time LATER — deliberately reversed
+        created_at=t_first_assert,
     )
-    await _pipeline(ltm, now=t_new).distill(ns, [recent])
+    await _pipeline(ltm, now=t_first_assert).distill(ns, [first])
 
-    stale = make_item(
-        ns, "Ada works at Acme", subject="Ada", predicate="works_at", obj="Acme", valid_at=t_old
+    second = make_item(
+        ns,
+        "Ada works at Acme",
+        subject="Ada",
+        predicate="works_at",
+        obj="Acme",
+        valid_at=datetime(2000, 1, 1, tzinfo=UTC),  # world-time EARLIER, but asserted LATER
+        created_at=t_second_assert,
     )
-    report = await _pipeline(ltm, now=t_new).distill(ns, [stale])
+    report = await _pipeline(ltm, now=t_second_assert).distill(ns, [second])
 
-    assert report.actions[0].kind is DistillActionKind.SELF_EXPIRE
-    # the recent fact stays the live answer; the stale incoming fact is stored invalidated.
+    # the SECOND-asserted fact wins (assertion recency) even though its own valid_at is earlier.
+    assert report.actions[0].kind is DistillActionKind.SUPERSEDE
+    assert report.actions[0].loser_ids == (first.id,)
     recall_objs = {h.item.object for h in await ltm.graph_recall(ns, subject="Ada", limit=10)}
-    assert recall_objs == {"Globex"}
+    assert recall_objs == {"Acme"}
 
 
 async def test_distill_noop_reinforces_identical_fact(
