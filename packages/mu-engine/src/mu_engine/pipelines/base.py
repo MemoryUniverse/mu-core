@@ -104,6 +104,10 @@ class Stage(Protocol):
 
     async def compensate(self, ctx: PipelineContext, outcome: StageOutcome) -> None: ...
 
+    async def reconstruct_produced(
+        self, ctx: PipelineContext, events: Sequence[DomainEvent]
+    ) -> dict[str, Any]: ...
+
 
 class BaseStage(ABC):
     """Implements the ledger gate + event discipline ONCE (PIPELINES §2.2).
@@ -117,6 +121,14 @@ class BaseStage(ABC):
     durable ledger row — never "mark then publish" as two steps — so a crash cannot leave the key
     marked complete with its events lost. A ledger hit returns the recorded events; ``SKIPPED``
     therefore NEVER means "no events".
+
+    (F1 — crash-replay resume) A ledger hit means the STAGE's durable side effect survived, but the
+    in-process ``ctx.state`` it would have populated (e.g. ``memory_ids``, ``stm_item``) did NOT —
+    that lived only in the crashed process's memory. ``reconstruct_produced`` is the hook a concrete
+    stage overrides to rebuild that ``produced`` dict FROM the durably-recorded events (never by
+    re-running ``_execute``'s minting logic — a fresh ``MemoryItem()`` mints a NEW random id, which
+    would silently duplicate the already-durable record). Default returns ``{}`` — correct for any
+    stage whose downstream neighbours don't consume its ``produced`` (e.g. a pure fan-out trigger).
     """
 
     name: str
@@ -134,11 +146,17 @@ class BaseStage(ABC):
         if key:
             record = await self._ledger.completed_with_events(key)
             if record is not None:
+                # (F1) The stage's durable write survived a crash; rehydrate ctx.state from the
+                # recorded events so downstream stages see the SAME shape they would have on a
+                # fresh OK run — never empty, never a freshly-minted id (PIPELINES id-stability,
+                # CANONICAL §7.1).
+                produced = await self.reconstruct_produced(ctx, record.events)
                 return StageOutcome(
                     status=StageStatus.SKIPPED,
                     reason="ledger-hit",
                     idempotency_key=key,
                     events=record.events,
+                    produced=produced,
                 )
         outcome = await self._execute(ctx)
         if outcome.status in (StageStatus.OK, StageStatus.DEGRADED) and key:
@@ -151,6 +169,17 @@ class BaseStage(ABC):
     async def compensate(self, ctx: PipelineContext, outcome: StageOutcome) -> None:
         """Saga rollback; default no-op for read-only / append-only stages (PIPELINES §2.2)."""
         return None
+
+    async def reconstruct_produced(
+        self, ctx: PipelineContext, events: Sequence[DomainEvent]
+    ) -> dict[str, Any]:
+        """Rebuild this stage's ``produced`` dict from its OWN durably-recorded events on a ledger
+        hit (F1). Default: nothing to rehydrate — correct for stages whose ``produced`` no later
+        stage in the pipeline reads. Concrete stages whose downstream neighbours DO depend on their
+        ``produced`` (e.g. a minted, otherwise-unrecoverable id) MUST override this — never
+        re-execute the minting logic, which would fabricate a new identity for an already-durable
+        record."""
+        return {}
 
 
 class HaltPolicy(StrEnum):

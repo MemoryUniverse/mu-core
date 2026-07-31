@@ -15,12 +15,14 @@ Stage list (engine-core-spec §6.4 CAPTURE->INGEST):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from hashlib import sha256
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from mu_contracts.domain.events import IngestCompleted, MemoryCaptured, MemoryPromoted
+from mu_contracts.domain.events import DomainEvent, IngestCompleted, MemoryCaptured, MemoryPromoted
 from mu_contracts.domain.model.memory import Namespace, Tier
 from mu_contracts.ports.time import Clock
 from mu_engine.pipelines.base import BaseStage, PipelineContext, StageOutcome, StageStatus
@@ -161,6 +163,36 @@ class WriteStmStage(BaseStage):
             events=[MemoryCaptured(namespace=activity.namespace, ids=[item.id], tier=Tier.STM)],
             idempotency_key=self.idempotency_key(ctx),
         )
+
+    async def reconstruct_produced(
+        self, ctx: PipelineContext, events: Sequence[DomainEvent]
+    ) -> dict[str, Any]:
+        """(F1 — crash-replay resume) On a ledger hit the STM write is durable but ``ctx.state``
+        (``stm_item``/``memory_ids``/``content_hash``) was only ever populated in the crashed
+        process's memory — ``DeterministicPromoteStage._resolve_item``'s recovery path (this
+        module, ``_resolve_item``) needs it back to promote instead of raising "no STM item".
+
+        Re-reads the SAME durable STM record by the id carried in the recorded ``MemoryCaptured``
+        event — NEVER calls ``_build_memory_item`` again, which would mint a fresh random ``id``
+        (``storage/domain/memory.py::_memory_id``) and silently duplicate the already-durable
+        write (the exact failure this hook exists to prevent, CANONICAL §7.1 id-stability).
+        """
+        activity = _activity(ctx)
+        ids = [mid for event in events if isinstance(event, MemoryCaptured) for mid in event.ids]
+        if not ids:
+            # Recorded events don't carry a MemoryCaptured (should be impossible for this stage —
+            # its own _execute always emits exactly one) — nothing to rehydrate.
+            return {}
+        item = await self._stm.get(activity.namespace, ids[0])
+        if item is None:
+            # Ledger says complete but the durable STM record is gone (evicted/corrupted store).
+            # Fail loud rather than silently re-minting a new id under the same recorded name.
+            raise StageExecutionError(
+                self.name,
+                f"ledger-complete for {ids[0]!r} but the STM record is missing "
+                "(durability invariant violated — refusing to mint a replacement id)",
+            )
+        return {"stm_item": item, "memory_ids": [item.id], "content_hash": item.content_hash}
 
 
 class DeterministicPromoteStage(BaseStage):

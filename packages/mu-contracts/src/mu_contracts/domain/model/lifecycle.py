@@ -32,7 +32,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, GetCoreSchemaHandler
+from pydantic import BaseModel, ConfigDict, Field, GetCoreSchemaHandler, GetJsonSchemaHandler
+from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import CoreSchema, core_schema
 
 from mu_contracts.domain.model.memory import Namespace
@@ -88,6 +89,21 @@ class UserPrefix(str):
             _validate,
             serialization=core_schema.plain_serializer_function_ser_schema(str),
         )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, schema: CoreSchema, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        # JSON-schema projection only — no-info plain-validator core schemas have no
+        # default JSON-schema mapping, so pydantic's generator raises unless a type
+        # supplies one explicitly (see module docstring: runtime validation/wire byte-shape
+        # is untouched by this method).
+        return {
+            "type": "string",
+            "format": "mu-user-prefix",
+            "pattern": _USER_PREFIX_PATTERN.pattern,
+            "examples": ["mu/acme/ws1/private/user-42/"],
+        }
 
 
 class LifecycleJobKind(StrEnum):
