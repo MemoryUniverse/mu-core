@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = [
+    "ArtifactFsSettings",
     "ChromaSettings",
     "FaissSettings",
     "FalkorDBSettings",
@@ -254,6 +255,18 @@ class FaissSettings(BaseModel):
     path: str | None = "./.mu_data/faiss"
 
 
+class ArtifactFsSettings(BaseModel):
+    """Artifact / ``ContextRepository`` role — the LOCAL-plane filesystem content store
+    (``mu_engine.storage.adapters.content_fs.FsContextRepositoryAdapter``; software-arch spec
+    §5 ``ContextRepository`` port, l.260-263). No container: a real on-disk directory tree,
+    content-addressed (git-object-store-shaped fan-out), genuinely persistent across process
+    restarts. ``content_root`` is the ONE tunable (DEV-STANDARDS rule 3 — never hardcoded at
+    the adapter); a test run points this at a throwaway scratch dir, same discipline as
+    :class:`ChromaSettings`/:class:`FaissSettings` above."""
+
+    content_root: str = "./.mu_data/artifacts"
+
+
 class StorageSettings(BaseModel):
     """The decided stores, each behind a pluggable port (DEV-STANDARDS rule 5). ``vector``
     (Qdrant) is the SHARED-plane reference; ``pgvector``/``chroma``/``faiss`` are the additional
@@ -272,6 +285,7 @@ class StorageSettings(BaseModel):
     pgvector: PgVectorSettings = Field(default_factory=PgVectorSettings)
     chroma: ChromaSettings = Field(default_factory=ChromaSettings)
     faiss: FaissSettings = Field(default_factory=FaissSettings)
+    artifact: ArtifactFsSettings = Field(default_factory=ArtifactFsSettings)
 
 
 class Settings(BaseSettings):

@@ -1,10 +1,13 @@
 """``IngestService.remember(activity)`` — the fast-return INGEST entry (engine-core-spec §5).
 
-Drives the CAPTURE->INGEST pipeline (``pipelines/concrete/ingest.py``): ``WriteStmStage`` (STM
-durable, id minted once) -> ``DeterministicPromoteStage`` (STM->MTM atomic-fact vector via the REAL
-local embedder) -> ``EmitIngestCompletedStage`` (DISTILL trigger). ``HALT_LOUD`` (engine-core-spec
-§6.4): a stage failure keeps the durable partial and re-raises — never a silent swallow, never a
-compensating rollback of an already-durable STM write.
+Drives the CAPTURE->INGEST pipeline (``pipelines/concrete/ingest.py``): ``PersistRawArtifactStage``
+(NEW, optional — persists the raw activity as a ContextArtifact provenance root, software-arch spec
+§6 ``IngestService.ingest`` step 1, l.340) -> ``WriteStmStage`` (STM durable, id minted once,
+kind=REFERENCE -> artifact_ref when the artifact stage ran, spec l.341) ->
+``DeterministicPromoteStage`` (STM->MTM atomic-fact vector via the REAL local embedder) ->
+``EmitIngestCompletedStage`` (DISTILL trigger). ``HALT_LOUD`` (engine-core-spec §6.4): a stage
+failure keeps the durable partial and re-raises — never a silent swallow, never a compensating
+rollback of an already-durable STM write.
 
 Ports only (DEV-STANDARDS rule 5); fully async. The writer NEVER waits for conflict detection
 (conflict-resolution-async §1). This slice runs the pipeline in-process; the durable-Temporal
@@ -34,6 +37,7 @@ from mu_engine.pipelines.concrete.ingest import (
     DeterministicPromoteStage,
     EmitIngestCompletedStage,
     IngestActivity,
+    PersistRawArtifactStage,
     WriteStmStage,
     _build_memory_item,
     activity_id_for,
@@ -48,7 +52,7 @@ from mu_engine.platform.observability import (
 )
 from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.services.settings import IngestSettings
-from mu_engine.storage.ports import MtmTierRepository, StmTierRepository
+from mu_engine.storage.ports import ContextRepository, MtmTierRepository, StmTierRepository
 
 __all__ = ["IngestResult", "IngestService"]
 
@@ -90,6 +94,7 @@ class IngestService:
         tracer: Tracer | None = None,
         metrics: MetricSink | None = None,
         audit: AuditLog | None = None,
+        artifacts: ContextRepository | None = None,
     ) -> None:
         self._bus = bus
         self._clock = clock
@@ -99,11 +104,25 @@ class IngestService:
         self._tracer: Tracer = tracer or NoopTracer()
         self._metrics: MetricSink = metrics or NoopMetricSink()
         self._audit: AuditLog = audit or NoopAuditLog()
+        # NEW — ``artifacts`` (software-arch spec §6, l.340): optional so every EXISTING caller
+        # that constructs an ``IngestService`` without an artifact store (every unit/integration
+        # test in this tree today) keeps its byte-identical behaviour — plain PROPOSITION
+        # captures, no PersistRawArtifactStage. A caller that DOES thread a real
+        # ``ContextRepository`` (the composition roots, ``mu_local``/``mu_engine_server``) gets
+        # the stage prepended and every capture becomes kind=REFERENCE targeting a persisted
+        # ContextArtifact (this ADDS the reference-capture path; it never removes the
+        # proposition/distill one downstream).
+        artifact_stage: tuple[Stage, ...] = (
+            (PersistRawArtifactStage(artifacts=artifacts, ledger=ledger, clock=clock),)
+            if artifacts is not None
+            else ()
+        )
         self._pipeline = Pipeline(
             name=_PIPELINE_NAME,
             halt_policy=HaltPolicy.HALT_LOUD,
             durable=False,
             stages=(
+                *artifact_stage,
                 WriteStmStage(stm=stm, ledger=ledger, clock=clock),
                 DeterministicPromoteStage(
                     stm=stm,
@@ -173,7 +192,12 @@ class IngestService:
         promoted = self._promoted_this_call(outcomes)
         content_hash = (
             str(ctx.state.get("content_hash") or "")
-            or _build_memory_item(activity, at=self._clock.now()).content_hash
+            or _build_memory_item(
+                activity,
+                at=self._clock.now(),
+                artifact_ref=ctx.state.get("artifact_id"),
+                provenance_id=ctx.state.get("artifact_provenance_id"),
+            ).content_hash
         )
         tiers = ("stm", "mtm") if promoted else ("stm",)
         return IngestResult(

@@ -21,6 +21,7 @@ build/
 *.ladybug
 models/
 data/
+.mu_data/
 
 # OS / editor
 .DS_Store

@@ -15,6 +15,7 @@ from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
 
+from mu_engine.storage.domain.artifact import ContextArtifact
 from mu_engine.storage.domain.conflict import ConflictEdges
 from mu_engine.storage.domain.entity import EntityResolution
 from mu_engine.storage.domain.memory import MemoryItem
@@ -23,6 +24,7 @@ from mu_engine.storage.domain.recall import Scored, SparseQuery
 
 __all__ = [
     "ConflictEdgeReader",
+    "ContextRepository",
     "ControlPlaneRepository",
     "EdgeSpec",
     "GraphNodeRow",
@@ -183,9 +185,47 @@ class GraphStorePort(Protocol):
 
     async def resolve_entity(self, ns: Namespace, name: str) -> EntityResolution: ...
 
+    async def by_artifact(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]:
+        """Reverse provenance lookup: every LTM ``:Memory`` node REFERENCES-linked to the
+        ``:Artifact`` node ``artifact_id`` (software-arch spec §5 ``ContextRepository``
+        docstring note + ``mu_contracts.ports.memory.MemoryTierRepository.by_artifact`` — "the
+        FIRST-CLASS reverse lookup ... never a scan"). Traverses FROM the merged ``:Artifact``
+        node via the existing ``REFERENCES`` edge this module's ``_upsert_fact_impl`` already
+        writes whenever ``item.artifact_ref`` is set — never a ``:Memory``-label scan."""
+        ...
+
 
 # alias — the LTM tier repo IS the graph store port (spec §5 tree)
 LtmTierRepository = GraphStorePort
+
+
+# ------------------------------------------------------------------ ContextRepository (§5)
+class ContextRepository(Protocol):
+    """The provenance-root store port (software-arch spec §5, l.260-263): persists the RAW
+    ingested activity as a :class:`~mu_engine.storage.domain.artifact.ContextArtifact` —
+    step 1 of ``IngestService.ingest`` (spec §6, l.340) — before the STM capture memory (step 2)
+    is minted as ``kind=REFERENCE`` pointing at it via ``artifact_ref``.
+
+    ``open`` (spec l.262, a streaming ``AsyncReadable`` read of the body) is DEFERRED — this
+    minimal-correct slice exposes ``get_blob`` (a bounded whole-body read) instead; see
+    ``adapters/content_fs.py``'s module docstring for the flagged simplification and the
+    full ``content_git.py`` (versioned, worktree-merge, "ported from Letta Context
+    Repositories" — spec l.437) this is a floor beneath, not a replacement for.
+    """
+
+    async def put(self, art: ContextArtifact, blob: bytes) -> ContextArtifact:
+        """Persist ``blob`` under ``art``'s locator; return the stored (possibly re-hashed)
+        handle. Content-addressed + idempotent: re-``put``-ting the SAME ``(namespace, id,
+        content_hash)`` is a no-op overwrite, never a duplicate."""
+        ...
+
+    async def get(self, ns: Namespace, artifact_id: str) -> ContextArtifact | None:
+        """Hydrate the content-free metadata handle by id — never the body (CANONICAL §3.1)."""
+        ...
+
+    async def get_blob(self, ns: Namespace, artifact_id: str) -> bytes | None:
+        """Hydrate the BODY by id (the bounded floor beneath spec l.262's streaming ``open``)."""
+        ...
 
 
 # ------------------------------------------------------------------ relational control plane

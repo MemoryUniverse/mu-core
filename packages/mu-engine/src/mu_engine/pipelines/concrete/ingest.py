@@ -6,11 +6,13 @@ deterministic STM->MTM promotion that embeds the ATOMIC-FACT vector and upserts 
 keyed by ``content_hash``. NO LLM on this path (the mem0 fact-extraction / diff-loop is the DISTILL
 slice). Fully async; the store I/O is bounded by the adapters' ``@retry_io``.
 
-Stage list (engine-core-spec §6.4 CAPTURE->INGEST):
-1. ``WriteStmStage``          — STM add, key ``activity_id`` (M12)      -> ``MemoryCaptured``
+Stage list (engine-core-spec §6.4 CAPTURE->INGEST; software-arch spec §6 ``IngestService.ingest``,
+l.338-342, provides the numbering ``PersistRawArtifactStage`` now fills in as step 1):
+0. ``PersistRawArtifactStage`` — persist raw as a ContextArtifact (provenance root, spec l.340)
+1. ``WriteStmStage``          — STM add, kind=REFERENCE -> artifact_ref (spec l.341), key
+                                 ``activity_id`` (M12)                  -> ``MemoryCaptured``
 2. ``DeterministicPromoteStage`` — MTM upsert, key ``content_hash``    -> ``MemoryPromoted``
 3. ``EmitIngestCompletedStage``  — fan-out trigger                     -> ``IngestCompleted``
-(``PersistRawArtifactStage`` — the ContextArtifact provenance root — lands with the artifact store.)
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from mu_engine.pipelines.errors import StageExecutionError
 from mu_engine.pipelines.ledger import StageLedger
 from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.services.settings import IngestSettings
+from mu_engine.storage.domain.artifact import ArtifactKind, ContextArtifact
 from mu_engine.storage.domain.memory import (
     FactObjectKind,
     MemoryItem,
@@ -39,12 +42,13 @@ from mu_engine.storage.domain.memory import (
     MemoryTier,
     Polarity,
 )
-from mu_engine.storage.ports import MtmTierRepository, StmTierRepository
+from mu_engine.storage.ports import ContextRepository, MtmTierRepository, StmTierRepository
 
 __all__ = [
     "DeterministicPromoteStage",
     "EmitIngestCompletedStage",
     "IngestActivity",
+    "PersistRawArtifactStage",
     "WriteStmStage",
     "activity_id_for",
 ]
@@ -98,19 +102,39 @@ def activity_id_for(activity: IngestActivity) -> str:
     return sha256(basis.encode("utf-8")).hexdigest()
 
 
-def _build_memory_item(activity: IngestActivity, *, at: datetime) -> MemoryItem:
+def _build_memory_item(
+    activity: IngestActivity,
+    *,
+    at: datetime,
+    artifact_ref: str | None = None,
+    provenance_id: str | None = None,
+) -> MemoryItem:
     """Mint the STM ``MemoryItem`` ONCE (CANONICAL §7.1 — id carried unchanged across tiers).
 
     ``content_hash`` is derived by the model from content + triple; it is DISTINCT from ``id``.
+
+    ``artifact_ref``/``provenance_id`` (NEW, software-arch spec §6 ``IngestService.ingest`` step
+    2, l.341: "write STM MemoryItems (kind=reference -> artifact)"): when
+    ``PersistRawArtifactStage`` ran ahead of this stage in the pipeline, it threads the minted
+    :class:`~mu_engine.storage.domain.artifact.ContextArtifact`'s id/provenance stream through
+    ``ctx.state`` — the STM capture record becomes ``kind=REFERENCE`` targeting it, per the
+    design's ``MemoryKind`` split (``storage/domain/memory.py`` "proposition = inline
+    self-contained fact; reference = handle to a ContextArtifact"). Both default to ``None`` so
+    this function stays byte-compatible for any OTHER caller that mints a plain, artifact-less
+    ``PROPOSITION`` directly (e.g. the content-hash-only fallback calls in this module and in
+    ``services/ingest.py``, and any pre-existing test that calls it bare).
     """
     ns = activity.namespace
     owner = activity.owner_id or ns.user
     object_kind = activity.object_kind
     if activity.object is not None and object_kind is None:
         object_kind = FactObjectKind.LITERAL
+    kwargs: dict[str, Any] = {}
+    if provenance_id is not None:
+        kwargs["provenance_id"] = provenance_id
     return MemoryItem(
         content=activity.text,
-        kind=MemoryKind.PROPOSITION,
+        kind=MemoryKind.REFERENCE if artifact_ref else MemoryKind.PROPOSITION,
         tier=MemoryTier.STM,
         state=MemoryState.ACTIVE,
         namespace=ns,
@@ -126,6 +150,8 @@ def _build_memory_item(activity: IngestActivity, *, at: datetime) -> MemoryItem:
         object=activity.object,
         object_kind=object_kind,
         polarity=activity.polarity,
+        artifact_ref=artifact_ref,
+        **kwargs,
     )
 
 
@@ -134,6 +160,64 @@ def _activity(ctx: PipelineContext) -> IngestActivity:
     if not isinstance(activity, IngestActivity):
         raise StageExecutionError("ingest", "ctx.state['activity'] is not an IngestActivity")
     return activity
+
+
+def artifact_id_for(activity: IngestActivity) -> str:
+    """Deterministic artifact id (software-arch spec §6, l.340) — the SAME discriminator basis
+    as :func:`activity_id_for` (this one raw activity has exactly one provenance root), prefixed
+    so it never collides with a memory id in a log/index that mixes both kinds."""
+    return f"art_{activity_id_for(activity)}"
+
+
+class PersistRawArtifactStage(BaseStage):
+    """Stage 0 — persist the raw activity as a ContextArtifact provenance root (software-arch
+    spec §6 ``IngestService.ingest`` step 1, l.340: "persist raw as ContextArtifact(s)
+    (provenance)"). Runs BEFORE ``WriteStmStage`` so the minted artifact id/provenance stream can
+    be threaded onto the STM ``MemoryItem``'s ``artifact_ref``/``provenance_id`` (step 2, l.341).
+
+    Idempotency (PIPELINES §2.2): NOT ledger-gated (``idempotency_key`` returns ``""``, mirroring
+    ``DeterministicPromoteStage``'s own "not every stage needs the ledger" precedent, l.235-239 of
+    this module) — the underlying write is ALREADY idempotent by construction: both the artifact
+    id (:func:`artifact_id_for`) and the blob path (content-hash-addressed, ``content_fs.py``)
+    are deterministic functions of the activity, so a crash-replay simply re-derives and re-``put``
+    s the IDENTICAL artifact (same id, same bytes) — a harmless overwrite, never a duplicate,
+    and never a re-mint of a fresh random id (CANONICAL §7.1 id-stability, applied here to the
+    artifact side of the provenance pair).
+    """
+
+    name = "persist_raw_artifact"
+
+    def __init__(self, *, artifacts: ContextRepository, ledger: StageLedger, clock: Clock) -> None:
+        super().__init__(ledger=ledger, clock=clock)
+        self._artifacts = artifacts
+
+    def idempotency_key(self, ctx: PipelineContext) -> str:
+        return ""  # not ledger-gated — see class docstring (the store write is self-idempotent).
+
+    async def _execute(self, ctx: PipelineContext) -> StageOutcome:
+        activity = _activity(ctx)
+        blob = activity.text.encode("utf-8")
+        content_hash = sha256(blob).hexdigest()
+        provenance_id = f"prov_{activity_id_for(activity)}"
+        ns = activity.namespace
+        art = ContextArtifact(
+            id=artifact_id_for(activity),
+            namespace=ns,
+            kind=ArtifactKind.TRANSCRIPT,
+            version=content_hash,
+            uri=f"artifact://{ns.to_prefix()}/{content_hash}",
+            content_hash=content_hash,
+            provenance_id=provenance_id,
+        )
+        stored = await self._artifacts.put(art, blob)
+        return StageOutcome(
+            status=StageStatus.OK,
+            produced={
+                "artifact": stored,
+                "artifact_id": stored.id,
+                "artifact_provenance_id": stored.provenance_id,
+            },
+        )
 
 
 class WriteStmStage(BaseStage):
@@ -155,7 +239,15 @@ class WriteStmStage(BaseStage):
 
     async def _execute(self, ctx: PipelineContext) -> StageOutcome:
         activity = _activity(ctx)
-        item = _build_memory_item(activity, at=self._clock.now())
+        # NEW (software-arch spec §6, l.341): when PersistRawArtifactStage ran ahead of this one
+        # (the normal pipeline order below), ctx.state carries the minted ContextArtifact's id +
+        # shared provenance stream — this capture record becomes kind=REFERENCE targeting it.
+        item = _build_memory_item(
+            activity,
+            at=self._clock.now(),
+            artifact_ref=ctx.state.get("artifact_id"),
+            provenance_id=ctx.state.get("artifact_provenance_id"),
+        )
         await self._stm.put(item)
         return StageOutcome(
             status=StageStatus.OK,
@@ -239,7 +331,12 @@ class DeterministicPromoteStage(BaseStage):
             return ""
         content_hash = (
             ctx.state.get("content_hash")
-            or _build_memory_item(activity, at=self._clock.now()).content_hash
+            or _build_memory_item(
+                activity,
+                at=self._clock.now(),
+                artifact_ref=ctx.state.get("artifact_id"),
+                provenance_id=ctx.state.get("artifact_provenance_id"),
+            ).content_hash
         )
         # NAMESPACE-SCOPED (AG-2 / design §13 item 6d): the bare content_hash collides across
         # tenants — two DIFFERENT users adding identical content+triple into one instance would

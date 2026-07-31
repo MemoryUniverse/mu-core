@@ -117,6 +117,11 @@ class StorageSettings(BaseModel):
     kv: BackendChoice = BackendChoice(backend="redis")  # STM (shared with the pipeline ledger)
     vector: BackendChoice = BackendChoice(backend="qdrant")  # MTM dense
     graph: BackendChoice = BackendChoice(backend="falkordb")  # LTM — MANDATORY graph engine
+    # ContextRepository (NEW — software-arch spec §5): the provenance-root artifact store
+    # PersistRawArtifactStage writes through. NOT mandatory (StoreRegistry.MANDATORY_ROLES is
+    # unchanged) — the filesystem floor (content_fs.py) is the only backend registered so far;
+    # a future content_git.py (spec l.437) selects in by changing this ONE field.
+    artifact: BackendChoice = BackendChoice(backend="filesystem")
     embedding: BackendChoice = BackendChoice(backend="minilm_local")  # REAL offline MiniLM
     llm: ModelProfileSettings | None = None  # None ⇒ heuristic mode (no synthesis); configured ⇒
     #                                          composition root builds a REAL ModelRouter (spec §7,

@@ -353,6 +353,23 @@ class FalkorLtmAdapter:
             )
         return EntityResolution(canonical_name=canonical, entity_uid=None, candidates=candidates)
 
+    async def by_artifact(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]:
+        return await self._retry(self._by_artifact_impl)(ns, artifact_id)
+
+    async def _by_artifact_impl(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]:
+        # Reverse provenance lookup (GraphStorePort.by_artifact, storage/ports.py): traverses
+        # FROM the merged (:Artifact) node via the REFERENCES edge `_upsert_fact_impl` already
+        # writes whenever `item.artifact_ref` is set (module docstring OWNER DECISION 1's same
+        # MERGE-on-write pattern) — a graph traversal off an indexed MERGE key, never a
+        # `:Memory`-label scan (mu_contracts.ports.memory.MemoryTierRepository.by_artifact
+        # docstring: "never a scan").
+        cypher = (
+            "MATCH (a:Artifact {namespace: $ns, id: $art})<-[:REFERENCES]-(m:Memory) "
+            "RETURN m.memory_json AS mj"
+        )
+        res = await g_query(self._graph(ns), cypher, {"ns": ns.to_prefix(), "art": artifact_id})
+        return [MemoryItem.model_validate_json(r[0]) for r in res]
+
 
 async def g_query(graph: Any, cypher: str, params: dict[str, Any]) -> list[list[Any]]:
     """Run an openCypher read and return the raw result rows (result_set)."""

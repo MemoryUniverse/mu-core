@@ -94,7 +94,12 @@ from mu_engine.services.recall import (
 from mu_engine.services.recall.dto import RecallChannels, RecallQuery, RecallResult
 from mu_engine.storage.domain.namespace import Visibility
 from mu_engine.storage.factories import STORE_REGISTRY
-from mu_engine.storage.ports import GraphStorePort, MtmTierRepository, StmTierRepository
+from mu_engine.storage.ports import (
+    ContextRepository,
+    GraphStorePort,
+    MtmTierRepository,
+    StmTierRepository,
+)
 from mu_engine.storage.registry import assert_mandatory_roles
 from mu_engine.surface.facade import SurfaceFacade
 from mu_engine_server.app import build_app
@@ -111,6 +116,10 @@ _VECTOR_BACKEND = "qdrant"
 _GRAPH_BACKEND = "falkordb"
 _RELATIONAL_BACKEND = "sqlite"  # off the ingest/recall critical path, same as LocalContainer
 _EMBEDDING_BACKEND = "minilm_local"
+# ContextRepository role (NEW — software-arch spec §5): not one of the four FIXED roles above
+# (never MANDATORY, module docstring) — a filesystem adapter, no dedicated EngineServerSettings
+# endpoint of its own; the factory falls back to the central ArtifactFsSettings.content_root.
+_ARTIFACT_BACKEND = "filesystem"
 
 
 class _WorkspaceDefaultModeResolver:
@@ -274,6 +283,11 @@ class EngineContainer:
         self.control = STORE_REGISTRY.build("relational", _RELATIONAL_BACKEND)
         self._register_closer(self.control, "_engine")
 
+        # (5b) ContextRepository (NEW — software-arch spec §5/§6, l.260-263/l.340), mirrors
+        #      LocalContainer's own step (5b): the artifact provenance-root store
+        #      `PersistRawArtifactStage` writes through. No network client to close.
+        self.artifacts: ContextRepository = STORE_REGISTRY.build("artifact", _ARTIFACT_BACKEND)
+
         # (6) LLM: settings.llm.enabled (default True, unlike LocalContainer's llm=None default —
         #     see SlmProfile's own docstring for why) ⇒ a REAL ModelRouter over the dev SLM +
         #     LlmFactExtractor for DISTILL's SPO extraction; disabled ⇒ heuristic mode, unchanged.
@@ -347,6 +361,8 @@ class EngineContainer:
             tracer=self.tracer,
             metrics=self.metrics,
             audit=self.audit,
+            # NEW (software-arch spec §6, l.340-341) — mirrors LocalContainer's own wiring.
+            artifacts=self.artifacts,
         )
         self.distill = DistillPipeline(
             ltm=self.ltm,

@@ -5,6 +5,7 @@ central config). Subtrees are sibling fields on Settings.
 """
 
 from mu_contracts.config.settings import (
+    ArtifactFsSettings,
     FalkorDBSettings,
     PostgresSettings,
     QdrantSettings,
@@ -16,6 +17,7 @@ from mu_contracts.config.settings import (
 )
 
 __all__ = [
+    "ArtifactFsSettings",
     "FalkorDBSettings",
     "PostgresSettings",
     "QdrantSettings",

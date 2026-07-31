@@ -37,6 +37,16 @@ floor, D2), ``memcached`` (real ``mu-dev-memcached``, CAS-emulated recency floor
 existing ``postgres``/``sqlite`` — the SAME ``RelationalControlPlaneAdapter`` class binds to
 all three dialects (dialect-aware upsert seam, spec §2.1/§3.1, D7). Every new backend is
 selected purely by a ``StorageSettings`` config value, never a code change at the call site.
+
+ARTIFACT ROLE (NEW — software-arch spec §5 ``ContextRepository``, l.260-263): a fifth role,
+``artifact``, self-registers its first backend, ``filesystem`` (``content_fs.py`` — the
+LOCAL-plane provenance-root store `PersistRawArtifactStage` (``pipelines/concrete/ingest.py``)
+writes through). NOT mandatory (``StoreRegistry.MANDATORY_ROLES`` is unchanged: relational +
+vector + graph) — a composition root that omits it simply runs without the reference-capture
+stage, byte-identical to before this role existed. Selecting a future versioned backend
+(``content_git`` — spec l.437, "ported from Letta Context Repositories") is, exactly like every
+role above, a config change (``StorageSettings.artifact`` / a new ``BackendChoice``), never an
+engine change.
 """
 
 from __future__ import annotations
@@ -52,6 +62,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from mu_contracts.config import get_settings
 from mu_engine.config.engine_settings import get_engine_settings
 from mu_engine.storage.adapters.chroma_mtm import ChromaMtmAdapter
+from mu_engine.storage.adapters.content_fs import FsContextRepositoryAdapter
 from mu_engine.storage.adapters.faiss_mtm import FaissMtmAdapter
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.memcached_stm import MemcachedStmAdapter
@@ -243,6 +254,21 @@ def _build_chroma(*, dim: int, **cfg: Any) -> ChromaMtmAdapter:
         store_io_timeout_s=float(cfg.get("store_io_timeout_s", chroma_settings.store_io_timeout_s)),
         min_widen=int(cfg.get("min_widen", chroma_settings.min_widen)),
     )
+
+
+@STORE_REGISTRY.register("artifact", "filesystem")
+def _build_artifact_fs(**cfg: Any) -> FsContextRepositoryAdapter:
+    """Builds the ``ContextRepository`` / artifact-content adapter (this task's new role —
+    software-arch spec §5, l.260-263). NOT one of ``StoreRegistry.MANDATORY_ROLES`` (registry.py)
+    — a caller/composition root that never wires ``artifact`` simply never gets
+    ``PersistRawArtifactStage`` (the caller opts in by threading ``artifacts=`` into
+    ``IngestService``); this factory only governs WHICH backend binds when it does. Falls back to
+    the central ``ArtifactFsSettings.content_root`` when ``cfg`` doesn't supply one (DEV-STANDARDS
+    rule 3), same pattern as ``_build_chroma``/``_build_faiss`` above.
+    """
+    artifact_settings = get_settings().storage.artifact
+    content_root = cfg.get("content_root") or artifact_settings.content_root
+    return FsContextRepositoryAdapter(content_root=str(content_root))
 
 
 @STORE_REGISTRY.register("vector", "faiss")

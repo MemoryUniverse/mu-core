@@ -7,6 +7,7 @@ Fully async; ported per CODE-ADOPTION-METHODOLOGY (cite file:line in each module
 
 from __future__ import annotations
 
+from mu_engine.storage.adapters.content_fs import FsContextRepositoryAdapter
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
@@ -14,6 +15,7 @@ from mu_engine.storage.adapters.relational_control import RelationalControlPlane
 
 __all__ = [
     "FalkorLtmAdapter",
+    "FsContextRepositoryAdapter",
     "QdrantMtmAdapter",
     "RedisStmAdapter",
     "RelationalControlPlaneAdapter",
