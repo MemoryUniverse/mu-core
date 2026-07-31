@@ -297,6 +297,29 @@ class FalkorLtmAdapter:
             },
         )
 
+    async def mark_conflict(self, ns: Namespace, a_id: str, b_id: str, *, at: datetime) -> None:
+        return await self._retry(self._mark_conflict_impl)(ns, a_id, b_id, at=at)
+
+    async def _mark_conflict_impl(
+        self, ns: Namespace, a_id: str, b_id: str, *, at: datetime
+    ) -> None:
+        # bare CONFLICTS_WITH edge between two facts that BOTH remain active (D3, spec §8) —
+        # no state/invalid_at write to either side, unlike `_invalidate_impl`'s bundled edge.
+        g = self._graph(ns)
+        await g.query(
+            "MATCH (a:Memory {namespace: $ns, id: $a}) "
+            "WITH a MATCH (b:Memory {namespace: $ns, id: $b}) "
+            "MERGE (a)-[c:CONFLICTS_WITH]->(b) "
+            "SET c.created_at = $at, c.reason = $reason",
+            params={
+                "ns": ns.to_prefix(),
+                "a": a_id,
+                "b": b_id,
+                "at": at.isoformat(),
+                "reason": "pending_adjudication",
+            },
+        )
+
     async def resolve_entity(self, ns: Namespace, name: str) -> EntityResolution:
         return await self._retry(self._resolve_entity_impl)(ns, name)
 

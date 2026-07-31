@@ -563,11 +563,22 @@ class DistillPipeline:
             await self._ltm.upsert_fact(reinforced)
             return self._action(DistillActionKind.NOOP, reinforced, (), "identical_active_fact")
 
-        residue = outcome.candidates
+        # DEFECT (ada_room real-path verify, live-reproduced): `outcome.candidates` is the
+        # reconcile-time snapshot (see `_live_residue`'s docstring) — re-read live, right before
+        # this decision, so a same-batch sibling written earlier in THIS resolve loop is seen.
+        residue = await self._live_residue(ns, winner)
         if not residue:
             await self._ltm.upsert_fact(winner)
             await self._maybe_promote_event(ns, winner)
             return self._action(DistillActionKind.ADD, winner, (), "new_subject_predicate")
+
+        # Written EARLY (mark_conflict wiring fix, live-reproduced): a withheld (PENDING/MANUAL)
+        # verdict below tags `winner`-vs-`candidate` CONFLICTS_WITH mid-loop, before either the
+        # COEXIST or SUPERSEDE branch would otherwise have upserted `winner` — `mark_conflict`'s
+        # own MATCH would silently no-op (find nothing, MERGE nothing) against a `winner` node
+        # that doesn't exist in the graph yet. Idempotent MERGE, so the SELF_EXPIRE branch's own
+        # later re-upsert (with `state=SUPERSEDED`) safely overwrites this exact same node.
+        await self._ltm.upsert_fact(winner)
 
         # Per-candidate verdicts. Sequential within ONE winner (AC-3.2's budget/order guarantee
         # applies per sweep-tick-per-winner residue, exactly the "N+1 candidates" shape it names).
@@ -586,6 +597,16 @@ class DistillPipeline:
             else:
                 verdict = _heuristic_only_verdict(winner, candidate, heuristic_flag)
             if not verdict.apply:
+                if verdict.kind is not AdjudicationKind.COEXIST:
+                    # A genuine contradiction that could NOT be auto-applied — a PENDING
+                    # bi-temporal tie (spec §8 "never fabricate") or a MANUAL-policy-withheld
+                    # SUPERSEDE/SELF_EXPIRE (CANONICAL §7.20). The adjudicator already parks a
+                    # `ConflictRecord` in its own side-channel inbox (`conflict.py::_park`); tag
+                    # the pair CONFLICTS_WITH in the GRAPH itself too — both facts stay active
+                    # (never a fabricated winner) but a direct GRAPH.QUERY / a future
+                    # `build_context` reader can now render "conflicting values noted" instead of
+                    # two bare, silently-unrelated active facts.
+                    await self._ltm.mark_conflict(ns, winner.id, candidate.id, at=self._clock.now())
                 continue  # parked (MANUAL_PENDING) or otherwise withheld — never fabricate
             if verdict.kind is AdjudicationKind.SELF_EXPIRE:
                 self_expire.append((candidate, verdict))
@@ -609,12 +630,12 @@ class DistillPipeline:
 
         if not supersede:
             # every residue candidate resolved COEXIST (or was parked) -> COEXIST, both stay live.
-            await self._ltm.upsert_fact(winner)
+            # `winner` was already upserted above (before the per-candidate loop).
             await self._maybe_promote_event(ns, winner)
             return self._action(DistillActionKind.COEXIST, winner, (), "non_functional_coexist")
 
         # SUPERSEDE: incoming wins, every adjudicated loser is invalidated-not-deleted.
-        await self._ltm.upsert_fact(winner)
+        # `winner` was already upserted above (before the per-candidate loop).
         await self._maybe_promote_event(ns, winner)
         loser_ids: list[str] = []
         for loser, _ in supersede:
@@ -640,6 +661,24 @@ class DistillPipeline:
         return self._action(
             DistillActionKind.SUPERSEDE, winner, tuple(loser_ids), "functional_or_polarity_conflict"
         )
+
+    async def _live_residue(self, ns: Namespace, winner: MemoryItem) -> tuple[MemoryItem, ...]:
+        """Live re-read of ``find_conflicts`` immediately before ``_resolve`` uses it (same
+        DEFECT-2 precedent as ``_current_node``, below): ``outcome.candidates`` is a
+        ``_reconcile``-time SNAPSHOT taken for the WHOLE window before ANY ``_resolve`` call
+        writes (module docstring / ``_distill``: reconcile runs for every winner up front, THEN
+        resolve runs). Two facts sharing (subject, predicate) that land in the SAME distill()
+        window — e.g. the real-path defect this fixes: "The Q3 planning meeting is in Room A"
+        and "...was moved to Room B" extracted from the SAME session's SAME consolidate() call —
+        never see each other in that snapshot: neither has been upserted to the store yet at the
+        moment either's OWN ``_reconcile`` ran, so both silently ADD as two permanently-active
+        "simultaneous truths" (ada_room real-path verify finding). Re-reading here, right before
+        the write decision, picks up any same-batch sibling THIS SAME ``_resolve`` loop already
+        wrote earlier in the batch (`_distill`'s `actions = [... for outcome in reconciled]` runs
+        every `_resolve` sequentially, in window order) exactly as a genuinely pre-existing store
+        candidate would be seen — no restructuring of the reconcile/resolve split needed."""
+        raw = await self._ltm.find_conflicts(ns, winner.subject or "", winner.predicate or "")
+        return tuple(c for c in raw if c.id != winner.id)[: self._settings.candidate_k]
 
     async def _current_node(
         self, ns: Namespace, stale: MemoryItem, *, at: datetime

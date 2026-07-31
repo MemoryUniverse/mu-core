@@ -170,6 +170,17 @@ class GraphStorePort(Protocol):
         self, ns: Namespace, loser_id: str, winner_id: str, *, at: Any, reason: str
     ) -> None: ...
 
+    async def mark_conflict(self, ns: Namespace, a_id: str, b_id: str, *, at: Any) -> None:
+        """Tag two STILL-ACTIVE facts ``CONFLICTS_WITH`` each other — no state/``invalid_at``
+        write to either side (D3, spec §8 "never fabricate"). Used for a verdict that could NOT
+        be auto-applied (a genuinely undecidable ``PENDING`` bi-temporal tie, or a MANUAL-policy-
+        withheld ``SUPERSEDE``/``SELF_EXPIRE``) so the conflict is still visible on the GRAPH
+        itself, not only in the adjudicator's side-channel ``ConflictRecord`` inbox. Distinct from
+        ``invalidate`` (which ALSO merges a ``CONFLICTS_WITH`` edge, but only as a byproduct of
+        flipping the loser to ``state=superseded``) — this is the bare, standalone edge for the
+        both-stay-active case."""
+        ...
+
     async def resolve_entity(self, ns: Namespace, name: str) -> EntityResolution: ...
 
 
