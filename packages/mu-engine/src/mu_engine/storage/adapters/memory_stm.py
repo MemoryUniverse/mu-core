@@ -23,6 +23,13 @@ coroutine (a deliberate simplicity trade-off for an embedded/test floor) while s
 guaranteeing an expired item is NEVER returned (the correctness property that matters); an
 expired entry is pruned opportunistically the next time it is touched or the namespace is
 capacity-evicted.
+
+WRITE-TIME DEDUP (D4, CONFIG-AND-DATA-FIX-PLAN.md PART 2 D4; conformance D-8), for PARITY with
+``RedisStmAdapter``/``ValkeyStmAdapter`` (same package, ``redis_stm.py`` module docstring): each
+``_Partition`` also carries a ``content_hash -> memory_id`` dict. On ``put()``, a content_hash
+already held by a DIFFERENT, still-resident id bumps that id's recency/expiry instead of forking
+a second entry — gated by ``stm_dedup_enabled`` (DI-threaded from ``IngestSettings.stm_dedup``,
+env ``MU_INGEST__STM_DEDUP``, by ``storage.factories._build_memory_kv``).
 """
 
 from __future__ import annotations
@@ -42,7 +49,7 @@ __all__ = ["InMemoryStmAdapter"]
 class _Partition:
     """One namespace's KV rows + recency index (spec §1 "dict + TTL heap + recency ZSET")."""
 
-    __slots__ = ("items", "recency")
+    __slots__ = ("chash", "items", "recency")
 
     def __init__(self) -> None:
         self.items: dict[str, tuple[MemoryItem, datetime | None]] = {}  # id -> (item, expires_at)
@@ -51,16 +58,24 @@ class _Partition:
         # pgvector_mtm.py/falkor_ltm.py) — left unannotated so it infers `Any` rather than
         # tripping `disallow_any_unimported` on an explicit `SortedList[...]` hint.
         self.recency = SortedList()
+        # D4 write-time dedup index (conformance D-8): content_hash -> memory_id, parity with
+        # RedisMapper.content_hash_key's Redis HASH (redis_stm.py module docstring).
+        self.chash: dict[str, str] = {}
 
 
 class InMemoryStmAdapter:
     """Implements ``StmTierRepository`` over a plain in-process dict (embedded floor)."""
 
     def __init__(
-        self, *, max_items_per_namespace: int = 10_000, default_ttl_s: int | None = 3600
+        self,
+        *,
+        max_items_per_namespace: int = 10_000,
+        default_ttl_s: int | None = 3600,
+        stm_dedup_enabled: bool = True,
     ) -> None:
         self._max_items = max_items_per_namespace
         self._default_ttl_s = default_ttl_s
+        self._stm_dedup_enabled = stm_dedup_enabled
         self._lock = asyncio.Lock()
         self._partitions: dict[str, _Partition] = {}
 
@@ -94,6 +109,10 @@ class InMemoryStmAdapter:
             part = self._partition(item.namespace)
             now = datetime.now(UTC)
             self._prune_expired_locked(part, now=now)
+
+            if self._stm_dedup_enabled and self._bump_if_duplicate_locked(part, item, now=now):
+                return  # duplicate content: recency/TTL bumped on the WINNER, no second entry.
+
             # re-put of an existing id: drop its stale recency entry first (id-stability, no fork).
             self._evict_locked(part, item.id)
             # `None` means "no TTL" (never expires); `0` is a valid (immediate-expiry) TTL —
@@ -106,10 +125,46 @@ class InMemoryStmAdapter:
             )
             part.items[item.id] = (item, expires_at)
             part.recency.add((-item.created_at.timestamp(), item.id))
+            if self._stm_dedup_enabled:
+                part.chash[item.content_hash] = item.id
             # bounded growth: evict the least-recent entries once over cap (never unbounded).
             while len(part.items) > self._max_items:
                 _, oldest_id = part.recency[-1]
                 self._evict_locked(part, oldest_id)
+
+    def _bump_if_duplicate_locked(
+        self, part: _Partition, item: MemoryItem, *, now: datetime
+    ) -> bool:
+        """D4 write-time dedup (conformance D-8), parity with ``RedisStmAdapter.
+        _bump_if_duplicate``: if ``item.content_hash`` already maps to a DIFFERENT, still-resident
+        id in this partition, bump ITS recency/expiry and report ``True`` instead of forking a
+        second entry. A stale mapping (the previous holder already expired/was evicted) is a miss
+        here too — ``part.items.get`` returning ``None`` — so ``put()`` falls through to the
+        normal write-through path, which overwrites ``part.chash`` with the new id (self-healing,
+        no separate cleanup needed on eviction)."""
+        existing_id = part.chash.get(item.content_hash)
+        if existing_id is None or existing_id == item.id:
+            return False
+        existing = part.items.get(existing_id)
+        if existing is None:
+            return False  # stale index entry — treat as a fresh write.
+        existing_item, _ = existing
+        self._evict_locked(part, existing_id)  # drop the stale (item, recency) pair for this id.
+        # Recency score bumps to the DUPLICATE submission's own `created_at` (mirrors
+        # `redis_stm.py._bump_if_duplicate`'s `ZADD ... item.created_at.timestamp()` — respects a
+        # test/caller-supplied deterministic timestamp exactly like the primary write path below
+        # does); TTL, however, is wall-clock `now` (the SAME split the primary path already makes:
+        # recency-order key vs. real-time expiry are independent axes in this adapter).
+        bumped = existing_item.model_copy(update={"created_at": item.created_at})
+        expires_at = (
+            now + timedelta(seconds=self._default_ttl_s)
+            if self._default_ttl_s is not None
+            else None
+        )
+        part.items[existing_id] = (bumped, expires_at)
+        part.recency.add((-item.created_at.timestamp(), existing_id))
+        part.chash[item.content_hash] = existing_id
+        return True
 
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         async with self._lock:

@@ -24,5 +24,7 @@ class ValkeyStmAdapter(RedisStmAdapter):
 
     No overridden behavior — the wire protocol, key catalog, and pipeline semantics are
     identical to Redis (spec §3.2 "wire-identical, no gap"); this subclass exists purely as
-    the distinct (kv, "valkey") registry identity.
+    the distinct (kv, "valkey") registry identity. Inherits ``RedisStmAdapter``'s D4 write-time
+    content-hash dedup (``stm_dedup_enabled``/``_bump_if_duplicate``) unmodified — the same
+    ``mu/…:stm:chash`` HASH key lives on this wire-identical store.
     """

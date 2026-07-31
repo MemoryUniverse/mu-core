@@ -158,3 +158,16 @@ class RecallSettings(BaseModel):
     weight_ltm: float = Field(default=1.0, ge=0.0)  # in-arm graph weight (§1.3 fuse)
     weight_private: float = Field(default=1.0, ge=0.0)  # federation: private-arm weight (§1.6)
     weight_shared: float = Field(default=1.0, ge=0.0)  # federation: shared-arm weight (§1.6)
+
+    # D4 read-time cross-tier dedup (CONFIG-AND-DATA-FIX-PLAN.md PART 2 D4; conformance D-8):
+    # ``ThreeChannelRecallRanker.rank`` fuses STM-floor + MTM + LTM by ``MemoryItem.id`` only — two
+    # DIFFERENT ids carrying the SAME ``content_hash`` (e.g. a fact present in both its STM raw form
+    # and an already-promoted copy) survive as two separate ``RecallItemView`` rows and double up in
+    # ``build_context`` (DATA-QUALITY-ASSESSMENT.md §3.1/#5 "Coffee-query context contained each
+    # fact twice"). ``RecallService.recall`` already runs ``dedup_by_content_hash`` at the
+    # PRIVATE⊕SHARED federation seam (fusion.py); this flag gates the SAME primitive applied one
+    # layer down, on the per-arm STM/MTM/LTM candidate set, before ``floor_protect_limit`` truncates
+    # it — so a duplicate never occupies two of the ``limit`` result slots in the first place. Env
+    # override: ``MU_RECALL__CROSS_TIER_DEDUP=false`` reverts to the pre-fix behavior (duplicates
+    # allowed through) for A/B comparison (DEV-STANDARDS rule 3).
+    cross_tier_dedup: bool = Field(default=True)

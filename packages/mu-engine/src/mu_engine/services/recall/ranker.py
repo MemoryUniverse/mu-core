@@ -31,6 +31,16 @@ Channel behaviour pinned to §1.3:
 LTM-store-down is the ONE named in-arm degrade (``DegradeReason.LTM_UNAVAILABLE`` /
 ``recall_mtm_only``, degradation §_RULES): the graph arm drops, MTM+floor return, the result is
 LABELLED. MTM/STM failures have NO degrade row — they re-raise loud (a deny, not a silent partial).
+
+BUG FIX (D4 / conformance D-8, data-quality assessment §3.1/#5, 2026-07-31): the STM/MTM/LTM fuse
+above merges by ``MemoryItem.id`` ONLY — the SAME fact recalled under two DIFFERENT ids (its STM
+row + an already-promoted MTM/LTM copy sharing ``content_hash``) used to survive as two separate
+``RecallItemView`` rows all the way into ``build_context`` ("Coffee-query context contained each
+fact twice"). ``_merge_floor`` now runs :func:`~mu_engine.services.recall.fusion.
+dedup_by_content_hash` over the floor-protected + fused candidate pool BEFORE the ``limit`` slice
+(``settings.cross_tier_dedup``, default on) — the SAME primitive ``RecallService.recall`` already
+runs one layer up at the private⊕shared federation seam, applied here to the per-arm candidate set
+so a duplicate never occupies one of the ``limit`` result slots in the first place.
 """
 
 from __future__ import annotations
@@ -48,7 +58,7 @@ from mu_engine.services.recall.dto import (
     RecallResult,
     RecallSettings,
 )
-from mu_engine.services.recall.fusion import FusionStrategy
+from mu_engine.services.recall.fusion import FusionStrategy, dedup_by_content_hash
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.domain.recall import RecallChannel, Scored
@@ -184,7 +194,12 @@ class ThreeChannelRecallRanker:
         protect_n = self._settings.floor_protect_limit
         protected_floor_views = [_to_view(s, "stm") for s in floor[:protect_n]]
 
-        items = _merge_floor(floor_views=protected_floor_views, fused=fused_views, limit=limit)
+        items = _merge_floor(
+            floor_views=protected_floor_views,
+            fused=fused_views,
+            limit=limit,
+            cross_tier_dedup=self._settings.cross_tier_dedup,
+        )
 
         ran = RecallChannels(
             stm=channels.stm,
@@ -228,14 +243,32 @@ def _channel_label(scored: Scored[MemoryItem]) -> str:
 
 
 def _merge_floor(
-    *, floor_views: list[RecallItemView], fused: list[RecallItemView], limit: int
+    *,
+    floor_views: list[RecallItemView],
+    fused: list[RecallItemView],
+    limit: int,
+    cross_tier_dedup: bool,
 ) -> list[RecallItemView]:
     """Merge the (now BOUNDED, §3.1/#1 bug fix) STM floor in AFTER fusion (hybrid.py:247): fusion
     may reorder but never evict a protected floor member. ``floor_views`` is capped upstream to
     ``settings.floor_protect_limit`` — NOT the whole STM candidate pool — so it always leaves room
     for the fused, query-relevant tail. Floor members lead (always recallable), then fused
-    non-duplicates fill up to ``limit``."""
+    non-duplicates fill up to ``limit``.
+
+    D4 cross-tier dedup (conformance D-8, ``settings.cross_tier_dedup``): the STM/MTM/LTM fuse
+    above merges by ``MemoryItem.id`` only, so the SAME fact surfaced from two different tiers
+    under two different ids (e.g. its STM row and an already-promoted MTM/LTM copy sharing
+    ``content_hash``) would otherwise occupy two of the ``limit`` slots below. Deduping by
+    ``content_hash`` HERE — floor members first, so a protected floor row always wins its
+    duplicate — before the ``[:limit]`` slice means a dup never crowds out a genuinely distinct
+    fact (matches the read-time half of the ``ada_coffee`` double-write finding, DATA-QUALITY-
+    ASSESSMENT.md §3.1/#5: "Coffee-query context contained each fact twice"). With the toggle off
+    this reduces to the identical ``[*floor_views, *tail][:limit]`` slice the pre-fix code took
+    (``floor_views`` is always <= ``limit`` in practice, so slicing the concatenation is equivalent
+    to the old two-part ``room``-bounded merge)."""
     floor_ids = {v.memory_id for v in floor_views}
     tail = [v for v in fused if v.memory_id not in floor_ids]
-    room = max(0, limit - len(floor_views))
-    return [*floor_views, *tail[:room]]
+    candidates = [*floor_views, *tail]
+    if cross_tier_dedup:
+        candidates = dedup_by_content_hash(candidates)
+    return candidates[:limit]

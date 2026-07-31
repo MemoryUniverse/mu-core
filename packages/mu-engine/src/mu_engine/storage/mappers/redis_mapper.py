@@ -41,6 +41,15 @@ class RedisMapper:
     def recency_key(ns: Namespace) -> str:
         return f"{_KEY_PREFIX}/{ns.to_prefix()}:stm:recency"
 
+    @staticmethod
+    def content_hash_key(ns: Namespace) -> str:
+        """D4 write-time dedup index (conformance D-8): a namespace-scoped Redis HASH mapping
+        ``content_hash -> memory_id`` (one field per distinct content seen in this partition's STM
+        window). Lets :class:`~mu_engine.storage.adapters.redis_stm.RedisStmAdapter` detect "this
+        exact content already has a live STM row" in O(1) — ``ports.py``'s ``StmTierRepository``
+        docstring promise ("Recency floor + TTL + chash dedup") this key finally implements."""
+        return f"{_KEY_PREFIX}/{ns.to_prefix()}:stm:chash"
+
     def to_store(self, item: MemoryItem) -> RedisRecord:
         return RedisRecord(
             key=self.memory_key(item.namespace, item.id),

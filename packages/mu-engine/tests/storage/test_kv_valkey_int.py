@@ -82,3 +82,54 @@ def test_valkey_is_a_distinct_registry_identity() -> None:
     stage 2026-07-27: "register the valkey backend explicitly")."""
     assert "valkey" in STORE_REGISTRY.known("kv")
     assert "redis" in STORE_REGISTRY.known("kv")
+
+
+async def test_write_time_dedup_skips_the_second_row(
+    settings: Settings,
+    valkey_client: Redis,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """D4 (conformance D-8), built THROUGH the real ``STORE_REGISTRY`` seam exactly as a
+    composition root selects it — parity with ``test_kv_redis_int.py``'s identical case."""
+    adapter = _build(settings.storage.valkey.url)
+    ns = make_ns()
+    first = make_item(ns, "Ada drinks black coffee")
+    second = make_item(ns, "Ada drinks black coffee")
+    assert first.id != second.id
+    assert first.content_hash == second.content_hash
+
+    await adapter.put(first)
+    await adapter.put(second)
+
+    recent = await adapter.recent(ns, limit=10)
+    assert len(recent) == 1, "duplicate content forked a second STM row"
+    assert recent[0].item.id == first.id
+    assert await adapter.get(ns, second.id) is None
+
+    await adapter.evict(ns, first.id)
+
+
+async def test_write_time_dedup_toggle_off_allows_duplicates(
+    settings: Settings,
+    valkey_client: Redis,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """``STORE_REGISTRY.build("kv", "valkey", stm_dedup_enabled=False, ...)`` — the toggle
+    genuinely reaches the real registry-built adapter, not just a bare constructor call."""
+    adapter: ValkeyStmAdapter = STORE_REGISTRY.build(
+        "kv", "valkey", url=settings.storage.valkey.url, stm_dedup_enabled=False
+    )
+    ns = make_ns()
+    first = make_item(ns, "Ada drinks black coffee")
+    second = make_item(ns, "Ada drinks black coffee")
+
+    await adapter.put(first)
+    await adapter.put(second)
+
+    recent = await adapter.recent(ns, limit=10)
+    assert len(recent) == 2, "toggle off must allow the duplicate through (pre-fix parity)"
+
+    await adapter.evict(ns, first.id)
+    await adapter.evict(ns, second.id)

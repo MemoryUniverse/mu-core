@@ -7,9 +7,27 @@ re-homed to the ``mu/…:stm:…`` key catalog via :class:`RedisMapper`.
 Fully async (``redis.asyncio``); no blocking in the loop (DEV-STANDARDS rule 1). Tenancy is
 enforced by :meth:`RedisMapper.memory_key` prefixing every key with ``Namespace.to_prefix()``
 (CANONICAL §1 rule 5). Field-projection is delegated to the mapper (spec Contract-change 5).
+
+WRITE-TIME DEDUP (D4, CONFIG-AND-DATA-FIX-PLAN.md PART 2 D4; conformance D-8): ``ports.py``'s
+``StmTierRepository`` docstring has promised "Recency floor + TTL + chash dedup" since the port
+was written, but no adapter implemented the last third of that — ``put()`` keyed SOLELY on
+``item.id`` (a fresh random id every call, ``storage/domain/memory.py::_memory_id``), so two
+``add()`` calls carrying byte-identical content landed as TWO STM rows (the empirically observed
+``ada_coffee`` written-twice defect, DATA-QUALITY-ASSESSMENT.md §3.1/#5). ``put()`` now maintains
+a namespace-prefixed ``content_hash -> memory_id`` index (:meth:`RedisMapper.content_hash_key`,
+a Redis HASH) alongside the existing payload + recency ZSET: a hit means "this exact content
+already has a live STM row" — bump that row's recency + TTL and SKIP the duplicate payload write
+(never fork a second entry); a miss (first-seen content, or the previous holder already expired/
+was evicted — self-healed via an ``EXISTS`` check, no separate cleanup needed elsewhere) writes
+through as before AND records the mapping. Gated by ``IngestSettings.stm_dedup`` (env
+``MU_INGEST__STM_DEDUP``, default on) — DI-threaded by ``storage.factories._build_redis``/
+``_build_valkey``, never hardcoded (DEV-STANDARDS rule 3).
 """
 
 from __future__ import annotations
+
+from collections.abc import Awaitable
+from typing import cast
 
 from redis.asyncio import Redis
 
@@ -27,6 +45,10 @@ __all__ = ["RedisStmAdapter"]
 # (``mu_engine.storage.factories._build_redis``/``_build_valkey``); a bare
 # ``RedisStmAdapter(client)`` (e.g. in a unit test) still gets a sane, named default.
 _DEFAULT_STORE_IO_TIMEOUT_S = 5.0
+# Same DEFAULT-only discipline for the D4 write-time dedup toggle: DI-threaded from
+# ``IngestSettings.stm_dedup`` (env ``MU_INGEST__STM_DEDUP``) by the SAME factories; a bare
+# ``RedisStmAdapter(client)`` still gets the safe (dedup ON) default.
+_DEFAULT_STM_DEDUP_ENABLED = True
 
 
 class RedisStmAdapter:
@@ -44,10 +66,12 @@ class RedisStmAdapter:
         *,
         mapper: RedisMapper | None = None,
         store_io_timeout_s: float = _DEFAULT_STORE_IO_TIMEOUT_S,
+        stm_dedup_enabled: bool = _DEFAULT_STM_DEDUP_ENABLED,
     ) -> None:
         self._redis = client
         self._mapper = mapper or RedisMapper()
         self._retry = retry_io(timeout_s=store_io_timeout_s)
+        self._stm_dedup_enabled = stm_dedup_enabled
 
     async def put(self, item: MemoryItem) -> None:
         return await self._retry(self._put_impl)(item)
@@ -55,6 +79,12 @@ class RedisStmAdapter:
     async def _put_impl(self, item: MemoryItem) -> None:
         row = self._mapper.to_store(item)
         recency = RedisMapper.recency_key(item.namespace)
+
+        if self._stm_dedup_enabled:
+            bumped = await self._bump_if_duplicate(item, row.ttl_s, recency)
+            if bumped:
+                return  # duplicate content: recency/TTL bumped on the WINNER, no second row.
+
         # ONE atomic transaction (MINOR-6): SET payload + ZADD recency + EXPIRE apply together
         # or not at all — no torn state where the payload exists without its recency member.
         pipe = self._redis.pipeline(transaction=True)
@@ -62,7 +92,47 @@ class RedisStmAdapter:
         pipe.zadd(recency, {item.id: item.created_at.timestamp()})
         if row.ttl_s:
             pipe.expire(recency, row.ttl_s)
+        if self._stm_dedup_enabled:
+            chash_key = RedisMapper.content_hash_key(item.namespace)
+            pipe.hset(chash_key, item.content_hash, item.id)
+            if row.ttl_s:
+                pipe.expire(chash_key, row.ttl_s)
         await pipe.execute()
+
+    async def _bump_if_duplicate(self, item: MemoryItem, ttl_s: int | None, recency: str) -> bool:
+        """D4 write-time dedup (conformance D-8): if ``item.content_hash`` already maps to a
+        DIFFERENT, still-live memory_id in this namespace, bump that row's recency score + TTL
+        and report ``True`` (skip the caller's payload write) instead of forking a second entry.
+
+        Self-healing (no separate cleanup path needed): the ``EXISTS`` check below treats a stale
+        mapping — the previous holder's TTL already expired, or it was explicitly ``evict()``-ed —
+        as a miss, so ``_put_impl`` falls through to a normal write-through that overwrites the
+        mapping with the new id (exactly the existing recency-ZSET self-heal pattern
+        ``_recent_impl`` already uses for expired members).
+        """
+        chash_key = RedisMapper.content_hash_key(item.namespace)
+        # redis-py's stub types `hget` as `Awaitable[str | None] | str | None` (a sync/async
+        # overload union the type checker can't narrow from a plain client instance, unlike
+        # `get`'s `Awaitable[Any] | Any` — same root cause as the `no-any-unimported` ignores
+        # elsewhere in this package's adapters); this client is always the real async one.
+        hget_call = cast(Awaitable[str | None], self._redis.hget(chash_key, item.content_hash))
+        existing_raw = await hget_call
+        if existing_raw is None:
+            return False
+        existing_id = _as_str(existing_raw)
+        if existing_id == item.id:
+            return False  # a genuine re-put of the SAME id — let the normal path re-write it.
+        existing_key = RedisMapper.memory_key(item.namespace, existing_id)
+        if not await self._redis.exists(existing_key):
+            return False  # stale index entry (winner expired/evicted) — treat as a fresh write.
+        pipe = self._redis.pipeline(transaction=True)
+        pipe.zadd(recency, {existing_id: item.created_at.timestamp()})
+        if ttl_s:
+            pipe.expire(existing_key, ttl_s)
+            pipe.expire(recency, ttl_s)
+            pipe.expire(chash_key, ttl_s)
+        await pipe.execute()
+        return True
 
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         return await self._retry(self._get_impl)(ns, memory_id)

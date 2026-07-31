@@ -50,6 +50,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from mu_contracts.config import get_settings
+from mu_engine.config.engine_settings import get_engine_settings
 from mu_engine.storage.adapters.chroma_mtm import ChromaMtmAdapter
 from mu_engine.storage.adapters.faiss_mtm import FaissMtmAdapter
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
@@ -148,6 +149,10 @@ def _build_redis(**cfg: Any) -> RedisStmAdapter:
     return RedisStmAdapter(
         client,
         store_io_timeout_s=cfg.get("store_io_timeout_s", redis_settings.store_io_timeout_s),
+        # D4 write-time dedup toggle (conformance D-8) — DI-threaded from the mu-engine
+        # intelligence-knob root (``EngineSettings.ingest.stm_dedup``, env
+        # ``MU_INGEST__STM_DEDUP``), never hardcoded (DEV-STANDARDS rule 3).
+        stm_dedup_enabled=cfg.get("stm_dedup_enabled", get_engine_settings().ingest.stm_dedup),
     )
 
 
@@ -163,6 +168,9 @@ def _build_valkey(**cfg: Any) -> ValkeyStmAdapter:
     return ValkeyStmAdapter(
         client,
         store_io_timeout_s=cfg.get("store_io_timeout_s", valkey_settings.store_io_timeout_s),
+        # D4 write-time dedup toggle (conformance D-8) — same knob as ``_build_redis`` (SAME
+        # ``EngineSettings.ingest.stm_dedup``; the wire-identical backends share one env knob).
+        stm_dedup_enabled=cfg.get("stm_dedup_enabled", get_engine_settings().ingest.stm_dedup),
     )
 
 
@@ -177,6 +185,8 @@ def _build_memory_kv(**cfg: Any) -> InMemoryStmAdapter:
             cfg.get("max_items_per_namespace", mem_settings.max_items_per_namespace)
         ),
         default_ttl_s=cfg.get("default_ttl_s", mem_settings.default_ttl_s),
+        # D4 write-time dedup toggle (conformance D-8) — parity with the redis/valkey factories.
+        stm_dedup_enabled=cfg.get("stm_dedup_enabled", get_engine_settings().ingest.stm_dedup),
     )
 
 
