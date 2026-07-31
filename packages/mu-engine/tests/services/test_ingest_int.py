@@ -98,6 +98,49 @@ async def test_remember_is_idempotent_on_replay(
     assert [h.item.id for h in hits] == [first.memory_id]
 
 
+async def test_second_call_with_different_activity_and_same_content_is_honest_about_reinforcement(
+    ingest_service: IngestService,
+    private_ns: Namespace,
+    qdrant_client: AsyncQdrantClient,
+    embedder: SentenceTransformerEmbedder,
+    query_vector: Callable[[str], Awaitable[list[float]]],
+) -> None:
+    """F2a receipt-honesty fix (Stage-F acceptance, ``tests/acceptance/test_f2a_crash_replay.py``).
+
+    Two INDEPENDENT ``remember()`` calls (distinct ``session_offset`` — never colliding on
+    ``WriteStmStage``'s own activity-id ledger, exactly what ``SurfaceFacade.add()`` mints fresh
+    per call, ``facade.py::_fresh_offset``) carrying the IDENTICAL content: a legitimate second
+    occurrence (reinforcement) mints its OWN ``memory_id`` (``activity_id_for``'s own docstring —
+    a new source offset is kept, never treated as a pure replay), but the content-hash-scoped
+    ``DeterministicPromoteStage`` ledger correctly dedupes the MTM write. Pre-fix, the SECOND
+    call's receipt falsely claimed ``promoted=True, tiers_written=("stm", "mtm")`` for a memory_id
+    that was NEVER actually written to MTM (only the FIRST memory_id was) — this test pins the
+    honest receipt this fix produces instead, distinct from
+    ``test_remember_is_idempotent_on_replay`` above (which replays the SAME activity/offset and
+    correctly still reports ``promoted=True``, matching that op's own completed state)."""
+    first = await ingest_service.remember(_fact(private_ns, offset="off-a", importance=0.9))
+    second = await ingest_service.remember(_fact(private_ns, offset="off-b", importance=0.9))
+
+    # two independent occurrences -> two distinct memory_ids (never collapsed to the first's id)
+    assert second.memory_id != first.memory_id
+    assert second.content_hash == first.content_hash
+
+    # the HONEST receipt: this call did NOT perform a new MTM write (reinforcement, not promotion)
+    assert second.promoted is False
+    assert second.tiers_written == ("stm",)
+
+    # the first call's receipt is unaffected — still a genuine, freshly-promoted write
+    assert first.promoted is True
+    assert first.tiers_written == ("stm", "mtm")
+
+    # ground truth: the content-hash MTM dedup itself still holds — exactly ONE point, at the
+    # FIRST call's memory_id (never duplicated, never re-pointed at the second's id)
+    mtm = QdrantMtmAdapter(qdrant_client, dim=embedder.dimension)
+    qv = await query_vector("Where does Ada work?")
+    hits = await mtm.semantic(private_ns, qv, limit=10)
+    assert [h.item.id for h in hits] == [first.memory_id]
+
+
 async def test_low_importance_stays_stm_only(
     ingest_service: IngestService,
     private_ns: Namespace,

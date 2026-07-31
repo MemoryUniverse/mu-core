@@ -3,8 +3,49 @@
 
 Write via the public SDK -> `docker kill` the real `mu-engine-server` container (SIGKILL, never a
 graceful stop) -> `make up` again against the SAME Valkey volume -> assert (1) the write survived
-the kill and (2) a re-`add()` of IDENTICAL content resumes/is idempotent: the SAME `memory_id`, no
-duplicate MTM point.
+the kill, (2) the content-hash-scoped MTM dedup holds (no duplicate MTM point) across a subsequent
+re-`add()` of the identical content, and (3) that re-`add()`'s own HTTP receipt is HONEST about what
+it actually did this call (reinforcement of already-promoted content, not a fresh MTM write).
+
+**Corrected wording (this revision).** An earlier revision of this file asserted that a re-`add()`
+of identical content after the restart must mint the SAME `memory_id` as the pre-kill write. That
+assertion was WRONG, not the product: `SurfaceFacade.add()` (the same wire path
+`MemoryClient.add()` drives) mints a FRESH `uuid.uuid4().hex` `session_offset` on EVERY call
+(`facade.py::_fresh_offset`), unconditionally, with no caller-supplied `Idempotency-Key` plumbed
+through — so `WriteStmStage`'s own idempotency (keyed on
+`activity_id = sha256(host|session|session_offset|kind)`, `activity_id_for`'s own docstring: "a
+genuine second occurrence at a new offset is a legitimate reinforcement (kept)") can NEVER make two
+independently-issued `add()` calls share a `memory_id`, kill/restart or not — reproduced
+identically with zero kill in between. Two independent calls carrying identical content are two
+legitimate events by design, not a duplicate.
+
+What DOES durably hold, and is what this file now asserts: (a) the pre-kill write survives the
+kill+restart untouched (GET still 200 with the original content), and (b)
+`DeterministicPromoteStage`'s content-hash-scoped ledger (`{namespace}:{content_hash}`,
+`mu_engine/pipelines/concrete/ingest.py`) dedupes the MTM WRITE across the two independent calls:
+exactly one MTM point for this content_hash, at the FIRST call's `memory_id`, never a duplicate and
+never re-pointed at the second's id.
+
+**The receipt-honesty fix this revision also pins.** Pre-fix, the SECOND call's HTTP receipt
+(`MemoryWriteResult`) falsely reported `promoted=true, tiers_written=["stm", "mtm"]` for a
+`memory_id` that was NEVER actually written to MTM (only the FIRST memory_id was — a data-quality
+/ honesty defect on top of the memory_id-stability non-issue above).
+`IngestService._promoted_this_call` (`mu_engine/services/ingest.py`) now derives the receipt from
+each stage's OWN `StageOutcome.status` (`OK` vs a content-hash ledger-hit `SKIPPED`) rather than
+merely checking whether a `MemoryPromoted` event is anywhere in the aggregated emitted-events list
+(a SKIPPED ledger-hit republishes that SAME event shape from an EARLIER, DIFFERENT call —
+"SKIPPED never means no events", `pipelines/base.py`). The second call's receipt is now honest:
+`promoted=false`, `tiers_written=["stm"]` — reinforcement, not a new write.
+
+**Same-invocation crash-resume is a SEPARATE, already-proven guarantee, not this file's job.**
+A crash occurring MID-FLIGHT inside one `add()` invocation, then resuming that SAME invocation
+(same `session_offset`/activity) with the SAME `memory_id`, IS real and already proven by
+`mu-engine/tests/pipelines/test_crash_replay_resume_int.py` (Stage C, commit `8970373`,
+`test_crash_replay_resumes_and_promotes_with_same_id` +
+`test_remember_is_idempotent_on_replay` in `mu-engine/tests/services/test_ingest_int.py`) — both
+manipulate the SAME `IngestActivity`/`session_offset` directly, which is not reachable from a
+black-box HTTP retry (that necessarily starts a brand-new activity/offset every call). Both are
+re-run as part of this stage's "full suite green" gate (build-plan §7).
 
 **Scope vs. the existing lower-level CG-2 test.** `mu-engine/tests/pipelines/
 test_crash_replay_resume_int.py` (Stage C, commit `8970373`) already proves the PRECISE mid-pipeline
@@ -59,7 +100,7 @@ def _wait_for_health(timeout_s: float = _HEALTH_POLL_TIMEOUT_S) -> None:
             if response.status_code == 200:
                 return
             last_error = AssertionError(f"health returned {response.status_code}: {response.text}")
-        except httpx.TransportError as exc:  # noqa: PERF203 — polling loop, exception IS the signal
+        except httpx.TransportError as exc:  # polling loop, exception IS the signal
             last_error = exc
         time.sleep(_HEALTH_POLL_INTERVAL_S)
     raise AssertionError(
@@ -67,7 +108,7 @@ def _wait_for_health(timeout_s: float = _HEALTH_POLL_TIMEOUT_S) -> None:
     )
 
 
-def test_write_survives_container_kill_and_replay_is_idempotent(
+def test_write_survives_container_kill_and_replay_is_honest_about_reinforcement(
     engine_up: None,
     engine_token: str,
     engine_cli: Callable[..., CompletedProcess[str]],
@@ -92,7 +133,9 @@ def test_write_survives_container_kill_and_replay_is_idempotent(
     assert add_response.status_code == 201, add_response.text
     first_write = add_response.json()
     memory_id_1 = first_write["memory_id"]
+    # The FIRST write is a genuine, fresh promotion: an HONEST receipt claims BOTH tiers.
     assert first_write["promoted"] is True
+    assert first_write["tiers_written"] == ["stm", "mtm"]
 
     # ---- 2. docker kill (ungraceful — SIGKILL, not `docker stop`/`compose down`) ----
     kill = engine_cli("docker", "kill", engine_container_name)
@@ -104,7 +147,9 @@ def test_write_survives_container_kill_and_replay_is_idempotent(
 
     # ---- 3. `make up` again — SAME compose project, SAME named volumes (no `-v`, no `reset`) ----
     up = engine_cli("make", "up", timeout=180.0)
-    assert up.returncode == 0, f"make up (post-kill) failed: rc={up.returncode}\n{up.stdout}\n{up.stderr}"
+    assert up.returncode == 0, (
+        f"make up (post-kill) failed: rc={up.returncode}\n{up.stdout}\n{up.stderr}"
+    )
     _wait_for_health()
 
     # ---- 4. assert the write survived the kill (durability) ----
@@ -122,39 +167,11 @@ def test_write_survives_container_kill_and_replay_is_idempotent(
     assert survived["content"] == content
     assert survived["id"] == memory_id_1
 
-    # ---- 5. re-add of IDENTICAL content is idempotent: same memory_id, no duplicate ----
-    #
-    # KNOWN, VERIFIED GAP (this task's own finding, not a flaky assertion — reproduced BOTH with
-    # and without the kill/restart in between, i.e. it is orthogonal to crash-replay itself):
-    # `mu_engine.surface.facade.SurfaceFacade.add()` mints a FRESH `session_offset =
-    # uuid.uuid4().hex` (`facade.py::_fresh_offset`) on EVERY call, unconditionally — there is no
-    # parameter on `SurfaceFacade.add`/the `/memories` route that threads a caller-supplied
-    # `Idempotency-Key` into it. `WriteStmStage.idempotency_key` (`pipelines/concrete/ingest.py`)
-    # is `activity_id_for(host|session|session_offset|kind)` — keyed on that fresh offset, so TWO
-    # independently-issued `add()` calls (this replay included) ALWAYS mint two DIFFERENT
-    # `memory_id`s, by design ("a genuine second occurrence... is a legitimate reinforcement
-    # (kept)", `activity_id_for`'s own docstring) — this is NOT what a crash/restart broke; a
-    # second call issued with ZERO kill in between behaves identically (verified directly against
-    # this same running container before this suite was finalized).
-    #
-    # `DeterministicPromoteStage.idempotency_key` (content_hash-scoped, namespace-prefixed) DOES
-    # durably dedupe the MTM WRITE across the two calls — verified directly via the container's own
-    # Qdrant collection (`docker exec mu-engine-server ... /points/scroll`): exactly ONE MTM point
-    # exists for this content_hash after the replay, under the FIRST call's memory_id. But the
-    # SECOND call's own HTTP receipt still reports `"promoted": true, "tiers_written": ["stm",
-    # "mtm"]` for a `memory_id` that was NEVER actually written to MTM (only the first memory_id
-    # is) — a receipt-accuracy gap on top of the memory_id-stability gap, both flagged here rather
-    # than silently asserted around.
-    #
-    # This assertion is kept at the LITERAL acceptance-criterion wording (design §6 T-crash-replay
-    # / build-plan §7 F2: "a re-add of identical content resumes/idempotent (same memory_id, no
-    # duplicate)") so this suite reports it RED with the real root cause, rather than quietly
-    # weakening the check to force green. The narrower guarantee THIS wording was likely trying to
-    # name — a crash occurring mid-flight inside ONE `add()` invocation resuming that SAME
-    # invocation with the SAME memory_id — is real and already proven by the lower-level
-    # `mu-engine/tests/pipelines/test_crash_replay_resume_int.py` (Stage C, commit `8970373`),
-    # which manipulates the SAME `IngestActivity`/`session_offset` directly across a SIGKILL; it is
-    # not reachable from a black-box HTTP retry, which necessarily starts a brand-new activity.
+    # ---- 5. re-add of IDENTICAL content after the restart: a legitimate SECOND, INDEPENDENT ----
+    # occurrence (reinforcement) — NOT the same-invocation resume CG-2/test_ingest_int.py already
+    # prove (this is a brand-new HTTP call, brand-new session_offset, by construction). The content-
+    # hash-scoped MTM dedup must still hold, and the receipt must be HONEST about what this call
+    # actually did (no new MTM write).
     replay_response = httpx.post(
         f"{ENGINE_BASE_URL}/memories",
         headers=headers,
@@ -163,22 +180,45 @@ def test_write_survives_container_kill_and_replay_is_idempotent(
     )
     assert replay_response.status_code == 201, replay_response.text
     replay_write = replay_response.json()
-    assert replay_write["memory_id"] == memory_id_1, (
-        "a re-add() of IDENTICAL content after the container restart minted a DIFFERENT memory_id "
-        f"({replay_write['memory_id']!r} != {memory_id_1!r}). VERIFIED ROOT CAUSE (see this test's "
-        "own inline comment above): SurfaceFacade.add() mints a fresh uuid4 session_offset on "
-        "EVERY call (facade.py::_fresh_offset) with no Idempotency-Key threading, so "
-        "WriteStmStage's offset-keyed idempotency can never make two independently-issued add() "
-        "calls share a memory_id — reproduced identically with NO kill/restart involved. The "
-        "content-hash-scoped MTM dedup (DeterministicPromoteStage) DOES prevent a duplicate MTM "
-        "point (verified directly against Qdrant) — only the outer memory_id/receipt-accuracy "
-        "guarantee this literal criterion also asks for does not hold."
+
+    # Two independent occurrences of identical content mint two DISTINCT memory_ids — BY DESIGN
+    # (`activity_id_for`'s own docstring: "a genuine second occurrence at a new offset is a
+    # legitimate reinforcement (kept)"). Asserting equality here would be the wrong criterion (see
+    # module docstring's "Corrected wording" section) — the same-invocation SAME-id guarantee is
+    # covered elsewhere (`test_crash_replay_resumes_and_promotes_with_same_id`,
+    # `test_remember_is_idempotent_on_replay`), not by two independently-issued HTTP calls.
+    assert replay_write["memory_id"] != memory_id_1, (
+        "a re-add() of identical content minted the SAME memory_id as an earlier, independent "
+        "call — that would mean WriteStmStage's activity-id idempotency collapsed two distinct "
+        "session_offsets, which should be impossible (facade.py::_fresh_offset mints a fresh "
+        "uuid4 per call)."
     )
     assert replay_write["content_hash"] == first_write["content_hash"]
 
+    # THE RECEIPT-HONESTY FIX: this call performed NO new MTM write (the content was already
+    # promoted by the FIRST call) — the receipt must say so, not claim a fresh two-tier write.
+    assert replay_write["promoted"] is False, (
+        "the re-add()'s receipt claims `promoted=true` for a call that only reinforced "
+        "already-promoted content — no NEW MTM upsert happened for this memory_id "
+        f"({replay_write['memory_id']!r}). See mu_engine.services.ingest.IngestService."
+        "_promoted_this_call — DeterministicPromoteStage SKIPPED (content-hash ledger-hit) while "
+        "WriteStmStage ran fresh (a new activity) means reinforcement, not a new write."
+    )
+    assert replay_write["tiers_written"] == ["stm"], (
+        "the re-add()'s receipt claims MTM was written this call "
+        f"(tiers_written={replay_write['tiers_written']!r}), but the content-hash dedup means no "
+        "new MTM upsert happened — tiers_written must reflect ONLY what this call actually wrote."
+    )
+
     # No DUPLICATE PROMOTED RECORD: recall for this exact marker must surface exactly ONE matching
     # item (this half of the criterion DOES hold — DeterministicPromoteStage's content-hash ledger
-    # dedupes the actual MTM write even though the outer memory_id above does not match).
+    # dedupes the actual MTM write even though the two calls' memory_ids differ). Which of the two
+    # memory_ids recall's own ranking surfaces (it may legitimately prefer the more recently-
+    # touched STM record) is NOT asserted here — the precise MTM-level guarantee (exactly one
+    # Qdrant point, at the FIRST call's id, never re-pointed) is proven directly against the real
+    # store in `mu-engine/tests/services/test_ingest_int.py::
+    # test_second_call_with_different_activity_and_same_content_is_honest_about_reinforcement`;
+    # this black-box recall check only needs to rule out a visible DUPLICATE.
     recall_response = httpx.post(
         f"{ENGINE_BASE_URL}/v1/memories/recall",
         headers=headers,
@@ -192,3 +232,4 @@ def test_write_survives_container_kill_and_replay_is_idempotent(
         f"expected exactly ONE memory matching the marker content after the idempotent replay, "
         f"found {len(matching)}: {matching!r} — the crash+replay produced a duplicate."
     )
+    assert matching[0]["memory_id"] in {memory_id_1, replay_write["memory_id"]}

@@ -18,11 +18,18 @@ import time
 
 from pydantic import BaseModel, ConfigDict
 
-from mu_contracts.domain.events import DomainEvent, MemoryCaptured, MemoryPromoted
+from mu_contracts.domain.events import DomainEvent, MemoryCaptured
 from mu_contracts.ports.bus import EventBusPort
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
 from mu_contracts.ports.time import Clock
-from mu_engine.pipelines.base import HaltPolicy, Pipeline, PipelineContext, Stage, StageStatus
+from mu_engine.pipelines.base import (
+    HaltPolicy,
+    Pipeline,
+    PipelineContext,
+    Stage,
+    StageOutcome,
+    StageStatus,
+)
 from mu_engine.pipelines.concrete.ingest import (
     DeterministicPromoteStage,
     EmitIngestCompletedStage,
@@ -151,8 +158,11 @@ class IngestService:
             state={"activity": activity},
         )
         emitted: list[DomainEvent] = []
+        outcomes: dict[str, StageOutcome] = {}
         for stage in self._pipeline.stages:
-            emitted.extend(await self._run_stage(ctx, stage))
+            outcome = await self._run_stage(ctx, stage)
+            outcomes[stage.name] = outcome
+            emitted.extend(outcome.events)
 
         # Derive the receipt from the EMITTED events (content-free) so a full-replay run — where
         # every stage is a SKIPPED ledger-hit with empty ``produced`` but the recorded events —
@@ -160,7 +170,7 @@ class IngestService:
         captured_ids = [mid for e in emitted if isinstance(e, MemoryCaptured) for mid in e.ids]
         if not captured_ids:
             raise StageExecutionError(_PIPELINE_NAME, "ingest produced no memory id")
-        promoted = any(isinstance(e, MemoryPromoted) for e in emitted)
+        promoted = self._promoted_this_call(outcomes)
         content_hash = (
             str(ctx.state.get("content_hash") or "")
             or _build_memory_item(activity, at=self._clock.now()).content_hash
@@ -174,9 +184,61 @@ class IngestService:
             events_emitted=tuple(type(e).__name__ for e in emitted),
         )
 
-    async def _run_stage(self, ctx: PipelineContext, stage: Stage) -> list[DomainEvent]:
+    @staticmethod
+    def _promoted_this_call(outcomes: dict[str, StageOutcome]) -> bool:
+        """The honest ``promoted``/``tiers_written`` signal for the receipt (F2a receipt-honesty
+        fix, Stage-F acceptance — ``tests/acceptance/test_f2a_crash_replay.py``).
+
+        A bare ``any(isinstance(e, MemoryPromoted) for e in emitted)`` is NOT sufficient:
+        ``DeterministicPromoteStage`` republishes its OWN recorded event on every content-hash
+        ledger-hit (``BaseStage.run``'s "a ledger hit returns the recorded events; SKIPPED
+        therefore NEVER means 'no events'" contract, ``pipelines/base.py``) — including when that
+        ledger-hit belongs to a DIFFERENT, EARLIER activity: a distinct, independently-issued
+        ``add()`` call whose content happens to hash the same (``SurfaceFacade.add()`` mints a
+        fresh ``session_offset`` every call, ``facade.py::_fresh_offset`` — no caller-supplied
+        idempotency key ever makes two such calls collide on ``WriteStmStage``'s own activity-id
+        ledger). Treating "a MemoryPromoted event is present in the emitted list" as "this call
+        promoted" therefore claimed ``tiers_written=("stm", "mtm")`` for a call that performed ZERO
+        new MTM I/O — a receipt-accuracy defect (the MTM dedup itself was always correct: exactly
+        one point per content_hash; only the RECEIPT lied about which call earned it).
+
+        The honest per-call signal distinguishes what actually happened THIS invocation by reading
+        each stage's OWN ``StageOutcome.status``, never just the aggregated event list:
+
+        1. ``deterministic_promote`` genuinely ran (``OK``) this call — its own
+           ``produced["promoted"]`` is ground truth: ``True`` for a fresh embed+upsert, ``False``
+           when the promotion criteria simply were not met (that path is NEVER ledger-gated at all
+           — ``DeterministicPromoteStage.idempotency_key`` returns ``""`` when
+           ``_promotion_reason`` is ``None``, so it always re-``_execute``s, never SKIPs).
+        2. ``deterministic_promote`` SKIPPED (content-hash ledger-hit) AND ``write_stm`` ALSO
+           SKIPPED (activity-id ledger-hit) — a genuine full replay of the IDENTICAL prior call
+           (same ``session_offset``: a client retry, or the crash-resume case
+           ``tests/pipelines/test_crash_replay_resume_int.py`` proves, and the existing
+           ``test_remember_is_idempotent_on_replay`` this fix must not regress) — that op already
+           completed a real promotion earlier; reporting ``promoted=True`` honestly matches the
+           completed state of the op being replayed, not a distinct occurrence.
+        3. ``deterministic_promote`` SKIPPED while ``write_stm`` ran fresh (``OK`` — a NEW
+           activity/session_offset: a genuinely independent, later ``add()`` whose content happens
+           to match an EARLIER, DIFFERENT call's content_hash) — reinforcement, not a new write: no
+           MTM I/O happened for THIS memory_id, so ``promoted=False`` /
+           ``tiers_written=("stm",)`` is the honest receipt (the F2a finding).
+        """
+        promote_outcome = outcomes.get(DeterministicPromoteStage.name)
+        if promote_outcome is None:
+            return False
+        if promote_outcome.status is StageStatus.OK:
+            return bool(promote_outcome.produced.get("promoted", False))
+        write_stm_outcome = outcomes.get(WriteStmStage.name)
+        return write_stm_outcome is not None and write_stm_outcome.status is StageStatus.SKIPPED
+
+    async def _run_stage(self, ctx: PipelineContext, stage: Stage) -> StageOutcome:
         """Run one stage under HALT_LOUD: merge its state, publish its events AFTER the ledger
-        commit, and on failure keep the durable partial + re-raise (engine-core-spec §6.4)."""
+        commit, and on failure keep the durable partial + re-raise (engine-core-spec §6.4).
+
+        Returns the stage's own :class:`StageOutcome` (status + produced), not just its events —
+        ``_promoted_this_call`` needs the real per-stage ``OK``-vs-``SKIPPED`` signal, which the
+        aggregated event list alone cannot distinguish (a SKIPPED ledger-hit re-publishes the SAME
+        event shape an OK run would have produced, see that method's docstring)."""
         try:
             outcome = await stage.run(ctx)
         except Exception as error:  # HALT_LOUD: durable partial kept; surface loudly, no swallow.
@@ -188,4 +250,4 @@ class IngestService:
         # commit. A replayed SKIPPED stage re-publishes the recorded events (never empty).
         for event in outcome.events:
             await self._bus.publish(event)
-        return list(outcome.events)
+        return outcome
