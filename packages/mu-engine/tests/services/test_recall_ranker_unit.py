@@ -128,6 +128,11 @@ class _EmptyLtm:
     async def resolve_entity(self, *a: object, **k: object) -> object:  # pragma: no cover
         raise NotImplementedError
 
+    async def traverse_entities(
+        self, ns: Namespace, *, query: str, max_hops: int, limit: int
+    ) -> list[Scored[MemoryItem]]:
+        return []  # D-4: no entity edges wired for this test — isolates STM/MTM interaction
+
 
 class _FakeEmbedder:
     """D1 test double for ``EmbeddingPort``: returns a caller-supplied vector per exact content

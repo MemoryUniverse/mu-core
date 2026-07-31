@@ -193,3 +193,17 @@ class RecallSettings(BaseModel):
     # embedder injected into the ranker is a FAIL-LOUD misconfiguration (``StmScoringConfigError``),
     # never a silent recency fallback (§5 "re-raise loud, not a silent partial").
     stm_scoring: Literal["embed", "lexical", "recency"] = "embed"
+
+    # D-4 multi-hop LTM traversal arm (ARCHITECTURE-CONFORMANCE.md "LTM graph arm thin";
+    # CONFIG-AND-DATA-FIX-PLAN.md PART 2 D6): bounds how many entity-edge hops
+    # ``ThreeChannelRecallRanker``'s LTM channel walks (``GraphStorePort.traverse_entities``) to
+    # answer a relational query ("who is Bo's manager?") that the flat ``graph_recall`` seed
+    # (whole-partition, currently-valid facts — see this module's docstring) cannot: a fact whose
+    # SUBJECT differs from the query's own entity mention never surfaces there, only via a
+    # traversal FROM the query's mentioned entity over the entity-entity edges
+    # ``FalkorLtmAdapter.upsert_fact`` now materializes (B5/B6). ``0`` disables the arm entirely
+    # (flat ``graph_recall`` only, pre-D6 behavior — A/B comparison / rollback, DEV-STANDARDS
+    # rule 3); the adapter itself further clamps any value > 2 down to 2 (deeper hops risk
+    # combinatorial blowup on a shared box, out of this task's scope). Env override:
+    # ``MU_RECALL__LTM_MAX_HOPS=0`` (or any int).
+    ltm_max_hops: int = Field(default=2, ge=0)

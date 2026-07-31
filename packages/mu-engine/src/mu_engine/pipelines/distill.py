@@ -526,6 +526,16 @@ class DistillPipeline:
             valid_at=valid_at,
             importance_score=source.importance_score,
             metadata=meta,
+            # PROVENANCE ONE-LINER (context-provenance follow-up): `_promote_structured` above
+            # copies the WHOLE source item (`model_copy(deep=True)`), so `provenance_id`/
+            # `artifact_ref` already ride along for free on that path. An EXTRACTED fact instead
+            # builds a brand-new `MemoryItem` here — without this, `model_post_init` would mint a
+            # FRESH `prov_{new_id}` (MemoryItem.provenance_id's own empty-string fallback),
+            # silently severing the extracted proposition from the ContextArtifact its source
+            # message traces back to. Copying both onto the extracted item closes that gap so
+            # `by_artifact()` finds it too.
+            provenance_id=source.provenance_id,
+            artifact_ref=source.artifact_ref,
         )
 
     # ---- reconcile (detect only) + resolve (adjudicate + apply) -----------------------------

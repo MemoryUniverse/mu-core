@@ -189,7 +189,7 @@ class ThreeChannelRecallRanker:
                     else _empty_scored()
                 )
                 ltm_t = tg.create_task(
-                    self._ltm_channel(ns, pool, caller_identity_set)
+                    self._ltm_channel(ns, pool, caller_identity_set, query)
                     if channels.ltm
                     else _ltm_ok([])
                 )
@@ -266,15 +266,44 @@ class ThreeChannelRecallRanker:
         )
 
     async def _ltm_channel(
-        self, ns: Namespace, pool: int, caller: CallerIdentitySet | None
+        self, ns: Namespace, pool: int, caller: CallerIdentitySet | None, query: str
     ) -> tuple[list[Scored[MemoryItem]], bool]:
         """LTM graph arm with the ONE named in-arm degrade (LTM_UNAVAILABLE, §5). Returns
-        ``(hits, degraded)``; a store-down drops the arm rather than failing the whole recall."""
+        ``(hits, degraded)``; a store-down drops the arm rather than failing the whole recall.
+
+        D-4 (ARCHITECTURE-CONFORMANCE.md "LTM graph arm thin"): ADDS a multi-hop entity-edge
+        traversal (:meth:`~mu_engine.storage.ports.GraphStorePort.traverse_entities`) alongside
+        the pre-existing flat ``graph_recall`` seed — never REPLACES it (module docstring "LTM
+        graph (bi-temporal)" section is otherwise unchanged: the flat seed still runs, still
+        contributes still-valid whole-partition facts to RRF). Traversal hits are merged in by
+        id, deduped against the flat seed's own hits (a fact both arms surface is not
+        double-counted) — the merged list is what the caller fuses into RRF below, so a
+        traversal-only hit ("who is Bo's manager?" -> "Ada manages Bo", never surfaced by the
+        flat seed if Ada/Bo aren't already in the recency-ordered whole-partition window)
+        competes on equal footing with every other LTM hit. ``settings.ltm_max_hops == 0``
+        disables the traversal call entirely (flat-only, pre-D6 behavior)."""
         try:
             hits = await self._ltm.graph_recall(ns, limit=pool, caller_identity_set=caller)
         except StoreUnavailableError:
             return [], True
-        return hits, False
+        if self._settings.ltm_max_hops <= 0:
+            return hits, False
+        try:
+            traversal_hits = await self._ltm.traverse_entities(
+                ns, query=query, max_hops=self._settings.ltm_max_hops, limit=pool
+            )
+        except StoreUnavailableError:
+            # the flat seed already succeeded above — a traversal-only outage degrades to
+            # flat-only LTM results rather than dropping the WHOLE arm (narrower than the
+            # named LTM_UNAVAILABLE degrade, which is reserved for the flat seed itself).
+            return hits, False
+        seen = {s.item.id for s in hits}
+        merged = list(hits)
+        for s in traversal_hits:
+            if s.item.id not in seen:
+                seen.add(s.item.id)
+                merged.append(s)
+        return merged, False
 
     async def _score_stm(
         self, floor: list[Scored[MemoryItem]], query: str, query_vec: Vector

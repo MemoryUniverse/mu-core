@@ -285,6 +285,28 @@ class QdrantMtmAdapter:
             points=[point_id(loser_id)],
         )
 
+    async def set_entity_uids(self, ns: Namespace, memory_id: str, entity_uids: list[str]) -> None:
+        return await self._retry(self._set_entity_uids_impl)(ns, memory_id, entity_uids)
+
+    async def _set_entity_uids_impl(
+        self, ns: Namespace, memory_id: str, entity_uids: list[str]
+    ) -> None:
+        """D-5 (ARCHITECTURE-CONFORMANCE.md, ``entity_uids`` DEAD): backfill the resolved
+        subject/object ``:Entity`` uids onto an already-promoted point's payload once
+        ``FalkorLtmAdapter.upsert_fact`` resolves them against the LTM graph (structural
+        ``EntityUidsSink`` seam, ``falkor_ltm.py``) — a payload-only PATCH (``set_payload``, the
+        SAME primitive ``invalidate`` above already uses), never a vector-losing full point
+        re-upsert. Forward-compat entity linking: no read path filters on this field yet, it
+        rides the payload for a future entity-scoped MTM query."""
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return
+        await self._qdrant.set_payload(
+            collection_name=name,
+            payload={"entity_uids": entity_uids},
+            points=[point_id(memory_id)],
+        )
+
     async def remove(self, ns: Namespace, memory_id: str) -> None:
         return await self._retry(self._remove_impl)(ns, memory_id)
 

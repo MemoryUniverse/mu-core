@@ -296,6 +296,16 @@ class LocalContainer:
             "graph", storage.graph.backend, **self._graph_cfg(storage.graph)
         )
         self._register_closer(self.ltm, "_db.connection")
+        # D-5 (ARCHITECTURE-CONFORMANCE.md entity_uids MTM payload): wire the just-built vector
+        # adapter into the just-built graph adapter's optional `EntityUidsSink` seam so
+        # `upsert_fact` can backfill `entity_uids` onto an already-promoted MTM point once it
+        # resolves subject/object entities. Duck-typed (`set_mtm_entity_sink`/`set_entity_uids`
+        # are BOTH structural, no shared base class) so a non-Qdrant `storage.vector.backend`
+        # (pgvector/chroma/faiss — none implement `set_entity_uids` today) or a non-FalkorDB
+        # future graph backend simply leaves this a no-op, never a hard failure.
+        set_sink = getattr(self.ltm, "set_mtm_entity_sink", None)
+        if callable(set_sink) and hasattr(self.mtm, "set_entity_uids"):
+            set_sink(self.mtm)
 
         # (5) control-plane (relational) — built through the STORE_REGISTRY seam (reuse). Off the
         #     ingest/recall critical path this slice; disposed on close.

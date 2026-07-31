@@ -277,6 +277,12 @@ class EngineContainer:
             "graph", _GRAPH_BACKEND, host=settings.falkordb.host, port=settings.falkordb.port
         )
         self._register_closer(self.ltm, "_db.connection")
+        # D-5 (ARCHITECTURE-CONFORMANCE.md entity_uids MTM payload) — same duck-typed wiring as
+        # ``mu_local.composition.LocalContainer``; a no-op if either side doesn't implement the
+        # structural seam (`set_mtm_entity_sink`/`set_entity_uids`).
+        set_sink = getattr(self.ltm, "set_mtm_entity_sink", None)
+        if callable(set_sink) and hasattr(self.mtm, "set_entity_uids"):
+            set_sink(self.mtm)
 
         # (5) control-plane (relational, sqlite in-memory — off the ingest/recall critical path,
         #     same default LocalContainer itself ships). Disposed on close.
