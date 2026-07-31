@@ -25,37 +25,67 @@ heuristic mode (no ``storage.llm`` configured) — mu-local NEVER fabricates an 
 synthesis. When a :class:`~mu_local.config.ModelProfileSettings` IS configured, ``ask`` recalls
 context (the same deterministic assembly :meth:`context` uses) and synthesises a REAL answer via
 the composition root's :class:`~mu_engine.providers.model_router.ModelRouter` ANSWER task.
+
+UNIFIED VERB SURFACE (build-plan Stage B, task B1; sdk-engine-server-design.md §2.5;
+``SDK-BUILD-DECISIONS.md`` Decision B):
+
+- ``add``/``recall`` now accept the canonical superset's SHARED-plane fields (``visibility``/
+  ``subject``/``predicate``/``object``), plane-gated through
+  :func:`mu_contracts.validation.validate_plane_fields`. ``LocalMemory`` is private-plane-only BY
+  CONSTRUCTION (module docstring above) — it always calls the validator with
+  ``shared_configured=False``, so any of those fields supplied as non-``None`` is REJECTED with
+  :class:`~mu_contracts.domain.errors.PlaneFieldRejectedError`, never silently accepted/dropped.
+  This is the intended, permanent behaviour for the embedded surface, not a temporary gap.
+- ``add`` returns the canonical :class:`~mu_contracts.contracts.views.MemoryWriteResult` (was
+  ``mu_local.views.MemoryWriteResult``) — MUST-ADD fields ``namespace``/``events_emitted`` are
+  populated from the resolved η and ``IngestResult.events_emitted`` respectively, zero extra I/O.
+- ``recall`` returns the canonical :class:`~mu_contracts.contracts.recall.RecallResult` (was the
+  lossy ``mu_local.views.MemoryListView`` via the now-deleted ``_to_list_view``) — the un-collapsed
+  engine result, carrying ``namespace``/``channels_run``/``generated_at`` that the old view threw
+  away. ``get``/``context`` are otherwise UNCHANGED (plan §3 B1 item (b)); ``context`` merely
+  follows ``recall``'s new item type since it assembles its window from ``recall``'s own output.
+- ``promote``/``demote`` are NEW — both delegate to the injected
+  :class:`~mu_engine.surface.facade.SurfaceFacade` (Stage A), which raises the named
+  :class:`~mu_engine.surface.facade.SurfaceVerbNotImplementedError` for both verbs today
+  (build-queue §13 item 5) — an honest, named 501, never a silent no-op. This is the one place
+  this facade "delegates through SurfaceFacade" (plan §3 B1 item (f)): every other verb keeps
+  calling the composition root directly, since re-deriving them through the facade would change
+  observable behaviour (e.g. the facade's own ``add`` stamps a different ``IngestActivity.host``,
+  ``mu_engine/surface/facade.py:387-391``) — "no engine algorithm change" per the plan, not "no
+  behaviour change," but this module honours the stronger bar anyway outside promote/demote.
 """
 
 from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
+from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallResult
+from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
+from mu_contracts.domain.model.memory import Tier
 from mu_contracts.domain.model.scope import ClientScope
 from mu_contracts.ports.bus import EventBusPort
 from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
 from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
 from mu_contracts.ports.time import Clock
+from mu_contracts.validation import validate_plane_fields
 from mu_engine.lifecycle.settings import LifecycleSettings
 from mu_engine.pipelines.concrete.ingest import IngestActivity
+from mu_engine.pipelines.distill import DistillActionKind
 from mu_engine.providers._contracts import Message, MessageRole
 from mu_engine.providers.catalog import Task
 from mu_engine.services.ingest import IngestResult
-from mu_engine.services.recall.dto import RecallChannels, RecallQuery, RecallResult
+from mu_engine.services.recall.dto import RecallChannels as _EngineRecallChannels
+from mu_engine.services.recall.dto import RecallQuery
+from mu_engine.services.recall.dto import RecallResult as _EngineRecallResult
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.surface.facade import SurfaceFacade
 from mu_local.composition import LocalContainer
 from mu_local.config import StorageSettings
 from mu_local.errors import LlmNotConfiguredError
-from mu_local.views import (
-    ConsolidateView,
-    ContextView,
-    MemoryListView,
-    MemoryRecordView,
-    MemoryWriteResult,
-)
+from mu_local.views import MemoryRecordView
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a hard import-time cycle.
     from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
@@ -88,6 +118,11 @@ class LocalMemory:
         self._container = LocalContainer(
             storage or StorageSettings(), settings=settings, lifecycle=lifecycle
         )
+        # Stage A's unified-surface facade, injected with THIS instance's own composition root
+        # (never a second, independently-constructed container — DEV-STANDARDS rule 9). Used only
+        # where delegating changes no observable behaviour today: promote/demote (module
+        # docstring "UNIFIED VERB SURFACE").
+        self._facade = SurfaceFacade(self._container, workspace=workspace, namespace=namespace)
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> LocalMemory:
@@ -108,11 +143,33 @@ class LocalMemory:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
+        # SHARED-plane fields of the canonical superset signature (design §2.5) — accepted so the
+        # signature matches the unified surface, always REJECTED (never silently dropped) because
+        # LocalMemory is private-plane-only by construction (module docstring, plane_gate.py's own
+        # docstring). Supplying a non-None value here always raises PlaneFieldRejectedError.
+        visibility: Visibility | None = None,
+        subject: str | None = None,
+        predicate: str | None = None,
+        object: str | None = None,  # matches the frozen wire field name, mu_sdk parity
     ) -> MemoryWriteResult:
         """Ingest one activity (STM durable -> deterministic STM->MTM promote). ``content`` accepts
         ``str | dict | list[dict]`` and normalises to messages (mem0 ``client/main.py:153-160``).
         Each message becomes one INGEST activity keyed by a fresh source offset (a genuine new
-        occurrence, CANONICAL §8-M12); MTM promotion is idempotent on ``content_hash``."""
+        occurrence, CANONICAL §8-M12); MTM promotion is idempotent on ``content_hash``.
+
+        Returns the canonical :class:`~mu_contracts.contracts.views.MemoryWriteResult` receipt
+        (Decision B) — ``namespace``/``events_emitted`` are populated from the resolved η and the
+        engine's own :class:`~mu_engine.services.ingest.IngestResult`, zero extra I/O."""
+        validate_plane_fields(
+            {
+                "visibility": visibility,
+                "subject": subject,
+                "predicate": predicate,
+                "object": object,
+            },
+            private_configured=True,
+            shared_configured=False,
+        )
         ns = self._ns(user, session)
         last: IngestResult | None = None
         for message in _normalize_messages(content):
@@ -133,6 +190,8 @@ class LocalMemory:
             content_hash=last.content_hash,
             promoted=last.promoted,
             tiers_written=last.tiers_written,
+            namespace=ns.to_prefix(),
+            events_emitted=last.events_emitted,
         )
 
     async def consolidate(
@@ -161,6 +220,11 @@ class LocalMemory:
             facts_extracted=report.facts_extracted,
             added=report.added,
             superseded=report.superseded,
+            # MUST-ADD (Decision B) — a NOOP action (identical active fact, mem0 NONE-reinforce,
+            # `mu_engine/pipelines/distill.py:207`) was silently dropped by the pre-Decision-B
+            # embedded `mu_local.views.ConsolidateView`; count it the same way `added`/
+            # `superseded` already count their own action kind (`distill.py:237-243`).
+            noop=sum(a.kind is DistillActionKind.NOOP for a in report.actions),
         )
 
     # ----------------------------------------------------------------------------- read
@@ -172,15 +236,36 @@ class LocalMemory:
         session: str | None = None,
         tier: MemoryTier | None = None,
         limit: int = 10,
-    ) -> MemoryListView:
+        # SHARED-plane fields — same discipline as :meth:`add`; always rejected when non-None
+        # (LocalMemory is private-plane-only by construction).
+        visibility: Visibility | None = None,
+        subject: str | None = None,
+        predicate: str | None = None,
+        object: str | None = None,  # matches the frozen wire field name, mu_sdk parity
+    ) -> RecallResult:
         """Federate-live RANKED recall over the private-own partition (STM floor ⊕ MTM dense ⊕ LTM
         graph), fused once. LOCAL mode has no shared arm (spec §3.2). ``tier`` narrows to one
-        channel; ``None`` runs all three."""
+        channel; ``None`` runs all three.
+
+        Returns the canonical :class:`~mu_contracts.contracts.recall.RecallResult` (Decision B) —
+        the un-collapsed engine result (``namespace``/``channels_run``/``generated_at``, richer
+        per-hit scores), replacing the lossy ``mu_local.views.MemoryListView`` this verb used to
+        collapse into via the now-deleted ``_to_list_view``."""
+        validate_plane_fields(
+            {
+                "visibility": visibility,
+                "subject": subject,
+                "predicate": predicate,
+                "object": object,
+            },
+            private_configured=True,
+            shared_configured=False,
+        )
         ns = self._ns(user, session)
         scope = self._scope(user, session)
         q = RecallQuery(namespace=ns, text=query, limit=limit, channels=_channels_for_tier(tier))
         result = await self._container.recall.recall(scope, q)
-        return _to_list_view(result)
+        return _to_recall_result(result)
 
     async def search(
         self,
@@ -190,7 +275,7 @@ class LocalMemory:
         session: str | None = None,
         tier: MemoryTier | None = None,
         limit: int = 10,
-    ) -> MemoryListView:
+    ) -> RecallResult:
         """mem0 muscle-memory alias for :meth:`recall` (spec verb-alias policy, §CC-6): ``recall``
         is the canonical read verb; ``search`` is a documented alias, one single behaviour."""
         return await self.recall(query, user=user, session=session, tier=tier, limit=limit)
@@ -230,10 +315,18 @@ class LocalMemory:
     ) -> ContextView:
         """Assemble a context window from recalled hits by DETERMINISTIC concatenation (no LLM
         synthesis — spec §7 INJECT render, Azure PARKED). The heuristic assembly folds behind an
-        injected renderer once synthesis lands, without changing recall's core."""
+        injected renderer once synthesis lands, without changing recall's core.
+
+        Returns the canonical :class:`~mu_contracts.contracts.views.ContextView` (Decision B) —
+        ``items`` is now the single canonical hit-item type
+        (:class:`~mu_contracts.contracts.recall.RecallItemView`), following :meth:`recall`'s own
+        migration; ``degraded`` stays the plain NAMED-degrade ``str | None`` the embedded shape
+        always used, derived from :class:`RecallResult`'s typed ``DegradeReason`` exactly as the
+        deleted ``_to_list_view`` used to (``ContextView``'s own docstring)."""
         listing = await self.recall(query, user=user, session=session, limit=limit)
         text = _render_context(listing.items, max_chars=max_chars)
-        return ContextView(text=text, items=listing.items, degraded=listing.degraded)
+        degraded = listing.degraded.value if listing.degraded is not None else None
+        return ContextView(text=text, items=listing.items, degraded=degraded)
 
     async def ask(
         self,
@@ -262,6 +355,32 @@ class LocalMemory:
         ]
         completion = await self._container.llm.generate(Task.ANSWER, messages)
         return completion.text
+
+    # ------------------------------------------------------------------- TO BUILD (§13 item 5)
+    async def promote(
+        self,
+        memory_id: str,
+        *,
+        user: str = _DEFAULT_USER,
+        session: str | None = None,
+    ) -> NoReturn:
+        """``promote`` — neither ``LocalMemory`` nor ``MemoryClient`` implements this today (design
+        §2.5 disposition table, build-queue §13 item 5). Delegates to the injected
+        :class:`~mu_engine.surface.facade.SurfaceFacade`, which raises the named
+        :class:`~mu_engine.surface.facade.SurfaceVerbNotImplementedError` — an honest 501, never a
+        silent no-op/partial success. This is the one verb where delegating through the facade is
+        genuinely "clean": neither surface has ANY behaviour to preserve here yet."""
+        await self._facade.promote(memory_id, user=user, session=session)
+
+    async def demote(
+        self,
+        memory_id: str,
+        *,
+        user: str = _DEFAULT_USER,
+        session: str | None = None,
+    ) -> NoReturn:
+        """``demote`` — same disposition/discipline as :meth:`promote` (build-queue §13 item 5)."""
+        await self._facade.demote(memory_id, user=user, session=session)
 
     # ----------------------------------------------------------------------------- lifecycle
     @property
@@ -335,35 +454,53 @@ def _normalize_messages(
     raise ValueError(f"content must be str, dict, or list[dict], got {type(content).__name__}")
 
 
-def _channels_for_tier(tier: MemoryTier | None) -> RecallChannels:
+def _channels_for_tier(tier: MemoryTier | None) -> _EngineRecallChannels:
     """A ``tier`` narrows recall to one channel; ``None`` runs all three (STM/MTM/LTM)."""
     if tier is None:
-        return RecallChannels()
-    return RecallChannels(
+        return _EngineRecallChannels()
+    return _EngineRecallChannels(
         stm=tier is MemoryTier.STM,
         mtm=tier is MemoryTier.MTM,
         ltm=tier is MemoryTier.LTM,
     )
 
 
-def _to_list_view(result: RecallResult) -> MemoryListView:
-    return MemoryListView(
+def _to_recall_result(result: _EngineRecallResult) -> RecallResult:
+    """Map the engine-native :class:`~mu_engine.services.recall.dto.RecallResult` onto the
+    canonical :class:`~mu_contracts.contracts.recall.RecallResult` (Decision B) — REPLACES the
+    deleted ``_to_list_view``/``mu_local.views.MemoryListView`` collapse. ``namespace`` and
+    ``DegradeReason`` are the SAME type on both sides (``mu_engine.storage.domain.namespace`` /
+    ``mu_engine.services.recall.dto`` re-export ``mu_contracts``'s own classes, module docstrings)
+    so they pass straight through; only the per-item ``Tier``/``RecallChannels`` shapes need an
+    explicit re-wrap since the engine's internal item additionally carries a federate-dedup
+    ``content_hash``/per-item ``namespace`` this surface deliberately drops (Decision B cross-
+    cutting section, ``mu_contracts.contracts.recall`` module docstring)."""
+    return RecallResult(
+        namespace=result.namespace,
         items=[
-            MemoryRecordView(
+            RecallItemView(
                 memory_id=item.memory_id,
                 content=item.content,
-                tier=item.tier.value,
+                tier=Tier(item.tier.value),
                 channel=item.channel,
-                score=item.fused_score,
+                fused_score=item.fused_score,
+                rerank_score=item.rerank_score,
                 is_floor=item.is_floor,
+                artifact_ref=item.artifact_ref,
             )
             for item in result.items
         ],
-        degraded=result.degraded.value if result.degraded is not None else None,
+        channels_run=RecallChannels(
+            stm=result.channels_run.stm,
+            mtm=result.channels_run.mtm,
+            ltm=result.channels_run.ltm,
+        ),
+        degraded=result.degraded,
+        generated_at=result.generated_at,
     )
 
 
-def _render_context(items: Sequence[MemoryRecordView], *, max_chars: int | None) -> str:
+def _render_context(items: Sequence[RecallItemView], *, max_chars: int | None) -> str:
     """Deterministic context assembly: one bullet per hit, truncated to ``max_chars`` (no LLM)."""
     lines = [f"- {item.content}" for item in items]
     text = "\n".join(lines)

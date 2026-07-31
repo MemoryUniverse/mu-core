@@ -33,6 +33,7 @@ __all__ = [
     "MemoryUniverseError",
     "NamespaceIsolationError",
     "PermissionNarrowingError",
+    "PlaneFieldRejectedError",
     "PrivacyTierConflictError",
     "PrivacyTierNotAvailableError",
     "ProviderError",
@@ -204,3 +205,21 @@ class VectorNotFilterableError(BackendUnavailableError):
 
 class UnknownBackendError(UnknownComponentError):
     """An unknown store-backend registry key (storage-pluggable §7)."""
+
+
+# ── plane-gating (design §2.5 "Unified verb surface"; build-plan Stage B ruling 1) ───────────
+class PlaneFieldRejectedError(MemoryUniverseError):
+    """A canonical-signature field was supplied for a plane the caller has not configured
+    (sdk-engine-server-design.md §2.5: "Supplying a field that doesn't apply to the currently-
+    configured plane is a REJECTION, not a silent no-op"). Raised by
+    :func:`mu_contracts.validation.plane_gate.validate_plane_fields` — the ONE validator both
+    ``LocalMemory`` (mu-local) and ``MemoryClient`` (mu-sdk-python) call, so a shared-plane field
+    (``visibility``/``subject``/``predicate``/``object``) supplied with no shared plane configured,
+    or a private-plane field (``user``/``session``/``agent``) supplied under a shared-only
+    configuration, fails the SAME named way on both surfaces — never a silent drop (DEV-STANDARDS
+    rule 8: fail-loud)."""
+
+    def __init__(self, field: str, *, plane: str, reason: str) -> None:
+        self.field = field
+        self.plane = plane
+        super().__init__(f"field {field!r} requires the {plane!r} plane to be configured: {reason}")

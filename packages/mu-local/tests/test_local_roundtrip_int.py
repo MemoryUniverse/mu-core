@@ -29,7 +29,11 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
+from mu_contracts.contracts.recall import RecallResult
+from mu_contracts.domain.errors import PlaneFieldRejectedError
 from mu_engine.storage.domain.memory import MemoryTier
+from mu_engine.storage.domain.namespace import Visibility
+from mu_engine.surface.facade import SurfaceVerbNotImplementedError
 from mu_local import LlmNotConfiguredError, LocalMemory, MemoryListView
 from mu_local.config import BackendChoice, StorageSettings
 from mu_local.errors import BackendUnavailableError
@@ -145,6 +149,61 @@ async def test_add_promote_recall_round_trips_across_all_three_stores(mem: Local
     # (8) heuristic mode refuses synthesis loudly — never an empty/degraded answer (spec §7, T7).
     with pytest.raises(LlmNotConfiguredError):
         await mem.ask("Where does Ada live?", user=_USER, session=_SESSION)
+
+
+async def test_add_returns_canonical_receipt_with_namespace_and_events(
+    mem: LocalMemory, uid: str
+) -> None:
+    """B1 (e) — ``add`` returns the canonical ``mu_contracts.contracts.views.MemoryWriteResult``
+    receipt, with the MUST-ADD ``namespace``/``events_emitted`` fields populated from the real
+    write (Decision B) — not the old 4-field ``mu_local.views.MemoryWriteResult``."""
+    receipt = await mem.add("Ada owns a red bicycle", user=_USER, session=_SESSION)
+    assert receipt.namespace == f"mu/org{uid}/ws{uid}/private/{_USER}/{_SESSION}"
+    assert receipt.events_emitted, "a real promoted add must emit at least one domain event"
+
+
+async def test_recall_returns_canonical_result_not_the_collapsed_list(
+    mem: LocalMemory, uid: str
+) -> None:
+    """B1 (d) — ``recall`` returns the canonical, un-collapsed
+    ``mu_contracts.contracts.recall.RecallResult`` (Decision B) — proves the fields the deleted
+    ``_to_list_view``/``MemoryListView`` collapse used to throw away (``namespace``,
+    ``channels_run``, ``generated_at``) are present, not just the item list."""
+    await mem.add("Ada owns a red bicycle", user=_USER, session=_SESSION)
+    result = await _eventually(
+        lambda: mem.recall("What does Ada own?", user=_USER, session=_SESSION)
+    )
+    assert isinstance(result, RecallResult)
+    assert result.namespace.org == f"org{uid}"
+    assert result.namespace.workspace == f"ws{uid}"
+    assert result.namespace.user == _USER
+    # no tier= narrowing on this call -> all three channels run (proves channels_run reports the
+    # engine's real per-channel decision, not a hardcoded/collapsed value).
+    assert result.channels_run.stm and result.channels_run.mtm and result.channels_run.ltm
+    assert result.generated_at is not None
+    assert result.items, "recall found no hits to prove the item type on"
+    assert result.items[0].fused_score >= 0.0, "canonical RecallItemView field, not the old .score"
+
+
+async def test_shared_plane_fields_rejected_on_add_and_recall(mem: LocalMemory) -> None:
+    """B1 (a) — the shared-plane fields (``visibility``/``subject``/``predicate``/``object``) are
+    accepted on the canonical superset signature but ALWAYS rejected by ``LocalMemory``, which is
+    private-plane-only by construction (design §2.5; ``mu_contracts.validation.plane_gate``) — a
+    named error, never a silent drop."""
+    with pytest.raises(PlaneFieldRejectedError):
+        await mem.add("x", user=_USER, session=_SESSION, visibility=Visibility.SHARED)
+    with pytest.raises(PlaneFieldRejectedError):
+        await mem.recall("x", user=_USER, session=_SESSION, subject="Ada")
+
+
+async def test_promote_and_demote_are_honest_named_501s(mem: LocalMemory) -> None:
+    """B1 (c) — ``promote``/``demote`` are new, delegate through ``SurfaceFacade`` (Stage A), and
+    raise the named ``SurfaceVerbNotImplementedError`` (build-queue §13 item 5) — never a silent
+    no-op/partial success."""
+    with pytest.raises(SurfaceVerbNotImplementedError):
+        await mem.promote("some-memory-id", user=_USER, session=_SESSION)
+    with pytest.raises(SurfaceVerbNotImplementedError):
+        await mem.demote("some-memory-id", user=_USER, session=_SESSION)
 
 
 def test_unsupported_backend_fails_loud_not_silent() -> None:

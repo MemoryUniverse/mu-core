@@ -39,10 +39,9 @@ from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
 from mu_engine.pipelines.concrete.ingest import IngestActivity
-from mu_engine.storage.domain.memory import FactObjectKind
+from mu_engine.storage.domain.memory import FactObjectKind, MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.domain.recall import Scored
-from mu_engine.storage.domain.memory import MemoryItem
 from mu_local import LocalMemory
 
 pytestmark = pytest.mark.integration
