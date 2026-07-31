@@ -50,6 +50,19 @@ COPY packages/mu-engine-server packages/mu-engine-server
 # copied above (keeps mu-local's source, tests/, and dev tooling out of the shipped image).
 RUN uv sync --frozen --no-dev --no-editable --package mu-engine-server
 
+# Bake the embedder weights in — this stage HAS network (uv sync above already required it) and
+# runs as root, unlike the runtime stage below. Without this, EngineContainer._build_embedder()
+# (composition.py:385 -> SentenceTransformer(...)) tries to download
+# sentence-transformers/all-MiniLM-L6-v2 (settings.py:_DEFAULT_MINILM_PATH, the exact id the
+# `minilm_local` catalog entry resolves to) from HuggingFace at container startup and crashes with
+# `OSError: PermissionError at /home/mu-engine-server/.cache/huggingface/hub` — the non-root
+# runtime user cannot write there and a self-contained image must not depend on network at
+# startup anyway. Downloading here, into a plain directory (not the final user's HOME), lets the
+# runtime stage COPY+chown it once and run fully offline.
+ENV HF_HOME=/opt/hf-cache
+RUN mkdir -p /opt/hf-cache && \
+    .venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+
 # -------------------------------------------------------------------------------------------------
 FROM python:3.12-slim AS runtime
 
@@ -67,11 +80,26 @@ COPY --from=builder /app/.venv /app/.venv
 # hands this wiring job to Stage E by name).
 COPY packages/mu-engine-server/docker/serve.py /app/serve.py
 
-RUN chown -R mu-engine-server:mu-engine-server /app /home/mu-engine-server
+# Baked embedder cache from the builder stage (see that stage's comment) — a plain, non-HOME path
+# so it survives independent of whatever HOME/user setup happens below; chown makes it READABLE
+# (not necessarily writable — offline mode never writes here) by the non-root runtime user.
+# NOTE: only HF_HOME is set (deliberately no SENTENCE_TRANSFORMERS_HOME) — sentence-transformers
+# passes SENTENCE_TRANSFORMERS_HOME straight through as huggingface_hub's `cache_dir` (no "/hub"
+# suffix appended), whereas an UNSET cache_folder falls back to huggingface_hub's own HF_HOME-based
+# default, which DOES nest under "<HF_HOME>/hub/...". The builder stage above only set HF_HOME, so
+# the model was downloaded to <HF_HOME>/hub/models--...; setting SENTENCE_TRANSFORMERS_HOME here
+# too would point lookups at <HF_HOME>/models--... instead (no "hub/") and silently miss the cache.
+# Leaving SENTENCE_TRANSFORMERS_HOME unset keeps both stages resolving the identical path.
+COPY --from=builder /opt/hf-cache /opt/hf-cache
+
+RUN chown -R mu-engine-server:mu-engine-server /app /home/mu-engine-server /opt/hf-cache
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    HOME=/home/mu-engine-server
+    HOME=/home/mu-engine-server \
+    HF_HOME=/opt/hf-cache \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 USER mu-engine-server
 EXPOSE 8300
