@@ -46,3 +46,21 @@ def test_assert_authorized_rejects_cross_tenant() -> None:
 def test_assert_authorized_allows_own_namespace() -> None:
     s = _scope()
     s.assert_authorized(s.namespace(Visibility.PRIVATE), "recall")  # no raise
+
+
+def test_assert_authorized_allows_private_cross_session_same_user() -> None:
+    """ADR 0030 (keep-and-scope): a PRIVATE namespace's ``session`` is a recall filter +
+    provenance stamp, never an isolation boundary — the SAME user's OTHER session must federate,
+    not raise. This is the exact carve-out the cross-session-federation bug was missing."""
+    s = _scope()
+    other_session = s.namespace(Visibility.PRIVATE).model_copy(update={"session": "s-other"})
+    s.assert_authorized(other_session, "recall")  # no raise
+
+
+def test_assert_authorized_rejects_shared_cross_session() -> None:
+    """SHARED (room) targets keep ``session`` as a hard wall — rooms are real walls (ADR 0030
+    "Alternatives and tradeoffs"); PRIVATE's relaxation must NOT bleed into SHARED."""
+    s = _scope()
+    other_room = s.namespace(Visibility.SHARED).model_copy(update={"session": "room-other"})
+    with pytest.raises(NamespaceIsolationError):
+        s.assert_authorized(other_room, "recall")

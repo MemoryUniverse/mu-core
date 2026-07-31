@@ -35,12 +35,17 @@ class DefaultTenancyGuard:
         """Raise ``NamespaceIsolationError`` unless ``scope`` may touch ``ns`` for ``operation``.
 
         Layers of the one refusal:
-          1. org / workspace / session must match the active scope (delegated to
+          1. org / workspace must match the active scope; session must match too UNLESS ``ns`` is
+             PRIVATE (ADR 0030: PRIVATE session is a filter/provenance stamp, never an isolation
+             boundary — SHARED rooms keep session as a hard wall) (delegated to
              ``ClientScope.assert_authorized`` — the same non-enumerating raise);
-          2. a PRIVATE η binds to the ACTING agent's own slot (``ns.user == agent_principal_id``);
+          2. a PRIVATE η binds to the ACTING agent's own slot (``ns.user == agent_principal_id``) —
+             this is what still fully blocks a cross-user PRIVATE read even though (1) no longer
+             gates PRIVATE on session;
           3. a SHARED η must have the zeroed sentinel user slot (``ns.user == "*"``).
         """
-        # (1) org/workspace/session — the contracts scope owns this exact non-enumerating check.
+        # (1) org/workspace(/session for SHARED) — the contracts scope owns this exact
+        # non-enumerating check.
         scope.assert_authorized(ns, operation)
 
         # (2)/(3) visibility ⇄ user-slot binding (spec §2 rule 2/3, §5).

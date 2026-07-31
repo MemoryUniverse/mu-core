@@ -162,15 +162,21 @@ class ClientScope(BaseModel):
         )
 
     def assert_authorized(self, target: Namespace, operation: str) -> None:
-        """Reject a cross-org / cross-workspace / cross-session target — the belt to
-        ``TenancyGuard``'s suspenders (platform-layer0 §3/§5). Raises ``NamespaceIsolationError``
-        with a non-enumerating message (never echo the requested id)."""
+        """Reject a cross-org / cross-workspace target — the belt to ``TenancyGuard``'s suspenders
+        (platform-layer0 §3/§5). A cross-session target is rejected too UNLESS ``target`` is
+        PRIVATE: for PRIVATE, ``session`` is a recall FILTER + provenance stamp, never an
+        isolation boundary (ADR 0030 "keep-and-scope" — the federate-live, session_scope=None
+        default deliberately surfaces the SAME user's OTHER sessions); the same-user invariant for
+        PRIVATE is independently enforced by ``DefaultTenancyGuard.assert_scope``'s user-slot check
+        that runs right after this. A SHARED (room) target's session stays a hard wall — rooms are
+        real walls, ADR 0030 "Alternatives and tradeoffs" — so cross-session SHARED is still
+        rejected. Raises ``NamespaceIsolationError`` with a non-enumerating message (never echo the
+        requested id)."""
         del operation
-        if (
-            target.org != self.org_id
-            or target.workspace != self.workspace_id
-            or target.session != self.session_id
-        ):
+        cross_session = target.session != self.session_id and target.visibility is not (
+            Visibility.PRIVATE
+        )
+        if target.org != self.org_id or target.workspace != self.workspace_id or cross_session:
             from mu_contracts.domain.errors import NamespaceIsolationError
 
             raise NamespaceIsolationError("not found")

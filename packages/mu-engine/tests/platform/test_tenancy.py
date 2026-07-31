@@ -67,6 +67,45 @@ def test_private_other_users_slot_denied() -> None:
         guard.assert_scope(_scope(), other, "read")
 
 
+def test_private_cross_session_same_user_allowed() -> None:
+    """ADR 0030: a PRIVATE η in a DIFFERENT session of the SAME (org, workspace, user) must
+    federate, not raise — the fix for the cross-session-federation bug. This is the belt-and-
+    suspenders layer ``RecallService.recall`` (service.py:134) re-checks every surviving item
+    against; it must let a genuinely cross-session, same-user hit through."""
+    guard = DefaultTenancyGuard()
+    other_session = Namespace(
+        org="orgA", workspace="wsA", user="p1", session="s-other", visibility=Visibility.PRIVATE
+    )
+    guard.assert_scope(_scope(), other_session, "read")  # no raise
+
+
+def test_private_cross_session_different_user_denied() -> None:
+    """The security half: relaxing the session check for PRIVATE must NOT weaken cross-user
+    isolation. Same org/workspace, a DIFFERENT session AND a DIFFERENT user slot — still denied,
+    because the user-slot check (step 2) is untouched by the session relaxation."""
+    guard = DefaultTenancyGuard()
+    other_user_other_session = Namespace(
+        org="orgA",
+        workspace="wsA",
+        user="someone_else",
+        session="s-other",
+        visibility=Visibility.PRIVATE,
+    )
+    with pytest.raises(NamespaceIsolationError):
+        guard.assert_scope(_scope(), other_user_other_session, "read")
+
+
+def test_shared_cross_session_denied() -> None:
+    """Rooms are real walls (ADR 0030): a SHARED η in a different session must stay denied even
+    though PRIVATE now federates across sessions."""
+    guard = DefaultTenancyGuard()
+    other_room = Namespace(
+        org="orgA", workspace="wsA", user="*", session="room-other", visibility=Visibility.SHARED
+    )
+    with pytest.raises(NamespaceIsolationError):
+        guard.assert_scope(_scope(), other_room, "read")
+
+
 def test_denial_message_is_non_enumerating() -> None:
     guard = DefaultTenancyGuard()
     other = Namespace(
