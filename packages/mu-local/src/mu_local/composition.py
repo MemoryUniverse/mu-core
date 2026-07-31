@@ -426,6 +426,11 @@ class LocalContainer:
             tracer=self.tracer,
             metrics=self.metrics,
             audit=self.audit,
+            # NEW (software-arch spec §6, l.340-341): threading a real ContextRepository turns ON
+            # `PersistRawArtifactStage` — every capture becomes kind=REFERENCE targeting a
+            # persisted ContextArtifact (see `services/ingest.py`'s `artifacts=None` docstring for
+            # why this stays optional at the service layer; this composition root always opts in).
+            artifacts=self.artifacts,
         )
         self.distill = DistillPipeline(
             ltm=self.ltm,
