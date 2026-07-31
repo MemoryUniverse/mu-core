@@ -30,6 +30,16 @@ the same importable closure a boundary-respecting caller can reach.
 per-verb RETURN DTO, out of this task's A4-winners scope) and stays in ``mu_sdk.models.recall``;
 that module should import ``RecallChannels``/``RecallMode`` from here instead of re-declaring them
 once B2 lands (not done by this task — B0 owns only ``mu-contracts``).
+
+**Update (R0, SDK<->mu-engine-server wire-request reconciliation):** the REQUEST side has since
+been single-sourced too — see :mod:`mu_contracts.contracts.requests`, which now declares the
+canonical ``RecallRequest`` (and ``AddRequest``/``GetRequest``/``ContextWindowRequest``/
+``ConsolidateRequest``) BOTH ``mu-engine-server`` and ``mu-sdk-python`` are meant to import, per
+that module's own docstring. The note above ("stays in ``mu_sdk.models.recall``") described the
+state before R0; ``mu_sdk.models.recall.RecallRequest`` and ``mu_engine_server.schemas.
+RecallRequest`` are now pre-canonical duplicates pending re-pointing at
+``mu_contracts.contracts.requests.RecallRequest`` (not done by this module — R0 owns only this
+``contracts/`` package, not the SDK or server call sites).
 """
 
 from __future__ import annotations

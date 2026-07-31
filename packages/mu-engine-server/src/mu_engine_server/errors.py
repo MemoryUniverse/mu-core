@@ -19,6 +19,7 @@ from typing import cast
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from mu_contracts.domain.errors import PlaneFieldRejectedError
 from mu_engine.lifecycle.mode_gate import ManagerOwnsLifecycleError
 from mu_engine.surface.facade import SurfaceVerbNotImplementedError
 
@@ -52,14 +53,35 @@ async def _bad_request(_request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": "ValueError", "detail": str(exc)})
 
 
+async def _plane_field_rejected(_request: Request, exc: Exception) -> JSONResponse:
+    # See _not_implemented's own comment on cast vs. assert (bandit S101 / -O stripping).
+    error = cast(PlaneFieldRejectedError, exc)
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "PlaneFieldRejectedError",
+            "field": error.field,
+            "plane": error.plane,
+            "detail": str(error),
+        },
+    )
+
+
 def register_exception_handlers(app: FastAPI) -> None:
-    """Wire the three named mappings this route layer needs (§2.1 verbs actually raise):
+    """Wire the four named mappings this route layer needs (§2.1 verbs actually raise):
 
     - :class:`SurfaceVerbNotImplementedError` -> ``501`` (``promote``/``demote``, always;
       ``build_context`` never — it is wired to a real op now, facade module docstring).
     - :class:`ManagerOwnsLifecycleError` -> ``409`` (``consolidate`` under a MANAGED namespace,
       ADR 0031 — ``mu_engine.lifecycle.mode_gate.ManagerModeGate.assert_manual_allowed``, called
       by ``SurfaceFacade.consolidate`` before it ever reaches ``distill``).
+    - :class:`PlaneFieldRejectedError` -> ``400`` (R1, SDK<->server request reconciliation — a
+      caller posted a shared-plane field, e.g. ``visibility``/``subject``/``predicate``/``object``
+      on ``POST /memories``, to this single-tenant PRIVATE-plane-only server;
+      ``routes/memories.py``'s ``add_memory`` calls
+      ``mu_contracts.validation.plane_gate.validate_plane_fields(..., shared_configured=False)``
+      before ever reaching the facade — this is that rejection's named, "not a silent no-op" HTTP
+      shape, design §2.5).
     - bare :class:`ValueError` -> ``400`` (``SurfaceFacade.add``'s empty-content-list refusal, the
       one non-``MemoryUniverseError`` raise this route layer's facade calls can produce).
 
@@ -69,4 +91,5 @@ def register_exception_handlers(app: FastAPI) -> None:
     """
     app.add_exception_handler(SurfaceVerbNotImplementedError, _not_implemented)
     app.add_exception_handler(ManagerOwnsLifecycleError, _manager_owns_lifecycle)
+    app.add_exception_handler(PlaneFieldRejectedError, _plane_field_rejected)
     app.add_exception_handler(ValueError, _bad_request)

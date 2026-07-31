@@ -25,6 +25,11 @@ __all__ = ["router"]
 
 router = APIRouter(dependencies=[Depends(require_bearer_token)])
 
+# See routes/memories.py's own comment: the canonical ContextWindowRequest.user field defaults to
+# None ("not supplied"), never a hardcoded literal — this server resolves its own single-tenant
+# default identity after parsing (mu_contracts.contracts.requests module docstring).
+_DEFAULT_USER = "default"
+
 
 @router.post("/v1/context/window", response_model=ContextView)
 async def build_context_window(
@@ -32,10 +37,16 @@ async def build_context_window(
     facade: MemorySurfacePort = Depends(get_facade),
 ) -> ContextView:
     """``build_context`` — deterministic context-window assembly (no LLM). Wired to the real op
-    (facade module docstring: "no longer a named 501")."""
+    (facade module docstring: "no longer a named 501").
+
+    ``ContextWindowRequest`` declares no shared-plane fields (``mu_contracts.contracts.requests``
+    module docstring's field-set table) — nothing here for a plane-gate check to ever reject, so
+    (unlike ``add_memory`` in ``routes/memories.py``) no ``validate_plane_fields`` call is made.
+    """
+    user = body.user if body.user is not None else _DEFAULT_USER
     return await facade.build_context(
         body.query,
-        user=body.user,
+        user=user,
         session=body.session,
         limit=body.limit,
         max_chars=body.max_chars,

@@ -22,12 +22,23 @@ from mu_contracts.contracts.memory import (
     PolarityLiteral,
 )
 from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallMode, RecallResult
+from mu_contracts.contracts.requests import (
+    AddRequest,
+    ConsolidateRequest,
+    ContextWindowRequest,
+    GetRequest,
+    RecallRequest,
+)
 from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
 
 __all__ = [
+    "AddRequest",
+    "ConsolidateRequest",
     "ConsolidateView",
     "ContentType",
     "ContextView",
+    "ContextWindowRequest",
+    "GetRequest",
     "MemoryResponse",
     "MemoryTierLiteral",
     "MemoryWriteResult",
@@ -35,5 +46,6 @@ __all__ = [
     "RecallChannels",
     "RecallItemView",
     "RecallMode",
+    "RecallRequest",
     "RecallResult",
 ]
