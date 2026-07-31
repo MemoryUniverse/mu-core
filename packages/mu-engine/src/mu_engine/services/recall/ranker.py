@@ -6,9 +6,17 @@ fact. It is the arm the federation runs TWICE — once per plane — differing o
 repositories + the caller identity set (§1.6/§4.2a, CANONICAL §7.9 "one fuse implementation").
 
 Channel behaviour pinned to §1.3:
-  * **STM floor** — ``recent(ns, limit)``, unconditional, ``is_floor=True``, ``state='active'`` at
-    the adapter (a superseded id is excluded from the window; the floor protects a *valid* recent
-    fact, never resurrects a retired one).
+  * **STM floor** — ``recent(ns, limit)``, ``state='active'`` at the adapter (a superseded id is
+    excluded from the window; the floor protects a *valid* recent fact, never resurrects a retired
+    one). BUG FIX (data-quality assessment §3.1/#1, 2026-07-31): the candidate pool now FUSES into
+    the same RRF pass as MTM/LTM (``weight_stm``) instead of being force-prepended whole — only the
+    ``settings.floor_protect_limit`` most-recent candidates are UNCONDITIONALLY protected
+    (``is_floor=True``, never evicted); the rest compete on fused rank like any other channel.
+    Before this fix, ``recency_floor_limit`` defaulted to the SAME width as the result ``limit``
+    (10==10), so a session with >= ``limit`` STM items consumed the ENTIRE result budget and the
+    query-relevant MTM/LTM channels never surfaced a single item — every ``recall()`` in that
+    session returned the identical, query-blind, insertion-order list (verbatim repro:
+    ``docs/tracking/DATA-QUALITY-ASSESSMENT.md`` §3.1).
   * **MTM dense** — ``semantic(ns, query_vec, ...)`` with the Model-A ``authorized_ids`` +
     ``state='active'`` predicate compiled server-side BEFORE top-k (adapter §3.2). Never pads.
   * **LTM graph (bi-temporal)** — ``graph_recall`` returns only ``m.state='active'`` facts whose
@@ -43,7 +51,7 @@ from mu_engine.services.recall.dto import (
 from mu_engine.services.recall.fusion import FusionStrategy
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
-from mu_engine.storage.domain.recall import Scored
+from mu_engine.storage.domain.recall import RecallChannel, Scored
 from mu_engine.storage.ports import LtmTierRepository, MtmTierRepository, StmTierRepository
 
 __all__ = ["RecallRanker", "ThreeChannelRecallRanker"]
@@ -151,18 +159,32 @@ class ThreeChannelRecallRanker:
         mtm_hits = mtm_t.result()
         ltm_hits, ltm_degraded = ltm_t.result()
 
-        # Fuse MTM ⊕ LTM by tier-stable id; a cosine score and a graph-hop count fuse by RANK only.
+        # Fuse STM ⊕ MTM ⊕ LTM by tier-stable id; a recency rank, a cosine score, and a graph-hop
+        # count fuse by RANK only (§1.3 "one fuse implementation"). BUG FIX (§3.1/#1): the STM
+        # candidate pool used to be excluded from this fusion and force-prepended WHOLE ahead of it
+        # (see module docstring) — that made the query-relevant MTM/LTM channels invisible whenever
+        # the session held >= `limit` STM items. It now competes on fused rank like any other
+        # channel; only a small, bounded prefix is still unconditionally protected below.
+        settings = self._settings
         fused_pairs = self._fusion.fuse(
-            [mtm_hits, ltm_hits],
+            [floor, mtm_hits, ltm_hits],
             id_of=lambda s: s.item.id,
-            weights=[self._settings.weight_mtm, self._settings.weight_ltm],
-            k=self._settings.rrf_k,
+            weights=[settings.weight_stm, settings.weight_mtm, settings.weight_ltm],
+            k=settings.rrf_k,
         )
-        fused_views = [_to_view(scored, _channel_label(scored)) for scored, _score in fused_pairs]
+        # `is_floor` from the adapter marks EVERY STM candidate (Scored.is_floor=True on the whole
+        # recency pool, redis_stm.py `recent()`) — force it False here so ONLY the explicitly
+        # protected prefix below is exempt from eviction; a fused-in STM item that didn't make the
+        # protected prefix must compete for its slot exactly like an MTM/LTM hit.
+        fused_views = [
+            _to_view(scored, _channel_label(scored)).model_copy(update={"is_floor": False})
+            for scored, _score in fused_pairs
+        ]
 
-        items = _merge_floor(
-            floor_views=[_to_view(s, "stm") for s in floor], fused=fused_views, limit=limit
-        )
+        protect_n = self._settings.floor_protect_limit
+        protected_floor_views = [_to_view(s, "stm") for s in floor[:protect_n]]
+
+        items = _merge_floor(floor_views=protected_floor_views, fused=fused_views, limit=limit)
 
         ran = RecallChannels(
             stm=channels.stm,
@@ -198,15 +220,21 @@ async def _ltm_ok(hits: list[Scored[MemoryItem]]) -> tuple[list[Scored[MemoryIte
 
 
 def _channel_label(scored: Scored[MemoryItem]) -> str:
-    return "ltm" if scored.channel.value.startswith("ltm") else "mtm"
+    if scored.channel.value.startswith("ltm"):
+        return "ltm"
+    if scored.channel is RecallChannel.STM_FLOOR:
+        return "stm"
+    return "mtm"
 
 
 def _merge_floor(
     *, floor_views: list[RecallItemView], fused: list[RecallItemView], limit: int
 ) -> list[RecallItemView]:
-    """Merge the STM floor in AFTER fusion (hybrid.py:247): fusion may reorder but never evict a
-    floor member. Floor members lead (always recallable), then fused non-duplicates fill up to
-    ``limit`` — the floor is protected even when it would push the list past ``limit``."""
+    """Merge the (now BOUNDED, §3.1/#1 bug fix) STM floor in AFTER fusion (hybrid.py:247): fusion
+    may reorder but never evict a protected floor member. ``floor_views`` is capped upstream to
+    ``settings.floor_protect_limit`` — NOT the whole STM candidate pool — so it always leaves room
+    for the fused, query-relevant tail. Floor members lead (always recallable), then fused
+    non-duplicates fill up to ``limit``."""
     floor_ids = {v.memory_id for v in floor_views}
     tail = [v for v in fused if v.memory_id not in floor_ids]
     room = max(0, limit - len(floor_views))

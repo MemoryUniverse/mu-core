@@ -139,8 +139,21 @@ class RecallSettings(BaseModel):
 
     strategy: str = "rrf_3channel_v1"  # recall_registry key (§1.3)
     rrf_k: int = Field(default=60, ge=1)  # RRF smoothing constant (fusion.py default)
-    recency_floor_limit: int = Field(default=10, ge=0)  # STM floor width (§1.3)
+    recency_floor_limit: int = Field(default=10, ge=0)  # STM floor CANDIDATE pool width (§1.3)
+    # Bug fix (data-quality assessment §3.1/#1, 2026-07-31): the floor candidate pool used to be
+    # merged in FRONT of the fused MTM/LTM tail UNCONDITIONALLY, and defaulted to the SAME width as
+    # the result `limit` (10==10) — so on any session with >= `limit` STM items, the floor consumed
+    # the entire result budget and the query-relevant fused channels never got a single slot
+    # (every `recall()` in a session became a byte-identical, query-blind insertion-order dump).
+    # `floor_protect_limit` bounds how many of the (still recency-ordered) STM candidates are
+    # UNCONDITIONALLY protected from eviction — the "never evict a just-said fact" guarantee — while
+    # the REST of the STM candidate pool now competes in the SAME RRF fusion as MTM/LTM (§1.3 "one
+    # fuse implementation") instead of being force-prepended. This keeps the recency intent (the
+    # `floor_protect_limit` most-recent facts are always recallable) without letting the STM channel
+    # swamp every other channel's relevance signal.
+    floor_protect_limit: int = Field(default=3, ge=0)
     channel_pool_size: int = Field(default=20, ge=1)  # per-channel fetch width > limit (ADR 0010)
+    weight_stm: float = Field(default=1.0, ge=0.0)  # in-arm recency-channel weight (§1.3 fuse)
     weight_mtm: float = Field(default=1.0, ge=0.0)  # in-arm dense weight (§1.3 fuse)
     weight_ltm: float = Field(default=1.0, ge=0.0)  # in-arm graph weight (§1.3 fuse)
     weight_private: float = Field(default=1.0, ge=0.0)  # federation: private-arm weight (§1.6)
