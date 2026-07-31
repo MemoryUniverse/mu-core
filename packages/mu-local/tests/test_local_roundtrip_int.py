@@ -4,8 +4,9 @@ MiniLM embedder, ZERO mocks (DEV-STANDARDS: non-negotiable; the task acceptance 
 ``LocalMemory().add(...)`` -> promote -> ``recall(...)`` round-trips real data across
 redis (STM) + qdrant (MTM) + falkordb (LTM) on the live containers:
 
-  * ``add`` writes STM (redis) and deterministically promotes to MTM (qdrant) — ``promoted`` +
-    ``"mtm"`` in ``tiers_written`` prove the qdrant WRITE;
+  * ``add`` writes STM (redis) and deterministically promotes to MTM (qdrant) when importance
+    crosses the gate (REMEDIATION Rank 2 / conformance A6 fix — promotion is NEVER unconditional)
+    — ``promoted`` + ``"mtm"`` in ``tiers_written`` prove the qdrant WRITE;
   * a tier=MTM recall returns qdrant hits — proves the qdrant READ;
   * ``consolidate`` reads the STM window (redis) and writes bi-temporal facts to LTM (falkordb);
   * a tier=LTM recall returns falkordb graph facts — proves the falkordb READ;
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 
 import pytest
@@ -31,6 +33,7 @@ from redis.asyncio import Redis
 from mu_contracts.config import Settings
 from mu_contracts.contracts.recall import RecallResult
 from mu_contracts.domain.errors import PlaneFieldRejectedError
+from mu_engine.config import get_engine_settings
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_engine.storage.domain.namespace import Visibility
 from mu_engine.surface.facade import SurfaceVerbNotImplementedError
@@ -100,8 +103,17 @@ async def _eventually(read: Callable[[], Awaitable[MemoryListView]]) -> MemoryLi
 
 async def test_add_promote_recall_round_trips_across_all_three_stores(mem: LocalMemory) -> None:
     # (1) WRITE — add durably lands in STM (redis) and promotes to MTM (qdrant).
-    r1 = await mem.add("Ada lives in Paris", user=_USER, session=_SESSION)
-    r2 = await mem.add("Ada works at Acme", user=_USER, session=_SESSION)
+    # REMEDIATION Rank 2 / conformance A6 fix: add() no longer hardcodes promote=True, so a
+    # default-importance add (0.5) would NOT promote (IngestSettings.importance_promote=0.6) —
+    # this test proves the promote PATHWAY (the qdrant MTM write), so it earns promotion
+    # explicitly via importance_score; the gate itself is proven by
+    # test_add_gates_promotion_on_importance_not_unconditionally below.
+    r1 = await mem.add(
+        "Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.9
+    )
+    r2 = await mem.add(
+        "Ada works at Acme", user=_USER, session=_SESSION, importance_score=0.9
+    )
     assert r1.promoted and r2.promoted, "STM->MTM deterministic promotion did not fire"
     assert "mtm" in r1.tiers_written, "qdrant MTM write not recorded in the receipt"
     assert r1.content_hash and r1.memory_id
@@ -151,13 +163,74 @@ async def test_add_promote_recall_round_trips_across_all_three_stores(mem: Local
         await mem.ask("Where does Ada live?", user=_USER, session=_SESSION)
 
 
+async def test_add_gates_promotion_on_importance_not_unconditionally(mem: LocalMemory) -> None:
+    """REMEDIATION Rank 2 / conformance A6 fix — the defect: both public write paths hardcoded
+    ``IngestActivity(..., promote=True)`` unconditionally, so EVERY ``add()`` promoted STM->MTM
+    regardless of importance, defeating the tier design. Proven here through the PUBLIC ``add()``
+    call only (never a hand-built ``IngestActivity``):
+
+    * no ``importance_score`` supplied -> ``IngestActivity.importance`` falls to its own field
+      default (0.5), BELOW ``IngestSettings.importance_promote`` (0.6, unmodified default) ->
+      ``promoted=False``, ``tiers_written == ("stm",)`` — STM-only, no MTM (qdrant) write at all.
+    * a high ``importance_score`` crosses the gate -> ``promoted=True``, ``"mtm" in
+      tiers_written`` — the SAME public verb, now earning the promotion honestly.
+    """
+    low = await mem.add("unimportant filler chatter", user=_USER, session=_SESSION)
+    assert low.promoted is False, "default importance (0.5) must NOT cross the 0.6 promote gate"
+    assert low.tiers_written == ("stm",), "an ungated add must land STM-only, never MTM"
+
+    high = await mem.add(
+        "Ada's passport number is a critical fact",
+        user=_USER,
+        session=_SESSION,
+        importance_score=0.9,
+    )
+    assert high.promoted is True, "importance >= gate must promote STM->MTM"
+    assert "mtm" in high.tiers_written
+
+
+async def test_add_importance_promote_threshold_is_env_overridable(
+    settings: Settings, uid: str
+) -> None:
+    """``MU_INGEST__IMPORTANCE_PROMOTE`` (Rank 1's env-wired ``EngineSettings.ingest``, threaded
+    into ``IngestService``/``DeterministicPromoteStage`` by ``mu_local.composition.LocalContainer``
+    C1) moves the promote boundary — proven through the PUBLIC ``LocalMemory.add()`` call, never a
+    hand-built ``IngestActivity`` or a directly-injected ``EngineSettings``: an ``importance_score``
+    that sits BELOW the default gate (0.6) but ABOVE a lowered, env-overridden gate now promotes."""
+    get_engine_settings.cache_clear()
+    os.environ["MU_INGEST__IMPORTANCE_PROMOTE"] = "0.2"
+    env_uid = f"{uid}env"
+    try:
+        memory = LocalMemory(
+            workspace=f"ws{env_uid}", namespace=f"org{env_uid}", settings=settings
+        )
+        try:
+            receipt = await memory.add(
+                "Ada's mid-importance note",
+                user=_USER,
+                session=_SESSION,
+                importance_score=0.4,  # below the DEFAULT 0.6 gate, above the lowered 0.2 gate
+            )
+            assert receipt.promoted is True, "MU_INGEST__IMPORTANCE_PROMOTE=0.2 must lower the gate"
+            assert "mtm" in receipt.tiers_written
+        finally:
+            await memory.aclose()
+    finally:
+        del os.environ["MU_INGEST__IMPORTANCE_PROMOTE"]
+        get_engine_settings.cache_clear()
+        await _teardown(settings, env_uid)
+
+
 async def test_add_returns_canonical_receipt_with_namespace_and_events(
     mem: LocalMemory, uid: str
 ) -> None:
     """B1 (e) — ``add`` returns the canonical ``mu_contracts.contracts.views.MemoryWriteResult``
     receipt, with the MUST-ADD ``namespace``/``events_emitted`` fields populated from the real
     write (Decision B) — not the old 4-field ``mu_local.views.MemoryWriteResult``."""
-    receipt = await mem.add("Ada owns a red bicycle", user=_USER, session=_SESSION)
+    # A6 fix: earn the promotion explicitly (default importance 0.5 no longer promotes).
+    receipt = await mem.add(
+        "Ada owns a red bicycle", user=_USER, session=_SESSION, importance_score=0.9
+    )
     assert receipt.namespace == f"mu/org{uid}/ws{uid}/private/{_USER}/{_SESSION}"
     assert receipt.events_emitted, "a real promoted add must emit at least one domain event"
 

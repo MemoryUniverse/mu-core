@@ -169,12 +169,21 @@ async def test_add_distill_ask_over_real_slm_closes_the_llm_seam(slm_mem: LocalM
     """The acceptance this file exists for: with an SLM profile configured, ``add`` then
     ``consolidate`` extracts SPO facts VIA THE REAL SLM (not the heuristic decomposer), and ``ask``
     returns a REAL generated answer instead of raising ``LlmNotConfiguredError``."""
-    # (1) WRITE — durable STM (redis) + deterministic MTM (qdrant) promotion, same as heuristic mode
+    # (1) WRITE — durable STM (redis) + deterministic MTM (qdrant) promotion, same as heuristic
+    # mode. REMEDIATION Rank 2 / conformance A6 fix: add() no longer hardcodes promote=True, so
+    # this test (proving the MTM write pathway) earns it explicitly via importance_score (default
+    # importance 0.5 sits below the 0.6 gate and would stay STM-only).
     r1 = await slm_mem.add(
-        "Ada lives in Paris and works at Acme as a data engineer.", user=_USER, session=_SESSION
+        "Ada lives in Paris and works at Acme as a data engineer.",
+        user=_USER,
+        session=_SESSION,
+        importance_score=0.9,
     )
     r2 = await slm_mem.add(
-        "Ada uses Postgres for the analytics warehouse.", user=_USER, session=_SESSION
+        "Ada uses Postgres for the analytics warehouse.",
+        user=_USER,
+        session=_SESSION,
+        importance_score=0.9,
     )
     assert r1.promoted and r2.promoted, "STM->MTM deterministic promotion did not fire"
 
@@ -210,8 +219,12 @@ async def test_add_distill_ask_over_real_slm_closes_the_llm_seam(slm_mem: LocalM
 async def test_none_profile_still_uses_heuristic_extraction(heuristic_mem: LocalMemory) -> None:
     """Backward-compat guard: ``StorageSettings(llm=None)`` (the untouched default) still yields
     deterministic heuristic SPO extraction and ``ask`` still refuses loudly — no behaviour change
-    for existing no-LLM callers of this facade."""
-    result = await heuristic_mem.add("Ada lives in Paris", user=_USER, session=_SESSION)
+    for existing no-LLM callers of this facade.
+
+    A6 fix: earn the promotion explicitly (default importance 0.5 no longer promotes)."""
+    result = await heuristic_mem.add(
+        "Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.9
+    )
     assert result.promoted
 
     report = await heuristic_mem.consolidate(user=_USER, session=_SESSION)

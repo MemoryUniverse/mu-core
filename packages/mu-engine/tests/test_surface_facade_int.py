@@ -122,6 +122,11 @@ class _FakeContainer:
 
 @pytest.mark.unit
 async def test_add_delegates_one_ingest_call_and_passes_result_through() -> None:
+    """REMEDIATION Rank 2 / conformance A6 fix: ``add()`` no longer hardcodes ``promote=True``
+    (the defect that short-circuited ``DeterministicPromoteStage``'s importance gate) — with no
+    ``importance_score`` supplied, the constructed ``IngestActivity`` carries ``promote=False`` and
+    lets its own ``importance`` field default (0.5) speak for the gate, exactly as
+    ``LocalMemory.add`` does."""
     container = _FakeContainer()
     facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
 
@@ -131,7 +136,8 @@ async def test_add_delegates_one_ingest_call_and_passes_result_through() -> None
     (activity,), _kwargs = container.ingest.remember.await_args
     assert isinstance(activity, IngestActivity)
     assert activity.text == "Ada lives in Paris"
-    assert activity.promote is True
+    assert activity.promote is False, "add() must never hardcode promote=True (A6 defect)"
+    assert activity.importance == 0.5, "no importance_score -> IngestActivity's own default"
     assert activity.namespace.org == _ORG
     assert activity.namespace.workspace == _WORKSPACE
     assert activity.namespace.user == _USER
@@ -147,6 +153,23 @@ async def test_add_delegates_one_ingest_call_and_passes_result_through() -> None
     assert result.tiers_written == fake.tiers_written
     assert result.events_emitted == fake.events_emitted
     assert result.namespace == activity.namespace.to_prefix()
+
+
+@pytest.mark.unit
+async def test_add_threads_importance_score_into_the_ingest_activity() -> None:
+    """A supplied ``importance_score`` (the canonical wire ``AddRequest`` field) lands verbatim on
+    ``IngestActivity.importance``, still with ``promote=False`` — proving the gate is decided by
+    the threaded importance, never by a hardcoded explicit-promote flag."""
+    container = _FakeContainer()
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    await facade.add(
+        "Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.95
+    )
+
+    (activity,), _kwargs = container.ingest.remember.await_args
+    assert activity.importance == 0.95
+    assert activity.promote is False
 
 
 @pytest.mark.unit
@@ -469,7 +492,13 @@ async def test_facade_write_is_readable_through_local_memory(
     η math, not just its call shape, matches ``LocalMemory``'s."""
     facade = SurfaceFacade(container, workspace=f"{_WORKSPACE}{uid}", namespace=f"{_ORG}{uid}")
 
-    written = await facade.add("Ada lives in Paris", user=_USER, session=_SESSION)
+    # REMEDIATION Rank 2 / A6 fix: add() no longer hardcodes promote=True — a default-importance
+    # add would NOT promote (0.5 < IngestSettings.importance_promote=0.6), so this test (proving
+    # the MTM write pathway, not the gate itself — that's covered by test_ingest_gates_promotion_
+    # on_importance_not_unconditionally below) explicitly earns promotion via importance_score.
+    written = await facade.add(
+        "Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.9
+    )
     assert written.promoted
     assert "mtm" in written.tiers_written
     assert written.content_hash and written.memory_id
@@ -492,7 +521,10 @@ async def test_local_memory_write_is_readable_through_facade(
     """(2) the REVERSE direction — ``LocalMemory`` WRITES; the facade reads it back."""
     facade = SurfaceFacade(container, workspace=f"{_WORKSPACE}{uid}", namespace=f"{_ORG}{uid}")
 
-    written = await mem.add("Ada works at Acme", user=_USER, session=_SESSION)
+    # A6 fix: earn the promotion explicitly (default importance 0.5 no longer promotes).
+    written = await mem.add(
+        "Ada works at Acme", user=_USER, session=_SESSION, importance_score=0.9
+    )
     assert written.promoted
 
     via_facade = await facade.get(written.memory_id, user=_USER, session=_SESSION)

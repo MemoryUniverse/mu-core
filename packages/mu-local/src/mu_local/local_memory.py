@@ -99,6 +99,12 @@ _HOST = "mu-local"
 # (mu-engine/tests/pipelines/test_distill_llm_slm_int.py:393-396) — a named module constant, never
 # an inline literal at the call site (DEV-STANDARDS rule 3).
 _ASK_SYSTEM_PROMPT = "Answer the question using ONLY the given facts. Be concise."
+# ``add()``'s "caller expressed no opinion" fallback — READ off ``IngestActivity.importance``'s own
+# field default rather than a second hardcoded ``0.5`` literal here (DEV-STANDARDS rule 3; also
+# keeps this module in lockstep if that default ever changes). A plain ``float`` (not ``Any``) so
+# mypy-strict can verify the ``importance=`` kwarg below without an ``**dict`` unpack (which mypy
+# cannot type-check against a ``BaseModel``'s heterogeneous field types).
+_DEFAULT_IMPORTANCE: float = IngestActivity.model_fields["importance"].default
 
 
 class LocalMemory:
@@ -143,6 +149,14 @@ class LocalMemory:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
+        # COMMON field (design §2.5 superset, canonical wire ``AddRequest.importance_score``,
+        # ``mu_contracts/contracts/requests.py:195``) — never plane-gated. ``None`` (the default)
+        # means "caller expressed no opinion": omitted from the constructed ``IngestActivity`` so
+        # its own field default (``0.5``) applies, unchanged from this verb's pre-fix behaviour. A
+        # real value threads straight through to the ONE gate that decides STM->MTM promotion —
+        # ``DeterministicPromoteStage``'s ``importance >= IngestSettings.importance_promote`` check
+        # (``mu-engine/pipelines/concrete/ingest.py:230``) — never hardcoded to force a promote.
+        importance_score: float | None = None,
         # SHARED-plane fields of the canonical superset signature (design §2.5) — accepted so the
         # signature matches the unified surface, always REJECTED (never silently dropped) because
         # LocalMemory is private-plane-only by construction (module docstring, plane_gate.py's own
@@ -152,10 +166,21 @@ class LocalMemory:
         predicate: str | None = None,
         object: str | None = None,  # matches the frozen wire field name, mu_sdk parity
     ) -> MemoryWriteResult:
-        """Ingest one activity (STM durable -> deterministic STM->MTM promote). ``content`` accepts
-        ``str | dict | list[dict]`` and normalises to messages (mem0 ``client/main.py:153-160``).
-        Each message becomes one INGEST activity keyed by a fresh source offset (a genuine new
-        occurrence, CANONICAL §8-M12); MTM promotion is idempotent on ``content_hash``.
+        """Ingest one activity (STM durable -> deterministic STM->MTM promote, GATED on importance
+        — REMEDIATION Rank 2 / conformance A6 fix). ``content`` accepts ``str | dict | list[dict]``
+        and normalises to messages (mem0 ``client/main.py:153-160``). Each message becomes one
+        INGEST activity keyed by a fresh source offset (a genuine new occurrence, CANONICAL
+        §8-M12); MTM promotion is idempotent on ``content_hash``.
+
+        ``promote`` is NEVER hardcoded ``True`` here (that was the A6 defect: it short-circuited
+        ``DeterministicPromoteStage``'s own importance/mention gate, so EVERY add promoted
+        regardless of salience, defeating the tier design). This verb constructs
+        ``IngestActivity(promote=False, importance=<threaded importance_score>)`` and lets the
+        deterministic stage make the tier call — ``explicit promote OR importance>=threshold`` —
+        exactly as engine-core-spec §12's gate is designed to. There is no caller-facing "force
+        promote" override on this verb today (the canonical ``AddRequest`` names no such field);
+        ``importance_score`` is the one lever a caller has, matching the wire contract's own field
+        set.
 
         Returns the canonical :class:`~mu_contracts.contracts.views.MemoryWriteResult` receipt
         (Decision B) — ``namespace``/``events_emitted`` are populated from the resolved η and the
@@ -171,6 +196,9 @@ class LocalMemory:
             shared_configured=False,
         )
         ns = self._ns(user, session)
+        # ``None`` means "caller expressed no opinion" -> falls to IngestActivity's own field
+        # default (module constant above), never a second hardcoded literal duplicating it here.
+        importance = importance_score if importance_score is not None else _DEFAULT_IMPORTANCE
         last: IngestResult | None = None
         for message in _normalize_messages(content):
             activity = IngestActivity(
@@ -179,8 +207,7 @@ class LocalMemory:
                 session_offset=uuid.uuid4().hex,  # unique ⇒ never a pure M12 replay
                 kind="user_message",
                 text=message["content"],
-                promote=True,  # an explicit LOCAL add is a salient assertion → STM->MTM (mem0
-                #                 add() always persists to the vector store, main.py:281)
+                importance=importance,
             )
             last = await self._container.ingest.remember(activity)
         if last is None:  # empty message list — fail loud, never a silent no-op

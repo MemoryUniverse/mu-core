@@ -95,6 +95,12 @@ _DEFAULT_SESSION = "default"
 # copy, mu-local/local_memory.py:71 / mu-engine/tests/pipelines/test_distill_llm_slm_int.py:393-
 # 396) — a named module constant, never an inline literal at the call site (DEV-STANDARDS rule 3).
 _ASK_SYSTEM_PROMPT = "Answer the question using ONLY the given facts. Be concise."
+# ``add()``'s "caller expressed no opinion" fallback — mirrors ``LocalMemory``'s identical module
+# constant (``mu-local/local_memory.py``, REMEDIATION Rank 2 / A6 fix): READ off
+# ``IngestActivity.importance``'s own field default rather than a second hardcoded ``0.5`` literal
+# (DEV-STANDARDS rule 3), and a plain ``float`` so mypy-strict can check the ``importance=`` kwarg
+# without an ``**dict`` unpack (which mypy cannot verify against a ``BaseModel``'s field types).
+_DEFAULT_IMPORTANCE: float = IngestActivity.model_fields["importance"].default
 
 
 class SurfaceVerbNotImplementedError(MemoryUniverseError):
@@ -175,13 +181,34 @@ class SurfaceFacade:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
+        # COMMON field (design §2.5 superset, canonical wire ``AddRequest.importance_score``,
+        # ``mu_contracts/contracts/requests.py:195``) — never plane-gated. Mirrors
+        # ``LocalMemory.add``'s own ``importance_score`` param (``mu-local/local_memory.py``,
+        # REMEDIATION Rank 2 / conformance A6 fix) field-for-field: ``None`` (the default) omits
+        # ``importance=`` from the constructed ``IngestActivity`` so its own field default (0.5)
+        # applies; a real value threads through to ``DeterministicPromoteStage``'s
+        # ``importance >= IngestSettings.importance_promote`` gate
+        # (``mu-engine/pipelines/concrete/ingest.py:230``).
+        importance_score: float | None = None,
     ) -> MemoryWriteResult:
-        """Ingest one activity (STM durable -> deterministic STM->MTM promote). Mirrors
-        ``LocalMemory.add`` (``mu-local/local_memory.py:105-172``) field-for-field, returning the
-        canonical :class:`~mu_contracts.contracts.views.MemoryWriteResult` receipt (module
-        docstring, Decision B) — ``namespace``/``events_emitted`` populated from the resolved η and
-        the engine's own :class:`IngestResult` respectively, zero extra I/O."""
+        """Ingest one activity (STM durable -> deterministic STM->MTM promote, GATED on importance
+        — REMEDIATION Rank 2 / conformance A6 fix). Mirrors ``LocalMemory.add`` (``mu-local/
+        local_memory.py``) field-for-field, returning the canonical
+        :class:`~mu_contracts.contracts.views.MemoryWriteResult` receipt (module docstring,
+        Decision B) — ``namespace``/``events_emitted`` populated from the resolved η and the
+        engine's own :class:`IngestResult` respectively, zero extra I/O.
+
+        ``promote`` is NEVER hardcoded ``True`` here (the A6 defect this fix removes: it
+        short-circuited ``DeterministicPromoteStage``'s own importance/mention gate, so EVERY add
+        promoted regardless of salience). ``IngestActivity(promote=False, importance=<threaded
+        importance_score>)`` lets the deterministic stage decide — ``explicit promote OR
+        importance>=threshold`` — matching ``LocalMemory.add``'s identical fix exactly. No
+        caller-facing "force promote" override exists on this verb today (the canonical
+        ``AddRequest`` names no such field)."""
         ns = self._ns(user, session)
+        # ``None`` means "caller expressed no opinion" -> falls to IngestActivity's own field
+        # default (module constant above) — mirrors ``LocalMemory.add``'s identical fix.
+        importance = importance_score if importance_score is not None else _DEFAULT_IMPORTANCE
         last: IngestResult | None = None
         for message in _normalize_messages(content):
             activity = IngestActivity(
@@ -190,7 +217,7 @@ class SurfaceFacade:
                 session_offset=_fresh_offset(),
                 kind="user_message",
                 text=message["content"],
-                promote=True,
+                importance=importance,
             )
             last = await self._container.ingest.remember(activity)
         if last is None:  # empty message list — fail loud, never a silent no-op

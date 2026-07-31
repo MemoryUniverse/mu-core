@@ -141,8 +141,14 @@ async def test_managed_mode_refuses_consolidate_loud(managed_mem: LocalMemory) -
 async def test_managed_mode_does_not_touch_other_verbs(managed_mem: LocalMemory) -> None:
     """S1-05 acceptance item 2: a MANAGED-mode refusal on ``consolidate()`` leaves every other
     verb's behaviour untouched on the SAME container — ``add``/``recall`` still round-trip real
-    data through STM (redis) and MTM (qdrant)."""
-    result = await managed_mem.add("Ada works at Acme", user=_USER, session=_SESSION)
+    data through STM (redis) and MTM (qdrant).
+
+    REMEDIATION Rank 2 / conformance A6 fix: ``add()`` no longer hardcodes ``promote=True``, so
+    the promotion this test proves must be EARNED via ``importance_score`` (default importance
+    0.5 sits below the 0.6 gate and would stay STM-only)."""
+    result = await managed_mem.add(
+        "Ada works at Acme", user=_USER, session=_SESSION, importance_score=0.9
+    )
     assert result.promoted and "mtm" in result.tiers_written
 
     with pytest.raises(ManagerOwnsLifecycleError):

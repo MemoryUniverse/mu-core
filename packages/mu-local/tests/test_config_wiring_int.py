@@ -123,7 +123,12 @@ async def _seed_and_recall(settings: Settings, uid: str) -> list[str]:
         StorageSettings(), workspace=f"ws{uid}", namespace=f"org{uid}", settings=settings
     )
     try:
-        await mem.add(_TARGET, user=_USER, session=_SESSION)
+        # REMEDIATION Rank 2 / conformance A6 fix: ``add()`` no longer hardcodes ``promote=True``,
+        # so a default-importance add would stay STM-only and never reach the MTM channel at all
+        # — this test's whole premise is ``_TARGET``'s MTM-rank-1 edge, so it must EARN its MTM
+        # presence explicitly. The fillers deliberately do NOT (their competing edge is pure STM
+        # recency, unaffected by the promote gate — the test's own docstring).
+        await mem.add(_TARGET, user=_USER, session=_SESSION, importance_score=0.9)
         for f in _FILLERS:
             await mem.add(f, user=_USER, session=_SESSION)
         # qdrant applies upserts asynchronously (real eventual-consistency, not a masked bug) —
