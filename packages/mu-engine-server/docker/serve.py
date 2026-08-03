@@ -49,11 +49,16 @@ _server = EngineServerApp(load_settings())
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    # T2 fix (CONFIG-AND-DATA-FIX-PLAN.md): starts the automatic lifecycle-sweep background task
+    # (EngineServerApp.start -> EngineContainer.start_lifecycle_sweep) — the ONE place this
+    # process's ASGI lifecycle exists, mirroring the shutdown hook one line below.
+    await _server.start()
     try:
         yield
     finally:
         # LIFO best-effort close of every store connection EngineContainer opened
-        # (EngineServerApp.shutdown -> EngineContainer.close) — nothing else calls this today.
+        # (EngineServerApp.shutdown -> EngineContainer.close, which also stops the lifecycle-sweep
+        # runner first) — nothing else calls this today.
         await _server.shutdown()
 
 

@@ -51,6 +51,7 @@ died with the process — the entire reason ``LocalContainer.__init__`` accepts 
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -62,11 +63,16 @@ from mu_contracts.domain.errors import BackendUnavailableError
 from mu_contracts.domain.model.memory import Namespace as _Namespace
 from mu_contracts.domain.model.memory import Visibility as _NsVisibility
 from mu_contracts.domain.model.recall import CallerIdentitySet
+from mu_contracts.ports.bus import EventBusPort
 from mu_contracts.ports.time import Clock
 from mu_engine.config import EngineSettings, get_engine_settings
 from mu_engine.lifecycle.conflict import ConflictAdjudicator, build_conflict_adjudicator
 from mu_engine.lifecycle.conflict_redis import ConflictRedisSettings, RedisConflictRecordRepository
+from mu_engine.lifecycle.demotion import DemotionService
+from mu_engine.lifecycle.manager import MemoryLifecycleManager
 from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate
+from mu_engine.lifecycle.promotion import PromotionService
+from mu_engine.lifecycle.salience import SalienceStrategy
 from mu_engine.lifecycle.settings import ManagerModeSettings
 from mu_engine.pipelines.distill import DistillPipeline
 from mu_engine.pipelines.ledger import RedisStageLedger
@@ -104,6 +110,7 @@ from mu_engine.storage.registry import assert_mandatory_roles
 from mu_engine.surface.facade import SurfaceFacade
 from mu_engine_server.app import build_app
 from mu_engine_server.auth import make_bearer_verifier, require_bearer_token
+from mu_engine_server.lifecycle_runner import EngineLifecycleSweepRunner
 from mu_engine_server.settings import EngineServerSettings, SlmProfile, load_settings
 
 __all__ = ["EngineContainer", "EngineServerApp"]
@@ -323,8 +330,18 @@ class EngineContainer:
         self.metrics = build_metrics(enabled=True)
         self.audit = build_audit(enabled=True)
 
-        # (7b) manager-mode gate — MANUAL default (mirrors LocalContainer's own narrowing:
-        #      no MaintenanceLoop/daemon runs the auto sweep here either).
+        # (7b) manager-mode gate — MANUAL default (mirrors LocalContainer's own narrowing for the
+        #      MANUAL VERB surface: `LocalMemory.consolidate()`-shaped calls / `POST
+        #      /lifecycle/enforce` still work unmanaged-gate-free under MANUAL/HYBRID). T2 fix
+        #      (CONFIG-AND-DATA-FIX-PLAN.md): this composition root NOW also starts an automatic
+        #      background sweep runner (`EngineLifecycleSweepRunner`, step 9 below,
+        #      `start_lifecycle_sweep()`/`stop_lifecycle_sweep()`) — unlike `LocalContainer`, which
+        #      still ships none. That runner's own `sweep_user(prefix)` calls are internal,
+        #      engine-driven triggers (`manual=False`, the default) — per
+        #      `MemoryLifecycleManager.sweep_user`'s own docstring, "never mode-gated: MANAGED
+        #      means exactly 'the engine drives this automatically'" — so they run unaffected by
+        #      whichever `manager_mode` a deployment configures; only `manual=True` verbs (an
+        #      external `POST /lifecycle/enforce`, a manual `consolidate()`) are ever gated.
         # C1: every OTHER lifecycle field wired from the WIRED `EngineSettings.lifecycle`
         # (`MU_LIFECYCLE__SALIENCE__W_RECENCY`, `MU_LIFECYCLE__PROMOTE_STM_MTM`, …); only
         # `manager_mode` keeps this composition root's deliberate MANUAL narrowing (structural,
@@ -413,9 +430,96 @@ class EngineContainer:
             tracer=self.tracer,
         )
 
+        # (9) T2 fix (CONFIG-AND-DATA-FIX-PLAN.md) — the real MemoryLifecycleManager (MLM) + the
+        #     in-process automatic sweep runner (`lifecycle_runner.py`'s own module docstring has
+        #     the full root-cause + design citation). Mirrors `LocalContainer.build_lifecycle_
+        #     manager`'s assembly (`mu_local/composition.py:507-597`) step-for-step: SAME
+        #     `stm`/`mtm`/`distill`/`bus`/`clock`/`mode_gate`/`conflict_adjudicator` instances this
+        #     container already built above — never a second, independently-constructed set
+        #     (DEV-STANDARDS rule 9: one composition root, one set of adapters). Unlike
+        #     `LocalContainer` (which only EXPOSES `build_lifecycle_manager()` as a factory a
+        #     daemonless embedded caller may or may not invoke), this always-on server ALWAYS
+        #     builds one — `lifecycle_manager=None` in `EngineServerApp.__init__` (a tracked gap
+        #     noted in this module's own prior revision) is now closed.
+        lifecycle_salience = SalienceStrategy(self.lifecycle_settings.salience)
+        lifecycle_promotion = PromotionService(
+            mtm=self.mtm,
+            distill=self.distill,  # SAME object LocalMemory-shaped `consolidate()` delegates to
+            salience=lifecycle_salience,
+            stm=self.stm,
+            settings=self.lifecycle_settings,
+            clock=self._clock,
+            bus=self._bus,
+            tracer=self.tracer,
+            metrics=self.metrics,
+            audit=self.audit,
+        )
+        lifecycle_demotion = DemotionService(
+            stm=self.stm,
+            mtm_remove=self.mtm,
+            salience=lifecycle_salience,
+            settings=self.lifecycle_settings,
+            clock=self._clock,
+            bus=self._bus,
+            tracer=self.tracer,
+            metrics=self.metrics,
+            audit=self.audit,
+        )
+        self.lifecycle_manager: MemoryLifecycleManager = MemoryLifecycleManager(
+            salience=lifecycle_salience,
+            promotion=lifecycle_promotion,
+            demotion=lifecycle_demotion,
+            distill=self.distill,
+            conflict=self.conflict_adjudicator,  # SAME instance self.distill was built with
+            mode_gate=self.mode_gate,
+            bus=self._bus,
+            settings=self.lifecycle_settings,
+            clock=self._clock,
+        )
+        self.lifecycle_runner: EngineLifecycleSweepRunner = EngineLifecycleSweepRunner(
+            bus=self._bus,
+            lifecycle_manager=self.lifecycle_manager,
+            settings=settings.lifecycle_sweep,
+        )
+        self._lifecycle_runner_task: asyncio.Task[None] | None = None
+
+    async def start_lifecycle_sweep(self) -> None:
+        """Starts `self.lifecycle_runner.run()` as a background `asyncio.Task` (T2 wiring) — a
+        no-op (never a silent double-start) if a task is already running. Called by
+        `EngineServerApp` at app-lifecycle startup (`docker/serve.py`'s lifespan)."""
+        if self._lifecycle_runner_task is not None and not self._lifecycle_runner_task.done():
+            return
+        self._lifecycle_runner_task = asyncio.create_task(
+            self.lifecycle_runner.run(), name="lifecycle-sweep-runner"
+        )
+
+    async def stop_lifecycle_sweep(self) -> None:
+        """Signals the runner to stop and awaits its background task's clean exit (ordered
+        shutdown, mirrors `close()`'s own best-effort discipline) — a no-op if never started."""
+        await self.lifecycle_runner.stop()
+        if self._lifecycle_runner_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._lifecycle_runner_task
+            self._lifecycle_runner_task = None
+
+    @property
+    def bus(self) -> EventBusPort:
+        """The SAME real ``InprocBus`` instance threaded into ``IngestService``/``DistillPipeline``/
+        ``self.lifecycle_runner`` above — PORT of ``LocalContainer.bus``'s identical accessor
+        (``mu_local/composition.py``: "a caller that needs to subscribe to THIS container's real
+        event stream ... must observe the identical bus captured memories publish onto, never a
+        second, independently-constructed ``InprocBus``"). Exists for the same reason there: an
+        external caller (a test verifying the T2 sweep, an operator script) that wants to observe
+        this process's real capture events needs this exact instance, not a fresh one."""
+        return self._bus
+
     async def close(self) -> None:
         """Release every store connection this container opened (LIFO), best-effort per client —
-        identical discipline to ``LocalContainer.close`` (``mu-local/composition.py:408-413``)."""
+        identical discipline to ``LocalContainer.close`` (``mu-local/composition.py:408-413``).
+        Stops the lifecycle sweep runner FIRST (best-effort) so no in-flight sweep races a store
+        connection this call is about to release."""
+        with contextlib.suppress(Exception):
+            await self.stop_lifecycle_sweep()
         for closer in reversed(self._closers):
             with contextlib.suppress(Exception):
                 await closer()
@@ -506,7 +610,12 @@ class EngineServerApp:
         verifier = make_bearer_verifier(self.settings.token_path)
         self.app: FastAPI = build_app(
             self.facade,
-            lifecycle_manager=None,  # MemoryLifecycleManager wiring — tracked gap, not this task
+            # T2 fix (CONFIG-AND-DATA-FIX-PLAN.md): a real MemoryLifecycleManager is now always
+            # composed (EngineContainer step 9) — the prior tracked gap ("MemoryLifecycleManager
+            # wiring — tracked gap, not this task") is closed. `GET /profile`/`POST
+            # /lifecycle/enforce`/`GET /lifecycle/events` (routes/lifecycle.py) stop 501-ing as a
+            # direct consequence.
+            lifecycle_manager=self.container.lifecycle_manager,
             workspace=self.settings.workspace,
             namespace=self.settings.namespace,
         )
@@ -522,8 +631,18 @@ class EngineServerApp:
         (a ``/health`` route, a readiness probe) reads."""
         return await self.container.health()
 
+    async def start(self) -> None:
+        """Starts the automatic lifecycle-sweep runner (T2 fix) as a background task — called at
+        app-lifecycle startup (`docker/serve.py`'s lifespan `try` block, before `yield`). A no-op
+        (never blocks, never raises) when `EngineServerSettings.lifecycle_sweep.enabled` is False —
+        `EngineLifecycleSweepRunner.run()` itself returns immediately in that case (see its own
+        docstring), so the background task this schedules completes right away rather than looping
+        forever doing nothing."""
+        await self.container.start_lifecycle_sweep()
+
     async def shutdown(self) -> None:
-        """Release every store connection this app's container opened (LIFO, best-effort)."""
+        """Release every store connection this app's container opened (LIFO, best-effort). Stops
+        the lifecycle-sweep runner first (`EngineContainer.close`'s own ordering)."""
         await self.container.close()
 
 
