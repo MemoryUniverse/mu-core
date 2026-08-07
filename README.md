@@ -1,4 +1,4 @@
-<img src="assets/logo.svg" alt="mu-core" width="96" height="96">
+<img src="assets/logo-lockup.png" alt="mu-core" width="420">
 
 # mu-core
 
