@@ -1,4 +1,10 @@
+<img src="assets/logo.svg" alt="mu-core" width="96" height="96">
+
 # mu-core
+
+The complete Memory Universe engine and the contracts every other package speaks.
+
+Part of [Memory Universe](https://github.com/MemoryUniverse).
 
 **The open memory engine at the heart of Memory Universe.** Tiered short/mid/long-term memory,
 real storage adapters, no server required to get value from it.
