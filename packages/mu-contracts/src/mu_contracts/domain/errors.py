@@ -28,6 +28,7 @@ __all__ = [
     "IllegalConflictTransitionError",
     "IllegalTransitionError",
     "InvalidBackendError",
+    "LlmNotConfiguredError",
     "MandatoryBackendMissingError",
     "MemoryLayerError",
     "MemoryUniverseError",
@@ -43,6 +44,7 @@ __all__ = [
     "SettingsValidationError",
     "StoreUnavailableError",
     "SubModelProviderDisabledError",
+    "SurfaceVerbNotImplementedError",
     "TenancyViolationError",
     "TierRepositoryUnavailableError",
     "UnknownBackendError",
@@ -223,3 +225,27 @@ class PlaneFieldRejectedError(MemoryUniverseError):
         self.field = field
         self.plane = plane
         super().__init__(f"field {field!r} requires the {plane!r} plane to be configured: {reason}")
+
+
+# ── verb surface / synthesis refusals (CO-3: folded from mu_engine.surface.facade /
+# mu_local.errors duplicates into this ONE canonical home, per this module's own docstring
+# "ONE typed error hierarchy" + "Home: mu-contracts") ─────────────────────────────────────────
+class SurfaceVerbNotImplementedError(MemoryUniverseError):
+    """A canonical verb has no engine-side implementation to delegate to yet (build-queue §13
+    item 5). Raised by ``SurfaceFacade.promote``/``.demote``/``.share`` (mu-engine) and mapped by
+    ``mu_engine_server.errors`` to HTTP 501 — NAMED so every layer imports ONE exception family,
+    never a bare ``NotImplementedError`` (not part of the ``MemoryUniverseError`` wire hierarchy)
+    and never a silent no-op (DEV-STANDARDS rule 8: fail-loud, no silent fallback)."""
+
+    def __init__(self, verb: str, *, reason: str) -> None:
+        self.verb = verb
+        super().__init__(f"SurfaceFacade.{verb}() is not implemented: {reason}")
+
+
+class LlmNotConfiguredError(MemoryUniverseError):
+    """``ask()`` / adjudication was called while the container is in heuristic mode (``llm=None``).
+
+    Neither ``mu_local.local_memory.LocalMemory`` nor ``mu_engine.surface.facade.SurfaceFacade``
+    ever answers with an empty/degraded synthesis (spec §7, T7): ``add``/``recall``/``context``
+    still work heuristically (no-LLM extraction + deterministic assembly), but a synthesis verb
+    refuses loudly until an LLM backend is configured. Both surfaces raise this SAME class."""
