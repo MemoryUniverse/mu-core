@@ -364,6 +364,31 @@ class MemoryLifecycleManager:
         # docstring's get_state stub note); bounded only by process lifetime.
         self._explain_log: dict[tuple[str, str], list[ExplainRecord]] = {}
 
+    # =================================================================== namespace registry (§7) ==
+    def note_active_namespace(self, ns: Namespace) -> None:
+        """Pure registry write (no batch counter, no auto-sweep trigger) — the population HALF of
+        :meth:`on_bus_event` without its fast-fire-trigger half. Exists because a plane can have
+        its OWN discovery/trigger loop over the identical bus (`mu_engine_server.lifecycle_runner.
+        EngineLifecycleSweepRunner`, T2) that must never ALSO call `on_bus_event` (that method's own
+        batch-threshold semantics would double-fire a sweep alongside the runner's own registry/
+        cadence, module docstring's "why this is redundant-but-required" note) — but that same
+        caller still needs THIS manager's `_active_namespaces` populated, because `sweep_user` ->
+        `_execute_sweep`/`_execute_consolidate` iterate ONLY over `_active_namespaces.get(prefix,
+        ())` to find real per-namespace work (`sweep_namespace_now`'s only caller in either execute
+        path). Before this method existed, a caller that drove its own registry and skipped
+        `on_bus_event` entirely left `_active_namespaces` permanently empty for every prefix it
+        ever swept: `sweep_user` still returned `JobStatus.SUCCEEDED` (the lease acquired and
+        released cleanly) but `_execute_sweep`'s `for ns in tuple(self._active_namespaces.get(
+        prefix, ()))` iterated zero times, so `sweep_namespace_now` (and therefore
+        `PromotionService.promote_session`'s STM->MTM promote + MTM->LTM distill) never ran for
+        ANY namespace — a sweep that looks like it worked while doing nothing. Confirmed by direct
+        probe against the real mu-dev stores (VM diagnostic, T2 cross-session-recall fix): `swept
+        >= 1` from `EngineLifecycleSweepRunner.tick_once()` while `MemoryLifecycleManager.
+        _active_namespaces` stayed `{}` throughout, and the swept fact never left session-scoped
+        STM. Idempotent (a ``set`` add): observing the same ``ns`` twice is a no-op the 2nd time."""
+        prefix = UserPrefix(ns)
+        self._active_namespaces.setdefault(prefix, set()).add(ns)
+
     # ======================================================================== warm reads (§5/§17)
     def get_state(self, ns: Namespace) -> LifecycleStateView:
         """Instant warm read — NEVER touches the runner (spec §5 read/write split: "``MLM.
@@ -485,7 +510,7 @@ class MemoryLifecycleManager:
             return
         ns = event.namespace
         prefix = UserPrefix(ns)
-        self._active_namespaces.setdefault(prefix, set()).add(ns)
+        self.note_active_namespace(ns)
         count = self._batch_counts.get(prefix, 0) + 1
         if count < self._settings.batch_size:
             self._batch_counts[prefix] = count

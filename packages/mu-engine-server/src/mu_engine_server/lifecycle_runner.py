@@ -57,6 +57,7 @@ import structlog
 
 from mu_contracts.domain.events import DomainEvent, MemoryCaptured, MemoryPromoted
 from mu_contracts.domain.model.lifecycle import JobHandle, UserPrefix
+from mu_contracts.domain.model.memory import Namespace
 from mu_contracts.ports.bus import EventBusPort, Subscription
 from mu_engine_server.settings import LifecycleSweepSettings
 
@@ -83,6 +84,16 @@ class LifecycleManagerPort(Protocol):
     async def sweep_user(self, user_prefix: UserPrefix, *, manual: bool = False) -> JobHandle:
         """Durable, per-user sweep (spec §5/§17): promotes+distills every namespace this
         user_prefix has been observed for, coalescing an in-flight re-trigger."""
+        ...
+
+    def note_active_namespace(self, ns: Namespace) -> None:
+        """Pure registry write (`MemoryLifecycleManager.note_active_namespace`'s own docstring —
+        the population half of `on_bus_event` without its batch-trigger half): tells the MLM which
+        REAL namespace `sweep_user(prefix)` should actually sweep. Required — without it,
+        `sweep_user` still returns a SUCCEEDED `JobHandle` but its per-namespace loop
+        (`_execute_sweep`) has nothing to iterate, so the sweep is a no-op that looks like it
+        worked (see this runner's `_on_bus_event`, and the T2 root-cause fix this Protocol member
+        was added for)."""
         ...
 
 
@@ -163,11 +174,20 @@ class EngineLifecycleSweepRunner:
 
     async def _on_bus_event(self, event: DomainEvent) -> None:
         """Handler for both `MemoryCaptured` and `MemoryPromoted` (both carry `namespace`, the
-        only field this handler reads)."""
+        only field this handler reads). Updates TWO registries from the SAME observed namespace:
+        this runner's own `_active_users` (which prefixes/when, drives this runner's own
+        periodic/idle cadence) AND the MLM's `_active_namespaces` via `note_active_namespace` (the
+        REAL per-namespace window `sweep_user` -> `_execute_sweep` needs to find any work at all —
+        deliberately NOT via `on_bus_event`, whose batch-threshold auto-fire would double-trigger
+        alongside this runner's own registry/cadence, module docstring). Without the second call,
+        `sweep_user` still reports success while sweeping zero namespaces — the exact T2 bug this
+        method now closes (root-caused via a direct VM probe against the real mu-dev stores)."""
         assert isinstance(event, MemoryCaptured | MemoryPromoted)  # noqa: S101 — structural guard;
         # InprocBus.subscribe only ever dispatches the two types this runner subscribed to.
-        prefix = UserPrefix(event.namespace)
+        ns = event.namespace
+        prefix = UserPrefix(ns)
         self._active_users[prefix] = time.monotonic()
+        self._mlm.note_active_namespace(ns)
 
     # ------------------------------------------------------------------------------ sweep firing
     async def _fire_sweep(self, prefix: UserPrefix) -> None:

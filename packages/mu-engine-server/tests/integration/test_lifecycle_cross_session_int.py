@@ -46,7 +46,6 @@ import pytest
 import pytest_asyncio
 import structlog
 
-from mu_contracts.domain.events import MemoryCaptured
 from mu_contracts.domain.model.memory import Namespace, Visibility
 from mu_engine.config import EngineSettings
 from mu_engine.lifecycle.settings import LifecycleSettings
@@ -184,6 +183,19 @@ async def test_cross_session_recall_misses_before_sweep_and_hits_after(
     consolidate()) -> HIT from session B."""
     user = "amir"
     query = "the probe fact for T2 cross-session recall"
+
+    # --- Subscribe the runner's bus listener BEFORE add() (test-bug fix, not a product fix —
+    # see module-level note below the imports): a real deployment always has the runner
+    # subscribed at server startup, long before any add() call, so it observes add()'s own
+    # REAL `MemoryCaptured` event (the correct namespace `SurfaceFacade._ns` built) directly.
+    # A prior version of this test subscribed AFTER add() and manually reconstructed a
+    # replacement `Namespace` to re-publish — but that reconstruction swapped `org`/`workspace`
+    # relative to `SurfaceFacade._ns`'s real field mapping (`workspace=` ctor kwarg -> `Namespace.
+    # workspace`, `namespace=` ctor kwarg -> `Namespace.org`), so the runner's active-namespace
+    # registry ended up holding a namespace that did not match anything `add()` actually wrote —
+    # `PromotionService.promote_session`'s STM window fetch then found 0 candidates every time.
+    # Subscribing first removes the reconstruction entirely and is also the more realistic setup.
+    container.lifecycle_runner._subscribe()
     write = await facade.add(query, user=user, session="session-a")
 
     try:
@@ -195,22 +207,11 @@ async def test_cross_session_recall_misses_before_sweep_and_hits_after(
         )
 
         # --- Drive ONE sweep tick, manually, without waiting on either timer. ---
-        # The runner's own registry is populated by observing the SAME bus IngestService
-        # publishes to (`container.bus`) — subscribe before the tick can see anything.
-        container.lifecycle_runner._subscribe()
         # `MaintenanceLoop`'s own unit tests use (`loop._subscribe()`), promoted to int-test tier
-        # here since this IS the "trigger one sweep tick programmatically" seam under test.
-        # Re-publish the capture event so the runner's registry (subscribed just now, after
-        # `add()` already fired its own event) observes this user - mirrors what a real deployment
-        # gets for free (the runner subscribes once at server startup, long before any add()).
-        ns = Namespace(
-            org=server_settings.workspace,
-            workspace="default",
-            user=user,
-            session="session-a",
-            visibility=Visibility.PRIVATE,
-        )
-        await container.bus.publish(MemoryCaptured(namespace=ns, ids=[write.memory_id]))
+        # here since this IS the "trigger one sweep tick programmatically" seam under test. The
+        # runner's active-user/active-namespace registries were already populated by add()'s own
+        # real `MemoryCaptured` event (subscribed above, before add() fired it) — no manual
+        # re-publish needed.
         swept = await container.lifecycle_runner.tick_once()
         assert swept >= 1, "the sweep tick must have acted on at least this one active user"
 
@@ -238,8 +239,11 @@ async def test_sweep_never_leaks_across_users_same_tenant(
     """Isolation check (task requirement): user X's swept fact must never surface for user Y,
     even though both share the same tenant/workspace and both get swept in the same tick."""
     query = "a private fact belonging only to user x"
-    write_x = await facade.add(query, user="user-x", session="session-a")
+    # Subscribe BEFORE add() — see the sibling test's comment: a real deployment's runner is
+    # always subscribed before any add() happens, and subscribing first lets add()'s own REAL
+    # `MemoryCaptured` event populate the runner's registries directly (no reconstruction needed).
     container.lifecycle_runner._subscribe()
+    write_x = await facade.add(query, user="user-x", session="session-a")
     await container.lifecycle_runner.tick_once()
 
     try:

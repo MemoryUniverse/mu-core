@@ -50,6 +50,11 @@ class _RecordingLifecycleManager:
         self.calls: list[_UserPrefix] = []
         self.called = asyncio.Event()
         self._gate = gate
+        # Records every `note_active_namespace` call (T2 fix: the runner's `_on_bus_event` now
+        # calls this alongside `sweep_user`, mirroring `MemoryLifecycleManager`'s real
+        # `_active_namespaces` registry write) — this file only proves the runner CALLS it with
+        # the observed namespace; the real registry's own behavior is `mu-engine`'s test suite.
+        self.noted_namespaces: list[Namespace] = []
 
     async def sweep_user(self, user_prefix: _UserPrefix, *, manual: bool = False) -> JobHandle:
         del manual
@@ -58,6 +63,9 @@ class _RecordingLifecycleManager:
         self.calls.append(user_prefix)
         self.called.set()
         return JobHandle(job_id=f"job-{len(self.calls)}", submitted_at=datetime.now(UTC))
+
+    def note_active_namespace(self, ns: Namespace) -> None:
+        self.noted_namespaces.append(ns)
 
 
 @pytest.fixture
