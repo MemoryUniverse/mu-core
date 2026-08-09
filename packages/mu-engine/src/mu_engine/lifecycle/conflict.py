@@ -69,6 +69,7 @@ from mu_contracts.domain.events import DegradedModeEntered, DegradeReason
 from mu_contracts.domain.model.conflict import ConflictRecord, ConflictState
 from mu_contracts.ports.governance import ConflictRecordRepository
 from mu_contracts.ports.time import Clock
+from mu_engine.lifecycle.settings import LifecycleSettings
 from mu_engine.platform.clock import SystemClock
 from mu_engine.providers._contracts import Completion, Message, MessageRole
 from mu_engine.providers.catalog import Task
@@ -89,6 +90,7 @@ __all__ = [
     "ResolutionStrategy",
     "build_conflict_adjudicator",
     "compute_conflict_id",
+    "conflict_adjudicator_settings_from_lifecycle",
 ]
 
 _log = structlog.get_logger("mu_engine.lifecycle.conflict")
@@ -139,6 +141,33 @@ class ConflictAdjudicatorSettings(BaseModel):
     adjudication_degrade_threshold_s: float = Field(default=30.0, ge=0.0)
     max_tokens: int = 256
     temperature: float = 0.0
+
+
+def conflict_adjudicator_settings_from_lifecycle(
+    lifecycle: LifecycleSettings,
+) -> ConflictAdjudicatorSettings:
+    """CONFIG-AND-DATA-FIX-PLAN.md §1.2 C3: builds the ``ConflictAdjudicatorSettings`` this
+    module's ``build_conflict_adjudicator(..., settings=...)`` takes FROM the WIRED
+    ``EngineSettings.lifecycle`` (``get_engine_settings().lifecycle``) instead of the composition
+    root omitting ``settings=`` entirely (-> ``ConflictAdjudicator.__init__``'s own bare
+    ``ConflictAdjudicatorSettings()`` fallback, ``:353`` — the exact orphan-knob shape this plan
+    closes). A pure, side-effect-free mapping (no I/O, unit-testable without a container) so both
+    ``mu_local.composition.LocalContainer`` and ``mu_engine_server.composition.EngineContainer``
+    share ONE translation instead of duplicating it (DEV-STANDARDS rule 7).
+
+    ``adjudication_budget_per_sweep``/``adjudication_degrade_threshold_s`` are the two fields
+    ``LifecycleSettings`` already carried (mirrored across both classes by the ORIGINAL spec —
+    ``ConflictAdjudicatorSettings``' own docstring); ``max_tokens``/``temperature`` are the two
+    ``adjudicator_*``-prefixed fields C3 added to ``LifecycleSettings`` for exactly this purpose —
+    every adjudicator knob is now reachable via the ONE ``MU_LIFECYCLE__…`` env family, never a
+    second ``MU_CONFLICT_ADJUDICATOR__…`` prefix for the same conceptual budget.
+    """
+    return ConflictAdjudicatorSettings(
+        adjudication_budget_per_sweep=lifecycle.adjudication_budget_per_sweep,
+        adjudication_degrade_threshold_s=lifecycle.adjudication_degrade_threshold_s,
+        max_tokens=lifecycle.adjudicator_max_tokens,
+        temperature=lifecycle.adjudicator_temperature,
+    )
 
 
 # --------------------------------------------------------------------------------------- budget

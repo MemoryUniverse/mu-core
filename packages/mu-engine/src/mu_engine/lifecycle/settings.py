@@ -166,6 +166,16 @@ class LifecycleSettings(BaseModel):
     # Task.CONFLICT_ADJUDICATION calls / sweep tick
     adjudication_degrade_threshold_s: float = Field(default=30.0, ge=0.0)  # S1: per-sweep
     # wall-clock budget, Clock-measured (§19)
+    # CONFIG-AND-DATA-FIX-PLAN.md §1.2 C3: the OTHER two ``lifecycle.conflict.
+    # ConflictAdjudicatorSettings`` fields (``max_tokens``/``temperature``) had no home on this
+    # tree at all (only ``adjudication_budget_per_sweep``/``adjudication_degrade_threshold_s``
+    # mirrored across both classes) — added here so a composition root can build the FULL
+    # ``ConflictAdjudicatorSettings`` from ONE wired subtree
+    # (``mu_engine.lifecycle.conflict.conflict_adjudicator_settings_from_lifecycle``) and every
+    # adjudicator knob is reachable via ``MU_LIFECYCLE__…`` (this subtree's own env prefix),
+    # never a second env-prefix family for the SAME conceptual budget.
+    adjudicator_max_tokens: int = Field(default=256, ge=1)
+    adjudicator_temperature: float = Field(default=0.0, ge=0.0)
 
     # --- observability + metering (§20) ---
     config_version: str = "v1"  # S6: tag on every job/explain/usage record this tick produces

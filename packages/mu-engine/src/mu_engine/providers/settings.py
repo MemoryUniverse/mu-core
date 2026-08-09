@@ -112,23 +112,45 @@ class ModelCatalogSettings(BaseModel):
     )
     local_priority_enabled: bool = True
     router: RouterSettings = Field(default_factory=RouterSettings)
+    # CONFIG-AND-DATA-FIX-PLAN.md §1.1 Group B: the offline-embedder default was a bare module
+    # const (`_DEFAULT_EMBED_BACKEND`/`_DEFAULT_MINILM_PATH` above), read only by
+    # `default_local_catalog()`'s own body — never reachable from the environment. Promoted here
+    # so `MU_MODEL_CATALOG__DEFAULT_EMBED_BACKEND`/`MU_MODEL_CATALOG__DEFAULT_MINILM_PATH` (via
+    # `EngineSettings.model_catalog`, C0) actually reach `default_local_catalog()` when a
+    # composition root passes its WIRED `ModelCatalogSettings` in (see that function's docstring).
+    default_embed_backend: str = _DEFAULT_EMBED_BACKEND
+    default_minilm_path: str = _DEFAULT_MINILM_PATH
 
 
-def default_local_catalog() -> ModelCatalogSettings:
+def default_local_catalog(catalog: ModelCatalogSettings | None = None) -> ModelCatalogSettings:
     """The LocalContainer default: an offline MiniLM embedder as the active embed backend, no
     cloud providers (the user adds them). This is the plane default described in §4 / §6 — the
     daemon ships the local embedder; THIN clients ship an empty catalog and route to server.
 
-    NOTE this is a factory (not a module constant) so each call yields a fresh, independent
-    catalog — no shared mutable default.
+    CONFIG-AND-DATA-FIX-PLAN.md §1.2 C2: ``catalog`` is an optional BASE — when a composition
+    root passes its WIRED ``get_engine_settings().model_catalog`` (C0/C1), every OTHER subtree on
+    it (``router``, ``providers``, ``deployments``, ``warm_local``, ``local_capable_tasks``,
+    ``local_priority_enabled``) is env-overridable (``MU_MODEL_CATALOG__ROUTER__…``, etc.) and
+    flows through UNCHANGED; only ``embedders`` is derived here, keyed by
+    ``catalog.default_embed_backend``/``catalog.default_minilm_path`` (also env-overridable, same
+    subtree) instead of a bare module constant. ``catalog=None`` (every call site before this
+    change) reproduces the EXACT prior behavior — ``ModelCatalogSettings()``'s own bare defaults —
+    so this is a no-drift, backward-compatible signature widening.
+
+    NOTE this always returns a FRESH object (``model_copy``, never mutates ``catalog``) so each
+    call yields an independent catalog — no shared mutable default.
     """
-    return ModelCatalogSettings(
-        embedders={
-            _DEFAULT_EMBED_BACKEND: WarmLocalConfig(
-                model_id=_DEFAULT_EMBED_BACKEND,
-                kind=ModelKind.EMBED,
-                model_load_path=_DEFAULT_MINILM_PATH,
-                normalize_embeddings=True,
-            )
-        },
+    base = catalog if catalog is not None else ModelCatalogSettings()
+    backend = base.default_embed_backend
+    return base.model_copy(
+        update={
+            "embedders": {
+                backend: WarmLocalConfig(
+                    model_id=backend,
+                    kind=ModelKind.EMBED,
+                    model_load_path=base.default_minilm_path,
+                    normalize_embeddings=True,
+                )
+            },
+        }
     )

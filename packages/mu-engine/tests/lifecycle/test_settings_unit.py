@@ -56,6 +56,11 @@ def test_lifecycle_settings_constructs_with_spec_defaults() -> None:
     assert settings.use_llm_adjudicator is True
     assert settings.adjudication_budget_per_sweep == 50
     assert settings.adjudication_degrade_threshold_s == pytest.approx(30.0)
+    # CONFIG-AND-DATA-FIX-PLAN.md §1.2 C3 — new fields, mirror ConflictAdjudicatorSettings' own
+    # defaults (lifecycle/conflict.py) so `conflict_adjudicator_settings_from_lifecycle` is a
+    # no-drift mapping.
+    assert settings.adjudicator_max_tokens == 256
+    assert settings.adjudicator_temperature == pytest.approx(0.0)
 
     assert settings.config_version == "v1"
     assert settings.policy_version == "v1"

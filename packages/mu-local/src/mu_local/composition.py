@@ -64,6 +64,7 @@ from mu_engine.lifecycle.conflict import (
     ConflictAdjudicator,
     InMemoryConflictRecordRepository,
     build_conflict_adjudicator,
+    conflict_adjudicator_settings_from_lifecycle,
 )
 from mu_engine.lifecycle.demotion import DemotionService
 from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate
@@ -189,7 +190,13 @@ def _build_llm_catalog(profile: ModelProfileSettings) -> tuple[ModelSettings, Mo
         kind=ModelKind.LLM,
         extra_params={"api_key": profile.api_key},  # passthrough seam (catalog.py:94), not a secret
     )
-    catalog_base = default_local_catalog()
+    # CONFIG-AND-DATA-FIX-PLAN.md §1.2 C2: the BASE catalog is now the WIRED
+    # `get_engine_settings().model_catalog` (C0) — `default_local_catalog()`'s optional `catalog`
+    # param (providers/settings.py) — so `MU_MODEL_CATALOG__ROUTER__…` (num_retries/timeout_s/
+    # cooldown_s/allowed_fails/health_interval_s/default_context_window) and
+    # `MU_MODEL_CATALOG__DEFAULT_EMBED_BACKEND`/`MU_MODEL_CATALOG__DEFAULT_MINILM_PATH` all reach
+    # the catalog `build_model_router` consumes below, not a bare `ModelCatalogSettings()`.
+    catalog_base = default_local_catalog(get_engine_settings().model_catalog)
     catalog = catalog_base.model_copy(update={"providers": [provider], "deployments": [deployment]})
     model_defaults = get_engine_settings().model
     models = model_defaults.model_copy(
@@ -325,7 +332,13 @@ class LocalContainer:
         # (6) LLM: None (default) ⇒ heuristic mode, unchanged; configured ⇒ a REAL ModelRouter
         #     (the reference SLM-integration catalog shape) + the LlmFactExtractor it feeds DISTILL.
         self.llm: ModelRouter | None = None
-        self._extractor: FactExtractorPort = HeuristicSpoExtractor()
+        # C2: `settings=` threaded from the WIRED `EngineSettings.extraction` — previously bare
+        # (`HeuristicSpoExtractor()`), so `MU_EXTRACTION__MIN_TOKENS`/`MU_EXTRACTION__…`-vocab
+        # overrides never reached the DEFAULT (heuristic, `storage.llm is None`) extraction path,
+        # only the LLM path below (which already threaded it via `model_copy`).
+        self._extractor: FactExtractorPort = HeuristicSpoExtractor(
+            settings=self._engine_settings.extraction
+        )
         if storage.llm is not None:
             self.llm = self._build_llm_router(storage.llm)
             # C1: base on the WIRED `EngineSettings.extraction` (so `MU_EXTRACTION__MIN_TOKENS`/
@@ -349,7 +362,13 @@ class LocalContainer:
         self._bus = InprocBus()
         self.tracer: Tracer = build_tracer(enabled=self._obs.otel_enabled, service_name="mu-local")
         self.metrics: MetricSink = build_metrics(enabled=self._obs.metrics_enabled)
-        self.audit: AuditLog = build_audit(enabled=self._obs.audit_enabled)
+        # C3: `settings=` threaded from the WIRED `EngineSettings.observability` so
+        # `MU_OBSERVABILITY__DURABLE_AUDIT_QUEUE_MAX` reaches `_DurableAuditLog`'s bounded queue
+        # whenever a durable sink IS configured (`build_audit`'s own docstring: this arg is a
+        # no-op when `durable_sink=None`, unchanged here — no durable sink is wired yet).
+        self.audit: AuditLog = build_audit(
+            enabled=self._obs.audit_enabled, settings=self._engine_settings.observability
+        )
 
         # (7b) lifecycle central-config + the engine-side manager-mode gate (ADR 0031; spec §3;
         #      S0-03/S0-07). ``LocalMemory.consolidate()`` calls ``self.mode_gate.assert_manual_
@@ -410,9 +429,15 @@ class LocalContainer:
         self._distill_settings = self._engine_settings.distill
         self.conflict_adjudicator: ConflictAdjudicator | None = None
         if self.llm is not None and self._distill_settings.use_llm_adjudicator:
+            # C3: `settings=` threaded from the WIRED `EngineSettings.lifecycle`
+            # (`MU_LIFECYCLE__ADJUDICATION_BUDGET_PER_SWEEP`, `MU_LIFECYCLE__
+            # ADJUDICATION_DEGRADE_THRESHOLD_S`, `MU_LIFECYCLE__ADJUDICATOR_MAX_TOKENS`,
+            # `MU_LIFECYCLE__ADJUDICATOR_TEMPERATURE`) instead of `build_conflict_adjudicator`
+            # omitting `settings=` entirely (-> a bare `ConflictAdjudicatorSettings()` fallback).
             self.conflict_adjudicator = build_conflict_adjudicator(
                 use_llm=True,
                 router=self.llm,
+                settings=conflict_adjudicator_settings_from_lifecycle(self.lifecycle_settings),
                 clock=self._clock,
                 bus=self._bus,
                 conflict_records=self._injected_conflict_records
@@ -621,7 +646,13 @@ class LocalContainer:
                 )
 
     def _build_embedder(self, choice: BackendChoice) -> SentenceTransformerEmbedder:
-        embedder = build_embedder(choice.backend, default_local_catalog())
+        # C2: the catalog backing this embedder is now the WIRED `EngineSettings.model_catalog`
+        # (`MU_MODEL_CATALOG__DEFAULT_EMBED_BACKEND`/`MU_MODEL_CATALOG__DEFAULT_MINILM_PATH`
+        # reach `default_local_catalog`'s embedder-default derivation), not a bare call. `choice.
+        # backend` (from `StorageSettings.embedding`, the storage-layer BACKEND-SELECTION knob)
+        # is unchanged — a deliberately separate concern from the model-layer's own default id.
+        catalog = default_local_catalog(self._engine_settings.model_catalog)
+        embedder = build_embedder(choice.backend, catalog)
         if not isinstance(embedder, SentenceTransformerEmbedder):  # fail-loud, never a silent None
             raise BackendUnavailableError(
                 f"embedding backend {choice.backend!r} did not resolve to a local embedder"

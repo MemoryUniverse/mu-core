@@ -66,7 +66,11 @@ from mu_contracts.domain.model.recall import CallerIdentitySet
 from mu_contracts.ports.bus import EventBusPort
 from mu_contracts.ports.time import Clock
 from mu_engine.config import EngineSettings, get_engine_settings
-from mu_engine.lifecycle.conflict import ConflictAdjudicator, build_conflict_adjudicator
+from mu_engine.lifecycle.conflict import (
+    ConflictAdjudicator,
+    build_conflict_adjudicator,
+    conflict_adjudicator_settings_from_lifecycle,
+)
 from mu_engine.lifecycle.conflict_redis import ConflictRedisSettings, RedisConflictRecordRepository
 from mu_engine.lifecycle.demotion import DemotionService
 from mu_engine.lifecycle.manager import MemoryLifecycleManager
@@ -191,7 +195,11 @@ def _build_llm_catalog(profile: SlmProfile) -> tuple[ModelSettings, ModelCatalog
         kind=ModelKind.LLM,
         extra_params={"api_key": profile.api_key},
     )
-    catalog_base = default_local_catalog()
+    # CONFIG-AND-DATA-FIX-PLAN.md §1.2 C2 (mirrors the identical fix in `mu_local.composition`):
+    # the BASE catalog is now the WIRED `get_engine_settings().model_catalog` (C0), so
+    # `MU_MODEL_CATALOG__ROUTER__…`/`MU_MODEL_CATALOG__DEFAULT_EMBED_BACKEND`/
+    # `MU_MODEL_CATALOG__DEFAULT_MINILM_PATH` all reach the catalog `build_model_router` consumes.
+    catalog_base = default_local_catalog(get_engine_settings().model_catalog)
     catalog = catalog_base.model_copy(update={"providers": [provider], "deployments": [deployment]})
     model_defaults = get_engine_settings().model
     models = model_defaults.model_copy(
@@ -249,7 +257,7 @@ class EngineContainer:
         )
 
         # (1) the REAL local embedder (offline MiniLM) — dimension read FROM the live model.
-        self.embedder: SentenceTransformerEmbedder = self._build_embedder()
+        self.embedder: SentenceTransformerEmbedder = self._build_embedder(self._engine_settings)
 
         # (2) STM (kv role: valkey, durable — appendonly yes per docker-compose.dev.yml) — built
         #     through the SAME STORE_REGISTRY seam LocalContainer uses.
@@ -305,7 +313,12 @@ class EngineContainer:
         #     see SlmProfile's own docstring for why) ⇒ a REAL ModelRouter over the dev SLM +
         #     LlmFactExtractor for DISTILL's SPO extraction; disabled ⇒ heuristic mode, unchanged.
         self.llm: ModelRouter | None = None
-        self._extractor: FactExtractorPort = HeuristicSpoExtractor()
+        # C2 (mirrors `mu_local.composition`): `settings=` threaded from the WIRED
+        # `EngineSettings.extraction` — previously bare, so `MU_EXTRACTION__MIN_TOKENS`/vocab
+        # overrides never reached the DEFAULT (heuristic) extraction path.
+        self._extractor: FactExtractorPort = HeuristicSpoExtractor(
+            settings=self._engine_settings.extraction
+        )
         if settings.llm.enabled:
             self.llm = self._build_llm_router(settings.llm)
             # C1: base on the WIRED `EngineSettings.extraction` (mirrors the identical fix in
@@ -328,7 +341,10 @@ class EngineContainer:
         self._bus = InprocBus()
         self.tracer = build_tracer(enabled=True, service_name="mu-engine-server")
         self.metrics = build_metrics(enabled=True)
-        self.audit = build_audit(enabled=True)
+        # C3: `settings=` threaded from the WIRED `EngineSettings.observability` so
+        # `MU_OBSERVABILITY__DURABLE_AUDIT_QUEUE_MAX` reaches `_DurableAuditLog`'s bounded queue
+        # whenever a durable sink is configured (mirrors `mu_local.composition`).
+        self.audit = build_audit(enabled=True, settings=self._engine_settings.observability)
 
         # (7b) manager-mode gate — MANUAL default (mirrors LocalContainer's own narrowing for the
         #      MANUAL VERB surface: `LocalMemory.consolidate()`-shaped calls / `POST
@@ -361,9 +377,13 @@ class EngineContainer:
         self._distill_settings = self._engine_settings.distill
         self.conflict_adjudicator: ConflictAdjudicator | None = None
         if self.llm is not None and self._distill_settings.use_llm_adjudicator:
+            # C3 (mirrors `mu_local.composition`): `settings=` threaded from the WIRED
+            # `EngineSettings.lifecycle` instead of `build_conflict_adjudicator` omitting
+            # `settings=` entirely (-> a bare `ConflictAdjudicatorSettings()` fallback).
             self.conflict_adjudicator = build_conflict_adjudicator(
                 use_llm=True,
                 router=self.llm,
+                settings=conflict_adjudicator_settings_from_lifecycle(self.lifecycle_settings),
                 clock=self._clock,
                 bus=self._bus,
                 conflict_records=self.conflict_records,
@@ -546,8 +566,12 @@ class EngineContainer:
 
     # ------------------------------------------------------------------------------------ helpers
     @staticmethod
-    def _build_embedder() -> SentenceTransformerEmbedder:
-        embedder = build_embedder(_EMBEDDING_BACKEND, default_local_catalog())
+    def _build_embedder(engine_settings: EngineSettings) -> SentenceTransformerEmbedder:
+        # C2 (mirrors `mu_local.composition`): the catalog backing this embedder is now the
+        # WIRED `EngineSettings.model_catalog` (`MU_MODEL_CATALOG__DEFAULT_EMBED_BACKEND`/
+        # `MU_MODEL_CATALOG__DEFAULT_MINILM_PATH`), not a bare `default_local_catalog()` call.
+        catalog = default_local_catalog(engine_settings.model_catalog)
+        embedder = build_embedder(_EMBEDDING_BACKEND, catalog)
         if not isinstance(embedder, SentenceTransformerEmbedder):
             raise BackendUnavailableError(
                 f"embedding backend {_EMBEDDING_BACKEND!r} did not resolve to a local embedder"

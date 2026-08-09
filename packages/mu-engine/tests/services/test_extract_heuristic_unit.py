@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from mu_engine.services.extract import HeuristicSpoExtractor, decompose_to_spo
+from mu_engine.services.extract import ExtractionSettings, HeuristicSpoExtractor, decompose_to_spo
 from mu_engine.storage.domain.memory import Polarity
 
 pytestmark = pytest.mark.unit
@@ -106,3 +106,27 @@ async def test_determinism_same_input_same_output() -> None:
     a = await _extract("Ada lives in Paris. Ada works at Acme.")
     b = await _extract("Ada lives in Paris. Ada works at Acme.")
     assert [f.model_dump() for f in a] == [f.model_dump() for f in b]
+
+
+async def test_settings_min_tokens_is_actually_consumed_by_the_extractor() -> None:
+    """CONFIG-AND-DATA-FIX-PLAN.md §1.2 C2: ``ExtractionSettings.min_tokens`` MUST reach
+    ``HeuristicSpoExtractor`` via its ``settings=`` constructor arg — the exact param the
+    composition roots now thread as ``HeuristicSpoExtractor(settings=engine_settings.extraction)``
+    instead of the previous bare ``HeuristicSpoExtractor()`` (which always fell back to
+    ``ExtractionSettings()``'s bare ``min_tokens=3``, unreachable from the environment).
+
+    ``"Ada is happy"`` is a 3-token sentence with a real copula pattern — at the DEFAULT
+    ``min_tokens=3`` it extracts; raising the floor to ``min_tokens=4`` via an explicit
+    ``settings=`` must now drop it as chit-chat noise, proving the constructor arg — not just the
+    class default — decides.
+    """
+    text = "Ada is happy"
+    default_facts = await HeuristicSpoExtractor().extract(text, now=NOW)
+    assert len(default_facts) == 1  # min_tokens=3 default: 3-token sentence clears the floor
+
+    raised_floor = HeuristicSpoExtractor(settings=ExtractionSettings(min_tokens=4))
+    raised_facts = await raised_floor.extract(text, now=NOW)
+    assert raised_facts == [], (
+        "min_tokens=4 (passed via settings=) did not reach the extractor — the 3-token sentence "
+        f"still extracted: {raised_facts!r}"
+    )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from mu_engine.platform.observability import (
+    AuditRecord,
     NoopAuditLog,
     NoopMetricSink,
     NoopTracer,
@@ -15,8 +16,19 @@ from mu_engine.platform.observability import (
     sanitize_label_value,
     sanitize_labels,
 )
+from mu_engine.platform.settings import ObservabilitySettings
 
 pytestmark = pytest.mark.unit
+
+
+class _FakeDurableSink:
+    """A minimal ``DurableAuditSink`` — no store, no I/O (structural Protocol conformance only)."""
+
+    def __init__(self) -> None:
+        self.appended: list[AuditRecord] = []
+
+    async def append(self, record: AuditRecord) -> None:
+        self.appended.append(record)
 
 
 def test_safe_value_accepts_ids_and_ns_prefix() -> None:
@@ -61,6 +73,23 @@ def test_builders_default_to_noop() -> None:
     assert isinstance(build_tracer(enabled=False), NoopTracer)
     assert isinstance(build_metrics(enabled=False), NoopMetricSink)
     assert isinstance(build_audit(enabled=False), NoopAuditLog)
+
+
+def test_build_audit_settings_arg_bounds_the_durable_queue() -> None:
+    """CONFIG-AND-DATA-FIX-PLAN.md §1.2 C3: ``ObservabilitySettings.durable_audit_queue_max``
+    MUST reach ``_DurableAuditLog``'s bounded ``asyncio.Queue`` via ``build_audit(...,
+    settings=...)`` — the exact constructor arg the composition roots now pass as
+    ``settings=engine_settings.observability`` instead of omitting it entirely (-> the internal
+    bare ``ObservabilitySettings()`` fallback, ``observability.py:400``)."""
+    sink = _FakeDurableSink()
+
+    default_log = build_audit(enabled=True, durable_sink=sink)
+    assert default_log._queue.maxsize == ObservabilitySettings().durable_audit_queue_max  # type: ignore[attr-defined]
+
+    bounded_log = build_audit(
+        enabled=True, durable_sink=sink, settings=ObservabilitySettings(durable_audit_queue_max=7)
+    )
+    assert bounded_log._queue.maxsize == 7  # type: ignore[attr-defined]
 
 
 def test_noop_span_is_a_context_manager() -> None:
