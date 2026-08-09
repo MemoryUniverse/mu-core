@@ -143,6 +143,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from mu_contracts.contracts.defaults import (
+    DEFAULT_CONSOLIDATE_LIMIT,
+    DEFAULT_RECALL_LIMIT,
+)
 from mu_contracts.contracts.memory import MemoryTierLiteral
 from mu_contracts.contracts.recall import RecallChannels, RecallMode
 from mu_contracts.domain.model.memory import Visibility
@@ -220,7 +224,7 @@ class RecallRequest(BaseModel):
 
     # COMMON fields — always-available pass-through (design §2.5), never plane-gated.
     tier: MemoryTierLiteral | None = None
-    limit: int = Field(default=10, ge=1)
+    limit: int = Field(default=DEFAULT_RECALL_LIMIT, ge=1)
     channels: RecallChannels = Field(default_factory=RecallChannels)
     mode: RecallMode = RecallMode.RANKED
     persona: str | None = None
@@ -276,7 +280,7 @@ class ContextWindowRequest(BaseModel):
     session: str | None = None
 
     # COMMON fields — never plane-gated.
-    limit: int = Field(default=10, ge=1)
+    limit: int = Field(default=DEFAULT_RECALL_LIMIT, ge=1)
     max_chars: int | None = None
 
 
@@ -312,4 +316,4 @@ class ConsolidateRequest(BaseModel):
     session: str | None = None
 
     # COMMON field.
-    limit: int = Field(default=50, ge=1)
+    limit: int = Field(default=DEFAULT_CONSOLIDATE_LIMIT, ge=1)

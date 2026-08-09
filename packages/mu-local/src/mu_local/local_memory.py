@@ -61,6 +61,10 @@ import uuid
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NoReturn
 
+from mu_contracts.contracts.defaults import (
+    DEFAULT_CONSOLIDATE_LIMIT,
+    DEFAULT_RECALL_LIMIT,
+)
 from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallResult
 from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
 from mu_contracts.domain.model.memory import Tier
@@ -226,7 +230,7 @@ class LocalMemory:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
-        limit: int = 50,
+        limit: int = DEFAULT_CONSOLIDATE_LIMIT,
     ) -> ConsolidateView:
         """MTM->LTM consolidation (DISTILL): extract bi-temporal SPO facts from the recent STM
         window and write them into the LTM graph, applying invalidate-don't-delete supersession.
@@ -262,7 +266,7 @@ class LocalMemory:
         user: str = _DEFAULT_USER,
         session: str | None = None,
         tier: MemoryTier | None = None,
-        limit: int = 10,
+        limit: int = DEFAULT_RECALL_LIMIT,
         # SHARED-plane fields — same discipline as :meth:`add`; always rejected when non-None
         # (LocalMemory is private-plane-only by construction).
         visibility: Visibility | None = None,
@@ -301,7 +305,7 @@ class LocalMemory:
         user: str = _DEFAULT_USER,
         session: str | None = None,
         tier: MemoryTier | None = None,
-        limit: int = 10,
+        limit: int = DEFAULT_RECALL_LIMIT,
     ) -> RecallResult:
         """mem0 muscle-memory alias for :meth:`recall` (spec verb-alias policy, §CC-6): ``recall``
         is the canonical read verb; ``search`` is a documented alias, one single behaviour."""
@@ -337,7 +341,7 @@ class LocalMemory:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
-        limit: int = 10,
+        limit: int = DEFAULT_RECALL_LIMIT,
         max_chars: int | None = None,
     ) -> ContextView:
         """Assemble a context window from recalled hits by DETERMINISTIC concatenation (no LLM
@@ -361,7 +365,7 @@ class LocalMemory:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
-        limit: int = 10,
+        limit: int = DEFAULT_RECALL_LIMIT,
     ) -> str:
         """Synthesise an answer over recalled context via the configured LLM's ANSWER task.
         Heuristic mode (``llm=None``, the default) refuses loudly — mu-local NEVER returns an
