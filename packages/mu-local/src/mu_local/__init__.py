@@ -14,7 +14,6 @@ from mu_local.views import (
     ConsolidateView,
     ContextView,
     MemoryListView,
-    MemoryRecordView,
     MemoryWriteResult,
 )
 
@@ -27,7 +26,6 @@ __all__ = [
     "LocalContainer",
     "LocalMemory",
     "MemoryListView",
-    "MemoryRecordView",
     "MemoryWriteResult",
     "ModelProfileSettings",
     "StorageSettings",

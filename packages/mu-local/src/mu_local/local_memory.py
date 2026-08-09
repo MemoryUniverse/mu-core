@@ -42,8 +42,15 @@ UNIFIED VERB SURFACE (build-plan Stage B, task B1; sdk-engine-server-design.md �
 - ``recall`` returns the canonical :class:`~mu_contracts.contracts.recall.RecallResult` (was the
   lossy ``mu_local.views.MemoryListView`` via the now-deleted ``_to_list_view``) — the un-collapsed
   engine result, carrying ``namespace``/``channels_run``/``generated_at`` that the old view threw
-  away. ``get``/``context`` are otherwise UNCHANGED (plan §3 B1 item (b)); ``context`` merely
-  follows ``recall``'s new item type since it assembles its window from ``recall``'s own output.
+  away. ``context`` merely follows ``recall``'s new item type since it assembles its window from
+  ``recall``'s own output.
+- ``get`` returns the canonical :class:`~mu_contracts.contracts.memory.MemoryResponse` (carryover
+  CO-1; was the retired ``mu_local.views.MemoryRecordView``, a thin ranked-hit shape) — parity with
+  the public ``MemoryClient.get`` (Decision B winner: a point-get is a full row, not a hit). Mirrors
+  :func:`~mu_engine.surface.facade._to_memory_response` (``mu_engine/surface/facade.py:486-519``),
+  the same engine-native :class:`~mu_engine.storage.domain.memory.MemoryItem` -> ``MemoryResponse``
+  mapping ``SurfaceFacade.get`` already performs, re-derived here as :func:`_to_memory_response`
+  below since ``mu_engine.surface.facade`` keeps that helper module-private.
 - ``promote``/``demote`` are NEW — both delegate to the injected
   :class:`~mu_engine.surface.facade.SurfaceFacade` (Stage A), which raises the named
   :class:`~mu_engine.surface.facade.SurfaceVerbNotImplementedError` for both verbs today
@@ -65,6 +72,7 @@ from mu_contracts.contracts.defaults import (
     DEFAULT_CONSOLIDATE_LIMIT,
     DEFAULT_RECALL_LIMIT,
 )
+from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallResult
 from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
 from mu_contracts.domain.model.memory import Tier
@@ -83,13 +91,12 @@ from mu_engine.services.ingest import IngestResult
 from mu_engine.services.recall.dto import RecallChannels as _EngineRecallChannels
 from mu_engine.services.recall.dto import RecallQuery
 from mu_engine.services.recall.dto import RecallResult as _EngineRecallResult
-from mu_engine.storage.domain.memory import MemoryTier
+from mu_engine.storage.domain.memory import MemoryItem, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.surface.facade import SurfaceFacade
 from mu_local.composition import LocalContainer
 from mu_local.config import StorageSettings
 from mu_local.errors import LlmNotConfiguredError
-from mu_local.views import MemoryRecordView
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a hard import-time cycle.
     from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
@@ -317,23 +324,23 @@ class LocalMemory:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
-    ) -> MemoryRecordView | None:
+    ) -> MemoryResponse | None:
         """Point-get one memory by id from the caller's STM partition (``None`` if absent). NOTE:
         the phase-0 MTM/LTM adapters expose no point-get, so this reads the STM tier only — a
         tracked, explicit narrowing (the ``user``/``session`` args name the η partition, since a
-        bare id cannot be located across prefix-partitioned stores)."""
+        bare id cannot be located across prefix-partitioned stores).
+
+        Returns the canonical :class:`~mu_contracts.contracts.memory.MemoryResponse` (carryover
+        CO-1) — get-parity with the public ``MemoryClient.get`` (Decision B winner: a point-get is
+        a full row, not a ranked hit). Was the retired ``mu_local.views.MemoryRecordView`` (module
+        docstring "UNIFIED VERB SURFACE"), a thinner 6-field shape this verb collapsed the STM
+        ``MemoryItem`` into; :func:`_to_memory_response` below now hydrates every
+        ``MemoryResponse`` field the STM row actually carries instead."""
         ns = self._ns(user, session)
         item = await self._container.stm.get(ns, memory_id)
         if item is None:
             return None
-        return MemoryRecordView(
-            memory_id=item.id,
-            content=item.content,
-            tier=item.tier.value,
-            channel="stm",
-            score=0.0,
-            is_floor=True,
-        )
+        return _to_memory_response(item)
 
     async def context(
         self,
@@ -528,6 +535,53 @@ def _to_recall_result(result: _EngineRecallResult) -> RecallResult:
         ),
         degraded=result.degraded,
         generated_at=result.generated_at,
+    )
+
+
+def _to_memory_response(item: MemoryItem) -> MemoryResponse:
+    """Map the engine-native :class:`~mu_engine.storage.domain.memory.MemoryItem` domain object
+    onto the canonical, FROZEN-wire-schema :class:`~mu_contracts.contracts.memory.MemoryResponse`
+    (Decision B; carryover CO-1) — :meth:`LocalMemory.get`'s new return DTO, replacing the retired
+    ``mu_local.views.MemoryRecordView``. Mirrors
+    :func:`~mu_engine.surface.facade._to_memory_response` (``mu_engine/surface/facade.py:486-519``)
+    field-for-field, re-derived here rather than imported since that helper is private to a module
+    this one only needs the identical mapping from, not a hard dependency on.
+
+    ``content_type`` has no correlate on ``MemoryItem`` (a storage/domain record, not an ingest-
+    time content-type tag); every memory ``add()`` writes originates as plain chat/activity text,
+    so ``"text"`` is the honest default, never a guess at a richer type the item does not carry
+    (same rationale as the facade's own mapping).
+
+    UNAVAILABLE from an STM point-get, left at ``MemoryResponse``'s own field default (documented,
+    never faked with a guessed value) because ``MemoryItem`` (``mu_engine/storage/domain/
+    memory.py:145-201``) carries no correlate for them today: ``speaker_kind``, ``speaker_id``,
+    ``source_id``, ``turn_id``, ``entity_id``, ``asserted_state``, ``gds_pagerank`` (an LTM-graph-
+    only aggregate), ``object_type``, ``object_value``, ``predicate_cardinality``, ``expires_at``,
+    ``last_seen``, ``mention_count`` (an LTM-graph-only aggregate), ``parent_ids``/``child_ids``
+    (LTM-graph-only lineage). Every other field below is a direct 1:1 read off ``MemoryItem``."""
+    return MemoryResponse(
+        id=item.id,
+        content=item.content,
+        content_type="text",
+        tier=item.tier.value,
+        state=item.state.value,
+        importance_score=item.importance_score,
+        access_count=item.access_count,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+        namespace=item.namespace.to_prefix(),
+        metadata={k: str(v) for k, v in item.metadata.items()},
+        source=item.source.value,
+        session_id=item.session_id,
+        subject=item.subject,
+        predicate=item.predicate,
+        object=item.object,
+        object_kind=item.object_kind.value if item.object_kind is not None else None,
+        polarity=item.polarity.value,
+        valid_at=item.valid_at,
+        invalid_at=item.invalid_at,
+        relevance_score=item.relevance_score,
+        content_hash=item.content_hash,
     )
 
 
