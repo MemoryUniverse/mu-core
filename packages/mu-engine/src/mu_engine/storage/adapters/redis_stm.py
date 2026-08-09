@@ -22,6 +22,12 @@ was evicted — self-healed via an ``EXISTS`` check, no separate cleanup needed 
 through as before AND records the mapping. Gated by ``IngestSettings.stm_dedup`` (env
 ``MU_INGEST__STM_DEDUP``, default on) — DI-threaded by ``storage.factories._build_redis``/
 ``_build_valkey``, never hardcoded (DEV-STANDARDS rule 3).
+
+RETURN-IDEMPOTENCY (``add()`` return contract, DATA-QUALITY-REASSESSMENT §3 "add() idempotency" /
+the D4 report): ``put()`` now RETURNS the resident memory id — ``item.id`` on a fresh write, or the
+WINNING (pre-existing) id on a dedup hit — so a caller (``WriteStmStage``) can surface the id the
+store actually kept, instead of the fresh id it discarded (``ports.py``'s ``StmTierRepository.put``
+docstring).
 """
 
 from __future__ import annotations
@@ -73,17 +79,20 @@ class RedisStmAdapter:
         self._retry = retry_io(timeout_s=store_io_timeout_s)
         self._stm_dedup_enabled = stm_dedup_enabled
 
-    async def put(self, item: MemoryItem) -> None:
+    async def put(self, item: MemoryItem) -> str:
         return await self._retry(self._put_impl)(item)
 
-    async def _put_impl(self, item: MemoryItem) -> None:
+    async def _put_impl(self, item: MemoryItem) -> str:
         row = self._mapper.to_store(item)
         recency = RedisMapper.recency_key(item.namespace)
 
         if self._stm_dedup_enabled:
-            bumped = await self._bump_if_duplicate(item, row.ttl_s, recency)
-            if bumped:
-                return  # duplicate content: recency/TTL bumped on the WINNER, no second row.
+            existing_id = await self._bump_if_duplicate(item, row.ttl_s, recency)
+            if existing_id is not None:
+                # duplicate content: recency/TTL bumped on the WINNER, no second row — RETURN
+                # that winner's id (return-idempotency, module docstring), never `item.id` (the
+                # fresh id the store never actually kept).
+                return existing_id
 
         # ONE atomic transaction (MINOR-6): SET payload + ZADD recency + EXPIRE apply together
         # or not at all — no torn state where the payload exists without its recency member.
@@ -98,11 +107,15 @@ class RedisStmAdapter:
             if row.ttl_s:
                 pipe.expire(chash_key, row.ttl_s)
         await pipe.execute()
+        return item.id
 
-    async def _bump_if_duplicate(self, item: MemoryItem, ttl_s: int | None, recency: str) -> bool:
+    async def _bump_if_duplicate(
+        self, item: MemoryItem, ttl_s: int | None, recency: str
+    ) -> str | None:
         """D4 write-time dedup (conformance D-8): if ``item.content_hash`` already maps to a
         DIFFERENT, still-live memory_id in this namespace, bump that row's recency score + TTL
-        and report ``True`` (skip the caller's payload write) instead of forking a second entry.
+        and return that WINNING id (skip the caller's payload write) instead of forking a second
+        entry. ``None`` means no bump happened (a miss, or a genuine re-put of the same id).
 
         Self-healing (no separate cleanup path needed): the ``EXISTS`` check below treats a stale
         mapping — the previous holder's TTL already expired, or it was explicitly ``evict()``-ed —
@@ -118,13 +131,13 @@ class RedisStmAdapter:
         hget_call = cast(Awaitable[str | None], self._redis.hget(chash_key, item.content_hash))
         existing_raw = await hget_call
         if existing_raw is None:
-            return False
+            return None
         existing_id = _as_str(existing_raw)
         if existing_id == item.id:
-            return False  # a genuine re-put of the SAME id — let the normal path re-write it.
+            return None  # a genuine re-put of the SAME id — let the normal path re-write it.
         existing_key = RedisMapper.memory_key(item.namespace, existing_id)
         if not await self._redis.exists(existing_key):
-            return False  # stale index entry (winner expired/evicted) — treat as a fresh write.
+            return None  # stale index entry (winner expired/evicted) — treat as a fresh write.
         pipe = self._redis.pipeline(transaction=True)
         pipe.zadd(recency, {existing_id: item.created_at.timestamp()})
         if ttl_s:
@@ -132,7 +145,7 @@ class RedisStmAdapter:
             pipe.expire(recency, ttl_s)
             pipe.expire(chash_key, ttl_s)
         await pipe.execute()
-        return True
+        return existing_id
 
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         return await self._retry(self._get_impl)(ns, memory_id)

@@ -25,7 +25,8 @@ async def test_put_get_evict_roundtrip(
     adapter = InMemoryStmAdapter()
     ns = make_ns()
     item = make_item(ns, "the sky is blue")
-    await adapter.put(item)
+    resident_id = await adapter.put(item)
+    assert resident_id == item.id  # a fresh write's resident id is always its own id
     got = await adapter.get(ns, item.id)
     assert got == item
     await adapter.evict(ns, item.id)
@@ -125,8 +126,15 @@ async def test_write_time_dedup_skips_the_second_row(
     assert first.id != second.id
     assert first.content_hash == second.content_hash
 
-    await adapter.put(first)
-    await adapter.put(second)
+    first_resident_id = await adapter.put(first)
+    second_resident_id = await adapter.put(second)
+
+    # RETURN-IDEMPOTENCY (add() return contract, DATA-QUALITY-REASSESSMENT §3 "add() idempotency"):
+    # put() reports the id the store ACTUALLY kept — the SECOND call's own minted id was never
+    # resident, so put() must hand back the FIRST call's id, not `second.id`.
+    assert first_resident_id == first.id
+    assert second_resident_id == first.id
+    assert second_resident_id != second.id
 
     recent = await adapter.recent(ns, limit=10)
     assert len(recent) == 1, "duplicate content forked a second STM row"
@@ -186,8 +194,37 @@ async def test_write_time_dedup_toggle_off_allows_duplicates(
     first = make_item(ns, "Ada drinks black coffee")
     second = make_item(ns, "Ada drinks black coffee")
 
-    await adapter.put(first)
-    await adapter.put(second)
+    first_resident_id = await adapter.put(first)
+    second_resident_id = await adapter.put(second)
+
+    # the toggle drives put()'s return contract too: dedup off -> always the given id back,
+    # never a substituted "existing winner" id (mint-new behavior, unchanged from pre-D4).
+    assert first_resident_id == first.id
+    assert second_resident_id == second.id
 
     recent = await adapter.recent(ns, limit=10)
     assert len(recent) == 2, "toggle off must allow the duplicate through (pre-fix parity)"
+
+
+async def test_write_time_dedup_is_scoped_per_namespace(
+    make_ns: Callable[..., Namespace], make_item: Callable[..., MemoryItem]
+) -> None:
+    """Isolation: identical content for a DIFFERENT user (a different η partition) is a DISTINCT
+    memory, never collapsed onto the other user's resident id — the D4 chash index lives inside
+    each `_Partition` (one per `Namespace.to_prefix()`), never a cross-tenant shared index."""
+    adapter = InMemoryStmAdapter()
+    ns_ada = make_ns(user="ada")
+    ns_bo = make_ns(user="bo")
+    ada_item = make_item(ns_ada, "Ada drinks black coffee")
+    bo_item = make_item(ns_bo, "Ada drinks black coffee")  # byte-identical content, DIFFERENT user
+    assert ada_item.content_hash == bo_item.content_hash
+
+    ada_resident_id = await adapter.put(ada_item)
+    bo_resident_id = await adapter.put(bo_item)
+
+    assert ada_resident_id == ada_item.id
+    assert bo_resident_id == bo_item.id  # own partition -> own fresh id, never collapsed
+    assert ada_resident_id != bo_resident_id
+
+    assert len(await adapter.recent(ns_ada, limit=10)) == 1
+    assert len(await adapter.recent(ns_bo, limit=10)) == 1

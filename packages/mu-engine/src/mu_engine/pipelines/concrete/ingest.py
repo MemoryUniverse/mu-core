@@ -225,7 +225,15 @@ class WriteStmStage(BaseStage):
 
     The writer NEVER waits for conflict detection (conflict-resolution-async §1 invariant 1): this
     stage returns on the STM-durable write; promotion + distill run downstream. Mints the id ONCE
-    and carries it forward in ``ctx.state`` (``memory_ids``) so every later tier reuses it.
+    and carries it forward in ``ctx.state`` (``memory_ids``) so every later tier reuses it — UNLESS
+    the STM adapter's own D4 write-time content-hash index reports that id was never actually kept
+    (a dedup hit against a DIFFERENT, still-resident row for the SAME content in this namespace),
+    in which case ``_execute`` re-stamps the RESIDENT id before it is carried forward
+    (return-idempotency — ``add()`` now returns the SAME id across repeat identical-content calls
+    in one namespace, DATA-QUALITY-REASSESSMENT §3 "add() idempotency"). This is per-``activity_id``
+    NOT ledger-gated (a fresh ``session_offset`` is always a fresh ``_execute``, per the class name
+    above) — the content-level idempotency lives entirely inside the STM store's own dedup index,
+    never this stage's own ledger key.
     """
 
     name = "write_stm"
@@ -248,7 +256,24 @@ class WriteStmStage(BaseStage):
             artifact_ref=ctx.state.get("artifact_id"),
             provenance_id=ctx.state.get("artifact_provenance_id"),
         )
-        await self._stm.put(item)
+        # RETURN-IDEMPOTENCY (``add()`` return contract, DATA-QUALITY-REASSESSMENT §3 "add()
+        # idempotency" / the D4 report): ``put()`` reports the RESIDENT memory id —
+        # ``item.id`` on a fresh write, or a DIFFERENT, still-resident id when the D4 write-time
+        # content-hash index (``ports.py``'s ``StmTierRepository.put`` docstring) already holds
+        # this exact content in this namespace. D4 landed the STORE-level dedup (one physical STM
+        # row) without ever surfacing it here, so ``IngestService.remember`` kept minting+
+        # returning a fresh id the store had already discarded — a caller-visible id that did not
+        # correspond to any physical row. Re-stamp ``item`` onto the id the store actually kept
+        # (never a second, independently-fetched copy) so every downstream consumer of THIS
+        # stage's ``produced`` — the ``MemoryCaptured`` event, ``IngestResult.memory_id``, and
+        # ``DeterministicPromoteStage``'s own id-stability (CANONICAL §7.1: a later promotion of
+        # this content writes to the SAME MTM point, never a stray new one) — sees ONE consistent
+        # identity. Gated entirely by the STM adapter's own ``stm_dedup_enabled``
+        # (``MU_INGEST__STM_DEDUP``): dedup off -> ``put()`` always returns ``item.id`` -> this is
+        # a no-op and ``add()`` reverts to minting a fresh id every call, unchanged.
+        resident_id = await self._stm.put(item)
+        if resident_id != item.id:
+            item = item.model_copy(update={"id": resident_id})
         return StageOutcome(
             status=StageStatus.OK,
             produced={"stm_item": item, "memory_ids": [item.id], "content_hash": item.content_hash},

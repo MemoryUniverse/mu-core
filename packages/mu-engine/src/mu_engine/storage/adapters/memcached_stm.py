@@ -100,15 +100,20 @@ class MemcachedStmAdapter:
             "(sustained write contention) — D6 recency floor unavailable"
         )
 
-    async def put(self, item: MemoryItem) -> None:
+    async def put(self, item: MemoryItem) -> str:
         return await self._retry(self._put_impl)(item)
 
-    async def _put_impl(self, item: MemoryItem) -> None:
+    async def _put_impl(self, item: MemoryItem) -> str:
         row = self._mapper.to_store(item)
         await self._mc.set(
             row.key.encode("utf-8"), row.blob.encode("utf-8"), exptime=row.ttl_s or 0
         )
         await self._update_recency(item.namespace, item.id, item.created_at.timestamp())
+        # NO write-time content-hash dedup on this adapter (D6 — memcached has no HASH primitive
+        # this adapter's D4 index could reuse; a tracked, separate gap, not this fix's scope), so
+        # every write is resident under its OWN `item.id` — the ``StmTierRepository.put`` return-
+        # idempotency contract (``ports.py``) degrades to a no-op here: always the given id.
+        return item.id
 
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         return await self._retry(self._get_impl)(ns, memory_id)

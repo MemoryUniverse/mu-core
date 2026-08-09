@@ -30,6 +30,12 @@ WRITE-TIME DEDUP (D4, CONFIG-AND-DATA-FIX-PLAN.md PART 2 D4; conformance D-8), f
 already held by a DIFFERENT, still-resident id bumps that id's recency/expiry instead of forking
 a second entry — gated by ``stm_dedup_enabled`` (DI-threaded from ``IngestSettings.stm_dedup``,
 env ``MU_INGEST__STM_DEDUP``, by ``storage.factories._build_memory_kv``).
+
+RETURN-IDEMPOTENCY (``add()`` return contract, DATA-QUALITY-REASSESSMENT §3 "add() idempotency" /
+the D4 report): ``put()`` now RETURNS the resident memory id — ``item.id`` on a fresh write, or the
+WINNING (pre-existing) id on a dedup hit — so a caller (``WriteStmStage``) can surface the id the
+store actually kept, instead of the fresh id it discarded (``ports.py``'s ``StmTierRepository.put``
+docstring).
 """
 
 from __future__ import annotations
@@ -104,14 +110,19 @@ class InMemoryStmAdapter:
         for mid in expired:
             self._evict_locked(part, mid)
 
-    async def put(self, item: MemoryItem) -> None:
+    async def put(self, item: MemoryItem) -> str:
         async with self._lock:
             part = self._partition(item.namespace)
             now = datetime.now(UTC)
             self._prune_expired_locked(part, now=now)
 
-            if self._stm_dedup_enabled and self._bump_if_duplicate_locked(part, item, now=now):
-                return  # duplicate content: recency/TTL bumped on the WINNER, no second entry.
+            if self._stm_dedup_enabled:
+                existing_id = self._bump_if_duplicate_locked(part, item, now=now)
+                if existing_id is not None:
+                    # duplicate content: recency/TTL bumped on the WINNER, no second entry —
+                    # RETURN that winner's id (return-idempotency, module docstring), never
+                    # `item.id` (the fresh id the store never actually kept).
+                    return existing_id
 
             # re-put of an existing id: drop its stale recency entry first (id-stability, no fork).
             self._evict_locked(part, item.id)
@@ -131,23 +142,25 @@ class InMemoryStmAdapter:
             while len(part.items) > self._max_items:
                 _, oldest_id = part.recency[-1]
                 self._evict_locked(part, oldest_id)
+            return item.id
 
     def _bump_if_duplicate_locked(
         self, part: _Partition, item: MemoryItem, *, now: datetime
-    ) -> bool:
+    ) -> str | None:
         """D4 write-time dedup (conformance D-8), parity with ``RedisStmAdapter.
         _bump_if_duplicate``: if ``item.content_hash`` already maps to a DIFFERENT, still-resident
-        id in this partition, bump ITS recency/expiry and report ``True`` instead of forking a
-        second entry. A stale mapping (the previous holder already expired/was evicted) is a miss
-        here too — ``part.items.get`` returning ``None`` — so ``put()`` falls through to the
-        normal write-through path, which overwrites ``part.chash`` with the new id (self-healing,
-        no separate cleanup needed on eviction)."""
+        id in this partition, bump ITS recency/expiry and return THAT id instead of forking a
+        second entry (``None`` when no bump happened — a miss, or a genuine re-put of the same
+        id). A stale mapping (the previous holder already expired/was evicted) is a miss here too
+        — ``part.items.get`` returning ``None`` — so ``put()`` falls through to the normal
+        write-through path, which overwrites ``part.chash`` with the new id (self-healing, no
+        separate cleanup needed on eviction)."""
         existing_id = part.chash.get(item.content_hash)
         if existing_id is None or existing_id == item.id:
-            return False
+            return None
         existing = part.items.get(existing_id)
         if existing is None:
-            return False  # stale index entry — treat as a fresh write.
+            return None  # stale index entry — treat as a fresh write.
         existing_item, _ = existing
         self._evict_locked(part, existing_id)  # drop the stale (item, recency) pair for this id.
         # Recency score bumps to the DUPLICATE submission's own `created_at` (mirrors
@@ -164,7 +177,7 @@ class InMemoryStmAdapter:
         part.items[existing_id] = (bumped, expires_at)
         part.recency.add((-item.created_at.timestamp(), existing_id))
         part.chash[item.content_hash] = existing_id
-        return True
+        return existing_id
 
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         async with self._lock:

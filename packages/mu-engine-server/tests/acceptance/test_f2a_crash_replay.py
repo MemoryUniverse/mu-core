@@ -7,29 +7,39 @@ the kill, (2) the content-hash-scoped MTM dedup holds (no duplicate MTM point) a
 re-`add()` of the identical content, and (3) that re-`add()`'s own HTTP receipt is HONEST about what
 it actually did this call (reinforcement of already-promoted content, not a fresh MTM write).
 
-**Corrected wording (this revision).** An earlier revision of this file asserted that a re-`add()`
-of identical content after the restart must mint the SAME `memory_id` as the pre-kill write. That
-assertion was WRONG, not the product: `SurfaceFacade.add()` (the same wire path
-`MemoryClient.add()` drives) mints a FRESH `uuid.uuid4().hex` `session_offset` on EVERY call
-(`facade.py::_fresh_offset`), unconditionally, with no caller-supplied `Idempotency-Key` plumbed
-through — so `WriteStmStage`'s own idempotency (keyed on
-`activity_id = sha256(host|session|session_offset|kind)`, `activity_id_for`'s own docstring: "a
-genuine second occurrence at a new offset is a legitimate reinforcement (kept)") can NEVER make two
-independently-issued `add()` calls share a `memory_id`, kill/restart or not — reproduced
-identically with zero kill in between. Two independent calls carrying identical content are two
-legitimate events by design, not a duplicate.
+**Re-corrected wording (this revision — supersedes the previous "Corrected wording" section).** A
+prior revision of this file asserted that a re-`add()` of identical content after the restart MUST
+NOT mint the SAME `memory_id` as the pre-kill write, reasoning that `SurfaceFacade.add()`'s FRESH
+`uuid.uuid4().hex` `session_offset` per call (`facade.py::_fresh_offset`) makes
+`WriteStmStage`'s own activity-id ledger (`activity_id = sha256(host|session|session_offset|kind)`)
+incapable of ever collapsing two independent calls onto one id. That reasoning about the ACTIVITY-
+ID ledger was correct and still holds — but it conflated "not ledger-gated on activity_id" with
+"cannot return the same id at all", missing the SEPARATE, store-level mechanism that also governs
+`add()`'s return contract: D4's write-time content-hash dedup index
+(`storage/adapters/{redis,valkey,memory}_stm.py`, `content_hash -> memory_id`). Pre-this-fix, D4
+already kept exactly ONE physical STM row for identical content in one namespace, but
+`WriteStmStage` never learned which id that row lived under — it kept minting+returning a FRESH id
+the store had already discarded (DATA-QUALITY-REASSESSMENT §3 "add() idempotency" / the D4 report).
+Now `StmTierRepository.put` reports the RESIDENT id back to `WriteStmStage`
+(`mu_engine/pipelines/concrete/ingest.py`), which re-stamps its own item onto it — so a re-`add()`
+of identical content in the SAME namespace DOES now return the SAME `memory_id` as the earlier
+call, whether or not a kill/restart happened in between (return-idempotency, gated on the SAME
+`MU_INGEST__STM_DEDUP` toggle D4 introduced).
 
-What DOES durably hold, and is what this file now asserts: (a) the pre-kill write survives the
-kill+restart untouched (GET still 200 with the original content), and (b)
+What this file now asserts: (a) the pre-kill write survives the kill+restart untouched (GET still
+200 with the original content), (b) a re-`add()` of the identical content after the restart
+RETURNS THE SAME `memory_id` as the pre-kill write (the return-idempotency fix above — this is now
+the file's headline assertion, not "two distinct ids by design"), and (c)
 `DeterministicPromoteStage`'s content-hash-scoped ledger (`{namespace}:{content_hash}`,
-`mu_engine/pipelines/concrete/ingest.py`) dedupes the MTM WRITE across the two independent calls:
-exactly one MTM point for this content_hash, at the FIRST call's `memory_id`, never a duplicate and
-never re-pointed at the second's id.
+`mu_engine/pipelines/concrete/ingest.py`) still dedupes the MTM WRITE across the two calls: exactly
+one MTM point for this content_hash, at that SAME shared `memory_id`, never a duplicate.
 
-**The receipt-honesty fix this revision also pins.** Pre-fix, the SECOND call's HTTP receipt
-(`MemoryWriteResult`) falsely reported `promoted=true, tiers_written=["stm", "mtm"]` for a
-`memory_id` that was NEVER actually written to MTM (only the FIRST memory_id was — a data-quality
-/ honesty defect on top of the memory_id-stability non-issue above).
+**The receipt-honesty fix this revision also pins (unchanged by the return-idempotency fix above,
+still verified here).** Pre-that-fix, the SECOND call's HTTP receipt (`MemoryWriteResult`) falsely
+reported `promoted=true, tiers_written=["stm", "mtm"]` for a memory_id that was NEVER actually
+written to MTM this call (a data-quality/honesty defect, separate from — and unaffected by — the
+return-idempotency fix above: the two receipts now share ONE `memory_id`, but only the FIRST call's
+receipt honestly claims the MTM write that id actually received).
 `IngestService._promoted_this_call` (`mu_engine/services/ingest.py`) now derives the receipt from
 each stage's OWN `StageOutcome.status` (`OK` vs a content-hash ledger-hit `SKIPPED`) rather than
 merely checking whether a `MemoryPromoted` event is anywhere in the aggregated emitted-events list
@@ -181,17 +191,19 @@ def test_write_survives_container_kill_and_replay_is_honest_about_reinforcement(
     assert replay_response.status_code == 201, replay_response.text
     replay_write = replay_response.json()
 
-    # Two independent occurrences of identical content mint two DISTINCT memory_ids — BY DESIGN
-    # (`activity_id_for`'s own docstring: "a genuine second occurrence at a new offset is a
-    # legitimate reinforcement (kept)"). Asserting equality here would be the wrong criterion (see
-    # module docstring's "Corrected wording" section) — the same-invocation SAME-id guarantee is
-    # covered elsewhere (`test_crash_replay_resumes_and_promotes_with_same_id`,
-    # `test_remember_is_idempotent_on_replay`), not by two independently-issued HTTP calls.
-    assert replay_write["memory_id"] != memory_id_1, (
-        "a re-add() of identical content minted the SAME memory_id as an earlier, independent "
-        "call — that would mean WriteStmStage's activity-id idempotency collapsed two distinct "
-        "session_offsets, which should be impossible (facade.py::_fresh_offset mints a fresh "
-        "uuid4 per call)."
+    # RETURN-IDEMPOTENCY (module docstring's "Re-corrected wording" section): identical content in
+    # the SAME namespace resolves to the SAME resident memory_id, even though the two HTTP calls
+    # are independent (distinct session_offsets — WriteStmStage's OWN activity-id ledger never
+    # collapses them; the SAME id comes back because D4's write-time STM content-hash dedup kept
+    # only ONE physical row, and WriteStmStage now surfaces THAT row's id instead of minting a
+    # fresh one the store would have discarded).
+    assert replay_write["memory_id"] == memory_id_1, (
+        "a re-add() of identical content after the kill+restart minted a DIFFERENT memory_id "
+        f"than the pre-kill write ({memory_id_1!r} vs {replay_write['memory_id']!r}) — the D4 "
+        "write-time STM content-hash dedup index kept only ONE physical row for this content, "
+        "so add()'s receipt must return THAT row's id (return-idempotency fix, "
+        "DATA-QUALITY-REASSESSMENT §3 'add() idempotency'), not a fresh id the store never "
+        "actually kept."
     )
     assert replay_write["content_hash"] == first_write["content_hash"]
 
@@ -211,14 +223,14 @@ def test_write_survives_container_kill_and_replay_is_honest_about_reinforcement(
     )
 
     # No DUPLICATE PROMOTED RECORD: recall for this exact marker must surface exactly ONE matching
-    # item (this half of the criterion DOES hold — DeterministicPromoteStage's content-hash ledger
-    # dedupes the actual MTM write even though the two calls' memory_ids differ). Which of the two
-    # memory_ids recall's own ranking surfaces (it may legitimately prefer the more recently-
-    # touched STM record) is NOT asserted here — the precise MTM-level guarantee (exactly one
-    # Qdrant point, at the FIRST call's id, never re-pointed) is proven directly against the real
-    # store in `mu-engine/tests/services/test_ingest_int.py::
-    # test_second_call_with_different_activity_and_same_content_is_honest_about_reinforcement`;
-    # this black-box recall check only needs to rule out a visible DUPLICATE.
+    # item — now the STRONGER guarantee that both calls share ONE memory_id makes this close to
+    # tautological at the STM layer, but it is still the right black-box check: it also rules out
+    # a stray SECOND Qdrant point (DeterministicPromoteStage's content-hash ledger dedupes the
+    # actual MTM write). The precise MTM-level guarantee (exactly one Qdrant point, at the shared
+    # memory_id, never re-pointed) is proven directly against the real store in
+    # `mu-engine/tests/services/test_ingest_int.py::
+    # test_second_call_with_different_activity_and_same_content_returns_existing_id`; this
+    # black-box recall check only needs to rule out a visible DUPLICATE.
     recall_response = httpx.post(
         f"{ENGINE_BASE_URL}/v1/memories/recall",
         headers=headers,

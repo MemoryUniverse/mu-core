@@ -108,7 +108,19 @@ class RowMapper(Protocol, Generic[SM]):
 class StmTierRepository(Protocol):
     """KV / STM tier (``storage-pluggable §1``). Recency floor + TTL + chash dedup."""
 
-    async def put(self, item: MemoryItem) -> None: ...
+    async def put(self, item: MemoryItem) -> str:
+        """Write ``item``, returning the RESIDENT memory id (add() return-idempotency fix,
+        DATA-QUALITY-REASSESSMENT §3 "add() idempotency" / the D4 report).
+
+        Normally ``item.id`` (a fresh write). On a write-time content-hash dedup hit (D4) — the
+        namespace already holds a DIFFERENT, still-resident row for this exact ``content_hash`` —
+        the store bumps THAT row's recency/TTL instead of forking a second physical entry, and
+        this returns THAT row's id, not ``item.id``. Every implementation MUST return the id of
+        whichever row is now physically resident under ``item.content_hash`` in this namespace, so
+        a caller (``WriteStmStage``) can re-stamp its own id onto the SAME identity the store
+        actually kept, instead of minting+returning an id the store never held (CANONICAL §7.1
+        id-stability applied to the dedup path)."""
+        ...
 
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None: ...
 

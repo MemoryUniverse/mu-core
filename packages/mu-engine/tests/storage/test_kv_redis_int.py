@@ -79,8 +79,15 @@ async def test_write_time_dedup_skips_the_second_row(
     assert first.id != second.id
     assert first.content_hash == second.content_hash
 
-    await adapter.put(first)
-    await adapter.put(second)
+    first_resident_id = await adapter.put(first)
+    second_resident_id = await adapter.put(second)
+
+    # RETURN-IDEMPOTENCY (add() return contract, DATA-QUALITY-REASSESSMENT §3 "add() idempotency"):
+    # put() reports the id the store ACTUALLY kept — the SECOND call's own minted id was never
+    # resident, so put() must hand back the FIRST call's id, not `second.id`.
+    assert first_resident_id == first.id
+    assert second_resident_id == first.id
+    assert second_resident_id != second.id
 
     recent = await adapter.recent(ns, limit=10)
     assert len(recent) == 1, "duplicate content forked a second STM row"
@@ -134,8 +141,13 @@ async def test_write_time_dedup_toggle_off_allows_duplicates(
     first = make_item(ns, "Ada drinks black coffee")
     second = make_item(ns, "Ada drinks black coffee")
 
-    await adapter.put(first)
-    await adapter.put(second)
+    first_resident_id = await adapter.put(first)
+    second_resident_id = await adapter.put(second)
+
+    # the toggle drives put()'s return contract too: dedup off -> always the given id back,
+    # never a substituted "existing winner" id (mint-new behavior, unchanged from pre-D4).
+    assert first_resident_id == first.id
+    assert second_resident_id == second.id
 
     recent = await adapter.recent(ns, limit=10)
     assert len(recent) == 2, "toggle off must allow the duplicate through (pre-fix parity)"
