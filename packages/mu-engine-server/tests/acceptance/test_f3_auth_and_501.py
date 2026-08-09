@@ -15,6 +15,8 @@ Split in two:
 
 from __future__ import annotations
 
+import uuid
+
 import httpx
 import pytest
 import pytest_asyncio
@@ -69,10 +71,11 @@ def test_malformed_scheme_is_401(engine_up: None, engine_token: str) -> None:
 
 def test_correct_bearer_is_200(engine_up: None, engine_token: str) -> None:
     del engine_up
+    marker = uuid.uuid4().hex[:12]
     response = _post(
         "/memories",
         headers={"Authorization": f"Bearer {engine_token}"},
-        json={"content": "F3-auth-smoke", "user": "f3-auth-user", "session": "s1"},
+        json={"content": f"F3-auth-smoke-{marker}", "user": "f3-auth-user", "session": "s1"},
     )
     assert response.status_code == 201, response.text
     body = response.json()
