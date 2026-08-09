@@ -19,9 +19,8 @@ from typing import cast
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from mu_contracts.domain.errors import PlaneFieldRejectedError
+from mu_contracts.domain.errors import PlaneFieldRejectedError, SurfaceVerbNotImplementedError
 from mu_engine.lifecycle.mode_gate import ManagerOwnsLifecycleError
-from mu_engine.surface.facade import SurfaceVerbNotImplementedError
 
 __all__ = ["register_exception_handlers"]
 

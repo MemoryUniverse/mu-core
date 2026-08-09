@@ -49,9 +49,10 @@ shape (``mu_local.views.ContextView``) was blocked on Decision B. Now that ``Con
 local_memory.py:503-509``) since that helper is private to a package this module cannot import.
 
 ``promote``/``demote``/``share`` (build-queue §13 items 5/3) still have no engine-side verb to
-delegate to — they still raise :class:`SurfaceVerbNotImplementedError`, a locally-defined
-``MemoryUniverseError`` subclass Stage C's HTTP layer maps to HTTP 501. This is a deliberate, NAMED
-gap (DEV-STANDARDS: never a silent no-op / fake success), not an oversight.
+delegate to — they still raise :class:`SurfaceVerbNotImplementedError`, imported from its
+canonical home ``mu_contracts.domain.errors`` (CO-3), which Stage C's HTTP layer maps to HTTP 501.
+This is a deliberate, NAMED gap (DEV-STANDARDS: never a silent no-op / fake success), not an
+oversight.
 """
 
 from __future__ import annotations
@@ -64,7 +65,7 @@ from mu_contracts.contracts.recall import RecallChannels as CanonicalRecallChann
 from mu_contracts.contracts.recall import RecallItemView as CanonicalRecallItemView
 from mu_contracts.contracts.recall import RecallResult as CanonicalRecallResult
 from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
-from mu_contracts.domain.errors import MemoryUniverseError
+from mu_contracts.domain.errors import LlmNotConfiguredError, SurfaceVerbNotImplementedError
 from mu_contracts.domain.model.memory import Tier as CanonicalTier
 from mu_contracts.domain.model.scope import ClientScope
 from mu_engine.lifecycle.mode_gate import ManagerModeGate
@@ -101,35 +102,6 @@ _ASK_SYSTEM_PROMPT = "Answer the question using ONLY the given facts. Be concise
 # (DEV-STANDARDS rule 3), and a plain ``float`` so mypy-strict can check the ``importance=`` kwarg
 # without an ``**dict`` unpack (which mypy cannot verify against a ``BaseModel``'s field types).
 _DEFAULT_IMPORTANCE: float = IngestActivity.model_fields["importance"].default
-
-
-class SurfaceVerbNotImplementedError(MemoryUniverseError):
-    """A canonical verb has no engine-side implementation to delegate to yet.
-
-    Covers ``promote``/``demote`` (build-queue §13 item 5 — neither surface implements these
-    today) and the ``build_context``/``share`` twins (§13 item 3 — their return-DTO shape is
-    itself an open decision, §2.5). NAMED so Stage B (item 5) has ONE importable exception family
-    to map onto HTTP 501 — never a bare ``NotImplementedError`` (which is a builtin, not part of
-    the ``MemoryUniverseError`` wire-error hierarchy, CANONICAL §6) and never a silent no-op.
-    """
-
-    def __init__(self, verb: str, *, reason: str) -> None:
-        self.verb = verb
-        super().__init__(f"SurfaceFacade.{verb}() is not implemented: {reason}")
-
-
-class LlmNotConfiguredError(MemoryUniverseError):
-    """``ask()`` was called while the injected container carries no LLM (heuristic mode).
-
-    A deliberate, NAMED duplicate of ``mu_local.errors.LlmNotConfiguredError`` (same refusal,
-    ``mu-local/local_memory.py:238-254``) — duplicated rather than imported because this package
-    may not import ``mu_local`` (module docstring). ``SurfaceFacade`` NEVER fabricates an
-    empty/degraded synthesis (spec §7, T7), matching mu-local's discipline exactly. TO RECONCILE:
-    build-queue §13 item 3 (or a dedicated follow-up) should fold these two classes into one home
-    once mu-contracts is confirmed as the right place for it (mirrors ``BackendUnavailableError``,
-    which mu-local already re-exports from mu-contracts rather than redefining, ``mu-local/
-    errors.py:12``) — flagged here, not fixed, since this task owns only ``mu_engine/surface/``.
-    """
 
 
 class LocalContainerLike(Protocol):
