@@ -39,8 +39,9 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
+from mu_contracts.contracts.recall import RecallResult
 from mu_engine.storage.domain.memory import MemoryTier
-from mu_local import LlmNotConfiguredError, LocalMemory, MemoryListView
+from mu_local import LlmNotConfiguredError, LocalMemory
 from mu_local.config import ModelProfileSettings, StorageSettings
 
 _USER = "u1"
@@ -147,8 +148,10 @@ async def _teardown(settings: Settings, uid: str) -> None:
         await redis.aclose()
 
 
-async def _eventually(read: Callable[[], Awaitable[MemoryListView]]) -> MemoryListView:
-    """Poll a recall until it returns hits (qdrant/falkordb apply writes asynchronously)."""
+async def _eventually(read: Callable[[], Awaitable[RecallResult]]) -> RecallResult:
+    """Poll a recall until it returns hits (qdrant/falkordb apply writes asynchronously).
+    ``RecallResult`` (not the retired ``mu_local.views.MemoryListView``) is what ``recall()``
+    actually returns (Decision B)."""
     last = await read()
     for _ in range(40):  # ~8s ceiling
         if last.items:

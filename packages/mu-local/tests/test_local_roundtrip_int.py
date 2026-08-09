@@ -37,7 +37,7 @@ from mu_engine.config import get_engine_settings
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_engine.storage.domain.namespace import Visibility
 from mu_engine.surface.facade import SurfaceVerbNotImplementedError
-from mu_local import LlmNotConfiguredError, LocalMemory, MemoryListView
+from mu_local import LlmNotConfiguredError, LocalMemory
 from mu_local.config import BackendChoice, StorageSettings
 from mu_local.errors import BackendUnavailableError
 
@@ -89,9 +89,11 @@ async def _teardown(settings: Settings, uid: str) -> None:
         await redis.aclose()
 
 
-async def _eventually(read: Callable[[], Awaitable[MemoryListView]]) -> MemoryListView:
+async def _eventually(read: Callable[[], Awaitable[RecallResult]]) -> RecallResult:
     """Poll a recall until it returns hits (qdrant applies upserts asynchronously — the store's
-    real eventual-consistency model, NOT a masked bug; bounded so a genuine empty still fails)."""
+    real eventual-consistency model, NOT a masked bug; bounded so a genuine empty still fails).
+    ``RecallResult`` (not the retired ``mu_local.views.MemoryListView``) is what ``recall()``
+    actually returns (Decision B)."""
     last = await read()
     for _ in range(40):  # ~8s ceiling
         if last.items:
