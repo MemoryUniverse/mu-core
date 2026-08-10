@@ -292,15 +292,30 @@ class PromotionService:
         return self._ingest_settings.stm_ttl_s - _age_hours(item, now) * 3600.0
 
     # ---- path (ii) — session-boundary consolidation --------------------------------------------
-    async def promote_session(self, ns: Namespace, session_id: str) -> PromotionReport:
+    async def promote_session(
+        self, ns: Namespace, session_id: str, *, force: bool = False
+    ) -> PromotionReport:
         """The daemon-callable entry point on ``Stop``/``SessionEnd``/``PreCompact``/the idle
         timer (spec §7b point 2; CANONICAL §5.2 — PreCompact has ONE owner, the daemon's
-        ``PreCompactPromoter``; THIS method is only the trigger INTERFACE it calls into, the hook
-        WIRING itself is S1-07's job). Sweeps *this session's* STM buffer, recomputes salience
-        with the full session window (no ``promote_min_age_h`` gate here — an explicit boundary
-        trigger, not the periodic backstop), promotes survivors STM->MTM, then hands every
-        survivor straight to DISTILL for MTM->LTM (spec: "promote survivors STM->MTM and distill
-        MTM->LTM" — no additional age gate on this path).
+        ``PreCompactPromoter``, which now calls THROUGH this method with ``force=True``). Sweeps
+        *this session's* STM buffer, recomputes salience with the full session window (no
+        ``promote_min_age_h`` gate here — an explicit boundary trigger, not the periodic backstop),
+        promotes survivors STM->MTM, then hands every survivor straight to DISTILL for MTM->LTM
+        (spec: "promote survivors STM->MTM and distill MTM->LTM" — no additional age gate on this
+        path).
+
+        ``force`` (the PreCompact promote-before-delete path, AGENT-INTEGRATION-AUDIT-AND-PLAN.md
+        §4 Phase 3): when ``True``, the STM->MTM salience gate (``promote_stm_mtm``) is BYPASSED —
+        EVERY item in this session's STM window is promoted regardless of routine salience, because
+        the host is about to compact/delete these turns and the whole point is to SAVE the at-risk
+        context before it is dropped, not to re-litigate whether each turn was individually salient
+        enough for the periodic backstop. The salience ``score`` is still computed and recorded on
+        each ``PromotionOutcome`` (honest provenance — the reader sees WHAT would have been gated
+        out), only the GATE DECISION is overridden. ``force`` reuses the SAME
+        ``_promote_to_mtm``/``_distill.distill`` machinery every other path uses — it is not a
+        second, parallel promoter (DEV-STANDARDS rule 6, DRY). ``force=False`` (every pre-existing
+        caller: the periodic backstop / ``Stop`` / idle timer via ``sweep_namespace_now``) is
+        byte-for-byte the prior gated behaviour.
         """
         if ns.session != session_id:
             raise ValueError(
@@ -316,8 +331,9 @@ class PromotionService:
             scored.item
             for scored in await self._stm.recent(ns, limit=self._settings.max_items_per_user_sweep)
         ]
+        reason = "precompact_promote_before_delete" if force else "session_boundary"
         stm_report, promoted_items = await self._stm_gate(
-            _SESSION_OP, ns, window, reason="session_boundary"
+            _SESSION_OP, ns, window, reason=reason, force=force
         )
         if not promoted_items:
             return stm_report
@@ -333,13 +349,16 @@ class PromotionService:
         window: Sequence[MemoryItem],
         *,
         reason: str,
+        force: bool = False,
     ) -> tuple[PromotionReport, list[MemoryItem]]:
         started = time.perf_counter()
         outcomes: list[PromotionOutcome] = []
         promoted_items: list[MemoryItem] = []
         with self._tracer.span(op, attributes={"ns": ns.to_prefix()}):
             try:
-                outcomes, promoted_items = await self._apply_stm_gate(ns, window, reason=reason)
+                outcomes, promoted_items = await self._apply_stm_gate(
+                    ns, window, reason=reason, force=force
+                )
             except asyncio.CancelledError:
                 raise
             except BaseException:
@@ -360,14 +379,17 @@ class PromotionService:
         return PromotionReport(outcomes=tuple(outcomes)), promoted_items
 
     async def _apply_stm_gate(
-        self, ns: Namespace, window: Sequence[MemoryItem], *, reason: str
+        self, ns: Namespace, window: Sequence[MemoryItem], *, reason: str, force: bool = False
     ) -> tuple[list[PromotionOutcome], list[MemoryItem]]:
         now = self._clock.now()
         outcomes: list[PromotionOutcome] = []
         promoted_items: list[MemoryItem] = []
         for item in window:
             score = self._salience.score(item, clock=self._clock)
-            if score >= self._settings.promote_stm_mtm:
+            # ``force`` (PreCompact promote-before-delete): promote EVERY at-risk turn regardless
+            # of routine salience — the host is about to drop these. ``score`` is still computed
+            # and recorded below (honest provenance), only the gate DECISION is overridden.
+            if force or score >= self._settings.promote_stm_mtm:
                 promoted = await self._promote_to_mtm(ns, item, reason=reason, now=now)
                 promoted_items.append(promoted)
                 outcomes.append(

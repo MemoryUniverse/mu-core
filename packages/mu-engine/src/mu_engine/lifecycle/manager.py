@@ -593,6 +593,31 @@ class MemoryLifecycleManager:
         if self._retention is not None:
             await self._retention.sweep(ns, clock=self._clock)
 
+    async def promote_session_now(
+        self, ns: Namespace, *, force: bool = False
+    ) -> None:
+        """PreCompact promote-before-delete entry point (additive public method,
+        AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase 3 — the deferred ``PreCompactPromoter`` owner
+        this manager now exposes for the daemon's hook wiring, ``mu_client.lifecycle.precompact``).
+
+        An INTERNAL, engine-driven trigger — NOT a manual verb, so it is deliberately NOT
+        mode-gated (MANAGED means exactly "the engine drives lifecycle automatically"; a PreCompact
+        control event from the host is such an automatic trigger, the same class as the
+        event-driven fast-fire / periodic backstop, never a caller self-authorizing a manual op).
+
+        Registers the namespace in the active-user registry (so a subsequent periodic backstop /
+        ``get_state`` sees it) and drives ``PromotionService.promote_session(force=force)``: with
+        ``force=True`` the session's at-risk STM turns are promoted STM->MTM and distilled MTM->LTM
+        REGARDLESS of routine salience — before the host compacts/deletes them. Reuses the SAME
+        promotion/consolidation machinery ``sweep_namespace_now`` uses; the promotion service
+        publishes its own ``MemoryPromoted`` events. Feeds this manager's ``explain()`` audit
+        trail from the outcome DTOs, exactly like the sweep path."""
+        self.note_active_namespace(ns)
+        promo_report = await self._promotion.promote_session(ns, ns.session, force=force)
+        for outcome in promo_report.outcomes:
+            if outcome.kind is PromotionOutcomeKind.STM_TO_MTM:
+                self._record_explain(ns, outcome.memory_id, TransitionKind.PROMOTE, outcome.score)
+
     # ================================================================================ internals ===
     async def _run_under_lease(
         self, prefix: UserPrefix, body: Callable[[], Awaitable[None]]
