@@ -6,6 +6,14 @@ storage-schema-rowmapper-spec.md §1. Every public model is re-exported here wit
 ``__all__`` (mypy ``no_implicit_reexport``).
 """
 
+from mu_contracts.domain.model.agent import (
+    AgentFramework,
+    AgentIdentity,
+    mint_agent_principal_id,
+    resolve_subagent_identity,
+    subagent_partition_session,
+    subagent_write_namespace,
+)
 from mu_contracts.domain.model.artifact import (
     ArtifactKind,
     ContextArtifact,
@@ -110,6 +118,8 @@ from mu_contracts.domain.model.usage import Usage
 __all__ = [
     "AclEntry",
     "AgentBinding",
+    "AgentFramework",
+    "AgentIdentity",
     "AgentKind",
     "ArtifactKind",
     "CallerIdentitySet",
@@ -195,4 +205,8 @@ __all__ = [
     "Vector",
     "Visibility",
     "WorkspaceMembership",
+    "mint_agent_principal_id",
+    "resolve_subagent_identity",
+    "subagent_partition_session",
+    "subagent_write_namespace",
 ]

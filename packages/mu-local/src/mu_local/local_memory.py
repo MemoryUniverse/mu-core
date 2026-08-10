@@ -75,8 +75,13 @@ from mu_contracts.contracts.defaults import (
 from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallResult
 from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
+from mu_contracts.domain.model.agent import (
+    AgentIdentity,
+    resolve_subagent_identity,
+    subagent_write_namespace,
+)
 from mu_contracts.domain.model.memory import Tier
-from mu_contracts.domain.model.scope import ClientScope
+from mu_contracts.domain.model.scope import AgentKind, ClientScope
 from mu_contracts.ports.bus import EventBusPort
 from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
 from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
@@ -168,6 +173,17 @@ class LocalMemory:
         # ``DeterministicPromoteStage``'s ``importance >= IngestSettings.importance_promote`` check
         # (``mu-engine/pipelines/concrete/ingest.py:230``) — never hardcoded to force a promote.
         importance_score: float | None = None,
+        # Phase 1.5 subagent partition (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §6; agent.py). When a
+        # capture is attributed to a Claude Code SUBAGENT, ``agent_type`` is its name (Task tool
+        # ``subagent_type``). Threading it here resolves a STABLE, deterministic
+        # ``agent_principal_id`` (:func:`resolve_subagent_identity`) and writes the memory into an
+        # AGENT-SCOPED SESSION under the SAME ``η.user`` (the owner) — a DISTINCT ``to_prefix()``
+        # partition the owner's federate-live recall still surfaces, cross-user still isolated
+        # (agent.py federation choice). ``None`` (every human/top-level caller) ⇒ the pre-existing
+        # single-partition behaviour, byte-for-byte. Mutually exclusive with ``agent`` (a
+        # pre-resolved identity); pass at most one.
+        agent_type: str | None = None,
+        agent: AgentIdentity | None = None,
         # SHARED-plane fields of the canonical superset signature (design §2.5) — accepted so the
         # signature matches the unified surface, always REJECTED (never silently dropped) because
         # LocalMemory is private-plane-only by construction (module docstring, plane_gate.py's own
@@ -206,7 +222,7 @@ class LocalMemory:
             private_configured=True,
             shared_configured=False,
         )
-        ns = self._ns(user, session)
+        ns = self._subagent_ns(user, session, agent_type=agent_type, agent=agent)
         # ``None`` means "caller expressed no opinion" -> falls to IngestActivity's own field
         # default (module constant above), never a second hardcoded literal duplicating it here.
         importance = importance_score if importance_score is not None else _DEFAULT_IMPORTANCE
@@ -467,6 +483,42 @@ class LocalMemory:
             session=session or _DEFAULT_SESSION,
             visibility=Visibility.PRIVATE,
         )
+
+    def _subagent_ns(
+        self,
+        user: str,
+        session: str | None,
+        *,
+        agent_type: str | None,
+        agent: AgentIdentity | None,
+    ) -> Namespace:
+        """The write η — Phase 1.5 (agent.py). No subagent attribution ⇒ the plain per-caller
+        partition (:meth:`_ns`), unchanged for every human/top-level write. A SUBAGENT attribution
+        (``agent_type`` to resolve here, or a pre-resolved ``agent``) builds a real
+        ``ClientScope`` with ``agent_kind=AgentKind.SUBAGENT`` — the identity model's first live
+        call site — and routes it through :func:`subagent_write_namespace`, which keeps ``η.user``
+        the owner (federation + isolation) and derives an AGENT-SCOPED SESSION (the distinct
+        partition)."""
+        if agent_type is None and agent is None:
+            return self._ns(user, session)
+        if agent_type is not None and agent is not None:
+            raise ValueError("pass at most one of agent_type / agent")
+        identity = agent or resolve_subagent_identity(
+            workspace_id=self._workspace,
+            owner_principal_id=user,
+            parent_session_id=session or _DEFAULT_SESSION,
+            agent_type=agent_type or "",
+        )
+        scope = ClientScope(
+            principal_id=user,  # the OWNER — η.user stays the owner (federation + isolation)
+            org_id=self._org,
+            workspace_id=self._workspace,
+            session_id=session or _DEFAULT_SESSION,
+            agent_principal_id=identity.agent_principal_id,
+            agent_kind=AgentKind.SUBAGENT,
+            agent_path=identity.agent_path,
+        )
+        return subagent_write_namespace(scope)
 
     def _scope(self, user: str, session: str | None) -> ClientScope:
         return ClientScope(
