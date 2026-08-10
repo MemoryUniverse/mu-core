@@ -134,6 +134,28 @@ class MtmTierRepository(Protocol):
 
     async def upsert(self, item: MemoryItem) -> None: ...
 
+    async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
+        """Point-get ONE MTM point by id from ``ns``'s partition (``None`` if absent) — the vector-
+        tier twin of :meth:`StmTierRepository.get`, added for the TARGETED single-memory lifecycle
+        verbs (``promote`` MTM->LTM / ``demote`` MTM->STM / ``update`` / ``delete``) which must
+        LOCATE a memory in its current tier before acting on it (the sweep-oriented
+        ``PromotionService``/``DemotionService`` take a caller-supplied window and never resolve a
+        bare id). A real store read (``AsyncQdrantClient.retrieve`` on ``QdrantMtmAdapter``), NOT a
+        semantic search (no query vector) and NOT filtered by ``state`` — a superseded/expired point
+        is still returned so ``delete``/``update`` can act on it idempotently."""
+        ...
+
+    async def expire(self, ns: Namespace, memory_id: str, *, at: Any) -> None:
+        """Soft-delete ONE MTM point (``delete`` verb, invalidate-don't-delete): flip its payload
+        ``state`` to ``expired`` + stamp ``invalid_at=at`` so the mandatory ``state='active'``
+        recall filter drops it from active recall, while the point itself STAYS (bi-temporal
+        history — never a hard point deletion). Distinct from :meth:`invalidate` (which models a
+        loser SUPERSEDED by a *winner*: ``state=superseded`` + ``superseded_by=<winner-id>``) — a
+        plain user delete has no winner, so it must not fabricate a supersession edge. Distinct from
+        :meth:`remove` (a genuine point deletion, for the demotion tier-down move). A payload-only
+        PATCH (``set_payload``), the SAME primitive ``invalidate`` uses — vector untouched."""
+        ...
+
     async def semantic(
         self,
         ns: Namespace,
@@ -177,6 +199,27 @@ class GraphStorePort(Protocol):
     """Graph / LTM tier — bi-temporal KG (``storage-pluggable §2.2``; graph MANDATORY)."""
 
     async def upsert_fact(self, item: MemoryItem) -> None: ...
+
+    async def get_fact(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
+        """Point-get ONE ``:Memory`` LTM node by id from ``ns``'s graph partition (``None`` if
+        absent) — the graph-tier twin of :meth:`StmTierRepository.get`/:meth:`MtmTierRepository.
+        get`, added for the TARGETED lifecycle verbs (``update``/``delete``) which must LOCATE a
+        fact before superseding/expiring it. A real ``MATCH (m:Memory {namespace, id})`` returning
+        ``m.memory_json`` (``FalkorLtmAdapter``), NOT filtered by ``state``/validity — a superseded/
+        expired fact is still returned so the verb can act on it idempotently. This is the by-ID
+        point-read the bi-temporal read models (``facts_at``/``graph_recall``) never exposed."""
+        ...
+
+    async def expire(self, ns: Namespace, memory_id: str, *, at: Any) -> None:
+        """Soft-delete ONE ``:Memory`` LTM node (``delete`` verb, invalidate-don't-delete): stamp
+        ``state='expired'`` + ``invalid_at=at`` so every mandatory read filter
+        (``state='active' AND (invalid_at='' OR invalid_at>now)``) drops it from active recall,
+        while the node + its edges STAY on the graph (bi-temporal history) — NEVER the hard
+        ``DETACH DELETE`` :meth:`gc_delete` performs (that is the retention sweep's GC of an
+        ALREADY-dead, window-elapsed, chain-head-dead fact). Distinct from :meth:`invalidate`
+        (loser SUPERSEDED_BY a winner) — a plain delete has no winner. Also closes the fact's own
+        entity-entity edge (bi-temporal parity), exactly as :meth:`invalidate` does."""
+        ...
 
     async def graph_recall(
         self,

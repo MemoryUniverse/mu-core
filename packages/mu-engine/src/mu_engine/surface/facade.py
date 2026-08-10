@@ -48,11 +48,23 @@ shape (``mu_local.views.ContextView``) was blocked on Decision B. Now that ``Con
 ``mu_local.local_memory._render_context``'s one-bullet-per-hit assembly (``mu-local/
 local_memory.py:503-509``) since that helper is private to a package this module cannot import.
 
-``promote``/``demote``/``share`` (build-queue §13 items 5/3) still have no engine-side verb to
-delegate to — they still raise :class:`SurfaceVerbNotImplementedError`, imported from its
-canonical home ``mu_contracts.domain.errors`` (CO-3), which Stage C's HTTP layer maps to HTTP 501.
-This is a deliberate, NAMED gap (DEV-STANDARDS: never a silent no-op / fake success), not an
-oversight.
+``promote``/``demote``/``update``/``delete`` are now REAL (build-queue §13 item 5 — the honest
+501s are retired): each is a THIN targeted verb over the already-real lifecycle + bi-temporal
+machinery, never a second copy of it. ``promote`` reuses ``PromotionService``'s own copy-on-write
+STM->MTM shape / ``DistillPipeline.distill`` MTM->LTM leg; ``demote`` reuses
+``DemotionService._demote_one``'s write-ahead-then-remove sequence; ``update`` = SUPERSEDE via
+``MtmTierRepository``/``GraphStorePort.invalidate`` (the same invalidate the conflict path uses);
+``delete`` = invalidate-don't-delete via the new ``expire`` soft-delete primitive (state=expired +
+invalid_at, kept in bi-temporal history — never a hard ``DETACH DELETE`` of active data). They
+LOCATE the target item via the new point-get primitives ``StmTierRepository.get`` (pre-existing) /
+``MtmTierRepository.get`` / ``GraphStorePort.get_fact``, and guard a nonexistent id with
+:class:`MemoryNotFoundError` (HTTP 404) and an invalid ``to_tier`` with ``ValueError`` (HTTP 400)
+— honest errors, never a silent no-op / fake success.
+
+``share`` (build-queue §13 item 3) still has no engine-side verb to delegate to — it still raises
+:class:`SurfaceVerbNotImplementedError`, imported from its canonical home
+``mu_contracts.domain.errors`` (CO-3), which Stage C's HTTP layer maps to HTTP 501. This is a
+deliberate, NAMED gap (DEV-STANDARDS: never a silent no-op / fake success), not an oversight.
 """
 
 from __future__ import annotations
@@ -64,13 +76,31 @@ from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallChannels as CanonicalRecallChannels
 from mu_contracts.contracts.recall import RecallItemView as CanonicalRecallItemView
 from mu_contracts.contracts.recall import RecallResult as CanonicalRecallResult
-from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
-from mu_contracts.domain.errors import LlmNotConfiguredError, SurfaceVerbNotImplementedError
+from mu_contracts.contracts.views import (
+    ConsolidateView,
+    ContextView,
+    MemoryVerbResult,
+    MemoryWriteResult,
+)
+from mu_contracts.domain.errors import (
+    LlmNotConfiguredError,
+    MemoryNotFoundError,
+    SurfaceVerbNotImplementedError,
+)
+from mu_contracts.domain.events import MemoryDemoted, MemoryPromoted
+from mu_contracts.domain.model.memory import State as CanonicalState
 from mu_contracts.domain.model.memory import Tier as CanonicalTier
 from mu_contracts.domain.model.scope import ClientScope
+from mu_contracts.ports.time import Clock
 from mu_engine.lifecycle.mode_gate import ManagerModeGate
 from mu_engine.pipelines.concrete.ingest import IngestActivity
-from mu_engine.pipelines.distill import DistillActionKind, DistillPipeline, DistillReport
+from mu_engine.pipelines.distill import (
+    DistillActionKind,
+    DistillPipeline,
+    DistillReport,
+    EventPublisher,
+)
+from mu_engine.platform.clock import SystemClock
 from mu_engine.providers._contracts import Message, MessageRole
 from mu_engine.providers.catalog import Task
 from mu_engine.providers.model_router import ModelRouter
@@ -79,13 +109,14 @@ from mu_engine.services.recall.dto import RecallChannels as _EngineRecallChannel
 from mu_engine.services.recall.dto import RecallQuery
 from mu_engine.services.recall.dto import RecallResult as _EngineRecallResult
 from mu_engine.services.recall.service import RecallService
-from mu_engine.storage.domain.memory import MemoryItem, MemoryTier
+from mu_engine.storage.domain.memory import MemoryItem, MemoryState, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
-from mu_engine.storage.ports import StmTierRepository
+from mu_engine.storage.ports import GraphStorePort, MtmTierRepository, StmTierRepository
 
 __all__ = [
     "LlmNotConfiguredError",
     "LocalContainerLike",
+    "MemoryNotFoundError",
     "SurfaceFacade",
     "SurfaceVerbNotImplementedError",
 ]
@@ -120,9 +151,29 @@ class LocalContainerLike(Protocol):
     ingest: IngestService
     distill: DistillPipeline
     stm: StmTierRepository
+    # ``mtm``/``ltm`` are needed by the TARGETED lifecycle verbs (``promote`` MTM->LTM / ``demote``
+    # MTM->STM / ``update`` / ``delete``) to LOCATE a memory in its current tier and run the REAL
+    # tier op on that one item — the sweep-oriented ``PromotionService``/``DemotionService`` take a
+    # caller-supplied window and never resolve a bare id. Already exactly these types on the real
+    # ``LocalContainer`` (``mu-local/composition.py``: ``self.mtm = STORE_REGISTRY.build("vector",
+    # ...)`` typed ``MtmTierRepository``, ``self.ltm = STORE_REGISTRY.build("graph", ...)`` typed
+    # ``GraphStorePort``) — ZERO adapter code.
+    mtm: MtmTierRepository
+    ltm: GraphStorePort
     recall: RecallService
     mode_gate: ManagerModeGate
     llm: ModelRouter | None
+
+    # The SAME real ``InprocBus`` ``ingest``/``distill`` publish onto (``LocalContainer.bus`` /
+    # ``EngineContainer.bus`` — a read-only PROPERTY returning ``EventBusPort``, structurally an
+    # ``EventPublisher``). Declared here as a read-only ``@property`` (not a settable attribute) so
+    # a container exposing ``bus`` as a property satisfies this Protocol (a plain attribute
+    # declaration would demand a settable, invariantly-typed field the property cannot match). The
+    # targeted promote/demote verbs publish ``MemoryPromoted``/``MemoryDemoted`` onto it exactly as
+    # ``PromotionService``/``DemotionService`` do for the automatic paths. ``None`` (heuristic/
+    # unwired) simply skips emission — never a hard failure.
+    @property
+    def bus(self) -> EventPublisher | None: ...
 
 
 class SurfaceFacade:
@@ -141,10 +192,16 @@ class SurfaceFacade:
         *,
         workspace: str = "local",
         namespace: str = "default",
+        clock: Clock | None = None,
     ) -> None:
         self._container = container
         self._workspace = workspace
         self._org = namespace
+        # UTC clock for the ``at=`` bi-temporal stamps ``update``/``delete`` write (supersede /
+        # soft-delete ``invalid_at``). Defaults to the SAME ``SystemClock`` the composition root
+        # threads into every service (``mu-local/composition.py``) — never a bare ``datetime.now``
+        # call at a verb site (MAJOR-3: bi-temporal stamps must be UTC-correct).
+        self._clock: Clock = clock or SystemClock()
 
     # ------------------------------------------------------------------------------------- write
     async def add(
@@ -326,28 +383,245 @@ class SurfaceFacade:
         self,
         memory_id: str,
         *,
+        to_tier: str,
         user: str = _DEFAULT_USER,
         session: str | None = None,
-    ) -> NoReturn:
-        """Neither ``LocalMemory`` nor ``MemoryClient`` implements ``promote`` today (design §9
-        table, build-queue §13 item 5) — a named, honest 501, never a silent no-op."""
-        del memory_id, user, session
-        raise SurfaceVerbNotImplementedError(
-            "promote", reason="no engine verb yet (build-queue §13 item 5) — maps to HTTP 501"
+    ) -> MemoryVerbResult:
+        """TARGETED single-memory promotion — run the REAL promotion path on ONE resident item,
+        moving it up one tier (``to_tier="mtm"``: STM->MTM, or ``to_tier="ltm"``: MTM->LTM). No new
+        memory logic: this LOCATES the item in its source tier and reuses the exact ops the
+        automatic :class:`~mu_engine.lifecycle.promotion.PromotionService` uses — never a second
+        copy of promotion logic (DEV-STANDARDS rule 6).
+
+        * **STM->MTM** (``to_tier="mtm"``): ``stm.get`` -> copy-on-write to MTM -> ``mtm.upsert`` —
+          byte-for-byte the shape ``PromotionService._promote_to_mtm`` (``promotion.py:414-432``) /
+          ``DeterministicPromoteStage`` (``ingest.py:227-259``) use: ``item.model_copy(deep=True)``
+          with ``tier=MTM``, ``state=ACTIVE``, refreshed ``updated_at``, then ``mtm.upsert``. The
+          STM copy is left in place (its Redis TTL is its own eviction), exactly as those paths do.
+        * **MTM->LTM** (``to_tier="ltm"``): ``mtm.get`` -> hand the ONE item to
+          ``DistillPipeline.distill`` (the SAME real MTM->LTM leg
+          ``PromotionService.sweep_mtm_to_ltm``
+          delegates to, ``promotion.py:227-263``) — DISTILL extracts + writes the LTM fact(s) and
+          emits its own ``MemoryPromoted(frm=MTM,to=LTM)``, so this method does not double-emit for
+          that leg.
+
+        A nonexistent id (absent from the source tier) raises :class:`MemoryNotFoundError` (HTTP
+        404); an invalid ``to_tier`` raises ``ValueError`` (HTTP 400) — honest errors, never a
+        silent no-op (the deliberate 501 this method used to be is now a REAL op, build-queue §13
+        item 5)."""
+        ns = self._ns(user, session)
+        target = _parse_tier(to_tier)
+        if target is MemoryTier.MTM:
+            item = await self._container.stm.get(ns, memory_id)
+            if item is None:
+                raise MemoryNotFoundError(memory_id, reason="not resident in STM (source tier)")
+            now = self._clock.now()
+            promoted = item.model_copy(deep=True)
+            promoted.tier = MemoryTier.MTM
+            promoted.state = MemoryState.ACTIVE
+            promoted.updated_at = now
+            await self._container.mtm.upsert(promoted)
+            events = await self._publish(
+                MemoryPromoted(
+                    namespace=ns,
+                    id=memory_id,
+                    frm=CanonicalTier.STM,
+                    to=CanonicalTier.MTM,
+                    reason="targeted_promote",
+                )
+            )
+            return MemoryVerbResult(
+                memory_id=memory_id,
+                verb="promote",
+                from_tier=MemoryTier.STM.value,
+                to_tier=MemoryTier.MTM.value,
+                tiers_affected=(MemoryTier.MTM.value,),
+                events_emitted=events,
+            )
+        if target is MemoryTier.LTM:
+            item = await self._container.mtm.get(ns, memory_id)
+            if item is None:
+                raise MemoryNotFoundError(memory_id, reason="not resident in MTM (source tier)")
+            # Real MTM->LTM promote = hand this ONE item to DISTILL (the exact leg
+            # PromotionService.sweep_mtm_to_ltm delegates to). DISTILL emits its own MemoryPromoted.
+            await self._container.distill.distill(ns, [item])
+            return MemoryVerbResult(
+                memory_id=memory_id,
+                verb="promote",
+                from_tier=MemoryTier.MTM.value,
+                to_tier=MemoryTier.LTM.value,
+                tiers_affected=(MemoryTier.LTM.value,),
+            )
+        raise ValueError(
+            f"promote: invalid to_tier {to_tier!r} — promotion moves STM->MTM (to_tier='mtm') or "
+            "MTM->LTM (to_tier='ltm'); 'stm' is not a promotion target (use demote for MTM->STM)"
         )
 
     async def demote(
         self,
         memory_id: str,
         *,
+        to_tier: str = "stm",
         user: str = _DEFAULT_USER,
         session: str | None = None,
-    ) -> NoReturn:
-        """Neither surface implements ``demote`` today (design §9 table, build-queue §13 item 5)."""
-        del memory_id, user, session
-        raise SurfaceVerbNotImplementedError(
-            "demote", reason="no engine verb yet (build-queue §13 item 5) — maps to HTTP 501"
+    ) -> MemoryVerbResult:
+        """TARGETED single-memory demotion — run the REAL MTM->STM forgetting-curve tier-down on ONE
+        resident MTM item (``to_tier="stm"``). Reuses the exact write-ahead-then-commit-delete
+        sequencing ``DemotionService._demote_one`` uses (``demotion.py:233-276``, "dup > loss"):
+        ``mtm.get`` the item -> write the STM-tier copy FIRST (``stm.put``, id-stable,
+        ``created_at`` preserved) -> THEN remove the MTM point (``mtm.remove``). Unlike the
+        automatic ``DemotionService`` this is user-forced, so it does NOT re-gate on
+        ``SalienceStrategy`` (the caller asked to demote THIS item); the store sequence is same.
+
+        A nonexistent id (absent from MTM) raises :class:`MemoryNotFoundError` (404); an invalid
+        ``to_tier`` raises ``ValueError`` (400)."""
+        ns = self._ns(user, session)
+        target = _parse_tier(to_tier)
+        if target is not MemoryTier.STM:
+            raise ValueError(
+                f"demote: invalid to_tier {to_tier!r} — demotion moves MTM->STM (to_tier='stm') "
+                "only; use promote for upward tier moves"
+            )
+        item = await self._container.mtm.get(ns, memory_id)
+        if item is None:
+            raise MemoryNotFoundError(memory_id, reason="not resident in MTM (source tier)")
+        now = self._clock.now()
+        stm_copy = item.model_copy(deep=True)
+        stm_copy.tier = MemoryTier.STM
+        stm_copy.state = MemoryState.ACTIVE
+        stm_copy.updated_at = now
+        # Step 1 — write-ahead: STM gets the copy BEFORE MTM loses its point (dup > loss).
+        await self._container.stm.put(stm_copy)
+        # Step 2 — commit: remove the MTM point (plain deletion — a tier-down move has no "winner").
+        await self._container.mtm.remove(ns, memory_id)
+        events = await self._publish(
+            MemoryDemoted(
+                namespace=ns,
+                id=memory_id,
+                tier=CanonicalTier.MTM,
+                to_tier=CanonicalTier.STM,
+                to_state=CanonicalState.ACTIVE,  # a real tier-down move, NOT archival (AC-1.3)
+                retention=0.0,  # user-forced, not salience-gated — no S(m) computed here
+            )
         )
+        return MemoryVerbResult(
+            memory_id=memory_id,
+            verb="demote",
+            from_tier=MemoryTier.MTM.value,
+            to_tier=MemoryTier.STM.value,
+            tiers_affected=(MemoryTier.STM.value, MemoryTier.MTM.value),
+            events_emitted=events,
+        )
+
+    async def update(
+        self,
+        memory_id: str,
+        new_content: str,
+        *,
+        user: str = _DEFAULT_USER,
+        session: str | None = None,
+    ) -> MemoryVerbResult:
+        """TARGETED update = SUPERSEDE (invalidate-don't-delete): create the NEW version and mark
+        the OLD one superseded by it, over the SAME bi-temporal supersession machinery an automatic
+        conflict-driven update uses (``DistillPipeline._resolve`` -> ``mtm``/``ltm.invalidate``).
+        No new memory logic:
+
+        1. LOCATE the old memory across the tiers it lives in (``stm.get`` / ``mtm.get`` /
+           ``ltm.get_fact``) — a nonexistent id raises :class:`MemoryNotFoundError` (404).
+        2. INGEST ``new_content`` via the REAL :meth:`add` path -> a fresh ``memory_id`` (STM
+           durable, importance-gated STM->MTM), the NEW version.
+        3. SUPERSEDE the old: ``mtm.invalidate`` / ``ltm.invalidate`` (``loser=old``,
+           ``winner=new``, ``at=now``, ``reason="update"``) stamp the old ``state=superseded`` +
+           ``invalid_at`` + a ``SUPERSEDED_BY``/``superseded_by`` link to the new id — the SAME
+           invalidate the conflict path uses. The old STM copy (ephemeral, no bi-temporal
+           substrate) is evicted so active recall returns the NEW version.
+
+        Returns the NEW memory (``memory_id`` = the new id, ``superseded_id`` = the old id) —
+        "return the new memory"."""
+        ns = self._ns(user, session)
+        now = self._clock.now()
+        old_stm = await self._container.stm.get(ns, memory_id)
+        old_mtm = await self._container.mtm.get(ns, memory_id)
+        old_ltm = await self._container.ltm.get_fact(ns, memory_id)
+        if old_stm is None and old_mtm is None and old_ltm is None:
+            raise MemoryNotFoundError(memory_id)
+        new_receipt = await self.add(new_content, user=user, session=session)
+        new_id = new_receipt.memory_id
+        affected: list[str] = []
+        if old_mtm is not None:
+            await self._container.mtm.invalidate(
+                ns, memory_id, new_id, at=now, reason="update"
+            )
+            affected.append(MemoryTier.MTM.value)
+        if old_ltm is not None:
+            await self._container.ltm.invalidate(
+                ns, memory_id, new_id, at=now, reason="update"
+            )
+            affected.append(MemoryTier.LTM.value)
+        if old_stm is not None:
+            await self._container.stm.evict(ns, memory_id)
+            affected.append(MemoryTier.STM.value)
+        return MemoryVerbResult(
+            memory_id=new_id,
+            verb="update",
+            superseded_id=memory_id,
+            tiers_affected=tuple(affected),
+        )
+
+    async def delete(
+        self,
+        memory_id: str,
+        *,
+        user: str = _DEFAULT_USER,
+        session: str | None = None,
+    ) -> MemoryVerbResult:
+        """TARGETED delete = INVALIDATE-DON'T-DELETE (soft delete): stop the memory appearing in
+        active recall while KEEPING it in bi-temporal history — never a hard ``DETACH DELETE`` of
+        active data. LOCATES the memory across the tiers it lives in and, per tier:
+
+        * **MTM/LTM** (bi-temporal substrate): ``mtm.expire`` / ``ltm.expire`` flip ``state`` to
+          ``expired`` + stamp ``invalid_at=now`` — the mandatory ``state='active'`` recall filter
+          drops it, the point/node STAYS (history intact, ``invalid_at`` set), no ``superseded_by``
+          fabricated (a plain delete has no winner). This reuses the SAME invalidate-don't-delete
+          substrate the supersession path uses, minus the winner.
+        * **STM** (ephemeral, TTL — NO bi-temporal substrate): ``stm.evict`` — there is no history
+          layer in STM to preserve (STM's own history is what promotion carries up to MTM/LTM), so
+          the honest "stop appearing in active recall" for an STM-only row is eviction.
+
+        A nonexistent id (absent from every tier) raises :class:`MemoryNotFoundError` (404)."""
+        ns = self._ns(user, session)
+        now = self._clock.now()
+        affected: list[str] = []
+        stm_item = await self._container.stm.get(ns, memory_id)
+        if stm_item is not None:
+            await self._container.stm.evict(ns, memory_id)
+            affected.append(MemoryTier.STM.value)
+        mtm_item = await self._container.mtm.get(ns, memory_id)
+        if mtm_item is not None:
+            await self._container.mtm.expire(ns, memory_id, at=now)
+            affected.append(MemoryTier.MTM.value)
+        ltm_item = await self._container.ltm.get_fact(ns, memory_id)
+        if ltm_item is not None:
+            await self._container.ltm.expire(ns, memory_id, at=now)
+            affected.append(MemoryTier.LTM.value)
+        if not affected:
+            raise MemoryNotFoundError(memory_id)
+        return MemoryVerbResult(
+            memory_id=memory_id,
+            verb="delete",
+            tiers_affected=tuple(affected),
+            invalidated=True,
+        )
+
+    async def _publish(self, event: MemoryPromoted | MemoryDemoted) -> tuple[str, ...]:
+        """Publish ONE lifecycle event onto the container's real bus (the SAME ``InprocBus``
+        ``PromotionService``/``DemotionService`` publish onto) and name it in the verb receipt's
+        ``events_emitted``. A no-op (empty tuple) when no bus is wired (heuristic/embedded) — never
+        a hard failure, mirroring the services' own ``if self._bus is not None`` guard."""
+        if self._container.bus is None:
+            return ()
+        await self._container.bus.publish(event)
+        return (type(event).__name__,)
 
     async def share(
         self,
@@ -392,6 +666,23 @@ class SurfaceFacade:
 
 
 # ------------------------------------------------------------------------------------ pure helpers
+_TIER_BY_NAME: dict[str, MemoryTier] = {tier.value: tier for tier in MemoryTier}
+
+
+def _parse_tier(to_tier: str) -> MemoryTier:
+    """Map a wire ``to_tier`` string (``"stm"``/``"mtm"``/``"ltm"``) to :class:`MemoryTier`,
+    failing LOUD on an unknown value (``ValueError`` -> HTTP 400) — never a silent default or
+    no-op. Mirrors ``mu_client.mcp.tools.resolve_tier``'s allowlist discipline; a ``MemoryTier``
+    passed straight through (defensive) is accepted too."""
+    key = to_tier.value if isinstance(to_tier, MemoryTier) else str(to_tier).strip().lower()
+    try:
+        return _TIER_BY_NAME[key]
+    except KeyError:
+        raise ValueError(
+            f"unknown to_tier {to_tier!r}; expected one of {sorted(_TIER_BY_NAME)}"
+        ) from None
+
+
 def _normalize_messages(
     content: str | dict[str, Any] | list[dict[str, Any]],
 ) -> list[dict[str, Any]]:

@@ -47,7 +47,13 @@ from mu_contracts.config import Settings
 from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallItemView as CanonicalRecallItemView
 from mu_contracts.contracts.recall import RecallResult as CanonicalRecallResult
-from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
+from mu_contracts.contracts.views import (
+    ConsolidateView,
+    ContextView,
+    MemoryVerbResult,
+    MemoryWriteResult,
+)
+from mu_contracts.domain.errors import MemoryNotFoundError
 from mu_contracts.domain.model.memory import Tier as CanonicalTier
 from mu_engine.lifecycle.mode_gate import ManagerModeGate
 from mu_engine.pipelines.concrete.ingest import IngestActivity
@@ -109,6 +115,20 @@ class _FakeContainer:
         self.stm = MagicMock()
         self.stm.get = AsyncMock(return_value=None)
         self.stm.recent = AsyncMock(return_value=[])
+        self.stm.put = AsyncMock(return_value="mem_fake1")
+        self.stm.evict = AsyncMock(return_value=None)
+        # mtm/ltm (targeted lifecycle verbs) — point-get returns None by default; tests that
+        # exercise a real move override these to return a MemoryItem.
+        self.mtm = MagicMock()
+        self.mtm.get = AsyncMock(return_value=None)
+        self.mtm.upsert = AsyncMock(return_value=None)
+        self.mtm.remove = AsyncMock(return_value=None)
+        self.mtm.invalidate = AsyncMock(return_value=None)
+        self.mtm.expire = AsyncMock(return_value=None)
+        self.ltm = MagicMock()
+        self.ltm.get_fact = AsyncMock(return_value=None)
+        self.ltm.invalidate = AsyncMock(return_value=None)
+        self.ltm.expire = AsyncMock(return_value=None)
         self.recall = MagicMock()
         self.recall.recall = AsyncMock()
         self.distill = MagicMock()
@@ -118,6 +138,7 @@ class _FakeContainer:
         # attribute back in as a real, spec-checked method double.
         self.mode_gate = MagicMock(spec=ManagerModeGate)
         self.llm: Any = None
+        self.bus: Any = None
 
 
 @pytest.mark.unit
@@ -295,25 +316,128 @@ async def test_ask_synthesises_via_the_configured_llm() -> None:
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("verb", ["promote", "demote", "share"])
-async def test_unbuilt_verbs_raise_the_named_error_without_touching_the_container(
-    verb: str,
-) -> None:
+async def test_share_still_raises_the_named_error_without_touching_the_container() -> None:
+    """``share`` (the private->shared crossing verb, build-queue §13 item 3) has no engine verb
+    yet — still an honest named 501, never a silent no-op. ``promote``/``demote``/``update``/
+    ``delete`` are now REAL (item 5) and covered separately below."""
     container = _FakeContainer()
     facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
 
     with pytest.raises(SurfaceVerbNotImplementedError) as exc_info:
-        if verb == "share":
-            await facade.share(
-                "mem_fake1", visibility=Visibility.SHARED, user=_USER, session=_SESSION
-            )
-        else:
-            await getattr(facade, verb)("mem_fake1", user=_USER, session=_SESSION)
-    assert exc_info.value.verb == verb
+        await facade.share("mem_fake1", visibility=Visibility.SHARED, user=_USER, session=_SESSION)
+    assert exc_info.value.verb == "share"
     container.ingest.remember.assert_not_awaited()
-    container.recall.recall.assert_not_awaited()
-    container.stm.get.assert_not_awaited()
-    container.distill.distill.assert_not_awaited()
+
+
+def _stm_item(memory_id: str = "mem_fake1", tier: MemoryTier = MemoryTier.STM) -> MemoryItem:
+    return MemoryItem(
+        id=memory_id,
+        content="Ada lives in Paris",
+        kind=MemoryKind.PROPOSITION,
+        namespace=_fake_ns(),
+        owner_id=_USER,
+        workspace_id=_WORKSPACE,
+        session_id=_SESSION,
+        tier=tier,
+    )
+
+
+@pytest.mark.unit
+async def test_promote_stm_to_mtm_copies_on_write_and_upserts() -> None:
+    """``promote(to_tier="mtm")`` LOCATES the item in STM and upserts a MTM-tier copy — the real
+    ``PromotionService._promote_to_mtm`` shape. Returns a ``MemoryVerbResult`` receipt."""
+    container = _FakeContainer()
+    container.stm.get = AsyncMock(return_value=_stm_item())
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    result = await facade.promote("mem_fake1", to_tier="mtm", user=_USER, session=_SESSION)
+
+    container.mtm.upsert.assert_awaited_once()
+    (promoted,), _ = container.mtm.upsert.await_args
+    assert promoted.tier is MemoryTier.MTM
+    assert isinstance(result, MemoryVerbResult)
+    assert result.verb == "promote"
+    assert result.from_tier == "stm" and result.to_tier == "mtm"
+
+
+@pytest.mark.unit
+async def test_promote_missing_id_raises_not_found() -> None:
+    container = _FakeContainer()  # stm.get returns None
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+    with pytest.raises(MemoryNotFoundError):
+        await facade.promote("nope", to_tier="mtm", user=_USER, session=_SESSION)
+
+
+@pytest.mark.unit
+async def test_promote_invalid_tier_raises_value_error() -> None:
+    container = _FakeContainer()
+    container.stm.get = AsyncMock(return_value=_stm_item())
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="to_tier"):
+        await facade.promote("mem_fake1", to_tier="bogus", user=_USER, session=_SESSION)
+
+
+@pytest.mark.unit
+async def test_demote_writes_stm_ahead_then_removes_mtm() -> None:
+    """``demote(to_tier="stm")`` LOCATES the item in MTM, writes the STM copy FIRST, THEN removes
+    the MTM point — the real ``DemotionService._demote_one`` write-ahead-then-remove sequence."""
+    container = _FakeContainer()
+    container.mtm.get = AsyncMock(return_value=_stm_item(tier=MemoryTier.MTM))
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    result = await facade.demote("mem_fake1", to_tier="stm", user=_USER, session=_SESSION)
+
+    container.stm.put.assert_awaited_once()
+    container.mtm.remove.assert_awaited_once()
+    assert result.verb == "demote"
+    assert result.from_tier == "mtm" and result.to_tier == "stm"
+
+
+@pytest.mark.unit
+async def test_update_ingests_new_and_supersedes_old() -> None:
+    """``update`` INGESTs the new content and SUPERSEDES the old via ``invalidate`` on the tiers
+    the old memory lives in (here: STM + MTM). Returns the NEW id + the superseded old id."""
+    container = _FakeContainer()
+    container.stm.get = AsyncMock(return_value=_stm_item())
+    container.mtm.get = AsyncMock(return_value=_stm_item(tier=MemoryTier.MTM))
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    result = await facade.update("mem_fake1", "Ada lives in Berlin", user=_USER, session=_SESSION)
+
+    container.ingest.remember.assert_awaited_once()  # new version ingested
+    container.mtm.invalidate.assert_awaited_once()  # old superseded in MTM
+    container.stm.evict.assert_awaited_once()  # old evicted from ephemeral STM
+    assert result.verb == "update"
+    assert result.superseded_id == "mem_fake1"
+    assert result.memory_id == "mem_fake1"  # the fake IngestResult's memory_id (new version)
+
+
+@pytest.mark.unit
+async def test_delete_soft_deletes_across_tiers() -> None:
+    """``delete`` = invalidate-don't-delete: STM evicted, MTM/LTM ``expire``d (state=expired +
+    invalid_at, kept in history)."""
+    container = _FakeContainer()
+    container.stm.get = AsyncMock(return_value=_stm_item())
+    container.mtm.get = AsyncMock(return_value=_stm_item(tier=MemoryTier.MTM))
+    container.ltm.get_fact = AsyncMock(return_value=_stm_item(tier=MemoryTier.LTM))
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+
+    result = await facade.delete("mem_fake1", user=_USER, session=_SESSION)
+
+    container.stm.evict.assert_awaited_once()
+    container.mtm.expire.assert_awaited_once()
+    container.ltm.expire.assert_awaited_once()
+    assert result.verb == "delete"
+    assert result.invalidated is True
+    assert set(result.tiers_affected) == {"stm", "mtm", "ltm"}
+
+
+@pytest.mark.unit
+async def test_delete_missing_id_raises_not_found() -> None:
+    container = _FakeContainer()  # all point-gets return None
+    facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
+    with pytest.raises(MemoryNotFoundError):
+        await facade.delete("nope", user=_USER, session=_SESSION)
 
 
 @pytest.mark.unit
@@ -568,10 +692,29 @@ async def test_facade_recall_consolidate_ask_and_unbuilt_verbs(
     assert {it.memory_id for it in ctx.items} >= {r1.memory_id, r2.memory_id}
     assert "Ada lives in Paris" in ctx.text or "Ada works at Acme" in ctx.text
 
-    # (7) promote/demote/share are honest 501-shaped refusals, never a silent no-op.
-    with pytest.raises(SurfaceVerbNotImplementedError):
-        await facade.promote(r1.memory_id, user=_USER, session=_SESSION)
-    with pytest.raises(SurfaceVerbNotImplementedError):
-        await facade.demote(r1.memory_id, user=_USER, session=_SESSION)
+    # (7) promote is REAL now (build-queue §13 item 5): r1 is an STM-only default-importance add
+    # (0.5 < 0.6 gate), so promote(to_tier="mtm") moves it up — proven by a direct MTM point-get.
+    promoted = await facade.promote(r1.memory_id, to_tier="mtm", user=_USER, session=_SESSION)
+    assert promoted.verb == "promote" and promoted.to_tier == "mtm"
+    assert await container.mtm.get(
+        Namespace(
+            org=f"{_ORG}{uid}",
+            workspace=f"{_WORKSPACE}{uid}",
+            user=_USER,
+            session=_SESSION,
+            visibility=Visibility.PRIVATE,
+        ),
+        r1.memory_id,
+    ) is not None, "promote did not create the MTM point"
+
+    # (8) demote is REAL — moves it back down; the MTM point is then gone (direct read).
+    demoted = await facade.demote(r1.memory_id, to_tier="stm", user=_USER, session=_SESSION)
+    assert demoted.verb == "demote" and demoted.to_tier == "stm"
+
+    # (9) a nonexistent id fails LOUD (404-equivalent), never a silent no-op.
+    with pytest.raises(MemoryNotFoundError):
+        await facade.demote("mem_does_not_exist", to_tier="stm", user=_USER, session=_SESSION)
+
+    # (10) share is STILL an honest 501 (build-queue §13 item 3, not yet built).
     with pytest.raises(SurfaceVerbNotImplementedError):
         await facade.share(r1.memory_id, visibility=Visibility.SHARED, user=_USER, session=_SESSION)

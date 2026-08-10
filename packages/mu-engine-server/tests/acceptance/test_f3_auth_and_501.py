@@ -1,16 +1,15 @@
-"""F3 — AUTH + 501 (build-plan §7 F3): no/blank/wrong bearer -> 401; correct -> 200; `promote`/
-`demote` -> a named 501 on the HTTP surface AND via the Python client, re-run against the
-CONTAINER (CG-3's own auth proof + BG-3's 501 proof, both re-run here as part of the whole).
+"""F3 — AUTH + targeted-verb behaviour (build-plan §7 F3): no/blank/wrong bearer -> 401; correct
+-> 200; `promote`/`demote` are now REAL (build-queue §13 item 5 landed — no longer 501s), so a
+verb call against a NONEXISTENT id returns a NAMED 404 (`MemoryNotFoundError`) on the HTTP surface
+AND via the Python client, re-run against the CONTAINER.
 
 Split in two:
 - HTTP-surface assertions (`test_*_http`) run unconditionally — raw `httpx` against the real
   container, no SDK dependency.
 - Python-client assertions (`test_*_python_client`) additionally need `mu_sdk` importable —
-  `MemoryClient.promote()`/`.demote()` raise the NAMED `SurfaceVerbNotImplementedError`
-  (`status_code=501`) CLIENT-SIDE, with NO network call at all (`mu_sdk/client.py`'s own
-  docstring: "promote/demote make no wire call at all — nothing on the other end to call yet"), so
-  this half proves the SAME 501 contract holds from the OTHER end of the wire — the caller never
-  needs to inspect an HTTP response to know the verb is unimplemented.
+  `MemoryClient.promote()`/`.demote()` now make a REAL wire call (the honest 501/no-network stub
+  is retired); a nonexistent id maps to the SDK's `NotFoundError`, proving the 404 contract holds
+  end-to-end.
 """
 
 from __future__ import annotations
@@ -84,36 +83,46 @@ def test_correct_bearer_is_200(engine_up: None, engine_token: str) -> None:
 
 
 # ============================================================================================
-# promote/demote — HTTP surface
+# promote/demote — HTTP surface (REAL verbs now; a nonexistent id -> named 404)
 # ============================================================================================
 
 
-def test_promote_is_501_http(engine_up: None, engine_token: str) -> None:
+def test_promote_missing_id_is_404_http(engine_up: None, engine_token: str) -> None:
     del engine_up
     response = _post(
         "/v1/memories/mem_does_not_matter/promote",
         headers={"Authorization": f"Bearer {engine_token}"},
+        json={"to_tier": "mtm"},
     )
-    assert response.status_code == 501
+    assert response.status_code == 404, response.text
     body = response.json()
-    assert body["verb"] == "promote"
-    assert body["error"] == "SurfaceVerbNotImplementedError"
+    assert body["error"] == "MemoryNotFoundError"
 
 
-def test_demote_is_501_http(engine_up: None, engine_token: str) -> None:
+def test_demote_missing_id_is_404_http(engine_up: None, engine_token: str) -> None:
     del engine_up
     response = _post(
         "/v1/memories/mem_does_not_matter/demote",
         headers={"Authorization": f"Bearer {engine_token}"},
+        json={"to_tier": "stm"},
     )
-    assert response.status_code == 501
-    body = response.json()
-    assert body["verb"] == "demote"
-    assert body["error"] == "SurfaceVerbNotImplementedError"
+    assert response.status_code == 404, response.text
+    assert response.json()["error"] == "MemoryNotFoundError"
+
+
+def test_promote_invalid_tier_is_400_http(engine_up: None, engine_token: str) -> None:
+    del engine_up
+    response = _post(
+        "/v1/memories/mem_does_not_matter/promote",
+        headers={"Authorization": f"Bearer {engine_token}"},
+        json={"to_tier": "bogus"},
+    )
+    # An unknown to_tier is a ValueError at the facade -> 400 (never a silent no-op / fake 200).
+    assert response.status_code == 400, response.text
 
 
 # ============================================================================================
-# promote/demote — via the Python client (no wire call at all, see module docstring)
+# promote/demote — via the Python client (a REAL wire call now; 404 -> NotFoundError)
 # ============================================================================================
 
 mu_sdk = pytest.importorskip("mu_sdk", reason="F3's Python-client half needs mu-sdk-python installed")
@@ -121,7 +130,7 @@ mu_sdk = pytest.importorskip("mu_sdk", reason="F3's Python-client half needs mu-
 from mu_sdk.auth import BearerAuth  # noqa: E402
 from mu_sdk.client import MemoryClient  # noqa: E402
 from mu_sdk.config import SdkConfig  # noqa: E402
-from mu_sdk.errors import SurfaceVerbNotImplementedError  # noqa: E402
+from mu_sdk.errors import NotFoundError  # noqa: E402
 
 
 @pytest_asyncio.fixture
@@ -134,19 +143,17 @@ async def local_server_client(engine_token: str) -> MemoryClient:
     await client.aclose()
 
 
-async def test_promote_is_501_python_client(
+async def test_promote_missing_id_maps_to_not_found_python_client(
     engine_up: None, local_server_client: MemoryClient
 ) -> None:
     del engine_up
-    with pytest.raises(SurfaceVerbNotImplementedError) as exc_info:
-        await local_server_client.promote("mem_does_not_matter", to_tier="ltm")
-    assert exc_info.value.status_code == 501
+    with pytest.raises(NotFoundError):
+        await local_server_client.promote("mem_does_not_matter", to_tier="mtm")
 
 
-async def test_demote_is_501_python_client(
+async def test_demote_missing_id_maps_to_not_found_python_client(
     engine_up: None, local_server_client: MemoryClient
 ) -> None:
     del engine_up
-    with pytest.raises(SurfaceVerbNotImplementedError) as exc_info:
+    with pytest.raises(NotFoundError):
         await local_server_client.demote("mem_does_not_matter", to_tier="stm")
-    assert exc_info.value.status_code == 501

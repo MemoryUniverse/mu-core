@@ -31,6 +31,7 @@ __all__ = [
     "LlmNotConfiguredError",
     "MandatoryBackendMissingError",
     "MemoryLayerError",
+    "MemoryNotFoundError",
     "MemoryUniverseError",
     "NamespaceIsolationError",
     "PermissionNarrowingError",
@@ -240,6 +241,20 @@ class SurfaceVerbNotImplementedError(MemoryUniverseError):
     def __init__(self, verb: str, *, reason: str) -> None:
         self.verb = verb
         super().__init__(f"SurfaceFacade.{verb}() is not implemented: {reason}")
+
+
+class MemoryNotFoundError(MemoryUniverseError):
+    """A TARGETED lifecycle verb (``promote``/``demote``/``update``/``delete`` — the surface
+    facade's single-memory verbs) was given a ``memory_id`` that resides in NONE of the tiers it
+    can act on within the caller's η partition. NAMED (not a bare ``KeyError``/``None`` return) so
+    every layer maps it the SAME way — HTTP 404 on the wire (``mu_engine_server.errors``), an SDK
+    ``NotFoundError`` — and never a silent no-op (DEV-STANDARDS rule 8: fail-loud). The verbs guard
+    a nonexistent id with THIS, exactly as they guard an invalid ``to_tier`` with a ``ValueError``
+    (mapped to 400) — an honest error, never a fake success."""
+
+    def __init__(self, memory_id: str, *, reason: str = "not resident in any tier") -> None:
+        self.memory_id = memory_id
+        super().__init__(f"memory {memory_id!r} not found: {reason}")
 
 
 class LlmNotConfiguredError(MemoryUniverseError):

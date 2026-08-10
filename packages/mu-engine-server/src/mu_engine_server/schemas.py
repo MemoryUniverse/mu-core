@@ -56,19 +56,34 @@ __all__ = [
     "LifecycleEnforceRequest",
     "MemoryVerbRequest",
     "RecallRequest",
+    "UpdateRequest",
 ]
 
 _DEFAULT_USER = "default"
 
 
 class MemoryVerbRequest(BaseModel):
-    """``POST /v1/memories/{id}/promote`` and ``.../demote`` body — both verbs are named 501s
-    today (facade module docstring, build-queue §13 item 5); this shape is what a real engine-side
-    verb will read once item 5 lands, so the route's wire contract does not change out from under
-    an existing caller when that happens."""
+    """``POST /v1/memories/{id}/promote`` and ``.../demote`` body — both verbs are now REAL
+    (build-queue §13 item 5 landed): ``SurfaceFacade.promote``/``.demote`` run the targeted
+    promotion/demotion over one resident item. ``to_tier`` names the destination tier
+    (``"mtm"``/``"ltm"`` for promote; ``"stm"`` for demote) — an unknown value is a ``ValueError``
+    (HTTP 400) at the facade, never a silent no-op."""
 
     model_config = ConfigDict(extra="forbid")
 
+    to_tier: str
+    user: str = _DEFAULT_USER
+    session: str | None = None
+
+
+class UpdateRequest(BaseModel):
+    """``PUT /memories/{id}`` body — the SUPERSEDE (update) verb: ``new_content`` becomes the new
+    version, the old id is marked superseded by it (``SurfaceFacade.update``, invalidate-don't-
+    delete). ``user``/``session`` name the η partition the memory lives in."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    new_content: str
     user: str = _DEFAULT_USER
     session: str | None = None
 

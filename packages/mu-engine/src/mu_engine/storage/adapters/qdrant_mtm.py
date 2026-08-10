@@ -173,6 +173,61 @@ class QdrantMtmAdapter:
             points=[models.PointStruct(id=row.point_id, vector=row.vector, payload=row.payload)],
         )
 
+    async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
+        return await self._retry(self._get_impl)(ns, memory_id)
+
+    async def _get_impl(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
+        # Point-get by id (targeted lifecycle verbs: promote MTM->LTM / demote / update / delete).
+        # Real ``AsyncQdrantClient.retrieve`` on the id-stable ``point_id`` — NOT a semantic search
+        # (no query vector) and NOT ``state``-filtered (a superseded/expired point is still
+        # returned, so delete/update act idempotently). Vectors ARE fetched so a caller that
+        # re-upserts the returned item (e.g. a copy-on-write tier move) keeps the embedding.
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return None
+        records = await self._qdrant.retrieve(
+            collection_name=name,
+            ids=[point_id(memory_id)],
+            with_payload=True,
+            with_vectors=True,
+        )
+        if not records:
+            return None
+        rec = records[0]
+        raw = rec.vector if isinstance(rec.vector, list) else []
+        vector = [float(v) for v in raw if isinstance(v, int | float)]
+        payload: dict[str, Any] = rec.payload or {}
+        return self._mapper.from_store(
+            QdrantPoint(
+                point_id=str(rec.id),
+                vector=vector,
+                sparse=None,
+                payload=payload,
+                collection=name,
+            )
+        )
+
+    async def expire(self, ns: Namespace, memory_id: str, *, at: datetime) -> None:
+        return await self._retry(self._expire_impl)(ns, memory_id, at=at)
+
+    async def _expire_impl(self, ns: Namespace, memory_id: str, *, at: datetime) -> None:
+        # Soft-delete (``delete`` verb, invalidate-don't-delete): flip state='expired' + stamp
+        # invalid_at so the ``state='active'`` recall filter (``_recall_filter``) drops it, while
+        # the point STAYS (bi-temporal history). Payload-only PATCH (``set_payload``, the SAME
+        # primitive ``invalidate`` uses) — vector untouched, NO ``superseded_by`` written (a plain
+        # delete has no winner, unlike ``invalidate``). Idempotent (id-stable ``point_id``).
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return
+        await self._qdrant.set_payload(
+            collection_name=name,
+            payload={
+                "state": MemoryState.EXPIRED.value,
+                "invalid_at": at.isoformat(),
+            },
+            points=[point_id(memory_id)],
+        )
+
     def _recall_filter(
         self,
         ns: Namespace,

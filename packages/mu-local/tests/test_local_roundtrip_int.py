@@ -32,11 +32,12 @@ from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
 from mu_contracts.contracts.recall import RecallResult
-from mu_contracts.domain.errors import PlaneFieldRejectedError
+from mu_contracts.contracts.views import MemoryVerbResult
+from mu_contracts.domain.errors import MemoryNotFoundError, PlaneFieldRejectedError
 from mu_engine.config import get_engine_settings
 from mu_engine.storage.domain.memory import MemoryTier
-from mu_engine.storage.domain.namespace import Visibility
-from mu_engine.surface.facade import SurfaceVerbNotImplementedError
+from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
 from mu_local import LlmNotConfiguredError, LocalMemory
 from mu_local.config import BackendChoice, StorageSettings
 from mu_local.errors import BackendUnavailableError
@@ -271,14 +272,93 @@ async def test_shared_plane_fields_rejected_on_add_and_recall(mem: LocalMemory) 
         await mem.recall("x", user=_USER, session=_SESSION, subject="Ada")
 
 
-async def test_promote_and_demote_are_honest_named_501s(mem: LocalMemory) -> None:
-    """B1 (c) — ``promote``/``demote`` are new, delegate through ``SurfaceFacade`` (Stage A), and
-    raise the named ``SurfaceVerbNotImplementedError`` (build-queue §13 item 5) — never a silent
-    no-op/partial success."""
-    with pytest.raises(SurfaceVerbNotImplementedError):
-        await mem.promote("some-memory-id", user=_USER, session=_SESSION)
-    with pytest.raises(SurfaceVerbNotImplementedError):
-        await mem.demote("some-memory-id", user=_USER, session=_SESSION)
+async def test_targeted_lifecycle_verbs_are_real_on_real_stores(
+    mem: LocalMemory, settings: Settings, uid: str
+) -> None:
+    """build-queue §13 item 5 — ``promote``/``demote``/``update``/``delete`` are now REAL over the
+    real lifecycle + bi-temporal machinery. PROVEN by DIRECT store reads (raw Qdrant ``retrieve``
+    of the point payload — independent of the verb code under test), ZERO mocks:
+
+    * ``promote`` a low-importance STM-only fact -> the MTM point now exists (direct qdrant read);
+    * ``demote`` it back -> the MTM point is gone, the STM copy is present;
+    * ``delete`` a promoted fact -> its MTM point is state=``expired`` + ``invalid_at`` set (STILL
+      present = bi-temporal history), and it drops from active recall (invalidate-don't-delete);
+    * ``update`` a promoted fact -> the old MTM point is state=``superseded`` + ``superseded_by``
+      the new id; the new version is active;
+    * a nonexistent id raises the named :class:`MemoryNotFoundError` (never a silent no-op).
+    """
+    ns = Namespace(
+        org=f"org{uid}", workspace=f"ws{uid}", user=_USER, session=_SESSION,
+        visibility=Visibility.PRIVATE,
+    )
+    dim = mem._container.embedder.dimension  # the live MiniLM dim (independent name math)
+    coll = collection_name(ns, dim)
+    qclient = AsyncQdrantClient(url=settings.storage.vector.url)
+
+    async def mtm_payload(memory_id: str) -> dict[str, object] | None:
+        """DIRECT raw-Qdrant read of a point's payload by id — NOT the adapter under test."""
+        if not await qclient.collection_exists(coll):
+            return None
+        recs = await qclient.retrieve(
+            collection_name=coll, ids=[point_id(memory_id)], with_payload=True
+        )
+        return dict(recs[0].payload or {}) if recs else None
+
+    try:
+        # ---- promote: STM-only (default importance 0.5 < 0.6 gate) -> MTM ----
+        low = await mem.add("Ada plays chess on Sundays", user=_USER, session=_SESSION)
+        assert not low.promoted, "default-importance add must NOT auto-promote"
+        assert await mtm_payload(low.memory_id) is None, "must not be in MTM before promote"
+        pres = await mem.promote(low.memory_id, to_tier="mtm", user=_USER, session=_SESSION)
+        assert isinstance(pres, MemoryVerbResult) and pres.verb == "promote"
+        assert pres.from_tier == "stm" and pres.to_tier == "mtm"
+        promoted_payload = await mtm_payload(low.memory_id)
+        assert promoted_payload is not None, "promote did not create the MTM point (direct read)"
+        assert promoted_payload["state"] == "active"
+
+        # ---- demote: MTM -> STM (MTM point gone, STM copy present) ----
+        dres = await mem.demote(low.memory_id, to_tier="stm", user=_USER, session=_SESSION)
+        assert dres.verb == "demote" and dres.to_tier == "stm"
+        assert await mtm_payload(low.memory_id) is None, "demote did not remove the MTM point"
+        stm_copy = await mem.get(low.memory_id, user=_USER, session=_SESSION)
+        assert stm_copy is not None and stm_copy.tier == "stm", "STM copy missing after demote"
+
+        # ---- delete: invalidate-don't-delete on a promoted fact ----
+        hi = await mem.add(
+            "Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.9
+        )
+        assert hi.promoted
+        assert (await mtm_payload(hi.memory_id) or {}).get("state") == "active"
+        delres = await mem.delete(hi.memory_id, user=_USER, session=_SESSION)
+        assert delres.verb == "delete" and delres.invalidated is True
+        deleted_payload = await mtm_payload(hi.memory_id)
+        assert deleted_payload is not None, "delete HARD-removed the point (must keep history)"
+        assert deleted_payload["state"] == "expired", "delete must soft-delete (state=expired)"
+        assert deleted_payload.get("invalid_at"), "delete must stamp invalid_at (bi-temporal)"
+        active = await mem.recall("Paris", user=_USER, session=_SESSION, tier=MemoryTier.MTM)
+        assert hi.memory_id not in {it.memory_id for it in active.items}, "deleted still in recall"
+
+        # ---- update: SUPERSEDE (old superseded_by new; new active) ----
+        base = await mem.add(
+            "Bob lives in Rome", user=_USER, session=_SESSION, importance_score=0.9
+        )
+        assert (await mtm_payload(base.memory_id) or {}).get("state") == "active"
+        upd = await mem.update(base.memory_id, "Bob lives in Milan", user=_USER, session=_SESSION)
+        assert upd.verb == "update" and upd.superseded_id == base.memory_id
+        assert upd.memory_id != base.memory_id, "update must return a NEW memory id"
+        old_payload = await mtm_payload(base.memory_id)
+        assert old_payload is not None and old_payload["state"] == "superseded"
+        assert old_payload["superseded_by"] == upd.memory_id, "old not linked to new (direct read)"
+        new_mem = await mem.get(upd.memory_id, user=_USER, session=_SESSION)
+        assert new_mem is not None and new_mem.content == "Bob lives in Milan"
+
+        # ---- nonexistent id fails LOUD (never a silent no-op) ----
+        with pytest.raises(MemoryNotFoundError):
+            await mem.delete("mem_does_not_exist", user=_USER, session=_SESSION)
+        with pytest.raises(MemoryNotFoundError):
+            await mem.promote("mem_does_not_exist", to_tier="mtm", user=_USER, session=_SESSION)
+    finally:
+        await qclient.close()
 
 
 def test_unsupported_backend_fails_loud_not_silent() -> None:

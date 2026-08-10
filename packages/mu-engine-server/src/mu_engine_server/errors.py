@@ -19,7 +19,11 @@ from typing import cast
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from mu_contracts.domain.errors import PlaneFieldRejectedError, SurfaceVerbNotImplementedError
+from mu_contracts.domain.errors import (
+    MemoryNotFoundError,
+    PlaneFieldRejectedError,
+    SurfaceVerbNotImplementedError,
+)
 from mu_engine.lifecycle.mode_gate import ManagerOwnsLifecycleError
 
 __all__ = ["register_exception_handlers"]
@@ -52,6 +56,19 @@ async def _bad_request(_request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": "ValueError", "detail": str(exc)})
 
 
+async def _memory_not_found(_request: Request, exc: Exception) -> JSONResponse:
+    # See _not_implemented's own comment on cast vs. assert (bandit S101 / -O stripping).
+    error = cast(MemoryNotFoundError, exc)
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": "MemoryNotFoundError",
+            "memory_id": error.memory_id,
+            "detail": str(error),
+        },
+    )
+
+
 async def _plane_field_rejected(_request: Request, exc: Exception) -> JSONResponse:
     # See _not_implemented's own comment on cast vs. assert (bandit S101 / -O stripping).
     error = cast(PlaneFieldRejectedError, exc)
@@ -69,8 +86,11 @@ async def _plane_field_rejected(_request: Request, exc: Exception) -> JSONRespon
 def register_exception_handlers(app: FastAPI) -> None:
     """Wire the four named mappings this route layer needs (§2.1 verbs actually raise):
 
-    - :class:`SurfaceVerbNotImplementedError` -> ``501`` (``promote``/``demote``, always;
-      ``build_context`` never — it is wired to a real op now, facade module docstring).
+    - :class:`SurfaceVerbNotImplementedError` -> ``501`` (``share`` only now — ``promote``/
+      ``demote`` are REAL ops as of build-queue §13 item 5, facade module docstring).
+    - :class:`MemoryNotFoundError` -> ``404`` (the targeted ``promote``/``demote``/``update``/
+      ``delete`` verbs, given a ``memory_id`` resident in no tier — an honest not-found, never a
+      silent no-op).
     - :class:`ManagerOwnsLifecycleError` -> ``409`` (``consolidate`` under a MANAGED namespace,
       ADR 0031 — ``mu_engine.lifecycle.mode_gate.ManagerModeGate.assert_manual_allowed``, called
       by ``SurfaceFacade.consolidate`` before it ever reaches ``distill``).
@@ -89,6 +109,7 @@ def register_exception_handlers(app: FastAPI) -> None:
     reverts to FastAPI's opaque default 500 for an error class already named here.
     """
     app.add_exception_handler(SurfaceVerbNotImplementedError, _not_implemented)
+    app.add_exception_handler(MemoryNotFoundError, _memory_not_found)
     app.add_exception_handler(ManagerOwnsLifecycleError, _manager_owns_lifecycle)
     app.add_exception_handler(PlaneFieldRejectedError, _plane_field_rejected)
     app.add_exception_handler(ValueError, _bad_request)

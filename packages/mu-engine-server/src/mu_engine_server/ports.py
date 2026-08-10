@@ -30,11 +30,16 @@ resolve, since ``mu_engine.lifecycle.manager`` has no route-shaped ``profile``/`
 
 from __future__ import annotations
 
-from typing import Any, NoReturn, Protocol
+from typing import Any, Protocol
 
 from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallResult
-from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
+from mu_contracts.contracts.views import (
+    ConsolidateView,
+    ContextView,
+    MemoryVerbResult,
+    MemoryWriteResult,
+)
 from mu_contracts.domain.model.lifecycle import JobHandle, UserPrefix
 from mu_contracts.domain.model.memory import Namespace
 from mu_engine.lifecycle.dto import LifecycleStateView
@@ -84,9 +89,21 @@ class MemorySurfacePort(Protocol):
         max_chars: int | None,
     ) -> ContextView: ...
 
-    async def promote(self, memory_id: str, *, user: str, session: str | None) -> NoReturn: ...
+    async def promote(
+        self, memory_id: str, *, to_tier: str, user: str, session: str | None
+    ) -> MemoryVerbResult: ...
 
-    async def demote(self, memory_id: str, *, user: str, session: str | None) -> NoReturn: ...
+    async def demote(
+        self, memory_id: str, *, to_tier: str, user: str, session: str | None
+    ) -> MemoryVerbResult: ...
+
+    async def update(
+        self, memory_id: str, new_content: str, *, user: str, session: str | None
+    ) -> MemoryVerbResult: ...
+
+    async def delete(
+        self, memory_id: str, *, user: str, session: str | None
+    ) -> MemoryVerbResult: ...
 
 
 class LifecycleSurfacePort(Protocol):

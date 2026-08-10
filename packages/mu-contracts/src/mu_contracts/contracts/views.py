@@ -32,6 +32,7 @@ from mu_contracts.contracts.recall import RecallItemView
 __all__ = [
     "ConsolidateView",
     "ContextView",
+    "MemoryVerbResult",
     "MemoryWriteResult",
 ]
 
@@ -79,6 +80,36 @@ class ContextView(BaseModel):
     text: str
     items: list[RecallItemView]
     degraded: str | None = None
+
+
+class MemoryVerbResult(BaseModel):
+    """The receipt of one TARGETED, single-memory lifecycle verb — ``promote``/``demote``/
+    ``update``/``delete`` (the four verbs the surface facade drives over the REAL lifecycle +
+    bi-temporal invalidation machinery: ``PromotionService``/``DemotionService``'s own copy-on-
+    write shapes, ``MtmTierRepository``/``GraphStorePort.invalidate`` supersede, and the
+    ``expire`` soft-delete). Distinct from :class:`MemoryWriteResult` (the ``add`` INGEST receipt)
+    because these verbs act on an ALREADY-resident memory: there is no fresh ``content_hash`` to
+    report, and the informative flags are the tier transition (``from_tier``/``to_tier``), which
+    tiers were touched (``tiers_affected``), and — for ``update`` — the id of the old version that
+    was superseded by the new one (``superseded_id``).
+
+    ``memory_id`` is the memory the verb's RESULT refers to: the same id for promote/demote/delete,
+    but for ``update`` it is the NEW version's id (the task's "return the new memory"), with the
+    superseded old id carried in ``superseded_id``. ``invalidated`` is set by ``delete`` (the item
+    was soft-deleted — state flipped to ``expired`` + ``invalid_at`` stamped, still in bi-temporal
+    history, dropped from active recall — never a hard ``DETACH DELETE`` of active data).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    memory_id: str
+    verb: str  # "promote" | "demote" | "update" | "delete"
+    from_tier: str | None = None
+    to_tier: str | None = None
+    tiers_affected: tuple[str, ...] = ()
+    superseded_id: str | None = None  # update: the old id now SUPERSEDED_BY memory_id
+    invalidated: bool = False  # delete: soft-deleted (state=expired + invalid_at), kept in history
+    events_emitted: tuple[str, ...] = ()
 
 
 class ConsolidateView(BaseModel):

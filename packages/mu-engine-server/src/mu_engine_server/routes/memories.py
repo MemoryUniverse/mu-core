@@ -40,7 +40,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallResult
-from mu_contracts.contracts.views import ConsolidateView, MemoryWriteResult
+from mu_contracts.contracts.views import ConsolidateView, MemoryVerbResult, MemoryWriteResult
 from mu_contracts.validation.plane_gate import validate_plane_fields
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_engine_server.auth import require_bearer_token
@@ -51,6 +51,7 @@ from mu_engine_server.schemas import (
     ConsolidateRequest,
     MemoryVerbRequest,
     RecallRequest,
+    UpdateRequest,
 )
 
 __all__ = ["router"]
@@ -142,25 +143,70 @@ async def consolidate_memories(
 
 @router.post(
     "/v1/memories/{memory_id}/promote",
-    responses={501: {"description": "no engine verb yet (build-queue §13 item 5)"}},
+    response_model=MemoryVerbResult,
+    responses={404: {"description": "memory not resident in the source tier"}},
 )
 async def promote_memory(
     memory_id: str,
     body: MemoryVerbRequest,
     facade: MemorySurfacePort = Depends(get_facade),
-) -> None:
-    """``promote`` — always ``501`` today; see module docstring."""
-    await facade.promote(memory_id, user=body.user, session=body.session)
+) -> MemoryVerbResult:
+    """``promote`` — TARGETED single-memory promotion (STM->MTM / MTM->LTM), now a REAL op
+    (build-queue §13 item 5). ``404`` (:class:`MemoryNotFoundError`) if the id is not resident in
+    the source tier; ``400`` (``ValueError``) on an invalid ``to_tier``."""
+    return await facade.promote(
+        memory_id, to_tier=body.to_tier, user=body.user, session=body.session
+    )
 
 
 @router.post(
     "/v1/memories/{memory_id}/demote",
-    responses={501: {"description": "no engine verb yet (build-queue §13 item 5)"}},
+    response_model=MemoryVerbResult,
+    responses={404: {"description": "memory not resident in MTM (source tier)"}},
 )
 async def demote_memory(
     memory_id: str,
     body: MemoryVerbRequest,
     facade: MemorySurfacePort = Depends(get_facade),
-) -> None:
-    """``demote`` — always ``501`` today; see module docstring."""
-    await facade.demote(memory_id, user=body.user, session=body.session)
+) -> MemoryVerbResult:
+    """``demote`` — TARGETED MTM->STM tier-down, now a REAL op. ``404`` if absent from MTM;
+    ``400`` on an invalid ``to_tier``."""
+    return await facade.demote(
+        memory_id, to_tier=body.to_tier, user=body.user, session=body.session
+    )
+
+
+@router.put(
+    "/memories/{memory_id}",
+    response_model=MemoryVerbResult,
+    responses={404: {"description": "memory not resident in any tier"}},
+)
+async def update_memory(
+    memory_id: str,
+    body: UpdateRequest,
+    facade: MemorySurfacePort = Depends(get_facade),
+) -> MemoryVerbResult:
+    """``update`` — SUPERSEDE the memory with ``new_content`` (invalidate-don't-delete): the old id
+    is marked superseded by the new version. Returns the NEW memory (``memory_id`` = new id,
+    ``superseded_id`` = old id). ``404`` if the id is not resident in any tier."""
+    return await facade.update(
+        memory_id, body.new_content, user=body.user, session=body.session
+    )
+
+
+@router.delete(
+    "/memories/{memory_id}",
+    response_model=MemoryVerbResult,
+    responses={404: {"description": "memory not resident in any tier"}},
+)
+async def delete_memory(
+    memory_id: str,
+    user: str = "default",
+    session: str | None = None,
+    facade: MemorySurfacePort = Depends(get_facade),
+) -> MemoryVerbResult:
+    """``delete`` — soft-delete (invalidate-don't-delete): MTM/LTM flip to ``state=expired`` +
+    ``invalid_at`` (kept in bi-temporal history, dropped from active recall); STM (ephemeral) is
+    evicted. NEVER a hard delete of active data. ``user``/``session`` are query params naming the η
+    partition (a DELETE carries no body). ``404`` if the id is not resident in any tier."""
+    return await facade.delete(memory_id, user=user, session=session)

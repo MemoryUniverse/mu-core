@@ -66,7 +66,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any
 
 from mu_contracts.contracts.defaults import (
     DEFAULT_CONSOLIDATE_LIMIT,
@@ -74,7 +74,12 @@ from mu_contracts.contracts.defaults import (
 )
 from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallResult
-from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
+from mu_contracts.contracts.views import (
+    ConsolidateView,
+    ContextView,
+    MemoryVerbResult,
+    MemoryWriteResult,
+)
 from mu_contracts.domain.model.agent import (
     AgentIdentity,
     resolve_subagent_identity,
@@ -410,31 +415,65 @@ class LocalMemory:
         completion = await self._container.llm.generate(Task.ANSWER, messages)
         return completion.text
 
-    # ------------------------------------------------------------------- TO BUILD (§13 item 5)
+    # ------------------------------------------------------ targeted lifecycle verbs (§13 item 5)
     async def promote(
         self,
         memory_id: str,
         *,
+        to_tier: str,
         user: str = _DEFAULT_USER,
         session: str | None = None,
-    ) -> NoReturn:
-        """``promote`` — neither ``LocalMemory`` nor ``MemoryClient`` implements this today (design
-        §2.5 disposition table, build-queue §13 item 5). Delegates to the injected
-        :class:`~mu_engine.surface.facade.SurfaceFacade`, which raises the named
-        :class:`~mu_engine.surface.facade.SurfaceVerbNotImplementedError` — an honest 501, never a
-        silent no-op/partial success. This is the one verb where delegating through the facade is
-        genuinely "clean": neither surface has ANY behaviour to preserve here yet."""
-        await self._facade.promote(memory_id, user=user, session=session)
+    ) -> MemoryVerbResult:
+        """``promote`` — TARGETED single-memory promotion (STM->MTM with ``to_tier="mtm"``,
+        MTM->LTM with ``to_tier="ltm"``). Delegates to the injected
+        :class:`~mu_engine.surface.facade.SurfaceFacade.promote`, which runs the REAL promotion
+        path on that one resident item (``PromotionService`` copy-on-write / ``DistillPipeline``
+        leg) — a nonexistent id raises
+        :class:`~mu_contracts.domain.errors.MemoryNotFoundError`, an invalid ``to_tier`` raises
+        ``ValueError``. No longer a 501 (build-queue §13 item 5 landed)."""
+        return await self._facade.promote(memory_id, to_tier=to_tier, user=user, session=session)
 
     async def demote(
         self,
         memory_id: str,
         *,
+        to_tier: str = "stm",
         user: str = _DEFAULT_USER,
         session: str | None = None,
-    ) -> NoReturn:
-        """``demote`` — same disposition/discipline as :meth:`promote` (build-queue §13 item 5)."""
-        await self._facade.demote(memory_id, user=user, session=session)
+    ) -> MemoryVerbResult:
+        """``demote`` — TARGETED single-memory MTM->STM tier-down (``to_tier="stm"``). Delegates to
+        :meth:`~mu_engine.surface.facade.SurfaceFacade.demote`, which reuses
+        ``DemotionService._demote_one``'s write-ahead-then-remove sequence on that one item."""
+        return await self._facade.demote(memory_id, to_tier=to_tier, user=user, session=session)
+
+    async def update(
+        self,
+        memory_id: str,
+        new_content: str,
+        *,
+        user: str = _DEFAULT_USER,
+        session: str | None = None,
+    ) -> MemoryVerbResult:
+        """``update`` — SUPERSEDE the old memory with a new version (invalidate-don't-delete).
+        Delegates to :meth:`~mu_engine.surface.facade.SurfaceFacade.update`, which INGESTs the new
+        content and marks the old ``superseded_by`` the new via the SAME
+        ``MtmTierRepository``/``GraphStorePort.invalidate`` the conflict path uses. Returns the NEW
+        memory (``memory_id`` = new id, ``superseded_id`` = old id)."""
+        return await self._facade.update(memory_id, new_content, user=user, session=session)
+
+    async def delete(
+        self,
+        memory_id: str,
+        *,
+        user: str = _DEFAULT_USER,
+        session: str | None = None,
+    ) -> MemoryVerbResult:
+        """``delete`` — soft-delete (invalidate-don't-delete): stop the memory appearing in active
+        recall while KEEPING it in bi-temporal history. Delegates to
+        :meth:`~mu_engine.surface.facade.SurfaceFacade.delete` (MTM/LTM ``expire`` = state=expired +
+        invalid_at; STM ``evict`` — no bi-temporal substrate there). Never a hard delete of active
+        data."""
+        return await self._facade.delete(memory_id, user=user, session=session)
 
     # ----------------------------------------------------------------------------- lifecycle
     @property

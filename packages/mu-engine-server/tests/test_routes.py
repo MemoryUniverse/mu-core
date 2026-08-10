@@ -18,21 +18,26 @@ verify gate's job with C4's real composition") — not re-attempted here.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, NoReturn
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallChannels, RecallResult
-from mu_contracts.contracts.views import ConsolidateView, ContextView, MemoryWriteResult
+from mu_contracts.contracts.views import (
+    ConsolidateView,
+    ContextView,
+    MemoryVerbResult,
+    MemoryWriteResult,
+)
+from mu_contracts.domain.errors import MemoryNotFoundError
 from mu_contracts.domain.model.lifecycle import JobHandle, UserPrefix
 from mu_contracts.domain.model.memory import Namespace, Visibility
 from mu_engine.lifecycle.dto import LifecycleStateView
 from mu_engine.lifecycle.explain import ExplainRecord
 from mu_engine.lifecycle.mode_gate import ManagerOwnsLifecycleError
 from mu_engine.storage.domain.memory import MemoryTier
-from mu_engine.surface.facade import SurfaceVerbNotImplementedError
 from mu_engine_server.app import build_app
 from mu_engine_server.auth import require_bearer_token
 
@@ -63,6 +68,7 @@ class _FakeFacade:
         self.get_return: MemoryResponse | None = None
         self.add_raises: Exception | None = None
         self.consolidate_raises: Exception | None = None
+        self.verb_raises: Exception | None = None  # promote/demote/update/delete error injection
 
     async def add(self, content: Any, *, user: str, session: str | None) -> MemoryWriteResult:
         self.calls.append(("add", (content,), {"user": user, "session": session}))
@@ -124,16 +130,64 @@ class _FakeFacade:
         )
         return ContextView(text="- Ada lives in Paris", items=[], degraded=None)
 
-    async def promote(self, memory_id: str, *, user: str, session: str | None) -> NoReturn:
-        self.calls.append(("promote", (memory_id,), {"user": user, "session": session}))
-        raise SurfaceVerbNotImplementedError(
-            "promote", reason="no engine verb yet (build-queue §13 item 5)"
+    async def promote(
+        self, memory_id: str, *, to_tier: str, user: str, session: str | None
+    ) -> MemoryVerbResult:
+        self.calls.append(
+            ("promote", (memory_id,), {"to_tier": to_tier, "user": user, "session": session})
+        )
+        if self.verb_raises is not None:
+            raise self.verb_raises
+        return MemoryVerbResult(
+            memory_id=memory_id,
+            verb="promote",
+            from_tier="stm",
+            to_tier=to_tier,
+            tiers_affected=(to_tier,),
         )
 
-    async def demote(self, memory_id: str, *, user: str, session: str | None) -> NoReturn:
-        self.calls.append(("demote", (memory_id,), {"user": user, "session": session}))
-        raise SurfaceVerbNotImplementedError(
-            "demote", reason="no engine verb yet (build-queue §13 item 5)"
+    async def demote(
+        self, memory_id: str, *, to_tier: str, user: str, session: str | None
+    ) -> MemoryVerbResult:
+        self.calls.append(
+            ("demote", (memory_id,), {"to_tier": to_tier, "user": user, "session": session})
+        )
+        if self.verb_raises is not None:
+            raise self.verb_raises
+        return MemoryVerbResult(
+            memory_id=memory_id,
+            verb="demote",
+            from_tier="mtm",
+            to_tier=to_tier,
+            tiers_affected=(to_tier, "mtm"),
+        )
+
+    async def update(
+        self, memory_id: str, new_content: str, *, user: str, session: str | None
+    ) -> MemoryVerbResult:
+        self.calls.append(
+            ("update", (memory_id, new_content), {"user": user, "session": session})
+        )
+        if self.verb_raises is not None:
+            raise self.verb_raises
+        return MemoryVerbResult(
+            memory_id="mem_new",
+            verb="update",
+            superseded_id=memory_id,
+            tiers_affected=("stm", "mtm"),
+        )
+
+    async def delete(
+        self, memory_id: str, *, user: str, session: str | None
+    ) -> MemoryVerbResult:
+        self.calls.append(("delete", (memory_id,), {"user": user, "session": session}))
+        if self.verb_raises is not None:
+            raise self.verb_raises
+        return MemoryVerbResult(
+            memory_id=memory_id,
+            verb="delete",
+            tiers_affected=("stm", "mtm", "ltm"),
+            invalidated=True,
         )
 
 
@@ -290,24 +344,81 @@ def test_consolidate_managed_namespace_maps_to_409() -> None:
     assert resp.json()["error"] == "ManagerOwnsLifecycleError"
 
 
-def test_promote_is_501() -> None:
+def test_promote_is_real_and_returns_verb_result() -> None:
     facade = _FakeFacade()
     client = _client(facade)
 
-    resp = client.post("/v1/memories/mem_1/promote", json={})
+    resp = client.post("/v1/memories/mem_1/promote", json={"to_tier": "mtm"})
 
-    assert resp.status_code == 501
-    assert resp.json()["verb"] == "promote"
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verb"] == "promote" and body["to_tier"] == "mtm"
+    assert facade.calls[-1] == ("promote", ("mem_1",), {"to_tier": "mtm", "user": "default", "session": None})
 
 
-def test_demote_is_501() -> None:
+def test_demote_is_real_and_returns_verb_result() -> None:
     facade = _FakeFacade()
     client = _client(facade)
 
-    resp = client.post("/v1/memories/mem_1/demote", json={})
+    resp = client.post("/v1/memories/mem_1/demote", json={"to_tier": "stm"})
 
-    assert resp.status_code == 501
+    assert resp.status_code == 200
     assert resp.json()["verb"] == "demote"
+
+
+def test_promote_missing_id_maps_to_404() -> None:
+    facade = _FakeFacade()
+    facade.verb_raises = MemoryNotFoundError("mem_x")
+    client = _client(facade)
+
+    resp = client.post("/v1/memories/mem_x/promote", json={"to_tier": "mtm"})
+
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "MemoryNotFoundError"
+
+
+def test_promote_invalid_tier_maps_to_400() -> None:
+    facade = _FakeFacade()
+    facade.verb_raises = ValueError("unknown to_tier 'bogus'")
+    client = _client(facade)
+
+    resp = client.post("/v1/memories/mem_1/promote", json={"to_tier": "bogus"})
+
+    assert resp.status_code == 400
+
+
+def test_update_is_real_and_returns_new_memory() -> None:
+    facade = _FakeFacade()
+    client = _client(facade)
+
+    resp = client.put("/memories/mem_1", json={"new_content": "Ada lives in Berlin"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verb"] == "update"
+    assert body["memory_id"] == "mem_new" and body["superseded_id"] == "mem_1"
+
+
+def test_delete_is_real_soft_delete() -> None:
+    facade = _FakeFacade()
+    client = _client(facade)
+
+    resp = client.delete("/memories/mem_1")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["verb"] == "delete" and body["invalidated"] is True
+
+
+def test_delete_missing_id_maps_to_404() -> None:
+    facade = _FakeFacade()
+    facade.verb_raises = MemoryNotFoundError("mem_x")
+    client = _client(facade)
+
+    resp = client.delete("/memories/mem_x")
+
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "MemoryNotFoundError"
 
 
 # ============================================================================================

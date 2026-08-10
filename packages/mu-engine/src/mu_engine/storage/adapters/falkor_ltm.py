@@ -356,6 +356,47 @@ class FalkorLtmAdapter:
                 memory_id=mtm_point_memory_id,
             )
 
+    async def get_fact(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
+        return await self._retry(self._get_fact_impl)(ns, memory_id)
+
+    async def _get_fact_impl(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
+        # Point-get by id (targeted lifecycle verbs: update/delete must LOCATE a fact first).
+        # A plain ``MATCH (m:Memory {namespace, id})`` returning ``m.memory_json`` — NOT filtered
+        # by state/validity (a superseded/expired fact is still returned so the verb acts on it
+        # idempotently), unlike ``graph_recall``/``facts_at`` (bi-temporal still-valid read models).
+        res = await g_query(
+            self._graph(ns),
+            "MATCH (m:Memory {namespace: $ns, id: $id}) RETURN m.memory_json AS mj",
+            {"ns": ns.to_prefix(), "id": memory_id},
+        )
+        if not res:
+            return None
+        return MemoryItem.model_validate_json(res[0][0])
+
+    async def expire(self, ns: Namespace, memory_id: str, *, at: datetime) -> None:
+        return await self._retry(self._expire_impl)(ns, memory_id, at=at)
+
+    async def _expire_impl(self, ns: Namespace, memory_id: str, *, at: datetime) -> None:
+        # Soft-delete (``delete`` verb, invalidate-don't-delete): stamp state='expired' +
+        # invalid_at so every mandatory read filter (state='active' AND (invalid_at='' OR
+        # invalid_at>now)) drops it, while the node + edges STAY (bi-temporal history) — NOT the
+        # hard ``DETACH DELETE`` ``gc_delete`` performs. NO ``SUPERSEDED_BY`` edge (a plain delete
+        # has no winner, unlike ``_invalidate_impl``). Closes the fact's own entity-entity edge too
+        # (bi-temporal parity), reusing ``_invalidate_entity_edge``.
+        g = self._graph(ns)
+        at_iso = at.isoformat()
+        await g.query(
+            "MATCH (m:Memory {namespace: $ns, id: $id}) "
+            "SET m.state = $expired, m.invalid_at = $at",
+            params={
+                "ns": ns.to_prefix(),
+                "id": memory_id,
+                "expired": MemoryState.EXPIRED.value,
+                "at": at_iso,
+            },
+        )
+        await self._invalidate_entity_edge(g, ns, memory_id, at_iso)
+
     async def graph_recall(
         self,
         ns: Namespace,
