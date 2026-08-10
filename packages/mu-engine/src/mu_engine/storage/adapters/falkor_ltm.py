@@ -128,6 +128,10 @@ _DEFAULT_SHORTLIST_SIZE = 5
 _DEFAULT_SIMILARITY_THRESHOLD = 0.84  # graph_falkor.py resolve_entity deterministic band
 # Per-attempt I/O budget (DEV-STANDARDS async sharpener: "timeouts on every external call").
 _DEFAULT_STORE_IO_TIMEOUT_S = 10.0
+# Safety bound on the SUPERSEDED_BY provenance-chain walk (:meth:`FalkorLtmAdapter.
+# chain_head_state`) — a real chain is a handful of links; this only guards against a corrupt
+# cyclic ``SUPERSEDED_BY`` edge causing an unbounded loop, never a normal-path limit.
+_MAX_CHAIN_HOPS = 64
 
 
 class FalkorLtmAdapter:
@@ -612,6 +616,78 @@ class FalkorLtmAdapter:
         )
         res = await g_query(self._graph(ns), cypher, {"ns": ns.to_prefix(), "art": artifact_id})
         return [MemoryItem.model_validate_json(r[0]) for r in res]
+
+    # ------------------------------------------------------------- LtmRetentionStorePort (S2-01)
+    # The three validity-first retention capabilities ``mu_engine.lifecycle.retention.
+    # RetentionService`` needs BEYOND ``GraphStorePort`` (that Protocol is an as-of/still-valid
+    # read model with no enumerate-by-state query and no hard delete — see ``retention.py``'s
+    # "missing LTM query/delete ports" note). PROMOTED here from the integrate-phase seam
+    # ``tests/lifecycle/test_retention_int.py::_RealLtmRetentionStore`` proved against the live
+    # mu-dev-falkordb — the SAME openCypher, now a REAL production adapter method (no test-only
+    # store in the production path). ``FalkorLtmAdapter`` therefore structurally satisfies the
+    # ``LtmRetentionStorePort`` Protocol (no import of the lifecycle layer needed — PEP 544).
+    async def facts_by_state(
+        self, ns: Namespace, states: frozenset[MemoryState]
+    ) -> list[MemoryItem]:
+        return await self._retry(self._facts_by_state_impl)(ns, states)
+
+    async def _facts_by_state_impl(
+        self, ns: Namespace, states: frozenset[MemoryState]
+    ) -> list[MemoryItem]:
+        # A full, namespace-scoped, un-filtered-by-validity enumeration of every :Memory node
+        # whose ``state`` is one of ``states`` (deliberately NOT ``facts_at`` — that is an
+        # as-of/still-valid read and would never return a dead or not-yet-expired-by-clock fact
+        # the retention sweep must act on).
+        cypher = (
+            "MATCH (m:Memory) WHERE m.namespace = $ns AND m.state IN $states "
+            "RETURN m.memory_json AS mj"
+        )
+        res = await g_query(
+            self._graph(ns),
+            cypher,
+            {"ns": ns.to_prefix(), "states": [s.value for s in states]},
+        )
+        return [MemoryItem.model_validate_json(r[0]) for r in res]
+
+    async def chain_head_state(self, ns: Namespace, memory_id: str) -> MemoryState:
+        return await self._retry(self._chain_head_state_impl)(ns, memory_id)
+
+    async def _chain_head_state_impl(self, ns: Namespace, memory_id: str) -> MemoryState:
+        # Walk the ``SUPERSEDED_BY`` provenance chain forward from ``memory_id`` to its terminal
+        # node (the one with no outgoing ``SUPERSEDED_BY`` edge — "the chain head") and return
+        # THAT node's state (spec §9 mermaid: GC only when "chain head dead"). A node with no
+        # outgoing edge is its own head (the common EXPIRED case — a self-expire gains no edge).
+        graph = self._graph(ns)
+        prefix = ns.to_prefix()
+        current_id = memory_id
+        for _ in range(_MAX_CHAIN_HOPS):
+            hop = await g_query(
+                graph,
+                "MATCH (:Memory {namespace: $ns, id: $id})-[:SUPERSEDED_BY]->(next:Memory) "
+                "RETURN next.id AS id",
+                {"ns": prefix, "id": current_id},
+            )
+            if not hop:
+                head = await g_query(
+                    graph,
+                    "MATCH (m:Memory {namespace: $ns, id: $id}) RETURN m.state AS state",
+                    {"ns": prefix, "id": current_id},
+                )
+                return MemoryState(head[0][0])
+            current_id = str(hop[0][0])
+        raise RuntimeError(f"chain_head_state: exceeded {_MAX_CHAIN_HOPS} hops (cycle?)")
+
+    async def gc_delete(self, ns: Namespace, memory_id: str) -> None:
+        return await self._retry(self._gc_delete_impl)(ns, memory_id)
+
+    async def _gc_delete_impl(self, ns: Namespace, memory_id: str) -> None:
+        # The one true HARD delete the retention sweep ever calls — never on an ACTIVE fact
+        # (RetentionService gates this on SUPERSEDED/EXPIRED + window + chain-head-dead). Real
+        # ``DETACH DELETE`` (drops the node AND its edges) against the live graph, no mock.
+        await self._graph(ns).query(
+            "MATCH (m:Memory {namespace: $ns, id: $id}) DETACH DELETE m",
+            params={"ns": ns.to_prefix(), "id": memory_id},
+        )
 
     async def traverse_entities(
         self, ns: Namespace, *, query: str, max_hops: int, limit: int

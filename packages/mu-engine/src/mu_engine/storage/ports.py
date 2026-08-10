@@ -156,6 +156,22 @@ class MtmTierRepository(Protocol):
         never substitute one for the other."""
         ...
 
+    async def scan_for_demotion(self, ns: Namespace, *, limit: int) -> list[MemoryItem]:
+        """Enumerate up to ``limit`` ACTIVE MTM points in ``ns``'s plane partition as
+        forgetting-curve DEMOTION candidates (spec §7b; the MTM-enumeration primitive the
+        automatic sweep needs to feed ``DemotionService.demote`` — previously the flagged
+        "no MTM-tier enumeration primitive exists" gap, ``manager.py``/``maintenance.py``).
+
+        A REAL, BOUNDED store read — NOT a query-vector semantic search (``semantic`` needs a
+        vector and top-k truncates) and NOT a scan-everything foot-gun: it filters server-side
+        to the plane's own partition (the SAME namespace/user-prefix match ``semantic`` compiles
+        for recall) AND ``state='active'`` BEFORE paging, capped at ``limit``. The staleness
+        decision itself is NOT made here — every returned item is re-scored by
+        ``DemotionService`` against ``SalienceStrategy`` (the Ebbinghaus gate), so a fresh/salient
+        item enumerated here is rescued, never demoted. Ordering is store-native (unordered);
+        the cap bounds RAM on a shared box, it is not a "most-stale-first" priority read."""
+        ...
+
 
 class GraphStorePort(Protocol):
     """Graph / LTM tier — bi-temporal KG (``storage-pluggable §2.2``; graph MANDATORY)."""

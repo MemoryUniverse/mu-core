@@ -47,6 +47,12 @@ __all__ = ["QdrantMtmAdapter"]
 # (e.g. in a unit test) still gets a sane, named default.
 _DEFAULT_STORE_IO_TIMEOUT_S = 10.0
 
+# Per-page size for the bounded demotion-candidate scroll (``scan_for_demotion`` below). The
+# caller-supplied ``limit`` (from ``LifecycleSettings.max_items_per_user_sweep``) is the hard cap;
+# this only bounds how many points are pulled per round-trip so one sweep never materializes a
+# whole partition into RAM at once (shared-box guard).
+_SCROLL_PAGE_SIZE = 256
+
 # The truncated, session-less user-prefix payload key (BQ3; ADR 0030 §1). Written on every
 # upsert (below) and indexed alongside ``namespace``; used ONLY to resolve the PRIVATE-own
 # federated-recall match value in ``_recall_filter`` — never a replacement for ``namespace``
@@ -306,6 +312,61 @@ class QdrantMtmAdapter:
             payload={"entity_uids": entity_uids},
             points=[point_id(memory_id)],
         )
+
+    async def scan_for_demotion(self, ns: Namespace, *, limit: int) -> list[MemoryItem]:
+        return await self._retry(self._scan_for_demotion_impl)(ns, limit=limit)
+
+    async def _scan_for_demotion_impl(self, ns: Namespace, *, limit: int) -> list[MemoryItem]:
+        # Bounded, plane-scoped enumeration of ACTIVE MTM points as DEMOTION candidates (spec
+        # §7b — the MTM-enumeration primitive the automatic sweep feeds ``DemotionService``).
+        # Reuses the SAME (key, value) namespace/user-prefix match ``_recall_filter`` compiles
+        # for recall (``_resolve_namespace_match`` with ``session_scope=None`` — for PRIVATE this
+        # is the federated, session-less user prefix, so one sweep sees every one of the user's
+        # sessions' stale points; for SHARED it is the exact ``to_prefix()``) PLUS the mandatory
+        # ``state='active'`` predicate — never a scan-everything read. ``scroll`` (NOT
+        # ``query_points``) because there is no query vector here: this is a filter-only, paged
+        # enumeration, capped at ``limit``. Vectors are NOT fetched (a demotion tier-down move
+        # never needs the embedding — it re-writes the item into STM by id).
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return []
+        match_key, match_value = _resolve_namespace_match(ns, session_scope=None)
+        scan_filter = models.Filter(
+            must=[
+                models.FieldCondition(key=match_key, match=models.MatchValue(value=match_value)),
+                models.FieldCondition(
+                    key="state", match=models.MatchValue(value=MemoryState.ACTIVE.value)
+                ),
+            ]
+        )
+        out: list[MemoryItem] = []
+        offset: Any = None
+        while len(out) < limit:
+            page = min(_SCROLL_PAGE_SIZE, limit - len(out))
+            records, offset = await self._qdrant.scroll(
+                collection_name=name,
+                scroll_filter=scan_filter,
+                limit=page,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+            )
+            for rec in records:
+                payload: dict[str, Any] = rec.payload or {}
+                out.append(
+                    self._mapper.from_store(
+                        QdrantPoint(
+                            point_id=str(rec.id),
+                            vector=[],
+                            sparse=None,
+                            payload=payload,
+                            collection=name,
+                        )
+                    )
+                )
+            if offset is None or not records:
+                break  # Qdrant signals "no more pages" with a null next-page offset.
+        return out
 
     async def remove(self, ns: Namespace, memory_id: str) -> None:
         return await self._retry(self._remove_impl)(ns, memory_id)

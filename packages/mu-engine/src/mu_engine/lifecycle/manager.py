@@ -81,17 +81,18 @@ conformance permits extra public methods" convention ``SqliteWalRunner`` already
 
 **Known, honestly-flagged gaps (shared, cross-task — not unique to this file)**:
 
-* **No MTM-tier enumeration primitive exists anywhere in the currently-landed code** —
-  ``MtmTierRepository`` (``storage/ports.py``) ships ``upsert``/``semantic``(query-vector-gated)/
-  ``invalidate`` only, no scan/list. ``DemotionService.demote`` and
-  ``PromotionService.sweep_mtm_to_ltm`` both take an explicit CALLER-supplied ``window`` (their own
-  docstrings: "this service does not enumerate MTM itself" / "the full-scan/backstop ENUMERATION
-  ... is the MaintenanceLoop's job") and ``MaintenanceLoop`` itself documents the SAME gap
-  ("Discovery gap ... needs a user-enumeration port no Stage-0/Stage-1 task in this plan yet
-  exposes"). Consequently this manager's automatic ``sweep_namespace_now`` runs the REAL promotion
-  leg (via ``promote_session``) but only runs the demotion leg when a window is explicitly
-  supplied (``mtm_candidates``) — there is no automatic MTM-tier demotion discovery this slice.
-  Flagged for whichever future task adds a genuine MTM scan/list port.
+* **MTM-tier demotion discovery is now AUTOMATIC (the enumeration primitive landed).**
+  ``MtmTierRepository`` (``storage/ports.py``) now ships ``scan_for_demotion(ns, *, limit)`` — a
+  real, bounded, plane-scoped Qdrant ``scroll`` (``QdrantMtmAdapter``) that enumerates a
+  namespace's ACTIVE MTM points. This manager takes the ``MtmTierRepository`` as an (optional)
+  constructor port (``mtm``) and :meth:`sweep_namespace_now` uses it to feed
+  ``DemotionService.demote`` on EVERY automatic sweep (bounded by ``max_items_per_user_sweep``),
+  so the demotion forgetting curve fires under the periodic/event-driven sweep with no
+  caller-supplied window — only genuinely-stale items (the ``DemotionService`` Ebbinghaus gate)
+  actually move. An explicit ``mtm_candidates`` window still overrides (the manual/test seam); a
+  legacy composition that wires neither leaves the demotion leg a documented skip, never a lie.
+  ``PromotionService.sweep_mtm_to_ltm``'s own MTM->LTM ``window`` is a SEPARATE consolidate path
+  (not this demotion leg) and remains caller-supplied.
 * **Single-item manual ``promote(ns, memory_id)``/``demote(ns, memory_id)`` execution is a
   documented stub** (mode-gate check + durable-enqueue submit are fully wired; ``run_job``'s
   PROMOTE/DEMOTE branches return ``JobStatus.FAILED`` with a named, content-free ``error``) for the
@@ -176,6 +177,7 @@ from mu_engine.lifecycle.settings import LifecycleSettings
 from mu_engine.pipelines.distill import DistillPipeline, EventPublisher
 from mu_engine.platform.clock import SystemClock
 from mu_engine.storage.domain.memory import MemoryItem
+from mu_engine.storage.ports import MtmTierRepository
 
 __all__ = [
     "ConflictAdjudicatorPort",
@@ -323,6 +325,7 @@ class MemoryLifecycleManager:
         promotion: PromotionService,
         demotion: DemotionService,
         distill: DistillPipeline,
+        mtm: MtmTierRepository | None = None,
         retention: RetentionServicePort | None = None,
         conflict: ConflictAdjudicatorPort | None = None,
         lease: LifecycleLeasePort | None = None,
@@ -337,6 +340,7 @@ class MemoryLifecycleManager:
         self._promotion = promotion
         self._demotion = demotion
         self._distill = distill
+        self._mtm = mtm
         self._retention = retention
         self._conflict = conflict
         self._mode_gate = mode_gate
@@ -570,10 +574,17 @@ class MemoryLifecycleManager:
         combined) — it publishes its OWN ``MemoryPromoted`` events via its own injected bus
         (mirrors ``DistillPipeline``'s self-publish pattern); this manager does not re-publish.
 
-        Demotion leg: only runs when the caller supplies ``mtm_candidates`` — this manager has no
-        MTM-tier enumeration primitive of its own (see module docstring's gap note); when
-        supplied, ``DemotionService.demote`` is called and (mirroring the promotion leg) publishes
-        its own ``MemoryDemoted`` events itself.
+        Demotion leg: AUTOMATIC on every sweep. An explicit caller-supplied ``mtm_candidates``
+        window still wins (the manual/test seam); otherwise, when an ``MtmTierRepository`` is
+        wired (``self._mtm``, the composition root always threads it — S1-05), this ENUMERATES the
+        plane's stale-eligible MTM points itself via ``MtmTierRepository.scan_for_demotion``
+        (bounded by ``LifecycleSettings.max_items_per_user_sweep``) and feeds them to
+        ``DemotionService.demote``. Only genuinely-stale items (``S(m) < demote_mtm``, the
+        Ebbinghaus gate re-scored inside ``DemotionService``) actually demote MTM->STM; a
+        fresh/salient enumerated item is rescued (zero writes). ``DemotionService`` publishes its
+        own ``MemoryDemoted`` events (mirroring the promotion leg); this manager does not
+        re-publish. When neither a window nor an ``mtm`` port is present the demotion leg is a
+        documented skip (an unwired legacy composition), never a silent lie.
 
         Both legs feed this manager's own ``explain()`` audit trail from their outcome DTOs.
         """
@@ -582,8 +593,13 @@ class MemoryLifecycleManager:
             if outcome.kind is PromotionOutcomeKind.STM_TO_MTM:
                 self._record_explain(ns, outcome.memory_id, TransitionKind.PROMOTE, outcome.score)
 
-        if mtm_candidates:
-            demo_report = await self._demotion.demote(ns, mtm_candidates)
+        candidates: Sequence[MemoryItem] = mtm_candidates
+        if not candidates and self._mtm is not None:
+            candidates = await self._mtm.scan_for_demotion(
+                ns, limit=self._settings.max_items_per_user_sweep
+            )
+        if candidates:
+            demo_report = await self._demotion.demote(ns, candidates)
             for demo_outcome in demo_report.outcomes:
                 if demo_outcome.demoted:
                     self._record_explain(

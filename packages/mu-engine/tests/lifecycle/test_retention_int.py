@@ -81,64 +81,15 @@ _T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 # =================================================================================================
-# The REAL LtmRetentionStorePort adapter over live mu-dev-falkordb — the integrate-phase seam
-# retention.py's module docstring calls for (no mock; genuine openCypher against the real
-# container, reusing FalkorLtmAdapter.graph_name_for + the SAME g_query helper the adapter uses).
+# The REAL LtmRetentionStorePort is now the production ``FalkorLtmAdapter`` itself (S2-01 CF-2
+# closed): ``facts_by_state``/``chain_head_state``/``gc_delete`` were promoted off the former
+# test-only ``_RealLtmRetentionStore`` in this file onto the adapter, so ``FalkorLtmAdapter``
+# structurally satisfies ``LtmRetentionStorePort`` — no test-only store in the production path.
+# This fixture hands the SAME live adapter straight through (genuine openCypher, real container).
 # =================================================================================================
-class _RealLtmRetentionStore:
-    _MAX_CHAIN_HOPS = 64
-
-    def __init__(self, ltm: FalkorLtmAdapter, db: FalkorDB) -> None:
-        self._ltm = ltm
-        self._db = db
-
-    def _graph(self, ns: Namespace) -> Any:
-        return self._db.select_graph(self._ltm.graph_name_for(ns))
-
-    async def facts_by_state(
-        self, ns: Namespace, states: frozenset[MemoryState]
-    ) -> list[MemoryItem]:
-        cypher = (
-            "MATCH (m:Memory) WHERE m.namespace = $ns AND m.state IN $states "
-            "RETURN m.memory_json AS mj"
-        )
-        res = await g_query(
-            self._graph(ns),
-            cypher,
-            {"ns": ns.to_prefix(), "states": [s.value for s in states]},
-        )
-        return [MemoryItem.model_validate_json(r[0]) for r in res]
-
-    async def chain_head_state(self, ns: Namespace, memory_id: str) -> MemoryState:
-        graph = self._graph(ns)
-        current_id = memory_id
-        for _ in range(self._MAX_CHAIN_HOPS):
-            hop = await g_query(
-                graph,
-                "MATCH (:Memory {namespace: $ns, id: $id})-[:SUPERSEDED_BY]->(next:Memory) "
-                "RETURN next.id AS id",
-                {"ns": ns.to_prefix(), "id": current_id},
-            )
-            if not hop:
-                head = await g_query(
-                    graph,
-                    "MATCH (m:Memory {namespace: $ns, id: $id}) RETURN m.state AS state",
-                    {"ns": ns.to_prefix(), "id": current_id},
-                )
-                return MemoryState(head[0][0])
-            current_id = str(hop[0][0])
-        raise RuntimeError(f"chain_head_state: exceeded {self._MAX_CHAIN_HOPS} hops (cycle?)")
-
-    async def gc_delete(self, ns: Namespace, memory_id: str) -> None:
-        await self._graph(ns).query(
-            "MATCH (m:Memory {namespace: $ns, id: $id}) DETACH DELETE m",
-            params={"ns": ns.to_prefix(), "id": memory_id},
-        )
-
-
 @pytest.fixture
-def ltm_retention(ltm: FalkorLtmAdapter, falkor_db: FalkorDB) -> LtmRetentionStorePort:
-    return _RealLtmRetentionStore(ltm, falkor_db)
+def ltm_retention(ltm: FalkorLtmAdapter) -> LtmRetentionStorePort:
+    return ltm
 
 
 def _fact(

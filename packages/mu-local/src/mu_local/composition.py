@@ -69,6 +69,7 @@ from mu_engine.lifecycle.conflict import (
 from mu_engine.lifecycle.demotion import DemotionService
 from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate
 from mu_engine.lifecycle.promotion import PromotionService
+from mu_engine.lifecycle.retention import RetentionService
 from mu_engine.lifecycle.salience import SalienceStrategy
 from mu_engine.lifecycle.settings import LifecycleSettings, ManagerModeSettings
 from mu_engine.pipelines.distill import DistillPipeline
@@ -559,9 +560,15 @@ class LocalContainer:
 
         WIRING NOTE (Stage-3 integrate, closed): ``conflict=self.conflict_adjudicator`` threads the
         SAME ``ConflictAdjudicator`` (or ``None`` in heuristic mode) this container already built
-        for ``self.distill`` — never a second instance. ``RetentionService`` (Stage-2, S2-01)
-        remains out of scope for this daemonless embedded facade — ``retention`` stays ``None``
-        (no-op) here; a future task that wants it wired threads it the same way. ``warm_cache`` is
+        for ``self.distill`` — never a second instance. ``mtm=self.mtm`` threads the SAME
+        ``MtmTierRepository`` this container already built so the manager's automatic sweep can
+        ENUMERATE stale MTM points (``scan_for_demotion``) and drive the demotion forgetting curve
+        with no caller-supplied window (S2 tier-lifecycle completion). ``retention=`` threads a
+        REAL ``RetentionService`` over the SAME ``self.ltm`` graph adapter — but ONLY when that
+        adapter is a ``FalkorLtmAdapter`` (the only graph backend that implements the three
+        ``LtmRetentionStorePort`` capabilities ``facts_by_state``/``chain_head_state``/
+        ``gc_delete``); a non-Falkor graph backend (none ship today) leaves ``retention=None`` (an
+        honest skip, never a fabricated no-op adapter). ``warm_cache`` is
         an optional passthrough kwarg (mirrors ``lease``/``runner``/``clock`` below) so mu-client's
         daemon can thread its real ``RecallInjectBridge`` (S3-02, the ``WarmRecallCacheServicePort``
         implementation) through this SAME composition root; mu-local's own daemonless callers omit
@@ -606,11 +613,33 @@ class LocalContainer:
             metrics=self.metrics,
             audit=self.audit,
         )
+        # Validity-first LTM retention (S2-01, ADR 0035): a REAL RetentionService over the SAME
+        # graph adapter, wired ONLY when it is a FalkorLtmAdapter — the one graph backend that
+        # implements the LtmRetentionStorePort capabilities (facts_by_state/chain_head_state/
+        # gc_delete). A non-Falkor backend (none ship today) leaves this None — an honest skip
+        # (manager.py:594's `if self._retention is not None` simply does not fire), never a
+        # fabricated no-op adapter in the production path.
+        from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
+
+        retention: RetentionService | None = None
+        if isinstance(self.ltm, FalkorLtmAdapter):
+            retention = RetentionService(
+                ltm=self.ltm,
+                ltm_retention=self.ltm,  # SAME real adapter — no test-only store in prod
+                settings=self.lifecycle_settings,
+                clock=self._clock,
+                bus=self._bus,
+                tracer=self.tracer,
+                metrics=self.metrics,
+                audit=self.audit,
+            )
         return MemoryLifecycleManager(
             salience=salience,
             promotion=promotion,
             demotion=demotion,
             distill=self.distill,  # SAME object LocalMemory.consolidate() delegates to
+            mtm=self.mtm,  # SAME MtmTierRepository — powers scan_for_demotion auto-drive
+            retention=retention,  # REAL RetentionService (FalkorDB) or honest None
             conflict=self.conflict_adjudicator,  # SAME instance self.distill was built with
             mode_gate=self.mode_gate,
             bus=self._bus,
