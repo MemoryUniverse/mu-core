@@ -14,6 +14,13 @@ COMPOSE := docker compose -f $(COMPOSE_FILE)
 TOKEN_DIR := $(HOME)/.memory-universe
 TOKEN_FILE := $(TOKEN_DIR)/engine-server.token
 
+# The image's runtime user is built with the HOST's uid/gid so it can read the 0600 bearer token
+# bind-mounted into the container (a 0600 file is readable only by its owning uid). Without this
+# the server builds and reports healthy but 401s every authenticated request on any host whose
+# user is not uid 1000.
+export MU_APP_UID := $(shell id -u)
+export MU_APP_GID := $(shell id -g)
+
 .PHONY: up down logs reset mint-token check-boundary
 
 # `make up`: (1) mint the per-process bearer token to disk if absent, mode 0600 (design §2.4/§11.2,

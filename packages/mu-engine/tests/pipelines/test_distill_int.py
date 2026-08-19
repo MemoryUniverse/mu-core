@@ -19,6 +19,7 @@ from mu_engine.pipelines.distill import DistillActionKind, DistillPipeline
 from mu_engine.services.extract import HeuristicSpoExtractor
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
+from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
 from mu_engine.storage.domain.memory import MemoryItem, MemoryTier, Polarity
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
@@ -35,12 +36,18 @@ class _FixedClock:
 
 
 def _pipeline(
-    ltm: FalkorLtmAdapter, *, now: datetime, mtm: QdrantMtmAdapter | None = None
+    ltm: FalkorLtmAdapter,
+    *,
+    now: datetime,
+    mtm: QdrantMtmAdapter | None = None,
+    stm: RedisStmAdapter | None = None,
 ) -> DistillPipeline:
     # MVP default: the deterministic heuristic extractor, no LLM (real-integration-testable now).
     # ``mtm`` wires the cross-store supersede so an MTM-resident loser also drops from MTM recall.
+    # ``stm`` wires the THIRD arm (§7.2 step 5, Redis bullet) so the loser also leaves the recency
+    # window — without it the STM floor re-surfaces the superseded fact as a top recall hit.
     return DistillPipeline(
-        ltm=ltm, extractor=HeuristicSpoExtractor(), clock=_FixedClock(now), mtm=mtm
+        ltm=ltm, extractor=HeuristicSpoExtractor(), clock=_FixedClock(now), mtm=mtm, stm=stm
     )
 
 
@@ -618,3 +625,101 @@ async def test_distill_same_batch_newer_wins_all_three_gold_pairs_reverse_order(
             if f.predicate == predicate
         }
         assert hist == {v1_obj}, f"{subject}/{predicate}: expected history={v1_obj!r}, got {hist!r}"
+
+
+async def test_supersession_evicts_loser_from_the_stm_recency_window(
+    ltm: FalkorLtmAdapter,
+    mtm: QdrantMtmAdapter,
+    stm: RedisStmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """REGRESSION (third arm of memory-layer-design.md §7.2 step 5, the Redis/STM bullet).
+
+    Live-reproduced before the fix: a functional supersession flipped the loser in LTM
+    (``state=superseded`` + ``SUPERSEDED_BY``) AND in MTM (``state=superseded``), but left the raw
+    source message sitting in the STM recency window. Because the STM floor force-includes the
+    most-recent window entries regardless of relevance, recall then returned the SUPERSEDED fact
+    as its TOP hit while the graph correctly knew it was dead — breaking the design's "absent from
+    EVERY hot read" half of invalidate-don't-delete.
+
+    The loser must leave the STM window; it must REMAIN in LTM history (never deleted).
+    """
+    ns = make_ns()
+    t_old = datetime(2019, 1, 1, tzinfo=UTC)
+    t_now = datetime(2024, 1, 1, tzinfo=UTC)
+
+    loser_src = make_item(
+        ns, "Ada works at Acme", valid_at=t_old, tier=MemoryTier.STM, created_at=t_old
+    )
+    await stm.put(loser_src)
+    await mtm.upsert(loser_src)
+    await _pipeline(ltm, now=t_old, mtm=mtm, stm=stm).distill(ns, [loser_src])
+    assert await stm.get(ns, loser_src.id) is not None, "precondition: loser is STM-resident"
+
+    winner_src = make_item(
+        ns, "Ada works at Globex", valid_at=t_now, tier=MemoryTier.STM, created_at=t_now
+    )
+    await stm.put(winner_src)
+    await mtm.upsert(winner_src)
+    report = await _pipeline(ltm, now=t_now, mtm=mtm, stm=stm).distill(ns, [winner_src])
+
+    assert report.superseded == 1
+    assert report.actions[0].kind is DistillActionKind.SUPERSEDE
+
+    # THE FIX: the superseded loser is out of the hot STM window...
+    assert await stm.get(ns, loser_src.id) is None, (
+        "superseded loser still resident in the STM recency window — the floor will re-surface it"
+    )
+    recent_ids = {scored.item.id for scored in await stm.recent(ns, limit=50)}
+    assert loser_src.id not in recent_ids
+    assert winner_src.id in recent_ids, "the winner must stay in the window"
+
+    # ...while history is fully retained in LTM (invalidate-don't-delete, never a destructive fix).
+    assert {f.object for f in await ltm.facts_at(ns, t_old, subject="Ada")} == {"Acme"}
+    assert {f.object for f in await ltm.facts_at(ns, t_now, subject="Ada")} == {"Globex"}
+
+
+async def test_self_expire_also_invalidates_across_mtm_and_stm(
+    ltm: FalkorLtmAdapter,
+    mtm: QdrantMtmAdapter,
+    stm: RedisStmAdapter,
+    qdrant_client: AsyncQdrantClient,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """REGRESSION (SELF_EXPIRE symmetry). SELF_EXPIRE is a supersession whose loser is the INCOMING
+    fact. The pre-fix branch wrote ONLY the graph arm — unlike the SUPERSEDE branch, which always
+    wrote all three — so a self-expiring fact stayed ``state=active`` on its MTM point and live in
+    the STM window, and kept being fused back into recall. Both arms must now fire here too.
+    """
+    dim = mtm._dim
+    ns = make_ns()
+    t_old = datetime(2019, 1, 1, tzinfo=UTC)
+    t_now = datetime(2024, 1, 1, tzinfo=UTC)
+
+    # The AUTHORITATIVE fact is asserted FIRST and is the more recently ASSERTED one...
+    newer = make_item(
+        ns, "Ada works at Globex", valid_at=t_now, tier=MemoryTier.STM, created_at=t_now
+    )
+    await stm.put(newer)
+    await mtm.upsert(newer)
+    await _pipeline(ltm, now=t_now, mtm=mtm, stm=stm).distill(ns, [newer])
+
+    # ...so this LATER-distilled but EARLIER-asserted fact must SELF-EXPIRE.
+    older = make_item(
+        ns, "Ada works at Acme", valid_at=t_old, tier=MemoryTier.STM, created_at=t_old
+    )
+    await stm.put(older)
+    await mtm.upsert(older)
+    report = await _pipeline(ltm, now=t_now, mtm=mtm, stm=stm).distill(ns, [older])
+
+    assert report.actions[0].kind is DistillActionKind.SELF_EXPIRE
+
+    # present-tense truth is the authoritative fact only
+    assert {f.object for f in await ltm.facts_at(ns, t_now, subject="Ada")} == {"Globex"}
+    # THE FIX: the self-expired incoming fact drops out of MTM and the STM window too.
+    assert await _mtm_point_state(qdrant_client, ns, older.id, dim=dim) == "superseded"
+    assert await stm.get(ns, older.id) is None, (
+        "self-expired fact still resident in the STM recency window"
+    )

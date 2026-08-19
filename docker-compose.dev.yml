@@ -129,8 +129,37 @@ services:
       start_period: 5s
     networks: [mu-dev]
 
+  pgvector:
+    # ALTERNATE MTM vector backend (storage-pluggable-spec.md §3.3) — a SEPARATE Postgres endpoint
+    # from the `postgres` control-plane service above, on its own host port (15433), matching
+    # MU_STORAGE__PGVECTOR__* in .env.test. Without this service the six pgvector integration
+    # tests fail on connection-refused, so the "config-driven MTM backend swap is behaviour-
+    # identical across Qdrant/Chroma/FAISS/pgvector" claim is not reproducible from the
+    # committed infra — the exact gap this service closes.
+    image: pgvector/pgvector:pg16
+    container_name: mu-dev-pgvector
+    environment:
+      POSTGRES_USER: mu
+      POSTGRES_PASSWORD: mu
+      POSTGRES_DB: mu
+    ports:
+      - "127.0.0.1:15433:5432"
+    volumes:
+      - mu-dev-pgvector-data:/var/lib/postgresql/data
+      # Pre-creates the `vector` extension on first boot — asyncpg fixes its type map at pool
+      # creation, so the extension must exist BEFORE the adapter's own pool connects.
+      - ./docker/pgvector-init.sql:/docker-entrypoint-initdb.d/10-pgvector.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mu -d mu"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks: [mu-dev]
+
 volumes:
   mu-dev-postgres-data:
+  mu-dev-pgvector-data:
   mu-dev-cache-data:
   mu-dev-qdrant-data:
   mu-dev-falkordb-data:

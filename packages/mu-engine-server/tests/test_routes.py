@@ -70,8 +70,24 @@ class _FakeFacade:
         self.consolidate_raises: Exception | None = None
         self.verb_raises: Exception | None = None  # promote/demote/update/delete error injection
 
-    async def add(self, content: Any, *, user: str, session: str | None) -> MemoryWriteResult:
-        self.calls.append(("add", (content,), {"user": user, "session": session}))
+    async def add(
+        self,
+        content: Any,
+        *,
+        user: str,
+        session: str | None,
+        importance_score: float | None = None,
+    ) -> MemoryWriteResult:
+        # `importance_score` is RECORDED, not ignored: the route used to drop this canonical
+        # AddRequest field, so no wire caller could clear the promote gate and reach MTM. Keeping
+        # it in `calls` lets the pass-through be asserted, not assumed.
+        self.calls.append(
+            (
+                "add",
+                (content,),
+                {"user": user, "session": session, "importance_score": importance_score},
+            )
+        )
         if self.add_raises is not None:
             raise self.add_raises
         return MemoryWriteResult(
@@ -241,7 +257,13 @@ def test_add_memory_returns_write_result() -> None:
     assert body["memory_id"] == "mem_1"
     assert body["promoted"] is True
     assert body["tiers_written"] == ["stm", "mtm"]
-    assert facade.calls == [("add", ("Ada lives in Paris",), {"user": _USER, "session": _SESSION})]
+    assert facade.calls == [
+        (
+            "add",
+            ("Ada lives in Paris",),
+            {"user": _USER, "session": _SESSION, "importance_score": None},
+        )
+    ]
 
 
 def test_add_memory_defaults_user_and_session() -> None:
@@ -251,7 +273,23 @@ def test_add_memory_defaults_user_and_session() -> None:
     resp = client.post("/memories", json={"content": "hi"})
 
     assert resp.status_code == 201
-    assert facade.calls[0][2] == {"user": "default", "session": None}
+    assert facade.calls[0][2] == {"user": "default", "session": None, "importance_score": None}
+
+
+def test_add_memory_passes_importance_score_through_to_the_facade() -> None:
+    """REGRESSION: the route used to DROP the canonical `AddRequest.importance_score`, so the
+    facade always saw `None` and fell back to the 0.5 default — meaning no wire/SDK caller could
+    ever clear `IngestSettings.importance_promote` (0.6) and get a memory into MTM. Live-
+    reproduced over the real HTTP surface: posting `importance_score: 0.95` still came back
+    `{"promoted": false, "tiers_written": ["stm"]}`.
+    """
+    facade = _FakeFacade()
+    client = _client(facade)
+
+    resp = client.post("/memories", json={"content": "hi", "importance_score": 0.95})
+
+    assert resp.status_code == 201
+    assert facade.calls[0][2]["importance_score"] == 0.95
 
 
 def test_add_memory_value_error_maps_to_400() -> None:
@@ -353,7 +391,11 @@ def test_promote_is_real_and_returns_verb_result() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["verb"] == "promote" and body["to_tier"] == "mtm"
-    assert facade.calls[-1] == ("promote", ("mem_1",), {"to_tier": "mtm", "user": "default", "session": None})
+    assert facade.calls[-1] == (
+        "promote",
+        ("mem_1",),
+        {"to_tier": "mtm", "user": "default", "session": None},
+    )
 
 
 def test_demote_is_real_and_returns_verb_result() -> None:

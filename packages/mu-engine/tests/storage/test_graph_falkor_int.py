@@ -191,3 +191,66 @@ async def test_multi_org_physical_isolation(
     # ... but the origin namespace still recalls its own fact.
     own = await ltm.graph_recall(ns_org_a_w1, subject="Ada", limit=10)
     assert [h.item.id for h in own] == [a1.id]
+
+
+async def test_graph_recall_federates_across_the_users_sessions_by_default(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """REGRESSION — the split-brained recall fabric.
+
+    ``QdrantMtmAdapter.recall`` already federated across a user's sessions whenever
+    ``session_scope`` was left at its ``None`` default (ADR 0030 "keep-and-scope"), but
+    ``graph_recall`` had NO such parameter and filtered ``m.namespace = $ns`` on the FULL,
+    session-included prefix. So the durable, user-scoped LTM tier — the one that is supposed to BE
+    the long-term memory — was the single arm that never federated: a fact distilled while the user
+    was in session A was invisible from session B, even though ``graph_name_for`` already put both
+    sessions' facts in the SAME physical partition.
+
+    Live consequence: an auto-captured turn (default importance -> STM-only, never promoted to MTM)
+    reached LTM only through ``consolidate``, and LTM then hid it from every other session — so a
+    brand-new agent session recalled nothing at all.
+    """
+    ns_a = make_ns(user="u1", session="sessionA")
+    ns_b = make_ns(user="u1", session="sessionB")
+    ns_other = make_ns(user="intruder", session="sessionA")
+
+    await ltm.upsert_fact(make_item(ns_a, "Ada lives in Paris", subject="Ada",
+                                    predicate="lives_in", obj="Paris"))
+
+    from_a = {h.item.object for h in await ltm.graph_recall(ns_a, subject="Ada", limit=10)}
+    assert from_a == {"Paris"}, "same-session recall regressed"
+
+    from_b = {h.item.object for h in await ltm.graph_recall(ns_b, subject="Ada", limit=10)}
+    assert from_b == {"Paris"}, (
+        "a DIFFERENT session of the SAME user could not see the fact — the LTM arm is still "
+        "session-locked while the MTM arm federates"
+    )
+
+    # Federation is per-USER: it must never widen into a cross-user leak.
+    from_other = await ltm.graph_recall(ns_other, subject="Ada", limit=10)
+    assert from_other == [], "cross-USER leak — federation widened past the user boundary"
+
+
+async def test_graph_recall_explicit_session_scope_still_narrows_to_one_session(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """The federate-live default must remain OPT-OUTABLE: passing a concrete ``session_scope``
+    narrows back to exactly one of the user's sessions (the pre-ADR-0030 behaviour), mirroring
+    ``MtmTierRepository.recall``'s identical contract."""
+    ns_a = make_ns(user="u1", session="sessionA")
+    ns_b = make_ns(user="u1", session="sessionB")
+
+    await ltm.upsert_fact(make_item(ns_a, "Ada lives in Paris", subject="Ada",
+                                    predicate="lives_in", obj="Paris"))
+
+    narrowed = await ltm.graph_recall(ns_b, subject="Ada", limit=10, session_scope="sessionB")
+    assert narrowed == [], "explicit session_scope did not narrow — the opt-out is broken"
+
+    widened = await ltm.graph_recall(ns_b, subject="Ada", limit=10, session_scope="sessionA")
+    assert {h.item.object for h in widened} == {"Paris"}, (
+        "session_scope must be able to target ANY of the user's sessions, not only the caller's"
+    )

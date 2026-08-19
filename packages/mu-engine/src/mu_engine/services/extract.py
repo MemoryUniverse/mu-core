@@ -126,8 +126,45 @@ class ExtractionSettings(BaseModel):
     # small, NAMED, extensible exception table (methodology's "at least a stable canonical
     # predicate" floor) — NOT meant to be exhaustive; ops extend via
     # ``MU_EXTRACTION__CANONICAL_PREDICATE_MAP='{"...": "..."}'``.
+    # When the LLM extractor is wired, ALSO run the deterministic decomposer over the SAME raw
+    # text and UNION the results (deduped on the SPO+polarity identity). Live-reproduced on the
+    # real 0.5B dev SLM: for the pair "The deploy window is Friday at 4pm." / "... is Monday at
+    # 10am." the LLM path returned ONE fact where the deterministic floor returns TWO — so the
+    # functional supersession never fired (`superseded=0` vs `superseded=1`) and the stale fact
+    # stayed active. A small local model silently producing FEWER facts than a pure function over
+    # the same sentence is a strict regression, and nothing guarded it: the LLM path had no
+    # degrade floor, unlike the adjudicator (which already has `_heuristic_only_verdict`).
+    # The union can only ever ADD propositions the deterministic rules can literally see in the
+    # source text, so it cannot invent content. Set False to get the raw LLM-only behaviour back.
+    llm_union_with_heuristic_floor: bool = True
     canonical_predicate_map: dict[str, str] = Field(
-        default_factory=lambda: {"hotel_booking": "hotel", "sister": "has_sibling"}
+        default_factory=lambda: {
+            "hotel_booking": "hotel",
+            "sister": "has_sibling",
+            # D-7, conservative half. ``DistillSettings.functional_predicates`` already enumerates
+            # the TENSE VARIANTS of the same relation ("live_in"/"lives_in"/"lived_in",
+            # "work_at"/"works_at"/"worked_at") as separately-functional, which only works if the
+            # SAME relation also collides on (subject, predicate) in ``find_conflicts`` — and it
+            # did not, because nothing folded the variants together. These entries are pure
+            # tense/exact-synonym unification (never a semantic re-interpretation), so they can
+            # never invent a conflict that the surface text did not already state.
+            "live_in": "lives_in",
+            "lived_in": "lives_in",
+            "resides_in": "lives_in",
+            "reside_in": "lives_in",
+            "resided_in": "lives_in",
+            "work_at": "works_at",
+            "worked_at": "works_at",
+            # DELIBERATELY NOT DEFAULTED: "moved_to" -> "lives_in" (and friends like "relocated_to"
+            # / "based_in" / "located_in"). Those are SEMANTIC re-interpretations, not tense
+            # variants, and "moved to" is genuinely ambiguous across domains — "Ada moved to
+            # Berlin" is a residence change, but "the standup moved to 11am" is a schedule change
+            # and "Ada moved to a new team" is neither. Folding them in by default would
+            # manufacture FALSE supersessions (silently destroying a true fact), which for a
+            # memory system is strictly worse than missing one. Deployments that know their
+            # domain opt in explicitly:
+            #   MU_EXTRACTION__CANONICAL_PREDICATE_MAP='{"moved_to": "lives_in"}'
+        }
     )
 
 
@@ -574,7 +611,19 @@ def _decompose_sentence(
     for i, tok in enumerate(lowclean):
         if tok in prep_verbs and i + 1 < len(lowclean) and lowclean[i + 1] in _PREPS:
             subj = " ".join(clean[:i])
-            predicate = f"{tok}_{lowclean[i + 1]}"
+            # D-7 GAP FIX: this path (and the transitive-verb path below) minted its predicate
+            # DIRECTLY and never consulted `_canonicalize_predicate`, so the canonical map was
+            # dead exactly where it matters most — these two branches are what produce
+            # `lives_in`/`resides_in`/`works_at`/`worked_at`, i.e. the tense-and-synonym variants
+            # `DistillSettings.functional_predicates` already enumerates as ONE relation. Without
+            # canonicalization those variants never collide on (subject, predicate) in
+            # `find_conflicts`, so "Ada lives in Paris" + "Ada resides in Madrid" both stayed
+            # active (live-reproduced). The ALREADY-JOINED snake form is passed on purpose: it
+            # contains no space, so the helper's head-initial-preposition rule cannot fire and
+            # split "lives_in" down to "lives" — a map MISS therefore returns the identical
+            # string this line produced before, making the change behaviour-preserving by
+            # construction and only ADDITIVE when a map entry matches.
+            predicate = _canonicalize_predicate(f"{tok}_{lowclean[i + 1]}", settings=settings)
             obj = _clean_object(clean[i + 2 :], settings=settings)
             return _emit(
                 subj,
@@ -601,7 +650,9 @@ def _decompose_sentence(
             subj = " ".join(clean[:i])
             return _emit(
                 subj,
-                tok,
+                # D-7 GAP FIX (same rationale as the prepositional branch above): a single-token
+                # verb has no space, so a map miss returns `tok` unchanged.
+                _canonicalize_predicate(tok, settings=settings),
                 obj,
                 polarity=polarity,
                 content=original,
@@ -729,7 +780,34 @@ class LlmFactExtractor:
                     fs, now=now, min_tokens=self._settings.min_tokens, settings=self._settings
                 )
             )
+        if not self._settings.llm_union_with_heuristic_floor:
+            return out
+        # DEGRADE FLOOR (see `ExtractionSettings.llm_union_with_heuristic_floor`): the LLM is a
+        # SUPERSET strategy, never a replacement for what the deterministic rules can already read
+        # straight out of the sentence. Run the same decomposer over the ORIGINAL text and union,
+        # so a weak/small model can only ever ADD to the floor, never silently drop below it.
+        floor = decompose_to_spo(
+            text, now=now, min_tokens=self._settings.min_tokens, settings=self._settings
+        )
+        seen = {_fact_identity(f) for f in out}
+        for f in floor:
+            key = _fact_identity(f)
+            if key not in seen:
+                seen.add(key)
+                out.append(f)
         return out
+
+
+def _fact_identity(fact: ExtractedFact) -> tuple[str, str, str, Polarity]:
+    """The dedup identity of a proposition — case-folded S/P/O plus polarity. Deliberately NOT the
+    full model: two extractors legitimately disagree on `content`/`source_span`/`valid_at_inferred`
+    for the SAME underlying fact, and treating those as distinct would double-write it."""
+    return (
+        fact.subject.strip().casefold(),
+        fact.predicate.strip().casefold(),
+        fact.object.strip().casefold(),
+        fact.polarity,
+    )
 
 
 def _parse_mem0_facts(raw: str) -> list[str]:

@@ -229,6 +229,11 @@ class GraphStorePort(Protocol):
         predicate: str | None = None,
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
+        # Mirrors `MtmTierRepository`'s own federate-live semantics (ADR 0030 "keep-and-scope"):
+        # `None` (the DEFAULT) federates every one of the user's sessions; an explicit session id
+        # narrows to that one; SHARED ignores it entirely. Absent here until now, which left the
+        # LTM arm session-locked while the MTM arm federated — a split-brained recall fabric.
+        session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]: ...
 
     async def facts_at(

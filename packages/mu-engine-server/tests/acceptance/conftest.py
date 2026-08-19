@@ -71,7 +71,9 @@ def engine_server_token() -> str:
         )
     token = ENGINE_TOKEN_PATH.read_text(encoding="utf-8").strip()
     if not token:
-        pytest.fail(f"Stage F precondition not met: bearer token file {ENGINE_TOKEN_PATH} is blank.")
+        pytest.fail(
+            f"Stage F precondition not met: bearer token file {ENGINE_TOKEN_PATH} is blank."
+        )
     return token
 
 
@@ -115,7 +117,9 @@ def run_engine_server_cli(*args: str, timeout: float = 120.0) -> subprocess.Comp
     """Runs a `docker`/`make` CLI command scoped to the `mu-engine-server` compose project's own
     directory (never the protected `mu-dev-*`/`gcmem-*` stacks, never `docker compose down -v` —
     F2a only ever `docker kill`s + `make up`s the SAME already-provisioned volumes)."""
-    return subprocess.run(
+    # S603: `args` is never untrusted input — every call site in this package passes literal
+    # `docker`/`make` argv built in test code (no shell, `shell=False`, no user/network data).
+    return subprocess.run(  # noqa: S603
         args,
         cwd=ENGINE_SERVER_PACKAGE_DIR,
         capture_output=True,

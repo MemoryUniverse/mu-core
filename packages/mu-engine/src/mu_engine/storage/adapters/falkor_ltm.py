@@ -80,6 +80,48 @@ class EntityUidsSink(Protocol):
     ) -> None: ...
 
 
+def _resolve_memory_namespace_filter(
+    ns: Namespace, *, session_scope: str | None
+) -> tuple[str, str]:
+    """The ``(cypher_predicate, param_value)`` pair the ``:Memory`` reads filter on — the GRAPH
+    twin of ``qdrant_mtm._resolve_namespace_match``, and deliberately the same three-way rule.
+
+    FEDERATE-LIVE GAP FIX (live-reproduced): ``QdrantMtmAdapter`` already honoured
+    ``session_scope=None`` by relaxing to the session-less USER prefix (ADR 0030 "keep-and-scope"
+    — federate every one of the user's sessions, the DEFAULT), but ``graph_recall``/``facts_at``
+    took no ``session_scope`` at all and filtered ``m.namespace = $ns`` on the FULL, session-
+    included ``to_prefix()``. So federate-live recall was split-brained: the MTM arm went
+    cross-session while the LTM arm — the durable, user-scoped tier that is supposed to BE the
+    long-term memory — stayed locked to whichever session asked. The physical partition
+    (``graph_name_for``: org/workspace/visibility/user, no session) already held every session's
+    facts side by side; only this read filter hid them. The same reasoning ``_user_scope_prefix``
+    below already applies to the ``:Entity`` sub-graph, never extended to ``:Memory`` until now.
+
+    * SHARED -> exact ``to_prefix()``, UNCONDITIONALLY (rooms are real walls; ``session_scope``
+      never relaxes SHARED — identical to the Qdrant rule).
+    * PRIVATE, ``session_scope is None`` -> ``STARTS WITH`` the user prefix + ``/`` (the trailing
+      separator makes it an exact segment boundary, never a sibling-prefix collision).
+    * PRIVATE, explicit ``session_scope`` -> exact, rebuilt with that session (narrows to ANY one
+      of the user's sessions, not only the caller's own).
+    """
+    if ns.visibility is Visibility.SHARED:
+        return "m.namespace = $ns", ns.to_prefix()
+    if session_scope is None:
+        return "m.namespace STARTS WITH $ns", f"{_user_scope_prefix(ns)}/"
+    scoped = (
+        ns
+        if session_scope == ns.session
+        else Namespace(
+            org=ns.org,
+            workspace=ns.workspace,
+            user=ns.user,
+            session=session_scope,
+            visibility=ns.visibility,
+        )
+    )
+    return "m.namespace = $ns", scoped.to_prefix()
+
+
 def _user_scope_prefix(ns: Namespace) -> str:
     """BUG2 FIX (data-quality re-assessment §3 "MULTI-HOP TRAVERSAL DOES NOT WALK", scoping
     caveat): the USER-level scope key for the ``:Entity`` sub-graph (subject/object nodes +
@@ -405,6 +447,7 @@ class FalkorLtmAdapter:
         predicate: str | None = None,
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
+        session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]:
         return await self._retry(self._graph_recall_impl)(
             ns,
@@ -412,6 +455,7 @@ class FalkorLtmAdapter:
             predicate=predicate,
             limit=limit,
             caller_identity_set=caller_identity_set,
+            session_scope=session_scope,
         )
 
     async def _graph_recall_impl(
@@ -422,15 +466,16 @@ class FalkorLtmAdapter:
         predicate: str | None = None,
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
+        session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]:
-        prefix = ns.to_prefix()
+        ns_predicate, ns_value = _resolve_memory_namespace_filter(ns, session_scope=session_scope)
         where = [
-            "m.namespace = $ns",
+            ns_predicate,
             "m.state = $active",
             "(m.invalid_at = '' OR m.invalid_at > $now)",
         ]
         params: dict[str, Any] = {
-            "ns": prefix,
+            "ns": ns_value,
             "active": MemoryState.ACTIVE.value,
             "now": self._clock.now().isoformat(),  # injected Clock, UTC (MAJOR-3)
             "limit": limit,

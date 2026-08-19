@@ -1,0 +1,11 @@
+-- mu-dev-pgvector init (runs once, on first container boot, via /docker-entrypoint-initdb.d).
+--
+-- The `vector` extension MUST exist BEFORE any asyncpg pool connects: asyncpg builds its type
+-- map when a connection is established, so a pool opened against a database where `vector` does
+-- not yet exist raises `ValueError: unknown type: public.vector` for the whole pool lifetime —
+-- even after PgVectorMtmAdapter itself runs `CREATE EXTENSION IF NOT EXISTS vector`.
+--
+-- This is what `.env.test` already documents as the contract for this container
+-- ("pgvector/pgvector:pg16, `vector` extension pre-created"); the compose service simply had no
+-- init step to make it true.
+CREATE EXTENSION IF NOT EXISTS vector;

@@ -68,7 +68,7 @@ def _clean_engine_settings_env() -> Iterator[None]:
     afterwards — this module is the only one in the suite that touches
     ``get_engine_settings``'s ``lru_cache``, but the cache is process-global, so a leak here would
     silently mis-wire every OTHER test that runs after it in the same session."""
-    keys = ("MU_RECALL__WEIGHT_MTM", "MU_INGEST__IMPORTANCE_PROMOTE")
+    keys = ("MU_RECALL__WEIGHT_MTM", "MU_RECALL__STM_SCORING", "MU_INGEST__IMPORTANCE_PROMOTE")
     saved = {k: os.environ.get(k) for k in keys}
     yield
     for k, v in saved.items():
@@ -153,10 +153,26 @@ async def test_recall_weight_mtm_override_changes_result_membership(settings: Se
     uid_default = uuid.uuid4().hex[:10]
     uid_zeroed = uuid.uuid4().hex[:10]
     try:
+        # STALE-PREMISE FIX. This test's whole design is "`_TARGET` has exactly ONE edge — its
+        # rank-1 MTM relevance — so zeroing `weight_mtm` must drop it." That premise silently
+        # stopped holding when the STM channel gained its own per-candidate RELEVANCE score
+        # (`RecallSettings.stm_scoring`, default "embed", `ranker.py:_score_stm`): under "embed",
+        # the semantically-perfect `_TARGET` also ranks top of the STM arm, so it survives
+        # `weight_mtm=0.0` on the STM edge alone and the test failed while the knob was in fact
+        # wired correctly (`composition.py` passes the WIRED `EngineSettings.recall`) — a red test
+        # that no longer proved its own claim.
+        #
+        # Pinning `stm_scoring="recency"` for BOTH legs restores the documented premise (STM
+        # contributes pure recency, on which `_TARGET` is dead last) so the ONLY thing that can
+        # surface `_TARGET` is the MTM weight — and, as a bonus, this now proves a SECOND engine
+        # knob reaches the composed ranker.
+        os.environ["MU_RECALL__STM_SCORING"] = "recency"
+
         # (1) DEFAULT — no override; `EngineSettings().recall.weight_mtm == 1.0` (RecallSettings'
         # own class default, unchanged by this fix). The oldest-but-relevant fact's rank-1 MTM
         # bonus outweighs its rank-last STM penalty and it SURFACES in the result.
         get_engine_settings.cache_clear()
+        assert get_engine_settings().recall.stm_scoring == "recency"
         default_contents = await _seed_and_recall(settings, uid_default)
         assert get_engine_settings().recall.weight_mtm == 1.0
         assert _TARGET in default_contents, (

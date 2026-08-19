@@ -77,7 +77,7 @@ from mu_engine.storage.domain.memory import (
     MemoryTier,
 )
 from mu_engine.storage.domain.namespace import Namespace
-from mu_engine.storage.ports import GraphStorePort, MtmTierRepository
+from mu_engine.storage.ports import GraphStorePort, MtmTierRepository, StmTierRepository
 
 if TYPE_CHECKING:
     # `mu_engine.lifecycle` package's own `__init__.py` eagerly imports `promotion.py`/`manager.py`,
@@ -358,6 +358,7 @@ class DistillPipeline:
         clock: Clock | None = None,
         settings: DistillSettings | None = None,
         mtm: MtmTierRepository | None = None,
+        stm: StmTierRepository | None = None,
         bus: EventPublisher | None = None,
         lease: WriterLeasePort | None = None,
         tracer: Tracer | None = None,
@@ -370,6 +371,12 @@ class DistillPipeline:
         self._extractor = extractor or HeuristicSpoExtractor()
         self._clock: Clock = clock or SystemClock()
         self._mtm = mtm  # cross-store invalidate for an un-promoted MTM-resident loser (§7.5)
+        # THIRD arm of the ONE cross-store supersession of memory-layer-design.md §7.2 step 5
+        # ("Redis (STM): if the loser id is still resident in the STM window, evict/mark it so the
+        # window read (§9) never surfaces it"). Without it the LTM/MTM arms both flip the loser
+        # while the raw STM window copy stays live, and the recency floor re-surfaces the
+        # superseded fact as a top recall hit — the "absent from EVERY hot read" invariant broken.
+        self._stm = stm
         self._bus = bus
         self._lease: WriterLeasePort = lease or InProcessWriterLease()
         # Central observability (DEV-STANDARDS rule 4): span + latency/error metrics + content-free
@@ -711,9 +718,24 @@ class DistillPipeline:
             winner.state = MemoryState.SUPERSEDED
             winner.invalid_at = _valid_at(newest)
             await self._ltm.upsert_fact(winner)
+            at = _valid_at(newest)
             await self._ltm.invalidate(
-                ns, winner.id, newest.id, at=_valid_at(newest), reason="superseded_by_more_recent"
+                ns, winner.id, newest.id, at=at, reason="superseded_by_more_recent"
             )
+            # SYMMETRY FIX (§7.2 step 5): SELF_EXPIRE is a supersession too — the LOSER is the
+            # incoming `winner` fact. The pre-fix branch wrote ONLY the graph arm, so the incoming
+            # fact's own MTM point and STM window copy stayed `state=active` and kept being fused
+            # back into recall. The SUPERSEDE branch below always did all three; this one now
+            # matches it exactly (same guards, same ingest-id resolution, same event).
+            if self._mtm is not None:
+                await self._invalidate_mtm_guarded(ns, loser=winner, winner=newest, at=at)
+            await self._evict_stm_guarded(ns, loser=winner)
+            if self._bus is not None:
+                await self._bus.publish(
+                    MemorySuperseded(
+                        namespace=ns, loser_id=winner.id, winner_id=newest.id, valid_at=at
+                    )
+                )
             return self._action(
                 DistillActionKind.SELF_EXPIRE, newest, (winner.id,), "incoming_older_than_candidate"
             )
@@ -741,6 +763,9 @@ class DistillPipeline:
             # point (404, the id-linkage crash); resolve the ingest id so the RIGHT MTM point flips.
             if self._mtm is not None:
                 await self._invalidate_mtm_guarded(ns, loser=loser, winner=winner, at=at)
+            # THIRD arm (§7.2 step 5, Redis/STM bullet): the raw STM window copy of the loser must
+            # leave the hot read too, or the recency floor re-surfaces the superseded fact.
+            await self._evict_stm_guarded(ns, loser=loser)
             loser_ids.append(loser.id)
             if self._bus is not None:
                 await self._bus.publish(
@@ -785,6 +810,43 @@ class DistillPipeline:
         """
         fresh = await self._ltm.facts_at(ns, at, subject=stale.subject)
         return next((f for f in fresh if f.id == stale.id), None)
+
+    # ---- STM cross-store arm — the third arm of §7.2 step 5 --------------------------------
+    async def _evict_stm_guarded(self, ns: Namespace, *, loser: MemoryItem) -> None:
+        """Drop a superseded loser out of the STM recency window (memory-layer-design.md §7.2
+        step 5, Redis bullet: "if the loser id is still resident in the STM window, evict/mark it
+        so the window read (§9) never surfaces it").
+
+        Keyed by the INGEST id via the same ``_mtm_point_id`` resolution the MTM arm uses — an
+        EXTRACTED fact mints a fresh LTM node id and records its source ingest id in
+        ``metadata['derived_from']``, and it is that raw source message which is STM-resident, not
+        the fact node. Passing the fact-node id would evict nothing and silently leave the stale
+        message in the window.
+
+        This is NOT a violation of invalidate-don't-delete: the loser is retained, queryable and
+        edge-linked in LTM (``state=superseded`` + ``invalid_at`` + ``SUPERSEDED_BY``) and stamped
+        ``state=superseded`` on its MTM point. STM is the volatile recency window (its own TTL is
+        its normal eviction), so removing the loser there destroys no history — it only enforces
+        the "absent from EVERY hot read" half of the invariant.
+
+        Best-effort by construction: STM eviction is idempotent and a miss is normal (the window
+        may have already TTL'd the id). A store-level failure must never fail the distill sweep —
+        the graph arm (source of truth) has always already committed by the time this runs — so it
+        degrades to a NAMED, content-free warning, exactly like the MTM arm.
+        """
+        if self._stm is None:
+            return
+        stm_id = self._mtm_point_id(loser)
+        try:
+            await self._stm.evict(ns, stm_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.warning(
+                "stm_supersede_evict_failed",
+                ns=ns.to_prefix(),
+                error_type=type(exc).__name__,
+            )
 
     # ---- MTM cross-store invalidate — NAMED degrade wrap (spec §13.2 fix #2) -----------------
     async def _invalidate_mtm_guarded(

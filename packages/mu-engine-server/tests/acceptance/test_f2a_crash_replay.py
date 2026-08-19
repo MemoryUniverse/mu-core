@@ -134,10 +134,22 @@ def test_write_survives_container_kill_and_replay_is_honest_about_reinforcement(
     headers = {"Authorization": f"Bearer {engine_token}", "Content-Type": "application/json"}
 
     # ---- 1. write via the public HTTP surface (the same wire shape MemoryClient.add() sends) ----
+    # STALE-PREMISE FIX. F2a is about CRASH DURABILITY of a genuinely two-tier (STM+MTM) write, not
+    # about the promote gate. It used to post a DEFAULT-importance body and assert
+    # `promoted is True`, which only held while `SurfaceFacade.add` hardcoded `promote=True` — the
+    # REMEDIATION Rank 2 / conformance A6 fix removed that, so a default-importance add correctly
+    # stays STM-only and this criterion started failing for a reason that has nothing to do with
+    # durability. Sending an explicit high `importance_score` restores the test's ACTUAL premise
+    # (a real STM+MTM write to crash-test) instead of weakening its assertions.
     add_response = httpx.post(
         f"{ENGINE_BASE_URL}/memories",
         headers=headers,
-        json={"content": content, "user": user, "session": session},
+        json={
+            "content": content,
+            "user": user,
+            "session": session,
+            "importance_score": 0.95,
+        },
         timeout=15.0,
     )
     assert add_response.status_code == 201, add_response.text
@@ -185,7 +197,12 @@ def test_write_survives_container_kill_and_replay_is_honest_about_reinforcement(
     replay_response = httpx.post(
         f"{ENGINE_BASE_URL}/memories",
         headers=headers,
-        json={"content": content, "user": user, "session": session},
+        json={
+            "content": content,
+            "user": user,
+            "session": session,
+            "importance_score": 0.95,  # same premise as the first write (see step 1)
+        },
         timeout=15.0,
     )
     assert replay_response.status_code == 201, replay_response.text

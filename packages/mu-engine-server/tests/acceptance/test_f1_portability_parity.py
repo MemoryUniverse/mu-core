@@ -35,11 +35,12 @@ mu_local = pytest.importorskip(
     "mu_local", reason="F1's embedded leg needs the mu-sdk[embedded] extra (mu-local) installed"
 )
 
-from mu_local.config import BackendChoice, StorageSettings  # noqa: E402 — after importorskip
 from mu_sdk.auth import BearerAuth  # noqa: E402
 from mu_sdk.client import MemoryClient  # noqa: E402
 from mu_sdk.config import SdkConfig  # noqa: E402
 from mu_sdk.transport import UnroutedEmbeddedCallError  # noqa: E402
+
+from mu_local.config import BackendChoice, StorageSettings  # noqa: E402 — after importorskip
 
 # Kept as plain literals (not imported from ./conftest.py) — this package's `tests/` directory is
 # one of SEVERAL identically-named namespace-package roots across the mu-core workspace
@@ -104,8 +105,20 @@ async def test_add_recall_get_field_equal_dtos_embedded_vs_local_server(
     session = "s1"
 
     # ---- add() on both legs ----
-    embedded_add = await embedded_client.add(content, user=user, session=session)
-    local_add = await local_server_client_ctx.add(content, user=user, session=session)
+    # STALE-PREMISE FIX (same class as F2a/F3): the `promoted is True` parity assertion below only
+    # held while `SurfaceFacade.add` hardcoded `promote=True`; after the REMEDIATION Rank 2 /
+    # conformance A6 fix a default-importance add correctly stays STM-only. Sending an explicit
+    # `importance_score` on BOTH legs keeps that assertion at full strength AND makes this a
+    # STRICTLY STRONGER parity proof: it now also demonstrates the canonical
+    # `AddRequest.importance_score` field survives BOTH transports identically (the embedded path
+    # always honoured it; the local_server path silently DROPPED it at the route until this
+    # session's fix, so this line is now a genuine cross-transport regression guard).
+    embedded_add = await embedded_client.add(
+        content, user=user, session=session, importance_score=0.95
+    )
+    local_add = await local_server_client_ctx.add(
+        content, user=user, session=session, importance_score=0.95
+    )
 
     # Namespace parity (CO-5, design §6's own guarantee — "identical return DTOs... no behavioral
     # divergence for the same input"): SAME user/session/workspace/namespace -> SAME η prefix,
@@ -129,7 +142,9 @@ async def test_add_recall_get_field_equal_dtos_embedded_vs_local_server(
 
     # ---- recall() on both legs ----
     embedded_recall = await embedded_client.recall(content, user=user, session=session, limit=5)
-    local_recall = await local_server_client_ctx.recall(content, user=user, session=session, limit=5)
+    local_recall = await local_server_client_ctx.recall(
+        content, user=user, session=session, limit=5
+    )
 
     embedded_contents = [item.content for item in embedded_recall.items]
     local_contents = [item.content for item in local_recall.items]

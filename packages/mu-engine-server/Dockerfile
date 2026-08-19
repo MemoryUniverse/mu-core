@@ -68,7 +68,16 @@ FROM python:3.12-slim AS runtime
 
 # Non-root (design §7.1 "thin image"; standard container hardening — nothing in this process needs
 # root once dependencies are installed).
-RUN useradd --create-home --home-dir /home/mu-engine-server --uid 1000 \
+# The runtime uid/gid MUST match the HOST user that `make up` mints the 0600 bearer token as:
+# the token is bind-mounted read-only into this image's HOME, and a 0600 file is readable ONLY by
+# its owning uid. Hardcoding 1000 silently produced a server that 401'd EVERY request on any host
+# whose user is not uid 1000 (live-reproduced on a uid-1001 host: `/health` was fine — it needs no
+# auth — while every authenticated route returned {"detail":"unauthorized"}). The Makefile passes
+# the real `id -u`/`id -g`; 1000 stays the default so a uid-1000 host is byte-identical to before.
+ARG APP_UID=1000
+ARG APP_GID=1000
+RUN groupadd --gid "$APP_GID" mu-engine-server 2>/dev/null || true; \
+    useradd --create-home --home-dir /home/mu-engine-server --uid "$APP_UID" --gid "$APP_GID" \
         --shell /usr/sbin/nologin mu-engine-server
 
 WORKDIR /app

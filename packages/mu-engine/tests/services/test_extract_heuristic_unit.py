@@ -130,3 +130,52 @@ async def test_settings_min_tokens_is_actually_consumed_by_the_extractor() -> No
         "min_tokens=4 (passed via settings=) did not reach the extractor — the 3-token sentence "
         f"still extracted: {raised_facts!r}"
     )
+
+
+# --------------------------------------------------------------------------- D-7 canonicalization
+# REGRESSION: `_canonicalize_predicate` existed and was documented as the D-7 predicate-
+# normalization seam, but the prepositional-verb and transitive-verb branches minted their
+# predicate DIRECTLY and never called it — so the canonical map was dead on exactly the branches
+# that produce `lives_in`/`resides_in`/`works_at`/`worked_at`. Those are the tense/synonym variants
+# `DistillSettings.functional_predicates` already enumerates as ONE relation, so leaving them
+# un-unified meant two surface forms of the same fact never collided on (subject, predicate) in
+# `find_conflicts` and BOTH stayed active — the "MU keeps stale truth" symptom.
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_predicate", "expected_object"),
+    [
+        ("Ada lives in Paris", "lives_in", "Paris"),
+        ("Ada resides in Madrid", "lives_in", "Madrid"),  # synonym -> same canonical predicate
+        ("Ada lived in Rome", "lives_in", "Rome"),  # past tense -> same canonical predicate
+        ("Ada works at Acme", "works_at", "Acme"),
+        ("Ada worked at Globex", "works_at", "Globex"),  # past tense -> same canonical predicate
+    ],
+)
+async def test_tense_and_synonym_variants_canonicalize_to_one_predicate(
+    text: str, expected_predicate: str, expected_object: str
+) -> None:
+    facts = await _extract(text)
+    assert len(facts) == 1
+    assert (facts[0].predicate, facts[0].object) == (expected_predicate, expected_object)
+
+
+async def test_ambiguous_semantic_verbs_are_not_canonicalized_by_default() -> None:
+    """`moved_to` is deliberately NOT folded into `lives_in` by default: "moved to" is ambiguous
+    across domains ("Ada moved to Berlin" = residence, "the standup moved to 11am" = schedule), so
+    defaulting it would manufacture FALSE supersessions — strictly worse for a memory system than
+    missing one. It stays a distinct predicate unless a deployment opts in explicitly.
+    """
+    facts = await _extract("Ada moved to Berlin")
+    assert len(facts) == 1
+    assert facts[0].predicate == "moved_to"
+
+
+async def test_operator_supplied_canonical_map_reaches_the_verb_branches() -> None:
+    """The documented opt-in (`MU_EXTRACTION__CANONICAL_PREDICATE_MAP`) must actually reach the
+    prepositional-verb branch — this is what makes the deliberate default above safe to keep.
+    """
+    settings = ExtractionSettings(canonical_predicate_map={"moved_to": "lives_in"})
+    facts = decompose_to_spo("Ada moved to Berlin", now=NOW, settings=settings)
+    assert len(facts) == 1
+    assert (facts[0].predicate, facts[0].object) == ("lives_in", "Berlin")

@@ -283,6 +283,12 @@ class ThreeChannelRecallRanker:
         competes on equal footing with every other LTM hit. ``settings.ltm_max_hops == 0``
         disables the traversal call entirely (flat-only, pre-D6 behavior)."""
         try:
+            # `session_scope` is left at its DEFAULT (`None` = federate every one of the user's
+            # sessions), exactly as this ranker already leaves `MtmTierRepository.recall`'s
+            # identical parameter at its default. Until `graph_recall` GREW that parameter, the
+            # LTM arm had no way to express it and filtered the full session-included namespace —
+            # so the MTM arm federated across sessions while the LTM arm, the durable user-scoped
+            # tier, stayed locked to the asking session. Same default, same semantics, one fabric.
             hits = await self._ltm.graph_recall(ns, limit=pool, caller_identity_set=caller)
         except StoreUnavailableError:
             return [], True

@@ -474,6 +474,10 @@ class LocalContainer:
             clock=self._clock,
             settings=self._distill_settings,
             mtm=self.mtm,
+            # Third arm of the cross-store supersession (memory-layer-design.md §7.2 step 5):
+            # without this the superseded loser stays live in the STM recency window and the
+            # recency floor re-surfaces it as a top recall hit.
+            stm=self.stm,
             bus=self._bus,
             tracer=self.tracer,
             metrics=self.metrics,

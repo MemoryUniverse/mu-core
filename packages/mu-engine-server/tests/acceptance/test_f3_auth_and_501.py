@@ -25,7 +25,9 @@ pytestmark = pytest.mark.integration
 ENGINE_BASE_URL = "http://127.0.0.1:8300"
 
 
-def _post(path: str, *, headers: dict[str, str] | None = None, json: dict | None = None) -> httpx.Response:
+def _post(
+    path: str, *, headers: dict[str, str] | None = None, json: dict | None = None
+) -> httpx.Response:
     return httpx.post(
         f"{ENGINE_BASE_URL}{path}",
         headers=headers,
@@ -54,7 +56,9 @@ def test_blank_bearer_is_401(engine_up: None) -> None:
 def test_wrong_bearer_is_401(engine_up: None) -> None:
     del engine_up
     response = _post(
-        "/memories", headers={"Authorization": "Bearer wrong-token-not-the-real-one"}, json={"content": "hi"}
+        "/memories",
+        headers={"Authorization": "Bearer wrong-token-not-the-real-one"},
+        json={"content": "hi"},
     )
     assert response.status_code == 401
 
@@ -64,7 +68,11 @@ def test_malformed_scheme_is_401(engine_up: None, engine_token: str) -> None:
     own `verify_bearer_token` requires the exact `Bearer ` prefix (`tests/test_auth.py::
     test_verify_bearer_token_wrong_scheme_raises`, unit tier; re-proven here over real HTTP)."""
     del engine_up
-    response = _post("/memories", headers={"Authorization": f"Basic {engine_token}"}, json={"content": "hi"})
+    response = _post(
+        "/memories",
+        headers={"Authorization": f"Basic {engine_token}"},
+        json={"content": "hi"},
+    )
     assert response.status_code == 401
 
 
@@ -74,7 +82,17 @@ def test_correct_bearer_is_200(engine_up: None, engine_token: str) -> None:
     response = _post(
         "/memories",
         headers={"Authorization": f"Bearer {engine_token}"},
-        json={"content": f"F3-auth-smoke-{marker}", "user": "f3-auth-user", "session": "s1"},
+        # STALE-PREMISE FIX (same class as F2a): this is an AUTH smoke test, but it asserted
+        # `promoted is True`, which only held while `SurfaceFacade.add` hardcoded `promote=True`.
+        # After the REMEDIATION Rank 2 / conformance A6 fix a default-importance add correctly
+        # stays STM-only. Send an explicit importance so the promotion assertion keeps its
+        # original STRENGTH instead of being deleted to make the test pass.
+        json={
+            "content": f"F3-auth-smoke-{marker}",
+            "user": "f3-auth-user",
+            "session": "s1",
+            "importance_score": 0.95,
+        },
     )
     assert response.status_code == 201, response.text
     body = response.json()
@@ -125,7 +143,9 @@ def test_promote_invalid_tier_is_400_http(engine_up: None, engine_token: str) ->
 # promote/demote — via the Python client (a REAL wire call now; 404 -> NotFoundError)
 # ============================================================================================
 
-mu_sdk = pytest.importorskip("mu_sdk", reason="F3's Python-client half needs mu-sdk-python installed")
+mu_sdk = pytest.importorskip(
+    "mu_sdk", reason="F3's Python-client half needs mu-sdk-python installed"
+)
 
 from mu_sdk.auth import BearerAuth  # noqa: E402
 from mu_sdk.client import MemoryClient  # noqa: E402

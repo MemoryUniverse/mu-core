@@ -16,7 +16,11 @@ from datetime import UTC, datetime
 import pytest
 
 from mu_engine.providers._contracts import Completion, Message
-from mu_engine.services.extract import LlmFactExtractor, build_extractor
+from mu_engine.services.extract import (
+    ExtractionSettings,
+    LlmFactExtractor,
+    build_extractor,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -96,3 +100,57 @@ def test_build_extractor_llm_wired() -> None:
     provider = _FakeProvider("{}")
     ex = build_extractor(use_llm=True, llm_provider=provider, model_group="hard_extract")
     assert ex.name == "llm_mem0_v1"
+
+
+# ------------------------------------------------------------------ LLM degrade floor (union)
+# REGRESSION, live-reproduced on the real 0.5B dev SLM: the LLM path returned FEWER propositions
+# than the pure-function deterministic decomposer would over the SAME text, so a functional
+# contradiction never collided and `superseded` came back 0 where the heuristic gave 1 — the stale
+# fact stayed active. A small local model silently dropping below the deterministic floor is a
+# strict regression, and nothing guarded it (unlike the adjudicator, which already degrades to
+# `_heuristic_only_verdict`). The union can only ADD propositions literally readable from the
+# source text, so it can never invent content.
+
+
+async def test_llm_extractor_unions_the_deterministic_floor_when_the_model_underextracts() -> None:
+    """The model returns only ONE of the two facts stated in the text; the floor supplies
+    the other."""
+    provider = _FakeProvider('{"facts": ["Ada lives in Paris"]}')
+    extractor = LlmFactExtractor(provider, model_group="hard_extract")
+
+    facts = await extractor.extract("Ada lives in Paris. Ada works at Acme.", now=NOW)
+
+    by_pred = {f.predicate: f.object for f in facts}
+    assert by_pred["lives_in"] == "Paris"
+    assert by_pred["works_at"] == "Acme", (
+        "the deterministic floor did not backfill the fact the model dropped — a weak model can "
+        "still silently lose a stated fact, which is what broke supersession on the real SLM"
+    )
+
+
+async def test_llm_extractor_union_does_not_duplicate_a_fact_both_paths_found() -> None:
+    """Identity is case-folded S/P/O + polarity, so the SAME fact found by BOTH the model and the
+    floor is stored once — the union must not double-write."""
+    provider = _FakeProvider('{"facts": ["ada LIVES IN paris"]}')
+    extractor = LlmFactExtractor(provider, model_group="hard_extract")
+
+    facts = await extractor.extract("Ada lives in Paris.", now=NOW)
+
+    assert len(facts) == 1, (
+        f"expected one deduped fact, got {[(f.subject, f.object) for f in facts]}"
+    )
+
+
+async def test_llm_extractor_floor_union_can_be_disabled() -> None:
+    """The floor is a documented, named setting — a deployment that genuinely wants raw LLM-only
+    output can turn it off and get the exact pre-fix behaviour back."""
+    provider = _FakeProvider('{"facts": ["Ada lives in Paris"]}')
+    extractor = LlmFactExtractor(
+        provider,
+        model_group="hard_extract",
+        settings=ExtractionSettings(llm_union_with_heuristic_floor=False),
+    )
+
+    facts = await extractor.extract("Ada lives in Paris. Ada works at Acme.", now=NOW)
+
+    assert [f.predicate for f in facts] == ["lives_in"]

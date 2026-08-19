@@ -59,6 +59,11 @@ class MemorySurfacePort(Protocol):
         *,
         user: str,
         session: str | None,
+        # Canonical COMMON AddRequest field (`requests.py:199`), honoured by `SurfaceFacade.add`
+        # and threaded to `DeterministicPromoteStage`'s importance>=threshold promote gate. It was
+        # absent from this protocol, so the route could not pass it without a type error — which
+        # is why the route silently dropped it and no wire caller could ever reach MTM.
+        importance_score: float | None = None,
     ) -> MemoryWriteResult: ...
 
     async def recall(

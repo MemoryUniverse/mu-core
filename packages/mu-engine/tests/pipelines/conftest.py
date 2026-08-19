@@ -17,10 +17,12 @@ import pytest
 import pytest_asyncio
 from falkordb.asyncio import FalkorDB
 from qdrant_client import AsyncQdrantClient
+from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
+from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
 from mu_engine.storage.domain.memory import (
     MemoryItem,
     MemoryKind,
@@ -150,3 +152,26 @@ async def qdrant_client(settings: Settings, uid: str) -> AsyncIterator[AsyncQdra
 async def mtm(qdrant_client: AsyncQdrantClient) -> QdrantMtmAdapter:
     """REAL Qdrant MTM adapter (the cross-store supersede target), ZERO mocks."""
     return QdrantMtmAdapter(qdrant_client, dim=_MTM_TEST_DIM)
+
+
+@pytest_asyncio.fixture
+async def stm_client(settings: Settings) -> AsyncIterator[Redis]:
+    """REAL Valkey/Redis connection for the STM arm of the cross-store supersession."""
+    client: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
+    try:
+        await client.ping()  # fail-loud probe; BLOCKED (never faked) if the cache is down
+        yield client
+    finally:
+        await client.aclose()
+
+
+@pytest_asyncio.fixture
+async def stm(stm_client: Redis, uid: str) -> AsyncIterator[RedisStmAdapter]:
+    """REAL STM adapter (third arm of memory-layer-design.md §7.2 step 5), ZERO mocks."""
+    try:
+        yield RedisStmAdapter(stm_client)
+    finally:
+        keys = [k async for k in stm_client.scan_iter(match=f"*{uid}*".encode())]
+        if keys:
+            with contextlib.suppress(Exception):  # best-effort teardown only
+                await stm_client.delete(*keys)

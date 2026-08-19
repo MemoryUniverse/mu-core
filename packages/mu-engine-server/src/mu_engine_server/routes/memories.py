@@ -93,7 +93,20 @@ async def add_memory(
         shared_configured=False,
     )
     user = body.user if body.user is not None else _DEFAULT_USER
-    return await facade.add(body.content, user=user, session=body.session)
+    # `importance_score` is a canonical COMMON AddRequest field (`requests.py:199`) and this
+    # module's own `_ADD_PLANE_GATED_FIELDS` comment already promises it "always passes through" —
+    # but the call below used to DROP it, so `SurfaceFacade.add` always saw its `None` default and
+    # fell back to the 0.5 field default. Consequence (live-reproduced over the real HTTP surface):
+    # a client posting `importance_score: 0.95` still got `{"promoted": false,
+    # "tiers_written": ["stm"]}` — i.e. NO wire/SDK caller could ever clear
+    # `IngestSettings.importance_promote` (0.6) and reach MTM, leaving the whole server plane
+    # effectively STM-only while the embedded/local path honoured the very same field.
+    return await facade.add(
+        body.content,
+        user=user,
+        session=body.session,
+        importance_score=body.importance_score,
+    )
 
 
 @router.get("/memories/{memory_id}", response_model=MemoryResponse)

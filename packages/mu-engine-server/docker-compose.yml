@@ -41,6 +41,11 @@ services:
     build:
       context: ../..
       dockerfile: packages/mu-engine-server/Dockerfile
+      args:
+        # Host uid/gid, exported by the Makefile — the container user must OWN the 0600 bearer
+        # token bind-mounted below, or every authenticated request 401s (see Dockerfile).
+        APP_UID: ${MU_APP_UID:-1000}
+        APP_GID: ${MU_APP_GID:-1000}
     image: mu-engine-server:latest
     container_name: mu-engine-server
     ports:
