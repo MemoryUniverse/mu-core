@@ -154,3 +154,33 @@ async def test_llm_extractor_floor_union_can_be_disabled() -> None:
     facts = await extractor.extract("Ada lives in Paris. Ada works at Acme.", now=NOW)
 
     assert [f.predicate for f in facts] == ["lives_in"]
+
+
+async def test_floor_union_never_manufactures_a_functional_contradiction() -> None:
+    """REGRESSION for a DESTRUCTIVE bug the first version of the floor union shipped.
+
+    The deterministic decomposer runs over the RAW sentence, so on a compound clause it produces a
+    garbage object: "Ada lives in Paris and works at Acme" yields
+    ``(Ada, lives_in, "Paris and works at Acme")``. The LLM splits it correctly into two facts.
+    Keyed on the full triple, the union kept BOTH — and two facts sharing (subject, predicate) with
+    DIFFERENT objects is exactly a functional contradiction, so supersession fired on a conflict
+    the source text never contained and erased the correct fact from recall (live-reproduced: the
+    promoted MTM point flipped to ``state=superseded``).
+
+    The union is therefore keyed on the RELATION: the floor backfills only relations the model
+    missed entirely, and never offers a second opinion on one the model already extracted.
+    """
+    provider = _FakeProvider('{"facts": ["Ada lives in Paris", "Ada works at Acme"]}')
+    extractor = LlmFactExtractor(provider, model_group="hard_extract")
+
+    facts = await extractor.extract("Ada lives in Paris and works at Acme", now=NOW)
+
+    by_pred: dict[str, list[str]] = {}
+    for f in facts:
+        by_pred.setdefault(f.predicate, []).append(f.object)
+
+    assert by_pred["lives_in"] == ["Paris"], (
+        "the floor's garbage compound object survived the union and will trigger a FALSE "
+        f"functional supersession against the model's correct fact: {by_pred}"
+    )
+    assert by_pred["works_at"] == ["Acme"]

@@ -786,26 +786,45 @@ class LlmFactExtractor:
         # SUPERSET strategy, never a replacement for what the deterministic rules can already read
         # straight out of the sentence. Run the same decomposer over the ORIGINAL text and union,
         # so a weak/small model can only ever ADD to the floor, never silently drop below it.
+        #
+        # The union is keyed on the RELATION, not on the full triple — see `_relation_identity`
+        # for the destructive bug that the full-triple key caused.
         floor = decompose_to_spo(
             text, now=now, min_tokens=self._settings.min_tokens, settings=self._settings
         )
-        seen = {_fact_identity(f) for f in out}
+        seen = {_relation_identity(f) for f in out}
         for f in floor:
-            key = _fact_identity(f)
+            key = _relation_identity(f)
             if key not in seen:
                 seen.add(key)
                 out.append(f)
         return out
 
 
-def _fact_identity(fact: ExtractedFact) -> tuple[str, str, str, Polarity]:
-    """The dedup identity of a proposition — case-folded S/P/O plus polarity. Deliberately NOT the
-    full model: two extractors legitimately disagree on `content`/`source_span`/`valid_at_inferred`
-    for the SAME underlying fact, and treating those as distinct would double-write it."""
+def _relation_identity(fact: ExtractedFact) -> tuple[str, str, Polarity]:
+    """The union key: case-folded (subject, predicate) + polarity — **deliberately WITHOUT the
+    object.**
+
+    The first version of the floor union keyed on full S/P/O, and that was a destructive bug
+    (live-reproduced). The deterministic decomposer runs over the RAW sentence, so on a compound
+    like *"Ada lives in Paris and works at Acme"* it yields the garbage fact
+    ``(Ada, lives_in, "Paris and works at Acme")`` — while the LLM correctly splits the sentence
+    into ``(Ada, lives_in, Paris)`` and ``(Ada, works_at, Acme)``. Keyed on S/P/O those are
+    *different* facts, so the union kept BOTH — and two facts sharing (subject, predicate) with
+    different objects is precisely a FUNCTIONAL CONTRADICTION. Supersession then fired on a
+    conflict that the source text never contained, flipping the correct fact's MTM point to
+    ``state=superseded`` and erasing it from recall.
+
+    Keying on the RELATION fixes the polarity of the trade-off. The floor now backfills only
+    relations the model missed **entirely**; where both saw the same relation, the model's
+    decomposition wins (it can split a compound clause; the regex floor cannot). The cost is that
+    a multi-valued relation the model under-extracted keeps only the model's value. That is the
+    right way round: for a memory system, DESTROYING a true fact is strictly worse than missing
+    one — the same reason ``moved_to -> lives_in`` is not canonicalized by default.
+    """
     return (
         fact.subject.strip().casefold(),
         fact.predicate.strip().casefold(),
-        fact.object.strip().casefold(),
         fact.polarity,
     )
 
