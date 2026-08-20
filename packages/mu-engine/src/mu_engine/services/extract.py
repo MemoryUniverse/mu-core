@@ -136,6 +136,38 @@ class ExtractionSettings(BaseModel):
     # degrade floor, unlike the adjudicator (which already has `_heuristic_only_verdict`).
     # The union can only ever ADD propositions the deterministic rules can literally see in the
     # source text, so it cannot invent content. Set False to get the raw LLM-only behaviour back.
+    # NOISE GATE (live-reproduced on the real hook path). An agent transcript is mostly
+    # INSTRUCTIONS, not assertions, and the decomposer was turning some of them into "facts":
+    # "Do not use any tools." became ('Do', 'use', 'any tools'), and "What is the passphrase?"
+    # became a fact whose subject was "What". A memory system that confidently remembers
+    # "Do use any tools" is worse than one that remembers nothing — the whole point of storing a
+    # fact is that it can later be asserted back.
+    #
+    # A sentence is dropped when its subject is one of these lead-ins. They are IMPERATIVE
+    # auxiliaries and INTERROGATIVE pronouns: neither can be the subject of an assertion in
+    # English, so a "fact" headed by one is a parse failure, not a memory.
+    # DELIBERATELY NARROW — only words that cannot head a noun-phrase subject in English, and only
+    # when the subject is that word ALONE. A broad list over-blocks: the first version included
+    # "note"/"report"/"answer"/"list"/"check", which are ordinary nouns, and it silently dropped
+    # the real fact in "Note taking is hard". Dropping a true fact to suppress noise is the wrong
+    # trade — the same principle that keeps `moved_to -> lives_in` out of the canonical map.
+    #
+    # The other instruction forms ("Please summarize the file.", "Run this command.") need no
+    # vocabulary at all: they match no assertion pattern and are already dropped.
+    imperative_subjects: frozenset[str] = frozenset(
+        {"do", "don't", "dont", "please", "let", "let's", "lets", "kindly"}
+    )
+    interrogative_subjects: frozenset[str] = frozenset(
+        {"what", "who", "when", "where", "why", "how", "which", "whose", "whom"}
+    )
+    # Discourse prefixes stripped before matching, so the SAME fact stated conversationally
+    # ("Noted — the passphrase is X") collides with its plain form ("the passphrase is X") instead
+    # of storing twice. This is the other half of the duplicate problem the demo exposed.
+    discourse_prefixes: tuple[str, ...] = (
+        "noted", "ok", "okay", "sure", "got it", "understood", "alright", "right", "yes", "no",
+        "thanks", "great", "perfect", "done",
+    )
+
     llm_union_with_heuristic_floor: bool = True
     canonical_predicate_map: dict[str, str] = Field(
         default_factory=lambda: {
@@ -393,6 +425,25 @@ def _find_word(lowered: str, phrase: str) -> int | None:
     return m.start() if m else None
 
 
+def _strip_discourse_prefix(subject: str, *, settings: ExtractionSettings) -> str:
+    """Drop a conversational lead-in from the SUBJECT so the same fact collides with its plain
+    form. Live: an assistant's "Noted — the ZEPHYR passphrase is X" produced the subject
+    "Noted — the ZEPHYR passphrase", which shares no identity with the user's own
+    "the ZEPHYR passphrase" — so the SAME fact stored twice and never superseded. Only a leading
+    marker followed by a separator (comma / dash / colon) is stripped, so a subject that merely
+    STARTS with such a word ("Note taking is hard") is untouched.
+    """
+    text = subject.strip()
+    lowered = text.lower()
+    for marker in settings.discourse_prefixes:
+        if not lowered.startswith(marker):
+            continue
+        rest = text[len(marker) :].lstrip()
+        if rest[:1] in {",", "-", "\u2014", "\u2013", ":"}:
+            return rest[1:].strip()
+    return text
+
+
 def _emit(
     subject: str,
     predicate: str,
@@ -402,13 +453,31 @@ def _emit(
     content: str,
     valid_at: datetime | None,
     span: tuple[int, int] | None,
+    settings: ExtractionSettings,
 ) -> ExtractedFact | None:
-    subject = subject.strip()
+    subject = _strip_discourse_prefix(subject, settings=settings)
     obj = obj.strip()
     predicate = predicate.strip().lower().replace(" ", "_")
     if not subject or not predicate or not obj:
         return None
     if subject.lower() in _NOISE_SUBJECTS:
+        return None
+    # THE NOISE GATE (see `ExtractionSettings.imperative_subjects`). Every pattern funnels through
+    # `_emit`, so this is the one place it belongs. An agent transcript is mostly instructions and
+    # questions; neither asserts anything, and a "fact" headed by an imperative auxiliary or an
+    # interrogative pronoun is a parse failure. Live-reproduced: "Do not use any tools." became
+    # ('Do', 'use', 'any tools') — the exact inverse of what the sentence said, because negation
+    # stripping had already removed the "not".
+    tokens = subject.split()
+    head = tokens[0].lower().strip(".,;:!?'\"")
+    # An INTERROGATIVE head is decisive at any length — no assertion has a subject headed by
+    # what/who/when/... ("What kind of model is best?" is still a question, not a memory).
+    if head in settings.interrogative_subjects:
+        return None
+    # An IMPERATIVE parse failure leaves the auxiliary STRANDED as a one-word subject ("Do"). A
+    # real noun phrase that merely begins with such a word has more to it, so the length check is
+    # what keeps this a scalpel.
+    if len(tokens) == 1 and head in settings.imperative_subjects:
         return None
     return ExtractedFact(
         subject=subject,
@@ -511,7 +580,14 @@ def _match_change_clause(
         return None
     obj = _clean_object(newval_tokens, settings=settings)
     return _emit(
-        subject, predicate, obj, polarity=polarity, content=original, valid_at=valid_at, span=span
+        subject,
+        predicate,
+        obj,
+        polarity=polarity,
+        content=original,
+        valid_at=valid_at,
+        span=span,
+        settings=settings,
     )
 
 
@@ -564,6 +640,7 @@ def _decompose_sentence(
             content=original,
             valid_at=valid_at,
             span=span,
+            settings=settings,
         )
 
     # (3) copula (negation-aware): predicate "is". Negatives (multi-word) are tried first so the
@@ -582,6 +659,7 @@ def _decompose_sentence(
                 content=original,
                 valid_at=valid_at,
                 span=span,
+            settings=settings,
             )
     for cop in (*_COPULAS_POS, *settings.copula_change_verbs):
         idx = _find_word(lowered, cop)
@@ -596,6 +674,7 @@ def _decompose_sentence(
                 content=original,
                 valid_at=valid_at,
                 span=span,
+            settings=settings,
             )
 
     # (4) verb-based patterns. Vocab = the closed module constant UNION the settings-driven
@@ -633,6 +712,7 @@ def _decompose_sentence(
                 content=original,
                 valid_at=valid_at,
                 span=span,
+            settings=settings,
             )
     for i, tok in enumerate(lowclean):
         if tok in trans_verbs and 0 < i <= len(clean) - 1:
@@ -658,6 +738,7 @@ def _decompose_sentence(
                 content=original,
                 valid_at=valid_at,
                 span=span,
+            settings=settings,
             )
     return None
 
@@ -671,8 +752,9 @@ def decompose_to_spo(
 ) -> list[ExtractedFact]:
     """Deterministically split ``text`` into atomic SPO ``ExtractedFact``s (no model call).
 
-    Sentence-splits on ``.;\\n``, drops chit-chat/noise (too-short, expletive subject, no
-    recognised verb), and matches an ordered, documented pattern set: value-change clause (D5-
+    Sentence-splits on ``.;?!\\n``, drops chit-chat/noise (too-short, expletive subject,
+    IMPERATIVE or INTERROGATIVE subject, no recognised verb), and matches an ordered,
+    documented pattern set: value-change clause (D5-
     quick) → possessive-attribute → copula(±negation, incl. "became"/"becomes") →
     prepositional-verb → transitive-verb. Anything that matches no pattern is dropped (honest:
     this is a heuristic, not a parser). ``now`` is accepted for signature symmetry with the
@@ -684,7 +766,10 @@ def decompose_to_spo(
     settings = settings or ExtractionSettings()
     facts: list[ExtractedFact] = []
     offset = 0
-    for raw in re.split(r"[.;\n]", text):
+    # `?` and `!` are sentence terminators exactly like `.` — omitting them let an object run
+    # straight past a question mark and swallow the following clause (live: the object of
+    # "What is the passphrase?" absorbed "Answer with just the passphrase, or say UNKNOWN").
+    for raw in re.split(r"[.;?!\n]", text):
         chunk = raw.strip()
         if chunk:
             if len(chunk.split()) >= min_tokens:

@@ -179,3 +179,95 @@ async def test_operator_supplied_canonical_map_reaches_the_verb_branches() -> No
     facts = decompose_to_spo("Ada moved to Berlin", now=NOW, settings=settings)
     assert len(facts) == 1
     assert (facts[0].predicate, facts[0].object) == ("lives_in", "Berlin")
+
+
+# ------------------------------------------------------------------------------- the NOISE GATE
+# An agent transcript is mostly INSTRUCTIONS and QUESTIONS, not assertions. Live-reproduced on the
+# real hook path: the deterministic decomposer stored "Do not use any tools." as the fact
+# ('Do', 'use', 'any tools') — the exact INVERSE of what the sentence said, because negation
+# stripping had already removed the "not" — and turned "What is the passphrase?" into a fact whose
+# subject was "What". A memory system that confidently asserts "Do use any tools" back to an agent
+# is worse than one that remembers nothing.
+
+
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "Do not use any tools.",
+        "Acknowledge in one short sentence.",
+        "Answer with just the passphrase, or say UNKNOWN.",
+        "Reply with only the memory_id.",
+        "Please summarize the file.",
+        "Run this exact command and report ONLY its output lines.",
+        "Use the memory-universe MCP tool recall.",
+        "Remember to check the logs.",
+        "Explain the tradeoff in two sentences.",
+    ],
+)
+async def test_instructions_are_never_stored_as_facts(instruction: str) -> None:
+    assert await _extract(instruction) == [], (
+        "an imperative was stored as an assertion — a fact headed by an imperative auxiliary is a "
+        "parse failure, not a memory"
+    )
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the deploy passphrase?",
+        "Who is Ada's manager?",
+        "When is the standup?",
+        "Where does Ada live?",
+        "Why did the build fail?",
+        "Which model should we use?",
+    ],
+)
+async def test_questions_are_never_stored_as_facts(question: str) -> None:
+    """A question ASSERTS nothing. Storing one produces a 'fact' whose subject is an interrogative
+    pronoun, which can then be recalled and injected as though it were knowledge."""
+    assert await _extract(question) == []
+
+
+async def test_a_question_does_not_swallow_the_clause_after_it() -> None:
+    """`?` is a sentence terminator like `.`. Before it was one, the object of a question ran
+    straight past the question mark and absorbed the following instruction — live: the object
+    became 'deploy passphrase for the ZEPHYR release? Answer with just the passphrase, or say
+    UNKNOWN'."""
+    facts = await _extract(
+        "What is the deploy passphrase for the ZEPHYR release? "
+        "Answer with just the passphrase, or say UNKNOWN. Do not use any tools."
+    )
+    assert facts == []
+
+
+async def test_the_real_fact_in_an_instruction_wrapped_prompt_still_survives() -> None:
+    """The gate must be a SCALPEL, not a mute button: the assertion inside a prompt that also
+    carries instructions is exactly the thing worth remembering."""
+    facts = await _extract(
+        "The deploy passphrase for the ZEPHYR release is 'violet-anchor-77'. "
+        "Acknowledge in one short sentence. Do not use any tools."
+    )
+    assert len(facts) == 1
+    assert facts[0].object == "'violet-anchor-77'"
+    assert "passphrase" in facts[0].subject
+
+
+async def test_a_discourse_prefix_is_stripped_so_the_same_fact_collides() -> None:
+    """The other half of the duplicate problem. An assistant's "Noted — the passphrase is X" used
+    to yield the subject "Noted — the passphrase", which shares no identity with the user's own
+    "the passphrase" — so the SAME fact stored twice and never superseded."""
+    assistant = await _extract("Noted — the ZEPHYR deploy passphrase is 'violet-anchor-77'.")
+    user = await _extract("the ZEPHYR deploy passphrase is 'violet-anchor-77'.")
+
+    assert len(assistant) == 1 and len(user) == 1
+    assert assistant[0].subject == user[0].subject, (
+        "the same fact stated conversationally does not collide with its plain form — this is why "
+        "the demo stored the passphrase five times"
+    )
+
+
+async def test_a_subject_merely_starting_with_a_marker_word_is_untouched() -> None:
+    """Only a marker followed by a separator is a discourse prefix. 'Note taking' is a subject."""
+    facts = await _extract("Note taking is hard")
+    assert len(facts) == 1
+    assert facts[0].subject == "Note taking"
