@@ -184,9 +184,7 @@ async def test_add_threads_importance_score_into_the_ingest_activity() -> None:
     container = _FakeContainer()
     facade = SurfaceFacade(container, workspace=_WORKSPACE, namespace=_ORG)  # type: ignore[arg-type]
 
-    await facade.add(
-        "Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.95
-    )
+    await facade.add("Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.95)
 
     (activity,), _kwargs = container.ingest.remember.await_args
     assert activity.importance == 0.95
@@ -646,9 +644,7 @@ async def test_local_memory_write_is_readable_through_facade(
     facade = SurfaceFacade(container, workspace=f"{_WORKSPACE}{uid}", namespace=f"{_ORG}{uid}")
 
     # A6 fix: earn the promotion explicitly (default importance 0.5 no longer promotes).
-    written = await mem.add(
-        "Ada works at Acme", user=_USER, session=_SESSION, importance_score=0.9
-    )
+    written = await mem.add("Ada works at Acme", user=_USER, session=_SESSION, importance_score=0.9)
     assert written.promoted
 
     via_facade = await facade.get(written.memory_id, user=_USER, session=_SESSION)
@@ -696,16 +692,19 @@ async def test_facade_recall_consolidate_ask_and_unbuilt_verbs(
     # (0.5 < 0.6 gate), so promote(to_tier="mtm") moves it up — proven by a direct MTM point-get.
     promoted = await facade.promote(r1.memory_id, to_tier="mtm", user=_USER, session=_SESSION)
     assert promoted.verb == "promote" and promoted.to_tier == "mtm"
-    assert await container.mtm.get(
-        Namespace(
-            org=f"{_ORG}{uid}",
-            workspace=f"{_WORKSPACE}{uid}",
-            user=_USER,
-            session=_SESSION,
-            visibility=Visibility.PRIVATE,
-        ),
-        r1.memory_id,
-    ) is not None, "promote did not create the MTM point"
+    assert (
+        await container.mtm.get(
+            Namespace(
+                org=f"{_ORG}{uid}",
+                workspace=f"{_WORKSPACE}{uid}",
+                user=_USER,
+                session=_SESSION,
+                visibility=Visibility.PRIVATE,
+            ),
+            r1.memory_id,
+        )
+        is not None
+    ), "promote did not create the MTM point"
 
     # (8) demote is REAL — moves it back down; the MTM point is then gone (direct read).
     demoted = await facade.demote(r1.memory_id, to_tier="stm", user=_USER, session=_SESSION)

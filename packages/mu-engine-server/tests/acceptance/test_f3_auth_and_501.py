@@ -155,9 +155,7 @@ from mu_sdk.errors import NotFoundError  # noqa: E402
 
 @pytest_asyncio.fixture
 async def local_server_client(engine_token: str) -> MemoryClient:
-    config = SdkConfig(
-        mode="local_server", endpoint=ENGINE_BASE_URL, auth=BearerAuth(engine_token)
-    )
+    config = SdkConfig(mode="local_server", endpoint=ENGINE_BASE_URL, auth=BearerAuth(engine_token))
     client = MemoryClient(config=config)
     yield client
     await client.aclose()

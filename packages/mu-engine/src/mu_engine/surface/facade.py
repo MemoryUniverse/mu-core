@@ -119,6 +119,7 @@ __all__ = [
     "MemoryNotFoundError",
     "SurfaceFacade",
     "SurfaceVerbNotImplementedError",
+    "to_memory_response",
 ]
 
 _DEFAULT_USER = "default"
@@ -318,12 +319,12 @@ class SurfaceFacade:
         Mirrors ``LocalMemory.get`` (``mu-local/local_memory.py:277-297``) — same phase-0 STM-only
         narrowing (MTM/LTM adapters expose no point-get yet). Returns the canonical, FROZEN-wire-
         schema :class:`~mu_contracts.contracts.memory.MemoryResponse` (Decision B) via
-        :func:`_to_memory_response` — never the engine-native :class:`MemoryItem` domain object."""
+        :func:`to_memory_response` — never the engine-native :class:`MemoryItem` domain object."""
         ns = self._ns(user, session)
         item = await self._container.stm.get(ns, memory_id)
         if item is None:
             return None
-        return _to_memory_response(item)
+        return to_memory_response(item)
 
     async def ask(
         self,
@@ -549,14 +550,10 @@ class SurfaceFacade:
         new_id = new_receipt.memory_id
         affected: list[str] = []
         if old_mtm is not None:
-            await self._container.mtm.invalidate(
-                ns, memory_id, new_id, at=now, reason="update"
-            )
+            await self._container.mtm.invalidate(ns, memory_id, new_id, at=now, reason="update")
             affected.append(MemoryTier.MTM.value)
         if old_ltm is not None:
-            await self._container.ltm.invalidate(
-                ns, memory_id, new_id, at=now, reason="update"
-            )
+            await self._container.ltm.invalidate(ns, memory_id, new_id, at=now, reason="update")
             affected.append(MemoryTier.LTM.value)
         if old_stm is not None:
             await self._container.stm.evict(ns, memory_id)
@@ -746,8 +743,18 @@ def _to_canonical_recall_result(result: _EngineRecallResult) -> CanonicalRecallR
     )
 
 
-def _to_memory_response(item: MemoryItem) -> MemoryResponse:
-    """Map the engine-native :class:`~mu_engine.storage.domain.memory.MemoryItem` domain object
+def to_memory_response(item: MemoryItem) -> MemoryResponse:
+    """PUBLIC because the wire has more than one end.
+
+    Was private, which forced every OTHER surface serving a ``get`` to either re-derive it or skip
+    it. ``mu-server`` skipped it: its ``GET /v1/memories/{id}`` was typed ``-> object`` with no
+    ``response_model``, so it serialized this engine-native row VERBATIM onto a public,
+    multi-tenant wire — 31 fields including the raw ``embedding`` vector, ``owner_id``,
+    ``workspace_id``, ``provenance_id`` and ``retention_class``. The public SDK, validating the
+    frozen ``MemoryResponse`` (``extra="forbid"``), rejected the response outright, which is how it
+    was found. One projection, exported once, is the fix; a second copy is the defect.
+
+    Map the engine-native :class:`~mu_engine.storage.domain.memory.MemoryItem` domain object
     onto the canonical, FROZEN-wire-schema :class:`~mu_contracts.contracts.memory.MemoryResponse`
     (Decision B) — the ``get`` return DTO this facade now serves (module docstring).
     ``content_type`` has no correlate on ``MemoryItem`` (a storage/domain record, not an

@@ -111,12 +111,8 @@ async def test_add_promote_recall_round_trips_across_all_three_stores(mem: Local
     # this test proves the promote PATHWAY (the qdrant MTM write), so it earns promotion
     # explicitly via importance_score; the gate itself is proven by
     # test_add_gates_promotion_on_importance_not_unconditionally below.
-    r1 = await mem.add(
-        "Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.9
-    )
-    r2 = await mem.add(
-        "Ada works at Acme", user=_USER, session=_SESSION, importance_score=0.9
-    )
+    r1 = await mem.add("Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.9)
+    r2 = await mem.add("Ada works at Acme", user=_USER, session=_SESSION, importance_score=0.9)
     assert r1.promoted and r2.promoted, "STM->MTM deterministic promotion did not fire"
     assert "mtm" in r1.tiers_written, "qdrant MTM write not recorded in the receipt"
     assert r1.content_hash and r1.memory_id
@@ -204,9 +200,7 @@ async def test_add_importance_promote_threshold_is_env_overridable(
     os.environ["MU_INGEST__IMPORTANCE_PROMOTE"] = "0.2"
     env_uid = f"{uid}env"
     try:
-        memory = LocalMemory(
-            workspace=f"ws{env_uid}", namespace=f"org{env_uid}", settings=settings
-        )
+        memory = LocalMemory(workspace=f"ws{env_uid}", namespace=f"org{env_uid}", settings=settings)
         try:
             receipt = await memory.add(
                 "Ada's mid-importance note",
@@ -288,7 +282,10 @@ async def test_targeted_lifecycle_verbs_are_real_on_real_stores(
     * a nonexistent id raises the named :class:`MemoryNotFoundError` (never a silent no-op).
     """
     ns = Namespace(
-        org=f"org{uid}", workspace=f"ws{uid}", user=_USER, session=_SESSION,
+        org=f"org{uid}",
+        workspace=f"ws{uid}",
+        user=_USER,
+        session=_SESSION,
         visibility=Visibility.PRIVATE,
     )
     dim = mem._container.embedder.dimension  # the live MiniLM dim (independent name math)
@@ -324,9 +321,7 @@ async def test_targeted_lifecycle_verbs_are_real_on_real_stores(
         assert stm_copy is not None and stm_copy.tier == "stm", "STM copy missing after demote"
 
         # ---- delete: invalidate-don't-delete on a promoted fact ----
-        hi = await mem.add(
-            "Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.9
-        )
+        hi = await mem.add("Ada lives in Paris", user=_USER, session=_SESSION, importance_score=0.9)
         assert hi.promoted
         assert (await mtm_payload(hi.memory_id) or {}).get("state") == "active"
         delres = await mem.delete(hi.memory_id, user=_USER, session=_SESSION)

@@ -290,8 +290,13 @@ async def test_one_automatic_sweep_promotes_demotes_and_retains(
 
     # (promote) a salient STM item — importance 1.0, created "now" -> S(m) >= promote_stm_mtm.
     promotable = make_item(
-        ns, "Ada works at Acme", subject="Ada", predicate="works_at", obj="Acme",
-        importance=1.0, created_at=now,
+        ns,
+        "Ada works at Acme",
+        subject="Ada",
+        predicate="works_at",
+        obj="Acme",
+        importance=1.0,
+        created_at=now,
     )
     await stm.put(promotable)
     # (demote) a genuinely-stale MTM point (10 days old, importance 0.1, never recalled).
@@ -301,12 +306,22 @@ async def test_one_automatic_sweep_promotes_demotes_and_retains(
     await mtm.upsert(stale)
     # (retain) an EPHEMERAL LTM fact already past its invalid_at, + a PERMANENT survivor.
     ephemeral = _ltm_fact(
-        ns, "trip ends", retention_class=RetentionClass.EPHEMERAL, valid_at=_T0,
-        invalid_at=_T0 + timedelta(days=5), subject="Bo", predicate="trip_ends",
+        ns,
+        "trip ends",
+        retention_class=RetentionClass.EPHEMERAL,
+        valid_at=_T0,
+        invalid_at=_T0 + timedelta(days=5),
+        subject="Bo",
+        predicate="trip_ends",
     )
     permanent = _ltm_fact(
-        ns, "Bo's dog is Rex", retention_class=RetentionClass.PERMANENT, valid_at=_T0,
-        invalid_at=None, subject="Bo", predicate="dog",
+        ns,
+        "Bo's dog is Rex",
+        retention_class=RetentionClass.PERMANENT,
+        valid_at=_T0,
+        invalid_at=None,
+        subject="Bo",
+        predicate="dog",
     )
     await ltm.upsert_fact(ephemeral)
     await ltm.upsert_fact(permanent)
@@ -385,7 +400,10 @@ def _build_manager(
     mtm_for_services: object = mtm if mtm is not None else _EmptyMtm()
     if ltm is not None:
         distill: object = DistillPipeline(
-            ltm=ltm, mtm=mtm_for_services, clock=clock, bus=bus  # type: ignore[arg-type]
+            ltm=ltm,
+            mtm=mtm_for_services,
+            clock=clock,
+            bus=bus,  # type: ignore[arg-type]
         )
         retention: RetentionService | None = RetentionService(
             ltm=ltm, ltm_retention=ltm, clock=clock, bus=bus

@@ -140,20 +140,35 @@ async def test_same_batch_conflict_pairs_resolve_to_one_active_head(
     slm_mem: LocalMemory, settings: Settings
 ) -> None:
     container = slm_mem._container
-    assert container.conflict_adjudicator is not None, (
-        "the SLM profile must build a REAL ConflictAdjudicator — D3 composition-root wiring"
-    )
+    assert (
+        container.conflict_adjudicator is not None
+    ), "the SLM profile must build a REAL ConflictAdjudicator — D3 composition-root wiring"
 
     falkor = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
     adapter = FalkorLtmAdapter(falkor)
     try:
         pairs = [
-            ("ada", "s_room", "The Q3 planning meeting is in Room A.",
-             "The Q3 planning meeting was moved to Room B.", "q3 planning meeting"),
-            ("bo", "s_standup", "Bo's team standup is at 9am.",
-             "Bo's team standup is now at 9:30am.", "bo"),
-            ("ada", "s_flight", "Ada's flight to Denver is on Tuesday.",
-             "Ada's flight to Denver moved to Thursday.", "ada"),
+            (
+                "ada",
+                "s_room",
+                "The Q3 planning meeting is in Room A.",
+                "The Q3 planning meeting was moved to Room B.",
+                "q3 planning meeting",
+            ),
+            (
+                "bo",
+                "s_standup",
+                "Bo's team standup is at 9am.",
+                "Bo's team standup is now at 9:30am.",
+                "bo",
+            ),
+            (
+                "ada",
+                "s_flight",
+                "Ada's flight to Denver is on Tuesday.",
+                "Ada's flight to Denver moved to Thursday.",
+                "ada",
+            ),
         ]
 
         results: dict[str, _PairResult] = {}

@@ -34,14 +34,26 @@ skips (never fails collection) when it is not, mirroring the exact discipline
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Final
 
 import httpx
 import pytest
 
-ENGINE_BASE_URL = "http://127.0.0.1:8300"
+#: Where the `make up` stack actually listens. Overridable because the stack does not have to be
+#: on this machine: this project's standing infrastructure rule is that heavy containers live on
+#: the dev VM and the laptop reaches them over SSH forwards, so a hardcoded loopback URL made a
+#: release-gate suite that could ONLY ever run where docker runs. Default is unchanged, so a
+#: local `make up` needs no environment at all.
+ENGINE_BASE_URL = os.environ.get("MU_ENGINE_SERVER_BASE_URL", "http://127.0.0.1:8300")
+#: argv prefix that carries a `docker`/`make` command to wherever the stack lives — e.g.
+#: ``ssh mu-dev-vm --``. EMPTY by default: with no prefix the command runs locally exactly as it
+#: always did. When set, `MU_ENGINE_SERVER_REMOTE_DIR` must name the package directory on that
+#: host, since `cwd=` cannot reach across the hop.
+ENGINE_CLI_PREFIX: Final = tuple(shlex.split(os.environ.get("MU_ENGINE_SERVER_CLI_PREFIX", "")))
 ENGINE_TOKEN_PATH = Path(
     os.environ.get("MU_ENGINE_SERVER_TOKEN_PATH")
     or (Path.home() / ".memory-universe" / "engine-server.token")
@@ -117,11 +129,30 @@ def run_engine_server_cli(*args: str, timeout: float = 120.0) -> subprocess.Comp
     """Runs a `docker`/`make` CLI command scoped to the `mu-engine-server` compose project's own
     directory (never the protected `mu-dev-*`/`gcmem-*` stacks, never `docker compose down -v` —
     F2a only ever `docker kill`s + `make up`s the SAME already-provisioned volumes)."""
+    if ENGINE_CLI_PREFIX:
+        remote_dir = os.environ.get("MU_ENGINE_SERVER_REMOTE_DIR")
+        if not remote_dir:
+            pytest.fail(
+                "MU_ENGINE_SERVER_CLI_PREFIX is set but MU_ENGINE_SERVER_REMOTE_DIR is not. The "
+                "prefix carries the command to another host, where `cwd=` cannot reach — the "
+                "remote package directory has to be named explicitly."
+            )
+        # One argv element, because that is the shape every remote-exec front end takes
+        # (`ssh host '<cmd>'`, `gcloud compute ssh --command '<cmd>'`). `shlex.quote`/`join` keep
+        # it a single well-formed command; the parts are still literals from test code.
+        argv: tuple[str, ...] = (
+            *ENGINE_CLI_PREFIX,
+            f"cd {shlex.quote(remote_dir)} && {shlex.join(args)}",
+        )
+        cwd: Path | None = None
+    else:
+        argv, cwd = args, ENGINE_SERVER_PACKAGE_DIR
+
     # S603: `args` is never untrusted input — every call site in this package passes literal
     # `docker`/`make` argv built in test code (no shell, `shell=False`, no user/network data).
     return subprocess.run(  # noqa: S603
-        args,
-        cwd=ENGINE_SERVER_PACKAGE_DIR,
+        argv,
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=timeout,

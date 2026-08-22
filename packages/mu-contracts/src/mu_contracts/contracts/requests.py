@@ -147,7 +147,7 @@ from mu_contracts.contracts.defaults import (
     DEFAULT_CONSOLIDATE_LIMIT,
     DEFAULT_RECALL_LIMIT,
 )
-from mu_contracts.contracts.memory import MemoryTierLiteral
+from mu_contracts.contracts.memory import ContentType, MemoryTierLiteral
 from mu_contracts.contracts.recall import RecallChannels, RecallMode
 from mu_contracts.domain.model.memory import Visibility
 
@@ -156,8 +156,45 @@ __all__ = [
     "ConsolidateRequest",
     "ContextWindowRequest",
     "GetRequest",
+    "MemoryCreateRequest",
     "RecallRequest",
 ]
+
+
+class MemoryCreateRequest(BaseModel):
+    """``POST /memories``'s **FROZEN** wire body (``api-mcp-surface-spec.md`` Appendix A.1,
+    ``api.py:103``; surface-table row ``:187``).
+
+    Distinct from :class:`AddRequest`, and the distinction is the point — the two were being
+    conflated, and a plane bound the wrong one:
+
+    * :class:`AddRequest` is the canonical ``add`` **method** superset (design §2.5). It carries the
+      PRIVATE-plane identity fields (``user``/``session``/``agent``) and ``idempotency_key``, which
+      are plane-gated or travel as a HEADER — not body fields on this route.
+    * This class is what actually goes on the WIRE for the shared write, and it is frozen: no
+      ``user``/``session``/``agent`` (tenancy is derived server-side from the resolved auth
+      identity, never accepted as a client-supplied body field — ``api-mcp-surface-spec.md`` §2.2,
+      so the surface is never an oracle a probe can steer), and it carries ``content_type`` +
+      ``local_memory_id``, which the method superset does not.
+
+    It lives HERE rather than in a client package because both sides of the wire have to agree on
+    it: the public SDK already declared this exact shape locally, and the shared plane declared a
+    narrower server-local one, so neither could talk to the other. A wire body with two spellings
+    is not a contract.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content: str = Field(min_length=1)
+    content_type: ContentType = "text"
+    tier: MemoryTierLiteral = "stm"
+    importance_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    visibility: Visibility
+    local_memory_id: str | None = None
+    subject: str | None = None
+    predicate: str | None = None
+    object: str | None = None  # matches the frozen MemoryResponse wire field name verbatim
+    metadata: dict[str, str] = Field(default_factory=dict)
 
 
 class AddRequest(BaseModel):

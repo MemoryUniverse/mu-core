@@ -164,8 +164,20 @@ class ExtractionSettings(BaseModel):
     # ("Noted — the passphrase is X") collides with its plain form ("the passphrase is X") instead
     # of storing twice. This is the other half of the duplicate problem the demo exposed.
     discourse_prefixes: tuple[str, ...] = (
-        "noted", "ok", "okay", "sure", "got it", "understood", "alright", "right", "yes", "no",
-        "thanks", "great", "perfect", "done",
+        "noted",
+        "ok",
+        "okay",
+        "sure",
+        "got it",
+        "understood",
+        "alright",
+        "right",
+        "yes",
+        "no",
+        "thanks",
+        "great",
+        "perfect",
+        "done",
     )
 
     llm_union_with_heuristic_floor: bool = True
@@ -659,7 +671,7 @@ def _decompose_sentence(
                 content=original,
                 valid_at=valid_at,
                 span=span,
-            settings=settings,
+                settings=settings,
             )
     for cop in (*_COPULAS_POS, *settings.copula_change_verbs):
         idx = _find_word(lowered, cop)
@@ -674,7 +686,7 @@ def _decompose_sentence(
                 content=original,
                 valid_at=valid_at,
                 span=span,
-            settings=settings,
+                settings=settings,
             )
 
     # (4) verb-based patterns. Vocab = the closed module constant UNION the settings-driven
@@ -712,7 +724,7 @@ def _decompose_sentence(
                 content=original,
                 valid_at=valid_at,
                 span=span,
-            settings=settings,
+                settings=settings,
             )
     for i, tok in enumerate(lowclean):
         if tok in trans_verbs and 0 < i <= len(clean) - 1:
@@ -738,7 +750,7 @@ def _decompose_sentence(
                 content=original,
                 valid_at=valid_at,
                 span=span,
-            settings=settings,
+                settings=settings,
             )
     return None
 

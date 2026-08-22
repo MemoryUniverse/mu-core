@@ -181,9 +181,7 @@ class _FakeFacade:
     async def update(
         self, memory_id: str, new_content: str, *, user: str, session: str | None
     ) -> MemoryVerbResult:
-        self.calls.append(
-            ("update", (memory_id, new_content), {"user": user, "session": session})
-        )
+        self.calls.append(("update", (memory_id, new_content), {"user": user, "session": session}))
         if self.verb_raises is not None:
             raise self.verb_raises
         return MemoryVerbResult(
@@ -193,9 +191,7 @@ class _FakeFacade:
             tiers_affected=("stm", "mtm"),
         )
 
-    async def delete(
-        self, memory_id: str, *, user: str, session: str | None
-    ) -> MemoryVerbResult:
+    async def delete(self, memory_id: str, *, user: str, session: str | None) -> MemoryVerbResult:
         self.calls.append(("delete", (memory_id,), {"user": user, "session": session}))
         if self.verb_raises is not None:
             raise self.verb_raises

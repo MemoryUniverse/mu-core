@@ -668,9 +668,9 @@ async def test_supersession_evicts_loser_from_the_stm_recency_window(
     assert report.actions[0].kind is DistillActionKind.SUPERSEDE
 
     # THE FIX: the superseded loser is out of the hot STM window...
-    assert await stm.get(ns, loser_src.id) is None, (
-        "superseded loser still resident in the STM recency window — the floor will re-surface it"
-    )
+    assert (
+        await stm.get(ns, loser_src.id) is None
+    ), "superseded loser still resident in the STM recency window — the floor will re-surface it"
     recent_ids = {scored.item.id for scored in await stm.recent(ns, limit=50)}
     assert loser_src.id not in recent_ids
     assert winner_src.id in recent_ids, "the winner must stay in the window"
@@ -720,6 +720,6 @@ async def test_self_expire_also_invalidates_across_mtm_and_stm(
     assert {f.object for f in await ltm.facts_at(ns, t_now, subject="Ada")} == {"Globex"}
     # THE FIX: the self-expired incoming fact drops out of MTM and the STM window too.
     assert await _mtm_point_state(qdrant_client, ns, older.id, dim=dim) == "superseded"
-    assert await stm.get(ns, older.id) is None, (
-        "self-expired fact still resident in the STM recency window"
-    )
+    assert (
+        await stm.get(ns, older.id) is None
+    ), "self-expired fact still resident in the STM recency window"

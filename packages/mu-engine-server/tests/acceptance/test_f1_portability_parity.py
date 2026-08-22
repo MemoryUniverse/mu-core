@@ -148,12 +148,12 @@ async def test_add_recall_get_field_equal_dtos_embedded_vs_local_server(
 
     embedded_contents = [item.content for item in embedded_recall.items]
     local_contents = [item.content for item in local_recall.items]
-    assert any(content in c for c in embedded_contents), (
-        f"embedded recall() did not surface its own just-added content: {embedded_contents!r}"
-    )
-    assert any(content in c for c in local_contents), (
-        f"local_server recall() did not surface its own just-added content: {local_contents!r}"
-    )
+    assert any(
+        content in c for c in embedded_contents
+    ), f"embedded recall() did not surface its own just-added content: {embedded_contents!r}"
+    assert any(
+        content in c for c in local_contents
+    ), f"local_server recall() did not surface its own just-added content: {local_contents!r}"
     assert set(embedded_recall.model_dump().keys()) == set(local_recall.model_dump().keys())
 
     # ---- get() — local_server leg is the golden path; embedded leg is a NAMED, tracked gap ----
@@ -168,12 +168,26 @@ async def test_add_recall_get_field_equal_dtos_embedded_vs_local_server(
 
 @pytest.mark.skip(
     reason=(
-        "design §6 T1b (MINOR 7): the remote leg (SdkConfig(mode='remote') against a real "
-        "mu-server) cannot run — mu-server is an initialized-but-empty repo (only README/LICENSE/"
-        "CLAUDE.md/.git, no local HTTP surface to test against yet). This is a sequencing fact, "
-        "not a design defect (design §6's own words) — tracked here so the ship-gate report names "
-        "it explicitly rather than silently omitting a third leg."
+        "design §6 T1b: the remote leg RUNS, but not from here. It lives in the private "
+        "plane's own "
+        "suite (mu-server/tests/integration/test_sdk_remote_leg_int.py), driving the public SDK in "
+        "mode='remote' against a real uvicorn-served mu-server on real stores. It cannot live in "
+        "THIS repo: mu-core is the OPEN half and must stay testable by anyone without the "
+        "commercial plane, so a mu-server dependency here would make the open suite unrunnable."
     )
 )
-def test_remote_leg_is_deferred() -> None:
+def test_remote_leg_runs_in_the_private_plane_s_suite() -> None:
+    """The previous skip reason had EXPIRED, and that is worth recording rather than quietly
+    editing away.
+
+    It said mu-server was "an initialized-but-empty repo (only README/LICENSE/CLAUDE.md/.git, no
+    local HTTP surface to test against yet)" — true when written, false two phases later. So a
+    release-gate criterion sat skipped behind a reason that no longer held, and the drift it hid
+    was real: the SDK's shared write got a 404 from that plane (frozen `POST /memories` was served
+    only at `/v1/memories`), its recall got a 422 (a hand-rolled body forbade the canonical DTO's
+    own fields), and its `get` was rejected client-side (the route returned the engine-native row,
+    raw `embedding` included, instead of the frozen `MemoryResponse`). All three are fixed and
+    asserted over a real wire — a skip whose reason is never re-read is a test that has stopped
+    being one.
+    """
     raise AssertionError("unreachable — see skip reason")

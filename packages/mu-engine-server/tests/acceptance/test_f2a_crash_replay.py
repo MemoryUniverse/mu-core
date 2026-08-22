@@ -169,9 +169,9 @@ def test_write_survives_container_kill_and_replay_is_honest_about_reinforcement(
 
     # ---- 3. `make up` again — SAME compose project, SAME named volumes (no `-v`, no `reset`) ----
     up = engine_cli("make", "up", timeout=180.0)
-    assert up.returncode == 0, (
-        f"make up (post-kill) failed: rc={up.returncode}\n{up.stdout}\n{up.stderr}"
-    )
+    assert (
+        up.returncode == 0
+    ), f"make up (post-kill) failed: rc={up.returncode}\n{up.stdout}\n{up.stderr}"
     _wait_for_health()
 
     # ---- 4. assert the write survived the kill (durability) ----

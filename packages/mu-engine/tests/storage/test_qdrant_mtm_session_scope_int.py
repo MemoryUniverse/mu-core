@@ -71,9 +71,7 @@ async def test_session_scope_set_narrows_to_one_session(
     await mtm.upsert(item_a)
     await mtm.upsert(item_b)
     try:
-        hits = await mtm.semantic(
-            ns_a, item_a.embedding or [], limit=10, session_scope="session-a"
-        )
+        hits = await mtm.semantic(ns_a, item_a.embedding or [], limit=10, session_scope="session-a")
         ids = {h.item.id for h in hits}
         assert item_a.id in ids
         assert item_b.id not in ids  # narrowed OUT — session_scope excludes session-b
@@ -145,13 +143,16 @@ async def test_private_truncated_only_when_scope_is_none(
         assert not value.endswith("session-a")
     else:
         assert key == "namespace"
-        assert value == Namespace(
-            org=ns.org,
-            workspace=ns.workspace,
-            user=ns.user,
-            session=session_scope,
-            visibility=ns.visibility,
-        ).to_prefix()
+        assert (
+            value
+            == Namespace(
+                org=ns.org,
+                workspace=ns.workspace,
+                user=ns.user,
+                session=session_scope,
+                visibility=ns.visibility,
+            ).to_prefix()
+        )
 
 
 async def test_shared_recall_unaffected_by_session_scope_none(

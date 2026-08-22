@@ -137,7 +137,10 @@ def uid() -> str:
 @pytest.fixture
 def private_ns(uid: str) -> Namespace:
     return Namespace(
-        org=f"org{uid}", workspace=f"ws{uid}", user="u1", session="s1",
+        org=f"org{uid}",
+        workspace=f"ws{uid}",
+        user="u1",
+        session="s1",
         visibility=Visibility.PRIVATE,
     )
 
@@ -207,12 +210,21 @@ def _run_process_a_to_stage1(
 ) -> str:
     """Real subprocess, real SIGKILL. Returns the STM id process A minted and durably wrote."""
     cfg = {
-        "org": ns.org, "workspace": ns.workspace, "user": ns.user, "session": ns.session,
-        "host": activity.host, "offset": activity.session_offset, "text": activity.text,
-        "importance": activity.importance, "subject": activity.subject,
-        "predicate": activity.predicate, "object": activity.object,
-        "redis_host": settings.storage.cache.host, "redis_port": settings.storage.cache.port,
-        "redis_db": settings.storage.cache.db, "ledger_prefix": ledger_prefix,
+        "org": ns.org,
+        "workspace": ns.workspace,
+        "user": ns.user,
+        "session": ns.session,
+        "host": activity.host,
+        "offset": activity.session_offset,
+        "text": activity.text,
+        "importance": activity.importance,
+        "subject": activity.subject,
+        "predicate": activity.predicate,
+        "object": activity.object,
+        "redis_host": settings.storage.cache.host,
+        "redis_port": settings.storage.cache.port,
+        "redis_db": settings.storage.cache.db,
+        "ledger_prefix": ledger_prefix,
     }
     env = dict(os.environ)
     env["MU_TEST_CRASH_CFG"] = json.dumps(cfg)
@@ -221,7 +233,10 @@ def _run_process_a_to_stage1(
     # process actually died via SIGKILL and a FRESH process resumed against the same durable store.
     proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell, no untrusted input
         [sys.executable, "-c", _PROCESS_A_SCRIPT],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     try:
         assert proc.stdout is not None
@@ -235,9 +250,9 @@ def _run_process_a_to_stage1(
         # SIGKILL — ungraceful, no cleanup handlers run, exactly the CG-2 repro (not terminate()).
         proc.send_signal(signal.SIGKILL)
         proc.wait(timeout=5)
-    assert proc.returncode == -signal.SIGKILL, (
-        f"process A returncode={proc.returncode!r} (expected killed)"
-    )
+    assert (
+        proc.returncode == -signal.SIGKILL
+    ), f"process A returncode={proc.returncode!r} (expected killed)"
     return item_id
 
 
@@ -271,7 +286,12 @@ async def test_crash_replay_resumes_and_promotes_with_same_id(
     mtm = QdrantMtmAdapter(qdrant_client, dim=embedder.dimension)
     ledger = RedisStageLedger(redis_client, key_prefix=ledger_prefix)
     service = IngestService(
-        stm=stm, mtm=mtm, embedder=embedder, bus=InprocBus(), ledger=ledger, clock=SystemClock(),
+        stm=stm,
+        mtm=mtm,
+        embedder=embedder,
+        bus=InprocBus(),
+        ledger=ledger,
+        clock=SystemClock(),
         settings=IngestSettings(),
     )
 
@@ -289,9 +309,9 @@ async def test_crash_replay_resumes_and_promotes_with_same_id(
     # pre-fix re-mint via ``_build_memory_item`` would NOT have matched).
     qv = await query_vector("Who leads the platform team at Nimbus?")
     hits = await mtm.semantic(private_ns, qv, limit=10)
-    assert [h.item.id for h in hits] == [durable_id], (
-        f"expected exactly one MTM point at the durable id, got {[h.item.id for h in hits]}"
-    )
+    assert [h.item.id for h in hits] == [
+        durable_id
+    ], f"expected exactly one MTM point at the durable id, got {[h.item.id for h in hits]}"
 
     # A THIRD call (genuine full replay, both stages already ledger-complete) stays idempotent too.
     replay = await service.remember(activity)
@@ -324,7 +344,9 @@ async def test_regression_pre_fix_would_have_thrown(private_ns: Namespace) -> No
     )
     # ctx.state mirrors EXACTLY what pre-fix write_stm's SKIPPED branch produced: nothing.
     ctx = PipelineContext(
-        pipeline="ingest", namespace=private_ns, correlation_id="corr-regression",
+        pipeline="ingest",
+        namespace=private_ns,
+        correlation_id="corr-regression",
         state={"activity": activity},
     )
 

@@ -82,9 +82,7 @@ async def test_remove_is_a_different_operation_from_invalidate(
 
     name = collection_name(ns, VECTOR_DIM)
     try:
-        await mtm.invalidate(
-            ns, loser.id, winner.id, at=datetime.now(UTC), reason="test-supersede"
-        )
+        await mtm.invalidate(ns, loser.id, winner.id, at=datetime.now(UTC), reason="test-supersede")
         # invalidate: the loser point STILL EXISTS, payload flipped to superseded.
         superseded = await qdrant_client.retrieve(
             collection_name=name, ids=[point_id(loser.id)], with_payload=True

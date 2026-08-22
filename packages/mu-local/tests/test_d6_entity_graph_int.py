@@ -62,7 +62,10 @@ async def test_entities_and_edge_materialize_and_multihop_traversal(
 ) -> None:
     container = mem._container
     ns = Namespace(
-        org=mem._org, workspace=mem._workspace, user=_USER, session=_SESSION,
+        org=mem._org,
+        workspace=mem._workspace,
+        user=_USER,
+        session=_SESSION,
         visibility=Visibility.PRIVATE,
     )
 
@@ -135,9 +138,9 @@ async def test_entities_and_edge_materialize_and_multihop_traversal(
         print(f"[D6-VERIFY] Ada/manages LTM node id/provenance_id: {rows}")  # noqa: T201
         assert rows, "extracted Ada/manages fact never landed in the graph"
         ltm_node_id, ltm_provenance_id = rows[0]
-        assert ltm_node_id != receipt.memory_id, (
-            "sanity: the extracted proposition mints its OWN id (derived_from tracks the source)"
-        )
+        assert (
+            ltm_node_id != receipt.memory_id
+        ), "sanity: the extracted proposition mints its OWN id (derived_from tracks the source)"
         assert ltm_provenance_id == source_item.provenance_id, (
             "extracted proposition's provenance_id does not trace back to its source STM item "
             f"(got {ltm_provenance_id!r}, source has {source_item.provenance_id!r})"
@@ -156,7 +159,10 @@ async def test_functional_supersede_invalidates_entity_edge(
     relation as current."""
     container = mem._container
     ns = Namespace(
-        org=mem._org, workspace=mem._workspace, user=_USER, session=_SESSION,
+        org=mem._org,
+        workspace=mem._workspace,
+        user=_USER,
+        session=_SESSION,
         visibility=Visibility.PRIVATE,
     )
     falkor = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
@@ -175,9 +181,9 @@ async def test_functional_supersede_invalidates_entity_edge(
             "RETURN r.invalid_at",
             params={"ns": user_ns},
         )
-        assert before.result_set and before.result_set[0][0] == "", (
-            "Ada/Acme entity edge must be ACTIVE before the superseding add"
-        )
+        assert (
+            before.result_set and before.result_set[0][0] == ""
+        ), "Ada/Acme entity edge must be ACTIVE before the superseding add"
 
         await mem.add("Ada works at Globex", user=_USER, session=_SESSION, importance_score=0.9)
         report2 = await mem.consolidate(user=_USER, session=_SESSION)
@@ -197,15 +203,17 @@ async def test_functional_supersede_invalidates_entity_edge(
             params={"ns": user_ns},
         )
         print(f"[D6-VERIFY supersede] Ada->Acme (loser) invalid_at rows: {after_loser.result_set}")  # noqa: T201
-        print(f"[D6-VERIFY supersede] Ada->Globex (winner) invalid_at rows: {after_winner.result_set}")  # noqa: T201, E501
+        print(  # noqa: T201
+            f"[D6-VERIFY supersede] Ada->Globex (winner) invalid_at rows: {after_winner.result_set}"
+        )
         assert after_loser.result_set, "loser entity edge disappeared entirely (should be RETAINED)"
         assert after_loser.result_set[0][0] != "", (
             "superseded fact's entity edge was NOT invalidated — a stale relation would still "
             "read as current"
         )
-        assert after_winner.result_set and after_winner.result_set[0][0] == "", (
-            "winner entity edge must be currently ACTIVE"
-        )
+        assert (
+            after_winner.result_set and after_winner.result_set[0][0] == ""
+        ), "winner entity edge must be currently ACTIVE"
 
         # a post-supersede traversal for "who does Ada work for?" must surface Globex, never the
         # stale Acme relation as current.
@@ -233,7 +241,10 @@ async def test_entity_uids_backfilled_onto_mtm_payload(
     through a recall-shaped read."""
     container = mem._container
     ns = Namespace(
-        org=mem._org, workspace=mem._workspace, user=_USER, session=_SESSION,
+        org=mem._org,
+        workspace=mem._workspace,
+        user=_USER,
+        session=_SESSION,
         visibility=Visibility.PRIVATE,
     )
     receipt = await mem.add("Ada manages Bo", user=_USER, session=_SESSION, importance_score=0.9)
@@ -251,8 +262,8 @@ async def test_entity_uids_backfilled_onto_mtm_payload(
         payload = points[0].payload or {}
         print(f"\n[D6-VERIFY entity_uids] MTM payload entity_uids: {payload.get('entity_uids')}")  # noqa: T201
         entity_uids = payload.get("entity_uids")
-        assert isinstance(entity_uids, list) and len(entity_uids) == 2, (
-            f"entity_uids was never backfilled onto the MTM payload: {payload.get('entity_uids')!r}"
-        )
+        assert (
+            isinstance(entity_uids, list) and len(entity_uids) == 2
+        ), f"entity_uids was never backfilled onto the MTM payload: {payload.get('entity_uids')!r}"
     finally:
         await qdrant.close()

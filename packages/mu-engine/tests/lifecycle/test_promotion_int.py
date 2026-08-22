@@ -238,12 +238,22 @@ async def test_promote_session_promotes_and_distills_the_whole_session(
     )
 
     first = make_item(
-        ns, "Ada works at Acme", subject="Ada", predicate="works_at", obj="Acme",
-        importance=1.0, created_at=_T0,
+        ns,
+        "Ada works at Acme",
+        subject="Ada",
+        predicate="works_at",
+        obj="Acme",
+        importance=1.0,
+        created_at=_T0,
     )
     second = make_item(
-        ns, "Bob works at Globex", subject="Bob", predicate="works_at", obj="Globex",
-        importance=1.0, created_at=_T0,
+        ns,
+        "Bob works at Globex",
+        subject="Bob",
+        predicate="works_at",
+        obj="Globex",
+        importance=1.0,
+        created_at=_T0,
     )
     await stm.put(first)
     await stm.put(second)

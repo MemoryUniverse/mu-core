@@ -140,9 +140,9 @@ async def test_two_users_identical_content_both_promote_to_their_own_mtm_partiti
     result_bo = await mem._container.ingest.remember(_activity(ns_bo, session_offset="off-bo"))
 
     # Sanity on the test's own premise: this really IS a content-hash-collision scenario.
-    assert result_ada.content_hash == result_bo.content_hash, (
-        "test setup invalid — identical content+triple must hash identically"
-    )
+    assert (
+        result_ada.content_hash == result_bo.content_hash
+    ), "test setup invalid — identical content+triple must hash identically"
     assert result_ada.memory_id != result_bo.memory_id, "each user must mint their OWN STM id"
 
     # The (misleading, pre-fix-passable) receipt flag: both report promoted=True even pre-fix,

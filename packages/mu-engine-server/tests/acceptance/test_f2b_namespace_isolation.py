@@ -85,9 +85,9 @@ def test_recall_does_not_cross_user_namespaces(engine_up: None, engine_token: st
         f"ada's own recall(user={ada_user!r}) did not surface her own just-added content: "
         f"{ada_contents!r}"
     )
-    assert not any(bo_only_marker in c for c in ada_contents), (
-        f"ada's recall(user={ada_user!r}) surfaced bo's content — namespace isolation broken."
-    )
+    assert not any(
+        bo_only_marker in c for c in ada_contents
+    ), f"ada's recall(user={ada_user!r}) surfaced bo's content — namespace isolation broken."
 
     bo_recall = _recall(engine_token, text=bo_only_marker, user=bo_user, session="s2")
     bo_contents = [item["content"] for item in bo_recall]

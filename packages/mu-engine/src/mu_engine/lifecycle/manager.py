@@ -609,9 +609,7 @@ class MemoryLifecycleManager:
         if self._retention is not None:
             await self._retention.sweep(ns, clock=self._clock)
 
-    async def promote_session_now(
-        self, ns: Namespace, *, force: bool = False
-    ) -> None:
+    async def promote_session_now(self, ns: Namespace, *, force: bool = False) -> None:
         """PreCompact promote-before-delete entry point (additive public method,
         AGENT-INTEGRATION-AUDIT-AND-PLAN.md §4 Phase 3 — the deferred ``PreCompactPromoter`` owner
         this manager now exposes for the daemon's hook wiring, ``mu_client.lifecycle.precompact``).

@@ -202,9 +202,7 @@ async def update_memory(
     """``update`` — SUPERSEDE the memory with ``new_content`` (invalidate-don't-delete): the old id
     is marked superseded by the new version. Returns the NEW memory (``memory_id`` = new id,
     ``superseded_id`` = old id). ``404`` if the id is not resident in any tier."""
-    return await facade.update(
-        memory_id, body.new_content, user=body.user, session=body.session
-    )
+    return await facade.update(memory_id, body.new_content, user=body.user, session=body.session)
 
 
 @router.delete(

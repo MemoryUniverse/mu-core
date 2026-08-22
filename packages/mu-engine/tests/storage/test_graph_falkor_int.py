@@ -216,8 +216,9 @@ async def test_graph_recall_federates_across_the_users_sessions_by_default(
     ns_b = make_ns(user="u1", session="sessionB")
     ns_other = make_ns(user="intruder", session="sessionA")
 
-    await ltm.upsert_fact(make_item(ns_a, "Ada lives in Paris", subject="Ada",
-                                    predicate="lives_in", obj="Paris"))
+    await ltm.upsert_fact(
+        make_item(ns_a, "Ada lives in Paris", subject="Ada", predicate="lives_in", obj="Paris")
+    )
 
     from_a = {h.item.object for h in await ltm.graph_recall(ns_a, subject="Ada", limit=10)}
     assert from_a == {"Paris"}, "same-session recall regressed"
@@ -244,13 +245,14 @@ async def test_graph_recall_explicit_session_scope_still_narrows_to_one_session(
     ns_a = make_ns(user="u1", session="sessionA")
     ns_b = make_ns(user="u1", session="sessionB")
 
-    await ltm.upsert_fact(make_item(ns_a, "Ada lives in Paris", subject="Ada",
-                                    predicate="lives_in", obj="Paris"))
+    await ltm.upsert_fact(
+        make_item(ns_a, "Ada lives in Paris", subject="Ada", predicate="lives_in", obj="Paris")
+    )
 
     narrowed = await ltm.graph_recall(ns_b, subject="Ada", limit=10, session_scope="sessionB")
     assert narrowed == [], "explicit session_scope did not narrow — the opt-out is broken"
 
     widened = await ltm.graph_recall(ns_b, subject="Ada", limit=10, session_scope="sessionA")
-    assert {h.item.object for h in widened} == {"Paris"}, (
-        "session_scope must be able to target ANY of the user's sessions, not only the caller's"
-    )
+    assert {h.item.object for h in widened} == {
+        "Paris"
+    }, "session_scope must be able to target ANY of the user's sessions, not only the caller's"

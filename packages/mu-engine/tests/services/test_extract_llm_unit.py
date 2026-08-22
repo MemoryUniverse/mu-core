@@ -136,9 +136,9 @@ async def test_llm_extractor_union_does_not_duplicate_a_fact_both_paths_found() 
 
     facts = await extractor.extract("Ada lives in Paris.", now=NOW)
 
-    assert len(facts) == 1, (
-        f"expected one deduped fact, got {[(f.subject, f.object) for f in facts]}"
-    )
+    assert (
+        len(facts) == 1
+    ), f"expected one deduped fact, got {[(f.subject, f.object) for f in facts]}"
 
 
 async def test_llm_extractor_floor_union_can_be_disabled() -> None:
