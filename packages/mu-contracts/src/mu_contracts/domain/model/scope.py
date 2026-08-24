@@ -26,6 +26,9 @@ __all__ = [
     "OrgMembership",
     "Principal",
     "PrincipalKind",
+    "PrincipalRecord",
+    "PrincipalSource",
+    "ResolvedPrincipal",
     "WorkspaceMembership",
 ]
 
@@ -68,6 +71,85 @@ class Principal(BaseModel):
     org_id: str = Field(min_length=1)  # tenant/billing root (un-collapse)
     kind: PrincipalKind = PrincipalKind.HUMAN
     display_name: str | None = Field(default=None, max_length=200)
+
+
+class PrincipalSource(StrEnum):
+    """How a principal row came to exist — a closed, content-free set
+    (mu-server-phase3-devices-sync-spec.md §4b.2/A). It is the field that lets an operator tell a
+    SEEDED identity from a minted one without reading ``created_by``."""
+
+    BOOTSTRAP = "bootstrap"
+    ADMIN = "admin"
+    SELF_ENROLL = "self_enroll"
+
+
+class PrincipalRecord(BaseModel):
+    """The registry ROW as the resolver reads it back — ``principals``
+    (mu-server-phase3-devices-sync-spec.md §4b.2/A).
+
+    Here rather than in the commercial plane by **ADR 0047**: a type that only *names* a concept is
+    vocabulary, and vocabulary lives in open ``mu-core`` whichever plane's work motivates it. The
+    *resolver* (``PostgresPrincipalRegistry``) stays in ``mu-server`` — that is O-44's closure, and
+    the split is the point: the shape of the record is a contract, reading it is behaviour.
+
+    ⚠ **``PrincipalRecord`` is deliberately NOT ``Principal``, and the overlap is not a bug.**
+    §4b.2/A: *"a DTO is the wire vocabulary, a row is the record"*. They agree on four fields;
+    ``created_at``/``updated_at``/``disabled_at``/``created_by``/``source`` belong to the record
+    ONLY and must never be added to ``Principal``.
+
+    ⚠ ``display_name`` is the one field here that is **not content-free by construction** — it is
+    operator-supplied free text. It is therefore never an event field, never a span attribute and
+    never a log field (§4b.2/A, §4b.8/6: the ``DomainEvent`` field-name guard cannot see this class
+    of leak, so the discipline is on the reader, not on a guard).
+
+    ``status`` and ``disabled_at`` are a **bi-temporal pair**: ``status`` carries the transaction-
+    time fact, ``disabled_at`` the world time of the suspension/removal. Either alone is a
+    single-axis row. Rows are retained on removal (invalidate-don't-delete) because the id is
+    stamped into ``authorized_ids`` and into ``private_sync_log.principal_id`` rows that must stay
+    attributable for audit.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1)  # pseudonymous stable id; goes into η.user and authorized_ids
+    org_id: str = Field(min_length=1)  # tenancy root — cross-checked against the credential's
+    kind: PrincipalKind = PrincipalKind.HUMAN
+    display_name: str | None = Field(default=None, max_length=200)  # ⚠ free text; never emitted
+    status: MembershipStatus = MembershipStatus.ACTIVE
+    created_at: datetime  # transaction time
+    updated_at: datetime  # advanced on every mutation
+    disabled_at: datetime | None = None  # world time of the suspension/removal
+    created_by: str = Field(min_length=1)  # provenance: a principal id, or the literal "bootstrap"
+    source: PrincipalSource
+
+    def is_resolvable(self) -> bool:
+        """The principal-side half of §4b.3 step 6. A suspended/removed principal is REFUSED, and
+        the refusal is a status check rather than a missing row — which is why every caller must
+        collapse it into the same non-enumerating failure as "no such row" (§4b.3, harm 4)."""
+        return self.status is MembershipStatus.ACTIVE
+
+
+class ResolvedPrincipal(BaseModel):
+    """What a **verified** credential resolves to — the return of
+    ``PrincipalRegistryPort.resolve_credential`` (mu-server-phase3-devices-sync-spec.md §4b.3
+    step 7, §4b.4). Vocabulary, so it lives here (ADR 0047); the resolver does not.
+
+    These three fields are exactly the coordinates the edge needs downstream and no more:
+    ``principal_id`` becomes ``AuthContext.principal_id``, ``org_id`` becomes ``AuthContext.org``,
+    ``workspace_id`` becomes ``AuthContext.workspace`` — each **replacing** a process-wide settings
+    default that a multi-tenant plane must never read for a request's tenancy (mu-server invariant
+    2: a caller that can name its own org can name someone else's, and a plane that reads one
+    default for every caller routes every tenant to the first tenant's home region).
+
+    ⚠ It carries **no credential material** — no secret, no ``hashed_secret``, no ``key_id``. A
+    resolved identity travels through the admission path; the thing that proved it does not.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    principal_id: str = Field(min_length=1)
+    org_id: str = Field(min_length=1)  # -> AuthContext.org
+    workspace_id: str = Field(min_length=1)  # -> AuthContext.workspace
 
 
 class OrgMembership(BaseModel):

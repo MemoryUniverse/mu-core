@@ -105,6 +105,9 @@ from mu_contracts.domain.model.scope import (
     OrgMembership,
     Principal,
     PrincipalKind,
+    PrincipalRecord,
+    PrincipalSource,
+    ResolvedPrincipal,
     WorkspaceMembership,
 )
 from mu_contracts.domain.model.session import (
@@ -169,8 +172,10 @@ __all__ = [
     "Polarity",
     "Principal",
     "PrincipalKind",
+    "PrincipalRecord",
     "PrincipalRef",
     "PrincipalRefKind",
+    "PrincipalSource",
     "PrivacyTier",
     "PrivateDelta",
     "PrivateSnapshot",
@@ -178,6 +183,7 @@ __all__ = [
     "QuietHours",
     "RecallChannel",
     "ResolutionOrigin",
+    "ResolvedPrincipal",
     "Retention",
     "RetentionPolicy",
     "Revocation",
