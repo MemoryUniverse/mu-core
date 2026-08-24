@@ -125,11 +125,90 @@ class Membership(Base):
     )
 
 
+# Extended for the principal registry (mu-server-phase3-devices-sync-spec.md §4b.2/A). Every new
+# column is additive on a table with zero rows today (verified: no `Principal(` call site in any
+# repo) — §4b.2/D records that NOT NULL-with-no-server-default is safe ONLY because of that, and the
+# same migration's docstring repeats the warning for the next editor.
 class Principal(Base):
     __tablename__ = "principals"
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)  # pseudonymous stable id
     kind: Mapped[str] = mapped_column(String(128), nullable=False)  # human|agent|service
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (§4b.2/A)
+    # operator-supplied free text — NOT content-free by construction; never an event field, span
+    # attribute or log field (§4b.2/A, §4b.8/6; the `DomainEvent` field-name guard cannot see it).
+    display_name: Mapped[str | None] = mapped_column(String(200))
+    status: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="active"
+    )  # active|suspended|removed (MembershipStatus) — resolution refuses non-active (§4b.3 step 6)
+    created_at: Mapped[datetime] = _dt()  # transaction time (bi-temporal half)
+    updated_at: Mapped[datetime] = _dt()  # advanced on every mutation
+    disabled_at: Mapped[datetime | None] = _dt_opt()  # world time of suspension/removal
+    # principal id, or "bootstrap" for the seeded root
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    source: Mapped[str] = mapped_column(String(128), nullable=False)  # bootstrap|admin|self_enroll
+
+    __table_args__ = (
+        # every legitimate LISTING is org-scoped; the resolver's PK lookup is the only un-scoped
+        # read and it immediately cross-checks the credential's org_id (§4b.2/A). Deliberately no
+        # UNIQUE(org_id, id): `id` is already globally unique as the PK, and a composite unique
+        # would imply an id may repeat across orgs, which it may not (§4b.2/A).
+        Index("ix_principals_org", "org_id"),
+    )
+
+
+# NEW (mu-server-phase3-devices-sync-spec.md §4b.2/B). SPEC DECISION D-43 — named
+# `principal_credentials`, not `api_keys`: the field set is adopted verbatim from
+# `auth-key-issuance-spec.md`'s `ApiKeyRecord` (minus the two fields §4b.1 cuts), but the first row
+# this table ever holds is the existing deployment token, not an API key, and `kind` discriminates.
+class PrincipalCredential(Base):
+    __tablename__ = "principal_credentials"
+
+    # public lookup handle embedded in the presented token — PK because verification must be one
+    # O(1) indexed read, never a scan over hashes (§4b.2/B, D-51). Not secret.
+    key_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(128), nullable=False)  # api_key|deployment_token
+    # denormalized onto the credential so resolution performs no join (§4b.2/B) -> AuthContext.org
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # -> AuthContext.workspace
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # the principal this credential authenticates AS. Integrity is enforced by the sole writer
+    # (PrincipalService), never a database ForeignKey — D-45: the same schema.py binds to SQLite on
+    # the client where FK enforcement is off by default, and a FK would make ORM insert order
+    # load-bearing across two adapters in two repos. This is a decision, not an omission.
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # HMAC-SHA256(pepper, secret), hex
+    hashed_secret: Mapped[str] = mapped_column(String(128), nullable=False)
+    # a slice for kind='api_key' (non-secret by construction, D-51's arithmetic); the literal
+    # constant "mu_bootstrap" for kind='deployment_token', NEVER a slice (D-52 — the asymmetry is
+    # the whole point: D-50's bootstrap credential has no key_id segment, so a slice of it is 12
+    # characters of a live secret).
+    display_prefix: Mapped[str] = mapped_column(String(128), nullable=False)
+    # operator-chosen, content-free
+    label: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = _dt()
+    # best-effort, written OUTSIDE the request's critical section, at most once per
+    # auth.last_used_resolution_s (D-46) — never a per-request UPDATE.
+    last_used_at: Mapped[datetime | None] = _dt_opt()
+    # NULL = non-expiring; also the rotation-grace carrier
+    expires_at: Mapped[datetime | None] = _dt_opt()
+    revoked_at: Mapped[datetime | None] = _dt_opt()  # invalidate-don't-delete
+    revoked_by: Mapped[str | None] = mapped_column(String(128))
+    rotated_from_key_id: Mapped[str | None] = mapped_column(String(128))  # rotation lineage
+    # principal id, or "bootstrap" for the seeded root
+    issued_by: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    __table_args__ = (
+        # the only listing query is "the credentials of this principal"; org_id-first means it
+        # cannot be answered cross-tenant even by a caller who gets the argument order wrong.
+        Index("ix_principal_credentials_principal", "org_id", "principal_id"),
+        # D-44: two rows sharing a hash is either a CSPRNG failure or a reused pepper across
+        # environments — either is a security incident, and this makes it fail loud at issue
+        # instead of silently authenticating two principals with one string. Deliberately no
+        # unique on (org_id, principal_id): a principal legitimately holds several credentials at
+        # once (that overlap IS rotation).
+        UniqueConstraint("hashed_secret", name="ux_principal_credentials_secret"),
+    )
 
 
 class NamespaceDef(Base):
