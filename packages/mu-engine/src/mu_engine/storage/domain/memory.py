@@ -26,13 +26,14 @@ validity-first LTM retention redesign that retires the 90d-recall-inactivity arc
 rule. No ``valid_until`` field is added — EPHEMERAL end-of-validity reuses the EXISTING
 ``invalid_at`` field (line ~124), matching ``facts_at(t)`` in ``falkor_ltm.py`` (F3).
 
-PIN GAP (flagged, not fixed here): CANONICAL §7.10/§7.26 describe ``pinned`` as an
-ALREADY-canonical field-group (GC-ineligibility keys off ``and not item.pinned``) that
-this task must reuse, not re-add. Grepping this shipped ``MemoryItem`` (and the parallel
-``mu_contracts/domain/model/memory.py:MemoryNode``) turns up NO ``pinned`` field on
-either model today — the canonical pin mechanism CANONICAL describes has not actually
-landed on the shipped code yet. Per this task's scope, no ``pinned`` field is invented
-here; this is an out-of-scope gap for a dedicated pin-mechanism task to close.
+PIN GAP — CLOSED (§7.17 item 4a total-order task, 2026-08-24): CANONICAL §7.10/§7.26/§7.17
+describe ``pinned`` as an ALREADY-canonical field-group (GC-ineligibility keys off
+``and not item.pinned``, CANONICAL:621; it is also the FIRST, dominant term of the §7.17
+total order, item 4a(b)). ``pinned: bool = False`` now lives on this shipped ``MemoryItem``
+(additive, default-False so every existing row/constructor stays valid) and on the parallel
+``mu_contracts/domain/model/memory.py:MemoryItem``. ``lifecycle/retention.py``'s
+``_is_pinned`` already duck-typed this via ``getattr(item, "pinned", False)`` in anticipation
+of exactly this field landing — no edit was needed there; it now reads the real field.
 """
 
 from __future__ import annotations
@@ -178,6 +179,12 @@ class MemoryItem(BaseModel):
     # facts only (never PERMANENT/pinned); reactivate-on-recall clears it.
     retention_class: RetentionClass = RetentionClass.DURABLE
     cold: bool = False
+
+    # Pin = retention, not access (CANONICAL §7.10/§7.26). GC-ineligible unconditionally
+    # (CANONICAL:621 "and not item.pinned", enforced by lifecycle/retention.py::_is_pinned) —
+    # but a pinned item CAN still be superseded; pin is the dominant, first term of the §7.17
+    # total order (item 4a(b)), never immunity from it. Additive, default False.
+    pinned: bool = False
 
     source: MemorySource = MemorySource.USER
 

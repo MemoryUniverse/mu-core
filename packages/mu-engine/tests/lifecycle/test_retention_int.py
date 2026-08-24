@@ -15,16 +15,15 @@ Covers S2-01's acceptance list (``.claude/team_analysis`` plan, task id S2-01):
 - **AC-2.2** — a PERMANENT fact is never archived/GC'd under an adversarial multi-year
   ``FrozenClock`` jump (REAL FalkorDB) — ``test_ac22_permanent_never_archived_under_multi_year_
   clock_jump`` (property-style: parametrized over several jump magnitudes). The **pinned** half
-  of AC-2.2 is a pure unit test of isolated logic (``test_ac22_pinned_mechanism_never_archived_
-  or_gcd``, NOT ``pytest.mark.integration``) — DEV-STANDARDS' one sanctioned exception ("mocks
-  allowed ONLY in pure unit tests of isolated logic"): the shipped ``MemoryItem`` (S0-06) does
-  not carry a ``pinned`` field yet (see ``retention.py``'s own "PIN GAP" docstring note and
-  ``storage/domain/memory.py``'s), and a real ``MemoryItem.model_validate_json`` round-trip
-  through FalkorDB's ``memory_json`` carrier would silently DROP an ad-hoc ``pinned`` field
-  added only on a local test subclass (base ``MemoryItem`` has no ``extra="forbid"`` guard, so
-  an unknown key is ignored on read-back) — so the *mechanism* (``RetentionService._is_pinned``
-  honored inside ``sweep()``) is proven directly against an in-memory ``LtmRetentionStorePort``
-  double instead of a real store round-trip that cannot yet carry the field.
+  of AC-2.2 (``test_ac22_pinned_mechanism_never_archived_or_gcd``, NOT ``pytest.mark.integration``)
+  stays a pure unit test of isolated logic against an in-memory ``LtmRetentionStorePort`` double
+  (DEV-STANDARDS' one sanctioned exception, "mocks allowed ONLY in pure unit tests of isolated
+  logic") — the point of this test is `RetentionService._is_pinned` honored inside `sweep()`
+  before any store is involved, which a store-round-trip test would not isolate any better. The
+  shipped `MemoryItem` now carries a real `pinned: bool` field (§7.17 item 4a total-order task,
+  2026-08-24; previously this test used a local test-only subclass to work around the field's
+  absence — no longer needed). ``storage/test_mappers_unit.py::test_graph_roundtrip_lossless``
+  covers the lossless `memory_json` carrier proof for `pinned` (mapper-level, pure logic).
 - **Never touches an ACTIVE non-expired fact; acts only on SUPERSEDED/EXPIRED, GC gated on BOTH
   ``gc_history_window_d`` AND provenance-chain-head-dead** — ``test_dead_fact_gc_requires_both_
   window_elapsed_and_chain_head_dead`` (both branches: chain head still ``ACTIVE`` keeps the
@@ -298,18 +297,9 @@ async def test_ac22_permanent_never_archived_under_multi_year_clock_jump(
 
 
 # -------------------------------------------------------------------------------------------
-# AC-2.2 (pinned half) — pure unit test of isolated logic (see module docstring: the shipped
-# MemoryItem does not carry `pinned` yet, so this proves the MECHANISM directly, not via a real
-# store round-trip that would silently drop the field).
+# AC-2.2 (pinned half) — pure unit test of isolated logic: proves `RetentionService._is_pinned`
+# is actually honored inside `sweep()` against an in-memory double, isolated from any store.
 # -------------------------------------------------------------------------------------------
-class _PinnedMemoryItem(MemoryItem):
-    """Test-only stand-in for the not-yet-landed canonical `pinned: bool` field (CANONICAL
-    §7.10/§7.26) — proves `RetentionService._is_pinned`'s `getattr` duck-typing composes
-    correctly the instant that field exists, without editing the shared model."""
-
-    pinned: bool = True
-
-
 class _InMemoryLtmDouble:
     """A REAL, fully-functional in-memory stand-in — not a mock of an external dependency, a
     pure-Python double for isolated-logic testing (DEV-STANDARDS' explicit exception). Records
@@ -345,7 +335,7 @@ async def test_ac22_pinned_mechanism_never_archived_or_gcd() -> None:
     ns = Namespace(
         org="org1", workspace="ws1", user="u1", session="s1", visibility=Visibility.PRIVATE
     )
-    pinned_ephemeral = _PinnedMemoryItem(
+    pinned_ephemeral = MemoryItem(
         content="pinned but time-bound",
         kind=MemoryKind.PROPOSITION,
         namespace=ns,
@@ -359,7 +349,7 @@ async def test_ac22_pinned_mechanism_never_archived_or_gcd() -> None:
         invalid_at=_T0 + timedelta(hours=1),  # long expired
         pinned=True,
     )
-    pinned_dead = _PinnedMemoryItem(
+    pinned_dead = MemoryItem(
         content="pinned but already superseded",
         kind=MemoryKind.PROPOSITION,
         namespace=ns,

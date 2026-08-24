@@ -351,16 +351,14 @@ class RetentionService:
 
     @staticmethod
     def _is_pinned(item: MemoryItem) -> bool:
-        """CANONICAL §7.10/§7.26: ``pinned`` is an ALREADY-canonical field-group
-        ("GC-ineligibility keys off ``and not item.pinned``"), reused here, not re-added. The
-        shipped ``MemoryItem`` (S0-06, ``storage/domain/memory.py``) does not carry a
-        ``pinned`` field yet — grepping it turns up none (that file's own "PIN GAP" docstring
-        note) — and this task's owned paths are ``retention.py`` only (adding the field to the
-        shared ``MemoryItem`` is out of scope: another task's owned file). ``getattr`` duck
-        typing means this composes CORRECTLY the moment ``pinned: bool`` lands on the shipped
-        model, with zero edit to this file; until then every item is treated as unpinned (the
-        honest, conservative default — never silently over-claims pin protection that doesn't
-        exist on the model yet).
+        """CANONICAL §7.10/§7.26/§7.17: ``pinned`` is an ALREADY-canonical field-group
+        ("GC-ineligibility keys off ``and not item.pinned``", CANONICAL:621), reused here, not
+        re-added. ``pinned: bool`` now lives on the shipped ``MemoryItem``
+        (``storage/domain/memory.py``, closed by the §7.17 item 4a total-order task,
+        2026-08-24). Kept as ``getattr`` duck typing rather than a direct ``item.pinned`` read —
+        harmless now that the field exists, and stays defensive against any OTHER structurally
+        similar object this Protocol-typed method might see, defaulting to unpinned (the honest,
+        conservative default) rather than raising ``AttributeError``.
         """
         return bool(getattr(item, "pinned", False))
 

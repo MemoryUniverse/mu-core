@@ -447,6 +447,12 @@ class PrivateSyncLogRow(Base):
     winner_id: Mapped[str | None] = mapped_column(String(128))
     loser_id: Mapped[str | None] = mapped_column(String(128))
     payload_ref: Mapped[str | None] = mapped_column(String(512))
+    # §7.17 item 4a — the two leading (dominant) total-order terms, additive (CANONICAL:777
+    # "every field is on the delta itself"; ADR 0046/CANONICAL §7.17 item 4a). Mirrors
+    # PrivateDelta.pinned / PrivateDelta.resolution_origin (mu_contracts.domain.model.device_sync).
+    pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # auto|manual|system_degraded
+    resolution_origin: Mapped[str | None] = mapped_column(String(128))
 
     __table_args__ = (
         # ADR 0026: the sync-log stream key is (org_id, principal_id); seq is the hub-assigned

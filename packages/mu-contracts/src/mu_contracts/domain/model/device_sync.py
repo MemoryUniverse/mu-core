@@ -18,6 +18,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from mu_contracts.domain.model.conflict import ResolutionOrigin
+
 __all__ = ["PrivateDelta", "PrivateSnapshot", "SyncOp"]
 
 
@@ -54,6 +56,15 @@ class PrivateDelta(BaseModel):
     provenance_id: str = Field(min_length=1)  # origin lineage (content-free id, §7.10 G4)
     winner_id: str | None = None  # REQUIRED for op in {SUPERSEDE, REINSTATE}
     loser_id: str | None = None  # REQUIRED for op in {SUPERSEDE, REINSTATE}
+    # §7.17 item 4a — the two leading (dominant, non-lexicographic) terms of the total order.
+    # Both MUST live on the delta itself (CANONICAL:777 "every field is on the delta itself"),
+    # since `total_order_key` (mu_engine.services.conflict.order) is a pure function over two
+    # PrivateDelta candidates with no store/registry access. `pinned` mirrors the winning
+    # MemoryItem's pin state onto the delta that asserts/reinforces it; `resolution_origin` is
+    # set to MANUAL on the delta a manual conflict resolution emits (conflict-resolution-async
+    # -design.md:261: "reuse SyncOp.SUPERSEDE/REINSTATE ... plus resolution_origin='manual'").
+    pinned: bool = False
+    resolution_origin: ResolutionOrigin | None = None
     caused_by_seq: int | None = None  # replica-apply echo of log seq N; projector DROPS it
     payload_ref: str | None = None  # pointer into the private-hosted partition (body lives there)
     key_epoch: int = Field(default=0, ge=0)  # RESERVED §7.18

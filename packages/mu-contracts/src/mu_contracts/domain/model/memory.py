@@ -218,6 +218,12 @@ class MemoryItem(BaseModel):
     mention_count: int = Field(default=1, ge=0)
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
     last_seen: datetime
+    # Pin = retention, not access (CANONICAL §7.10/§7.26). The GC-eligibility predicate gains
+    # `and not item.pinned` (CANONICAL:621) — a pinned item is never GC'd unconditionally, but it
+    # CAN still be superseded: pin is not immunity from the §7.17 total order, it is the FIRST,
+    # dominant term of it (§7.17 item 4a(b)) — a pinned item is simply never the auto-loser.
+    # Defaulted False so every existing constructor/row stays valid (additive field).
+    pinned: bool = False
     # ---- Artifact/Provenance-links group (FIRST-CLASS mapped, NOT metadata overflow; §7.1) ----
     artifact_ref: str | None = None  # -> ContextArtifact.id when kind=REFERENCE; reverse-queryable
     provenance_id: str = Field(

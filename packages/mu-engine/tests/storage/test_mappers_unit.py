@@ -30,6 +30,7 @@ def _item() -> MemoryItem:
         polarity=Polarity.POSITIVE,
         artifact_ref="art_1",
         embedding=[0.1, 0.2, 0.3, 0.4],
+        pinned=True,  # §7.17 item 4a total-order task: proves `pinned` round-trips losslessly too
     )
 
 
