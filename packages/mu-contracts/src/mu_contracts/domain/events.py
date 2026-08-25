@@ -752,8 +752,17 @@ class BackpressureRejected(DomainEvent):
 # =============================================================================================
 # §5.5a — device registry + private sync
 # =============================================================================================
+# ``org_id`` on all five rows below closes **O-21** (phase-3 spec §14), with the matching
+# ``CANONICAL-CONTRACTS.md`` §5 payload amendment authored in the same change. The gap was real,
+# not cosmetic: ``org`` is the BILLING/tenancy root (ADR 0026) and ``workspace_id`` alone does not
+# identify it, so on a multi-tenant plane a metering or audit consumer of these events could not
+# attribute a device lifecycle to the org that pays for it — and a consumer that tried would have
+# to join back to a control-plane table these events exist to avoid needing. It is the first
+# field on each payload because it is the first term of ``device_id``'s own hash
+# (``CANONICAL:647``: *"keyed on `org` post-ADR-0026"*).
 class DeviceEnrolled(DomainEvent):
     device_id: str
+    org_id: str
     workspace_id: str
     principal_id: str
     platform: DevicePlatform
@@ -764,6 +773,7 @@ class DeviceEnrolled(DomainEvent):
 
 class DeviceActivated(DomainEvent):
     device_id: str
+    org_id: str
     workspace_id: str
     principal_id: str
     at_seq: int
@@ -771,15 +781,22 @@ class DeviceActivated(DomainEvent):
 
 class DeviceRevoked(DomainEvent):
     device_id: str
+    org_id: str
     workspace_id: str
     principal_id: str
     by: str
+    #: A :class:`~mu_contracts.domain.model.device.RevokeReason` VALUE, never free text (D-34).
+    #: Typed ``str`` because the event catalog pins it so; the producing service face takes the
+    #: closed enum, which is what makes the guarantee enforceable. ``_FORBIDDEN_EVENT_FIELDS`` is
+    #: a field-NAME guard and cannot see an operator-supplied sentence in a field called
+    #: ``reason`` — so the discipline lives at the producer, and an acceptance gate asserts it.
     reason: str
 
 
 class DeviceKeyEpochRotated(DomainEvent):
     """RESERVED with §7.18 — not emitted while E2E is deferred."""
 
+    org_id: str
     workspace_id: str
     principal_id: str
     epoch: int
@@ -787,6 +804,7 @@ class DeviceKeyEpochRotated(DomainEvent):
 
 
 class PrivateDeltaAppended(DomainEvent):
+    org_id: str
     workspace_id: str
     principal_id: str
     seq: int
@@ -797,6 +815,13 @@ class PrivateDeltaAppended(DomainEvent):
 
 
 class PrivateDeltaApplied(DomainEvent):
+    #: O-21's fix, extended to the sixth row of this block. It was left off when the five rows
+    #: above gained it, and the asymmetry was flagged in review: ``org`` is the BILLING/tenancy
+    #: root (ADR 0026) and ``workspace_id`` alone does not identify it, so a metering or audit
+    #: consumer of this event could not attribute an applied delta to the org that pays for it.
+    #: Free to add today precisely because the event has ZERO producers — the projector is build
+    #: step 9 — so there is no payload in flight to migrate.
+    org_id: str
     workspace_id: str
     principal_id: str
     device_id: str

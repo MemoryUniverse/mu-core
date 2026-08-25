@@ -25,6 +25,7 @@ __all__ = [
     "DeviceState",
     "HostingMode",
     "PrivacyTier",
+    "RevokeReason",
 ]
 
 
@@ -67,11 +68,24 @@ class DeviceState(StrEnum):
 
 class DeviceRecord(BaseModel):
     """The single device DTO (sync-devices §A.2). ``device_id`` is deterministic/idempotent:
-    ``"dev_" + sha256(workspace_id | principal_id | public_key)[:24]``."""
+    ``"dev_" + sha256(org_id | principal_id | public_key)[:24]``.
+
+    ⚠ **The hash basis is ``org_id``, not ``workspace_id``** — ``CANONICAL-CONTRACTS.md:647``
+    (*"keyed on `org` post-ADR-0026"*) and phase-3 spec D-12. This docstring said
+    ``workspace_id`` until the ``org_id`` field below landed, and the two together were the
+    "two carriers for one hash input" D-33 closes: the id is computed from ``org_id``, so a
+    reader who transcribes the old sentence builds a DIFFERENT id for the same keypair and
+    forks a phantom device on every re-enrol.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     device_id: str = Field(min_length=1)
+    #: **The tenancy ROOT (ADR 0026), and the first term of the ``device_id`` hash** — added by
+    #: phase-3 spec D-12/D-13 so the registry's isolation is structural rather than a filter a
+    #: later caller can drop. ``DeviceRow`` (``mu-engine``'s ``schema.py``) has carried this
+    #: column since ``46ae4bcc2472``; the DTO did not, so the adapter could not populate it.
+    org_id: str = Field(min_length=1)
     workspace_id: str = Field(min_length=1)  # tenancy tag == Namespace.workspace
     principal_id: str = Field(min_length=1)  # the ONE owning principal
     public_key: str = Field(min_length=1)  # base64 device public key
@@ -107,6 +121,14 @@ class DeviceEnrollRequest(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    #: ⚠ **Present on the PORT DTO and absent from the WIRE body — D-33's precedence rule.**
+    #: ``DeviceEnrollRequest`` is constructed SERVER-SIDE by ``DeviceService.enroll`` from the
+    #: verified ``AuthContext``; the HTTP body for ``POST /v1/devices/enroll`` carries no
+    #: ``org_id``/``principal_id``/``workspace_id`` at all, because a caller that can name its
+    #: own tenancy can name someone else's (``mu-server/CLAUDE.md`` invariant 2). This is why
+    #: ``enroll`` keeps its single-argument face while D-13 puts ``org_id`` first on every other
+    #: port method: one carrier per call, never both unsigned.
+    org_id: str = Field(min_length=1)
     workspace_id: str = Field(min_length=1)
     principal_id: str = Field(min_length=1)
     public_key: str = Field(min_length=1)
@@ -115,3 +137,30 @@ class DeviceEnrollRequest(BaseModel):
     app_build: str = Field(default="", max_length=64)
     client_mode: ClientMode
     privacy_tier: PrivacyTier
+
+
+class RevokeReason(StrEnum):
+    """The CLOSED set a device revocation may carry — phase-3 spec **D-34**.
+
+    ``DeviceRevoked.reason`` is a required free-form ``str`` in the event catalog
+    (``CANONICAL-CONTRACTS.md:375``), and the bus's content-free guard is a **field-name** check
+    (``events.py``'s ``_FORBIDDEN_EVENT_FIELDS``) — so an operator- or user-supplied sentence in
+    ``reason`` passes class definition and lands on the SHARED bus and in every trace of that
+    event. The codebase already has the right precedent one layer over: ``MemoryItem.quarantined``
+    documents *"`reason` is a named code, never memory content"*.
+
+    So the SERVICE face takes this enum and the EVENT field stays ``str`` (carrying the member's
+    value). ``StrEnum`` makes that a projection rather than a conversion, and it makes the closed
+    set the only thing a caller can construct.
+
+    ``UNSPECIFIED`` exists because ``D:203``/``S:136`` type the service's ``reason`` as
+    ``str | None`` while the event's field is REQUIRED: a ``None`` reason has no defined mapping,
+    so the service substitutes this constant rather than widening the event.
+    """
+
+    UNSPECIFIED = "unspecified"
+    USER_REQUESTED = "user_requested"
+    LOST_OR_STOLEN = "lost_or_stolen"
+    DECOMMISSIONED = "decommissioned"
+    POLICY = "policy"
+    KEY_COMPROMISE = "key_compromise"

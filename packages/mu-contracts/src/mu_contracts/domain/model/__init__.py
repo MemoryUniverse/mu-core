@@ -35,6 +35,7 @@ from mu_contracts.domain.model.device import (
     DeviceState,
     HostingMode,
     PrivacyTier,
+    RevokeReason,
 )
 from mu_contracts.domain.model.device_sync import PrivateDelta, PrivateSnapshot, SyncOp
 from mu_contracts.domain.model.entity import EntityCandidate, EntityResolution
@@ -187,6 +188,7 @@ __all__ = [
     "Retention",
     "RetentionPolicy",
     "Revocation",
+    "RevokeReason",
     "Role",
     "RoleMembership",
     "RoomMessage",
