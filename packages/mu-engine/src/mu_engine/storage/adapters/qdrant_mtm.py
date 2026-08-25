@@ -197,7 +197,7 @@ class QdrantMtmAdapter:
         raw = rec.vector if isinstance(rec.vector, list) else []
         vector = [float(v) for v in raw if isinstance(v, int | float)]
         payload: dict[str, Any] = rec.payload or {}
-        return self._mapper.from_store(
+        item = self._mapper.from_store(
             QdrantPoint(
                 point_id=str(rec.id),
                 vector=vector,
@@ -206,6 +206,25 @@ class QdrantMtmAdapter:
                 collection=name,
             )
         )
+        # ⚠ **The namespace check is what makes this a read "from ``ns``'s partition"**, which is
+        # what ``MtmTierRepository.get``'s port promises — and without it the promise was FALSE.
+        # Neither of the two things this point-get keys on is namespace-scoped: the collection is
+        # ``mu_mtm__{workspace}__{visibility}__{dim}`` (no org, no user) and the point id is
+        # ``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt). Isolation in this tier is
+        # FILTER-based by design, and the filter lives in ``semantic()``; ``retrieve`` takes none.
+        # So a bare id from ANOTHER org or ANOTHER user, sharing only the workspace string and the
+        # visibility, came back here as a hit — reproduced end-to-end against real Qdrant, where a
+        # victim's ``content_hash`` and ``provenance_id`` crossed into another principal's data.
+        # STM (key-prefixed by ``Namespace.to_prefix()``) and LTM (``MATCH (m:Memory {namespace,
+        # id})``) were already scoped; this tier was the one hole, and it is the tier every
+        # id-resolving lifecycle verb probes.
+        #
+        # Enforced post-read rather than as a Qdrant filter deliberately: ``retrieve`` compares the
+        # RECONSTRUCTED item, so it cannot be defeated by a payload whose index keys and canonical
+        # fields disagree, and it needs no new payload index. ``None`` (not a raise) is the right
+        # answer — to this caller the memory genuinely is not in its partition, which is exactly
+        # what the port documents ``None`` to mean, and a raise would leak that the id exists.
+        return item if item.namespace == ns else None
 
     async def expire(self, ns: Namespace, memory_id: str, *, at: datetime) -> None:
         return await self._retry(self._expire_impl)(ns, memory_id, at=at)

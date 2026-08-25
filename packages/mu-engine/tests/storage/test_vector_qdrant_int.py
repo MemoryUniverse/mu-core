@@ -83,6 +83,64 @@ async def test_namespace_filter(
     assert hits_b == []
 
 
+async def test_point_get_returns_the_item_from_its_own_namespace(
+    mtm: QdrantMtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """The positive half of :func:`test_point_get_refuses_another_namespaces_memory`.
+
+    Without it, hard-coding ``get`` to ``return None`` would make the refusal test pass — which is
+    this project's recorded "passes while proving nothing" pattern, and the reason both directions
+    are asserted rather than only the interesting one.
+    """
+    ns = make_ns()
+    item = make_item(ns, "point-get me")
+    await mtm.upsert(item)
+    got = await mtm.get(ns, item.id)
+    assert got is not None
+    assert got.id == item.id
+    assert got.namespace == ns
+
+
+async def test_point_get_refuses_another_namespaces_memory(
+    mtm: QdrantMtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """``get`` must read *from ``ns``'s partition* — the port's own words — and it did not.
+
+    ⚠ **This was a live cross-tenant read, not a hypothetical.** Neither key this point-get uses
+    is namespace-scoped: the collection is ``mu_mtm__{workspace}__{visibility}__{dim}`` (no org,
+    no user) and the point id is ``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt), and
+    ``retrieve`` carries no payload filter — isolation in this tier is filter-based and the filter
+    lives in ``semantic()`` (see :func:`test_namespace_filter`, which pins that for the search
+    path and says nothing about this one). So a bare id belonging to another user — or another
+    ORG, since the org is not in the collection name either — resolved here. Every id-resolving
+    lifecycle verb on ``MemoryFacade`` (get / promote / demote / update / delete) probes this
+    method, and ``mu-server``'s appender B was demonstrated appending a foreign memory's
+    ``content_hash`` and ``provenance_id`` into another principal's private sync log through it.
+
+    **What breaks it:** removing the ``item.namespace == ns`` comparison at the end of
+    ``_get_impl``. The two namespaces here deliberately share a collection — same workspace, same
+    PRIVATE visibility, different user slot — so the store genuinely returns the point and only
+    the adapter can refuse it.
+    """
+    victim_ns = make_ns(user="u_victim")
+    caller_ns = make_ns(user="u_caller")
+    assert collection_name(victim_ns, VECTOR_DIM) == collection_name(caller_ns, VECTOR_DIM), (
+        "the pre-condition did not hold: the two namespaces are in different collections, so "
+        "this test would pass without the guard"
+    )
+    victim = make_item(victim_ns, "the victim's secret")
+    await mtm.upsert(victim)
+    assert await mtm.get(victim_ns, victim.id) is not None, "the victim is not even stored"
+
+    assert (
+        await mtm.get(caller_ns, victim.id) is None
+    ), "a point-get resolved a memory from another principal's partition"
+
+
 async def test_state_active_supersede_drop(
     mtm: QdrantMtmAdapter,
     make_ns: Callable[..., Namespace],
