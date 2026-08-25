@@ -409,3 +409,76 @@ async def test_protected_floor_is_reordered_by_relevance_not_recency() -> None:
         "the just-said-but-irrelevant fact still leads the protected block over the "
         "older-but-relevant one — floor is not reorderable by relevance"
     )
+
+
+class _RecordingLtm(_EmptyLtm):
+    """Records the ``caller_identity_set`` each LTM arm is actually CALLED with.
+
+    C2 GAP: the adapter-level regression tests
+    (``tests/storage/test_falkor_traverse_authz_int.py``) call ``traverse_entities`` DIRECTLY, so
+    nothing covered the CALL SITE — deleting ``caller_identity_set=caller`` from
+    ``ThreeChannelRecallRanker._ltm_channel`` reopened the exact bypass with a fully green suite
+    (verified by mutation). The wall is only as good as the thread that reaches it.
+    """
+
+    def __init__(self) -> None:
+        self.graph_recall_caller: object = "<never called>"
+        self.traverse_caller: object = "<never called>"
+
+    async def graph_recall(
+        self,
+        ns: Namespace,
+        *,
+        subject: str | None = None,
+        predicate: str | None = None,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        self.graph_recall_caller = caller_identity_set
+        return []
+
+    async def traverse_entities(
+        self,
+        ns: Namespace,
+        *,
+        query: str,
+        max_hops: int,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        self.traverse_caller = caller_identity_set
+        return []
+
+
+@pytest.mark.asyncio
+async def test_ranker_threads_the_caller_identity_set_to_the_traversal_arm() -> None:
+    """C2 CALL-SITE REGRESSION: the multi-hop arm must receive the SAME caller identity set the
+    flat ``graph_recall`` seed receives. ``traverse_entities`` DERIVES memory ids from a
+    workspace-wide entity graph; with no caller set the adapter's SHARED hydration has nothing to
+    match ``m.authorized_ids`` against and the ACL clause is skipped entirely."""
+    ltm = _RecordingLtm()
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({}),  # type: ignore[arg-type]
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency"),
+        clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+    )
+    caller = frozenset({"principal-alice"})
+    assert RecallSettings().ltm_max_hops > 0, "precondition: the traversal arm is ON by default"
+
+    await ranker.rank(
+        _NS,
+        "who is Bo's manager?",
+        [0.0, 0.0],
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=caller,
+    )
+
+    assert ltm.traverse_caller == caller, (
+        "C2 AUTHZ BYPASS at the CALL SITE: the ranker did not thread caller_identity_set into "
+        "traverse_entities — the adapter's SHARED ACL clause is then skipped entirely"
+    )
+    assert ltm.graph_recall_caller == caller, "the flat seed's caller threading regressed"
