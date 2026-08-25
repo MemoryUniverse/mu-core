@@ -776,7 +776,13 @@ class FalkorLtmAdapter:
         )
 
     async def traverse_entities(
-        self, ns: Namespace, *, query: str, max_hops: int, limit: int
+        self,
+        ns: Namespace,
+        *,
+        query: str,
+        max_hops: int,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
     ) -> list[Scored[MemoryItem]]:
         """D-4 (ARCHITECTURE-CONFORMANCE.md "LTM graph arm thin"): the multi-hop traversal arm —
         answers a relational query ("who is Bo's manager?") by seeding on entity NAMES found in
@@ -797,13 +803,34 @@ class FalkorLtmAdapter:
         query. Bi-temporal: an edge whose ``invalid_at`` has passed (superseded, per
         :meth:`_invalidate_entity_edge`) is excluded from every hop, so a stale relation never
         resurfaces via traversal.
+
+        AUTHZ (C2 fix): the ids this arm derives come from the WORKSPACE-wide ``:Entity``
+        sub-graph (``_user_scope_prefix``, user slot ``*`` on SHARED), so the ``:Memory``
+        hydration below MUST re-impose both walls ``graph_recall`` already imposes — the
+        ``_resolve_memory_namespace_filter`` room predicate AND, on SHARED, the
+        ``m.authorized_ids`` Model-A ACL predicate built from ``caller_identity_set``
+        (CANONICAL-CONTRACTS.md:529, governance-policy-spec.md:124). Both are SERVER-SIDE and
+        PRE-truncation (CANONICAL-CONTRACTS.md:508-510), never a post-filter on the returned
+        rows. Before this fix the hydration carried NEITHER, so a multi-hop recall returned facts
+        from any room in the workspace and from any ACL — a bypass strictly worse than the MTM
+        leak fixed in ``7ccc405``, which at least required the caller to already KNOW a memory id.
         """
         return await self._retry(self._traverse_entities_impl)(
-            ns, query=query, max_hops=max_hops, limit=limit
+            ns,
+            query=query,
+            max_hops=max_hops,
+            limit=limit,
+            caller_identity_set=caller_identity_set,
         )
 
     async def _traverse_entities_impl(
-        self, ns: Namespace, *, query: str, max_hops: int, limit: int
+        self,
+        ns: Namespace,
+        *,
+        query: str,
+        max_hops: int,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
     ) -> list[Scored[MemoryItem]]:
         tokens = {t.casefold() for t in re.findall(r"[A-Za-z0-9]+", query) if len(t) > 1}
         if not tokens:
@@ -850,23 +877,45 @@ class FalkorLtmAdapter:
 
         if not memory_hop:
             return []
-        # BUG2 FIX (scoping): NO `:Memory`-namespace filter here — the ids above already came ONLY
-        # from entity edges inside THIS SAME physical per-user graph (`self._graph(ns)`, keyed on
-        # org/workspace/visibility/user — never crosses a tenant boundary), so re-imposing the
-        # session-scoped `m.namespace = $ns` equality here would silently drop every hit whose
-        # source fact was captured in a DIFFERENT session than the one the caller happens to be
-        # querying from — exactly the re-assessment's "a query from another session returns 0"
-        # caveat, even though the physical partition already holds it.
+        # C2 FIX (authorization bypass): the hydration below re-imposes the SAME two walls
+        # `_graph_recall_impl` imposes, because the ids above were derived from the WORKSPACE-wide
+        # entity sub-graph (`_user_scope_prefix`, user slot `*` on SHARED) and therefore prove
+        # nothing about the room or the ACL of the `:Memory` they point at.
+        #
+        # `_resolve_memory_namespace_filter` is used rather than `_user_scope_prefix` precisely
+        # because it already encodes the asymmetry this arm needs, and the asymmetry is
+        # DELIBERATE on both sides:
+        #   * PRIVATE, `session_scope is None` (the only mode this arm calls it in) -> `STARTS
+        #     WITH` the session-less USER prefix, so the BUG2 cross-session walk is PRESERVED
+        #     exactly: a relational query issued from session B still hydrates a fact captured in
+        #     session A. That was the whole point of the BUG2 scoping fix and is not narrowed.
+        #   * SHARED -> exact `to_prefix()` (room-included), UNCONDITIONALLY — "rooms are real
+        #     walls" (this module's own `_resolve_memory_namespace_filter` docstring). SHARED must
+        #     NOT get the PRIVATE relaxation: a different session on the SHARED plane is a
+        #     different ROOM, not another of the user's own conversations.
+        ns_predicate, ns_value = _resolve_memory_namespace_filter(ns, session_scope=None)
+        fetch_where = [
+            ns_predicate,
+            "m.id IN $ids",
+            "m.state = $active",
+            "(m.invalid_at = '' OR m.invalid_at > $now)",
+        ]
+        fetch_params: dict[str, Any] = {
+            "ns": ns_value,
+            "ids": list(memory_hop),
+            "active": MemoryState.ACTIVE.value,
+            "now": now_iso,
+        }
+        # The Model-A ACL clause — the SAME form `_graph_recall_impl` builds, reused verbatim
+        # rather than a second dialect of the same rule.
+        if ns.visibility is Visibility.SHARED and caller_identity_set is not None:
+            fetch_where.append("ANY(cid IN $caller WHERE cid IN m.authorized_ids)")
+            fetch_params["caller"] = list(caller_identity_set)
         fetch_cypher = (
-            "MATCH (m:Memory) WHERE m.id IN $ids "
-            "AND m.state = $active AND (m.invalid_at = '' OR m.invalid_at > $now) "
+            f"MATCH (m:Memory) WHERE {' AND '.join(fetch_where)} "
             "RETURN m.id AS id, m.memory_json AS mj"
         )
-        rows = await g_query(
-            g,
-            fetch_cypher,
-            {"ids": list(memory_hop), "active": MemoryState.ACTIVE.value, "now": now_iso},
-        )
+        rows = await g_query(g, fetch_cypher, fetch_params)
         scored: list[Scored[MemoryItem]] = []
         for mid, mj in rows:
             hop = memory_hop.get(str(mid), hops)

@@ -295,8 +295,17 @@ class ThreeChannelRecallRanker:
         if self._settings.ltm_max_hops <= 0:
             return hits, False
         try:
+            # C2 FIX: the caller identity set goes to the traversal arm too — it is the SAME
+            # `caller` the flat `graph_recall` seed above already receives. The traversal arm
+            # DERIVES memory ids from a workspace-wide entity graph, so leaving it off here was a
+            # live authorization bypass: SHARED hits came back unfiltered by `m.authorized_ids`
+            # AND unfiltered by room.
             traversal_hits = await self._ltm.traverse_entities(
-                ns, query=query, max_hops=self._settings.ltm_max_hops, limit=pool
+                ns,
+                query=query,
+                max_hops=self._settings.ltm_max_hops,
+                limit=pool,
+                caller_identity_set=caller,
             )
         except StoreUnavailableError:
             # the flat seed already succeeded above — a traversal-only outage degrades to

@@ -129,7 +129,13 @@ class _EmptyLtm:
         raise NotImplementedError
 
     async def traverse_entities(
-        self, ns: Namespace, *, query: str, max_hops: int, limit: int
+        self,
+        ns: Namespace,
+        *,
+        query: str,
+        max_hops: int,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
     ) -> list[Scored[MemoryItem]]:
         return []  # D-4: no entity edges wired for this test — isolates STM/MTM interaction
 

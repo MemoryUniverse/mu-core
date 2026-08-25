@@ -262,14 +262,28 @@ class GraphStorePort(Protocol):
     async def resolve_entity(self, ns: Namespace, name: str) -> EntityResolution: ...
 
     async def traverse_entities(
-        self, ns: Namespace, *, query: str, max_hops: int, limit: int
+        self,
+        ns: Namespace,
+        *,
+        query: str,
+        max_hops: int,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
     ) -> list[Scored[MemoryItem]]:
         """Multi-hop entity-edge traversal (D-4, ARCHITECTURE-CONFORMANCE.md "LTM graph arm
         thin"): seeds on entity names found in ``query`` and walks the entity-entity edges
         ``upsert_fact`` materializes (B5/B6), up to ``max_hops`` (1-2), returning the underlying
         ``:Memory`` fact(s) each traversed edge traces back to. See
         ``FalkorLtmAdapter.traverse_entities`` for the full contract (seed matching, bi-temporal
-        exclusion of superseded edges, hop-distance scoring)."""
+        exclusion of superseded edges, hop-distance scoring).
+
+        ``caller_identity_set`` carries the SAME Model-A caller PRINCIPAL-id set ``graph_recall``
+        takes (CANONICAL-CONTRACTS.md §7.4) and is load-bearing on the SHARED plane: this arm
+        DERIVES memory ids from a workspace-wide entity graph, so without it the hydration has
+        nothing to filter ``m.authorized_ids`` against and returns ``:Memory`` rows from any room
+        and any ACL in the workspace. The parameter exists because the PORT must be able to
+        express the caller set — an implementation that ignores it on SHARED is an authorization
+        bypass, not an optimization."""
         ...
 
     async def by_artifact(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]:
