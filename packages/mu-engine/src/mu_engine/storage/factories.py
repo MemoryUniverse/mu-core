@@ -141,15 +141,30 @@ def _build_falkordb(**cfg: Any) -> FalkorLtmAdapter:
     taking precedence — see this module's EXTENSION SEAM note above for how a future
     (graph, "neo4j"|"kuzu"|"ladybug"|"neptune") backend registers alongside this one.
     """
-    db = FalkorDB(host=cfg["host"], port=cfg["port"])
     graph_settings = get_settings().storage.graph
+    # Resolved BEFORE constructing ``FalkorDB``: its ``__init__`` builds a synchronous probe
+    # connection (``Is_Cluster`` -> ``redis.Redis(...).info(section="server")``, even on the
+    # ``falkordb.asyncio`` class — see ``falkordb/asyncio/cluster.py``) and blocks the event
+    # loop thread on it during ASGI startup (``mu_server.app.lifespan`` -> ``SharedContainer``
+    # -> this factory). Left unbounded, a FalkorDB that accepts TCP but never answers wedges
+    # startup forever, before ``/health`` exists to report it. Threading the SAME
+    # ``store_io_timeout_s`` budget the adapter already uses for every later call into
+    # ``socket_timeout``/``socket_connect_timeout`` bounds that constructor-time probe by the
+    # store's own configured budget rather than a new hardcoded constant (DEV-STANDARDS rule 3).
+    store_io_timeout_s = cfg.get("store_io_timeout_s", graph_settings.store_io_timeout_s)
+    db = FalkorDB(
+        host=cfg["host"],
+        port=cfg["port"],
+        socket_timeout=store_io_timeout_s,
+        socket_connect_timeout=store_io_timeout_s,
+    )
     return FalkorLtmAdapter(
         db,
         shortlist_size=cfg.get("shortlist_size", graph_settings.entity_shortlist_size),
         similarity_threshold=cfg.get(
             "similarity_threshold", graph_settings.entity_similarity_threshold
         ),
-        store_io_timeout_s=cfg.get("store_io_timeout_s", graph_settings.store_io_timeout_s),
+        store_io_timeout_s=store_io_timeout_s,
     )
 
 
