@@ -69,7 +69,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import timedelta
-from typing import Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 import structlog
 from pydantic import BaseModel, ConfigDict
@@ -300,6 +300,14 @@ class RetentionService:
             head_state = await self._ltm_retention.chain_head_state(ns, item.id)
             if head_state is MemoryState.ACTIVE:
                 continue  # chain head still alive (spec §9 mermaid) — keep the whole history
+            # Mapped BEFORE the irreversible delete, deliberately. ``_to_contract_state`` is
+            # exhaustive and raises ``KeyError`` on an unmapped member rather than guessing (see
+            # ``_STATE_MAP``). Computing it after ``gc_delete`` would make that loud failure
+            # DESTRUCTIVE: the fact would already be gone, its ``MemoryGarbageCollected`` would
+            # never publish, and the raise would abort the sweep with the remaining dead facts
+            # unprocessed. Mapping first means an unmapped state costs us a refused sweep with
+            # nothing deleted — loud AND recoverable, which is the whole point of failing loud.
+            prior_state = self._to_contract_state(item.state)
             await self._ltm_retention.gc_delete(ns, item.id)
             outcomes.append(
                 RetentionOutcome(
@@ -308,11 +316,7 @@ class RetentionService:
             )
             if self._bus is not None:
                 await self._bus.publish(
-                    MemoryGarbageCollected(
-                        namespace=ns,
-                        id=item.id,
-                        prior_state=self._to_contract_state(item.state),
-                    )
+                    MemoryGarbageCollected(namespace=ns, id=item.id, prior_state=prior_state)
                 )
 
         report = RetentionReport(evaluated=evaluated, outcomes=tuple(outcomes))
@@ -362,16 +366,43 @@ class RetentionService:
         """
         return bool(getattr(item, "pinned", False))
 
+    # ``mu_engine.storage.domain.memory.MemoryState`` (engine) and ``mu_contracts.domain.model.
+    # memory.State`` (published) are two independent, un-reconciled definitions of the same
+    # canonical axis (flagged debt, ``storage/domain/memory.py``'s own "RE-HOME NOTE"; ADR 0049
+    # does not merge them, it only closes the one member gap that was producing a wrong
+    # published value). Kept as an explicit, EXHAUSTIVE dict rather than a same-string shortcut
+    # (e.g. ``ContractState(state.value)``) on purpose: the two enums are separately maintained,
+    # so a future engine-side member landing without its published counterpart must fail LOUDLY
+    # here — not silently coerce via string parity, and not fall through to a wrong default the
+    # way the pre-ADR-0049 ``ARCHIVED`` fallback did. That silent fallback is exactly what let
+    # this defect hide (ADR 0049 "Context").
+    #
+    # ⚠ The guard is RUNTIME-only, and saying so matters: ``mypy --strict`` does not check dict-key
+    # exhaustiveness, so adding a seventh ``MemoryState`` member without a row here type-checks
+    # and lints clean, then raises ``KeyError`` on the first sweep that meets one. That is louder
+    # than the wrong-value-forever it replaces, but it is NOT a compile-time impossibility — do
+    # not read this comment as one. The call site maps BEFORE ``gc_delete`` precisely so that
+    # runtime failure costs a refused sweep rather than a deleted fact with no event.
+    _STATE_MAP: ClassVar[dict[MemoryState, ContractState]] = {
+        MemoryState.ACTIVE: ContractState.ACTIVE,
+        MemoryState.ARCHIVED: ContractState.ARCHIVED,
+        MemoryState.SUPERSEDED: ContractState.SUPERSEDED,
+        MemoryState.QUARANTINED: ContractState.QUARANTINED,
+        MemoryState.DELETED: ContractState.DELETED,
+        MemoryState.EXPIRED: ContractState.EXPIRED,  # ADR 0049 — the fix: no longer ARCHIVED
+    }
+
     @staticmethod
     def _to_contract_state(state: MemoryState) -> ContractState:
-        """``mu_contracts.domain.model.memory.State`` (the event-catalog's state enum) has no
-        ``EXPIRED`` member — it and ``mu_engine.storage.domain.memory.MemoryState`` are two
-        independent, un-reconciled definitions of the same canonical record (flagged debt,
-        ``storage/domain/memory.py``'s own "RE-HOME NOTE"). ``MemoryGarbageCollected.
-        prior_state`` is typed against the contracts enum, so an ``EXPIRED``-origin GC reports
-        the closest honest analogue: ``ARCHIVED`` (a dead, history-retained state — never
-        ``ACTIVE``, never fabricating an ``EXPIRED`` member that doesn't exist on that enum).
+        """Map the engine's internal lifecycle state onto the published event-catalog ``State``
+        (CANONICAL §7.5's SIX-member axis, ADR 0049) for ``MemoryGarbageCollected.prior_state``.
+
+        EXHAUSTIVE over ``_STATE_MAP``: every current ``MemoryState`` member has an explicit,
+        named published counterpart — most saliently ``EXPIRED -> EXPIRED``, since before ADR
+        0049 the published enum lacked that member and this method substituted ``ARCHIVED``,
+        making every GC event for a self-expired EPHEMERAL fact report a death that never
+        happened (ADR 0049 "Context"). A ``MemoryState`` with no entry raises ``KeyError``
+        rather than guessing — see the class-level comment on ``_STATE_MAP`` for why that's the
+        deliberate choice now that the two enums' members line up 1:1.
         """
-        if state is MemoryState.SUPERSEDED:
-            return ContractState.SUPERSEDED
-        return ContractState.ARCHIVED
+        return RetentionService._STATE_MAP[state]

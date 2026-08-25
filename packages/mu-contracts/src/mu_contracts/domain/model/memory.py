@@ -49,14 +49,25 @@ class Tier(StrEnum):
 
 
 class State(StrEnum):
-    """Lifecycle state axis (memory-layer §1.1). Every hot read filters ``ACTIVE``
-    (CANONICAL §7.5); ``SUPERSEDED``/``ARCHIVED`` are retained (invalidate-don't-delete)."""
+    """Lifecycle state axis (memory-layer §1.1) — SIX members (CANONICAL §7.5, ADR 0049). Every
+    hot read filters ``ACTIVE``; ``SUPERSEDED``/``ARCHIVED``/``EXPIRED`` are all retained
+    (invalidate-don't-delete).
+
+    ``EXPIRED`` (defined by ADR 0035, ratified into this published enum by ADR 0049) is the
+    **EPHEMERAL exit**: a bookkeeping/GC flip driven by ``now >= invalid_at``, **NOT a recall
+    gate** — ``facts_at(t)`` already excludes a fact whose ``invalid_at`` has passed via the
+    bi-temporal window, so this member changes nothing about the ``state='active'`` filter. It
+    exists so the GC sweep and ``MemoryGarbageCollected.prior_state`` can say which death a fact
+    died: "its validity ran out" is a different operational outcome from "it was demoted and
+    archived", and consumers must be able to tell them apart.
+    """
 
     ACTIVE = "active"
     ARCHIVED = "archived"
     SUPERSEDED = "superseded"
     QUARANTINED = "quarantined"
     DELETED = "deleted"
+    EXPIRED = "expired"
 
 
 class MemoryKind(StrEnum):
