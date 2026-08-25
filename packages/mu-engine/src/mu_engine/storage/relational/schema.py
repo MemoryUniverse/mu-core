@@ -532,6 +532,34 @@ class PrivateSyncLogRow(Base):
     pinned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # auto|manual|system_degraded
     resolution_origin: Mapped[str | None] = mapped_column(String(128))
+    # The remaining three columns build step 2c named and revision 1ab7f7175baa did not carry.
+    # Each is additive and nullable-safe; none changes an existing constraint.
+    #
+    # `resolved_by` — CANONICAL:538's attribution half of a manual resolution, mirroring
+    # PrivateDelta.resolved_by. Without the column a manually-resolved SUPERSEDE round-trips
+    # through the log having forgotten who resolved it.
+    resolved_by: Mapped[str | None] = mapped_column(String(128))
+    # `caused_by_seq` — the loop-suppression marker, already a shipped field on the WIRE delta
+    # (`PrivateDelta.caused_by_seq`, "replica-apply echo of log seq N; projector DROPS it"). With
+    # no column the field silently vanishes on the way through the log, so a replica-apply echo
+    # reads back indistinguishable from an original write — which is the one distinction appender
+    # B's loop suppression is built on.
+    caused_by_seq: Mapped[int | None] = mapped_column(BigInteger)
+    # `appended_at` — the HUB's receive time, server-set on every append and never client-supplied.
+    # It is the retention window's only possible basis: `SyncSettings.private_sync_log_retention_s`
+    # is a duration, and with no timestamp on the row a pruner (O-32) cannot be written at all.
+    # No reader today, by construction — that is O-32, and this closes one of its two blockers.
+    #
+    # ⚠ The ``server_default`` mirrors revision ``9c41d0b7ae52``, which needed one to add a NOT
+    # NULL column to a possibly-populated table. Declared here too so the ORM model and the
+    # migrated database do not DRIFT: without it the next ``alembic revision --autogenerate``
+    # compares model-without-default against database-with-default and proposes DROPPING the
+    # default, which would make the very next additive revision unsafe on a live table. The
+    # adapter still sets the value explicitly on every insert, so this is a migration device and
+    # never a second writer.
+    appended_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
 
     __table_args__ = (
         # ADR 0026: the sync-log stream key is (org_id, principal_id); seq is the hub-assigned

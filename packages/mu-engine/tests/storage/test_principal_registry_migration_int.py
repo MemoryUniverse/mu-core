@@ -42,8 +42,23 @@ _ALEMBIC_INI = (
     / "relational"
     / "alembic.ini"
 )
-_HEAD = "f6fc5f7052cc"
+_HEAD = "f6fc5f7052cc"  # THE REVISION UNDER TEST — not necessarily the chain head, see below
 _PRIOR = "1ab7f7175baa"  # the revision this one Revises — build step 2c's landed revision
+
+#: ⚠ **The cleanup below restores the chain's ACTUAL head, which is NOT ``_HEAD``.**
+#:
+#: This test downgrades the SHARED dev database and must put it back, because the other
+#: integration fixtures here run ``Base.metadata.create_all`` (``checkfirst`` — it creates missing
+#: TABLES and never adds a missing COLUMN to an existing one). So a database left one revision
+#: short stays short, and every later test that reads a column added after ``_HEAD`` fails with
+#: ``UndefinedColumn`` — in a *different file*, with no hint that this test caused it.
+#:
+#: That is not hypothetical: it happened the moment revision ``9c41d0b7ae52`` landed on top of
+#: ``f6fc5f7052cc``. This test restored the database to ``_HEAD``, its own revision, and four
+#: assertions in ``test_private_sync_log_int.py`` began failing — while passing in isolation.
+#: Using alembic's ``"head"`` literal makes the cleanup correct for every revision that lands
+#: after this one, instead of correct only until the next one.
+_CHAIN_HEAD = "head"
 
 _PRINCIPAL_COLUMNS = {
     "id",
@@ -203,9 +218,11 @@ async def test_migration_round_trip_and_backward_compatible_defaults(engine: Asy
         assert set(await _columns(engine, "principals")) == set(post_cols)
         assert set(await _columns(engine, "principal_credentials")) == set(cred_cols)
     finally:
-        # Leave the shared dev database at head, whatever happened above — other integration
-        # fixtures assume the schema they were built against is the one currently live.
-        async with engine.connect() as conn:
-            current = await conn.scalar(text("select version_num from alembic_version"))
-        if current != _HEAD:
-            await asyncio.to_thread(command.upgrade, cfg, _HEAD)
+        # Leave the shared dev database at the CHAIN head, whatever happened above — other
+        # integration fixtures assume the schema they were built against is the one currently
+        # live, and `create_all` cannot repair a missing column. See `_CHAIN_HEAD`'s note: this
+        # used to restore `_HEAD` (this test's own revision) and silently broke a sibling file the
+        # first time a later revision landed. Unconditional, because `upgrade` to head is a no-op
+        # when the database is already there, and a "current != x" guard is exactly the check that
+        # was wrong before.
+        await asyncio.to_thread(command.upgrade, cfg, _CHAIN_HEAD)
