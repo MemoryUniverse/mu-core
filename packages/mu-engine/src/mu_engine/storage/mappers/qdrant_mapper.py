@@ -20,7 +20,14 @@ from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.ports import QdrantPoint
 
-__all__ = ["QdrantMapper", "collection_name", "point_id"]
+__all__ = ["NAMESPACE_PAYLOAD_KEY", "QdrantMapper", "collection_name", "point_id"]
+
+# The ONE payload/metadata key every MTM backend stores ``Namespace.to_prefix()`` under, defined
+# HERE (the mapper that writes it) so the adapters that must scope a by-id write to a namespace
+# spell it once instead of four times: Qdrant's keyword-indexed payload field, Chroma's flat
+# metadata key, FAISS's docstore payload key. (pgvector promotes it to a real SQL column of the
+# same name, declared in its own DDL.)
+NAMESPACE_PAYLOAD_KEY = "namespace"
 
 
 def point_id(memory_id: str) -> str:
@@ -43,7 +50,7 @@ class QdrantMapper:
         payload = item.to_dict()
         payload.pop("embedding", None)  # vector nulled out of payload (mtm_qdrant.py:213-214)
         # flattened indexed filter keys (spec §3.2)
-        payload["namespace"] = item.namespace.to_prefix()
+        payload[NAMESPACE_PAYLOAD_KEY] = item.namespace.to_prefix()
         payload["namespace_parts"] = list(item.namespace.parts())
         payload["state"] = item.state.value
         payload["visibility"] = item.namespace.visibility.value

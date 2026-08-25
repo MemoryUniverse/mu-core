@@ -77,6 +77,7 @@ from mu_engine.storage.domain.memory import (
     MemoryTier,
 )
 from mu_engine.storage.domain.namespace import Namespace
+from mu_engine.storage.errors import MtmPointAbsentError
 from mu_engine.storage.ports import GraphStorePort, MtmTierRepository, StmTierRepository
 
 if TYPE_CHECKING:
@@ -866,7 +867,7 @@ class DistillPipeline:
         reason = "functional_supersede"
         try:
             await self._mtm.invalidate(ns, loser_point, winner_point, at=at, reason=reason)
-        except UnexpectedResponse as exc:
+        except (UnexpectedResponse, MtmPointAbsentError) as exc:
             self._pending_mtm_retries.append(
                 _PendingMtmInvalidate(
                     ns=ns,
@@ -879,7 +880,11 @@ class DistillPipeline:
             _log.warning(
                 "mtm_invalidate_point_absent",
                 ns=ns.to_prefix(),
-                status_code=exc.status_code,
+                # `MtmPointAbsentError` is the namespace-scoped adapter's own typed absence
+                # signal (C3): once a by-id payload write carries the tenancy predicate, a miss
+                # is a silent success at the wire level, so Qdrant's raw 404 no longer fires.
+                # Both spellings mean the same thing here — the point is not (yet) visible.
+                status_code=getattr(exc, "status_code", None),
             )
             if self._bus is not None:
                 await self._bus.publish(
@@ -887,7 +892,7 @@ class DistillPipeline:
                         component="mtm",
                         mode="mtm_invalidate_deferred",
                         reason=DegradeReason.MTM_INVALIDATE_POINT_ABSENT,
-                        detail=f"status={exc.status_code}",
+                        detail=f"status={getattr(exc, 'status_code', type(exc).__name__)}",
                     )
                 )
 
@@ -912,7 +917,8 @@ class DistillPipeline:
                     at=pending.at,
                     reason=pending.reason,
                 )
-            except UnexpectedResponse:
+            except (UnexpectedResponse, MtmPointAbsentError):
+                # both spellings mean "still not visible" — see `_invalidate_mtm_guarded`.
                 remaining.append(pending)  # still absent — retried again next tick
         self._pending_mtm_retries = remaining
 

@@ -37,7 +37,7 @@ from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
 from mu_engine.storage.mappers.chroma_mapper import ChromaMapper, chroma_collection_name
-from mu_engine.storage.mappers.qdrant_mapper import point_id
+from mu_engine.storage.mappers.qdrant_mapper import NAMESPACE_PAYLOAD_KEY, point_id
 from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["ChromaMtmAdapter"]
@@ -226,8 +226,23 @@ class ChromaMtmAdapter:
         async with self._lock:
             col = await self._collection(ns)
             pid = point_id(loser_id)
+            # ⚠ The `where` clause is the TENANCY predicate, not a convenience. The collection is
+            # `chroma_collection_name(ns, dim)` — workspace + visibility only, no org and no user
+            # — and `pid` is `uuid5(NAMESPACE_URL, memory_id)`, unsalted by namespace, so a bare
+            # `loser_id` from another org/user names a real row of this same collection. The
+            # adapter applies the exact-equality scope itself, on the write path as well as the
+            # read (`storage-pluggable-spec.md §483-485`; CANONICAL §1 rule 5), reusing the
+            # SAME `namespace == to_prefix()` metadata pre-filter `_semantic_impl` pushes down.
+            # It gates the `col.update` below: a foreign id matches nothing, `metas` is empty,
+            # and this returns as the ordinary already-absent no-op. Chroma has no single atomic
+            # filtered-update primitive, but the get+update pair runs wholly inside this
+            # adapter's `self._lock` and its `PersistentClient` is single-writer by adapter
+            # policy, so no window is opened between the two.
             existing = await asyncio.to_thread(
-                col.get, ids=[pid], include=["metadatas", "documents", "embeddings"]
+                col.get,
+                ids=[pid],
+                where={NAMESPACE_PAYLOAD_KEY: {"$eq": ns.to_prefix()}},
+                include=["metadatas", "documents", "embeddings"],
             )
             metas = existing.get("metadatas") or []
             docs = existing.get("documents") or []

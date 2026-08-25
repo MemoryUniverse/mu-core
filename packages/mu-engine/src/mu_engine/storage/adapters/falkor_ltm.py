@@ -55,6 +55,7 @@ from mu_engine.storage.domain.entity import EntityCandidate, EntityResolution
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored
+from mu_engine.storage.errors import MtmPointAbsentError
 from mu_engine.storage.mappers.graph_mapper import GraphMapper
 
 __all__ = ["EntityUidsSink", "FalkorLtmAdapter"]
@@ -386,9 +387,12 @@ class FalkorLtmAdapter:
             await self._mtm_entity_sink.set_entity_uids(
                 item.namespace, mtm_point_memory_id, entity_uids
             )
-        except UnexpectedResponse:
+        except (UnexpectedResponse, MtmPointAbsentError):
             # write-after-read visibility lag (same NAMED degrade precedent as
             # `DistillPipeline._invalidate_mtm_guarded`) — the point isn't visible in Qdrant yet.
+            # `MtmPointAbsentError` is the namespace-scoped adapter's typed spelling of the same
+            # thing (C3): once the by-id payload write carries the tenancy predicate, a miss is a
+            # silent wire-level success, so Qdrant's raw 404 no longer fires on its own.
             # Best-effort forward-compat backfill: never fails the LTM write itself, no retry
             # queue (unlike the invalidate guard) since a MISSED entity_uids backfill is a
             # degraded-but-safe outcome (the fact + entity edge are still correct in the graph).

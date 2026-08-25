@@ -253,8 +253,19 @@ class DemotionService:
         # (DEV-STANDARDS rule 7 — a cross-cutting concern is the ADAPTER's decorator, e.g.
         # every real *TierRepository already wraps its I/O in `retry_io`; this service does not
         # duplicate that loop).
+        #
+        # ⚠ `item.namespace`, NOT the sweep's `ns`. `MtmTierRepository.remove` is namespace-scoped
+        # in the ADAPTER (C3) — it deletes a point only from the partition it is handed — and for
+        # PRIVATE this sweep's own candidate source, `scan_for_demotion`, is deliberately
+        # session-FEDERATED (BQ3/ADR 0030: it matches the session-less user prefix so one sweep
+        # sees every one of the user's sessions). So `ns` here is the sweep's session and `item`
+        # may legitimately belong to ANOTHER session of the SAME user; handing the adapter `ns`
+        # would address the wrong partition, the scoped delete would match nothing, and step 1's
+        # write-ahead copy would silently become a permanent cross-tier DUPLICATE — with no
+        # exception raised, so not even the rollback below would fire. The item's own namespace is
+        # both the correct partition and the one step 1 already wrote to (`stm_copy.namespace`).
         try:
-            await self._mtm_remove.remove(ns, item.id)
+            await self._mtm_remove.remove(item.namespace, item.id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -284,7 +295,12 @@ class DemotionService:
         the item is left in both stores — logged loudly, never silently dropped either way."""
         _log.warning("demotion_mtm_remove_failed_rolling_back", memory_id=item.id, error=str(cause))
         try:
-            await self._stm.evict(ns, item.id)
+            # `item.namespace` for the same reason step 2 uses it (see `_demote_one`): STM is
+            # key-prefixed by `Namespace.to_prefix()`, and the write-ahead copy this compensates
+            # for was written under `stm_copy.namespace` — the ITEM's. Evicting under the sweep's
+            # `ns` would miss a federated cross-session copy and leave the very duplicate this
+            # rollback exists to prevent.
+            await self._stm.evict(item.namespace, item.id)
         except asyncio.CancelledError:
             raise
         except Exception as rollback_exc:

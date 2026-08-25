@@ -517,7 +517,15 @@ async def test_mtm_invalidate_point_absent_degrades_and_retries_next_tick(
     await qdrant_client.upsert(
         collection_name=collection_name(ns, dim),
         points=[
-            PointStruct(id=point_id(loser_src.id), vector=[0.0] * dim, payload={"state": "active"})
+            PointStruct(
+                id=point_id(loser_src.id),
+                vector=[0.0] * dim,
+                # `namespace` is not decoration: every point the promotion pipeline writes carries
+                # it (`QdrantMapper.to_store`), and the by-id payload write is namespace-scoped in
+                # the adapter (C3) — a hand-rolled point without it is not a point that could
+                # exist, and the retry below would correctly refuse to patch it.
+                payload={"state": "active", "namespace": ns.to_prefix()},
+            )
         ],
     )
     assert await _mtm_point_state(qdrant_client, ns, loser_src.id, dim=dim) == "active"

@@ -35,7 +35,13 @@ from mu_engine.platform.decorators import retry_io
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
-from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper, collection_name, point_id
+from mu_engine.storage.errors import MtmPointAbsentError
+from mu_engine.storage.mappers.qdrant_mapper import (
+    NAMESPACE_PAYLOAD_KEY,
+    QdrantMapper,
+    collection_name,
+    point_id,
+)
 from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["QdrantMtmAdapter"]
@@ -62,7 +68,7 @@ _USER_PREFIX_KEY = "namespace_user_prefix"
 
 # payload fields promoted to server-side indexes (spec §3.2).
 _KEYWORD_INDEXES = (
-    "namespace",
+    NAMESPACE_PAYLOAD_KEY,
     _USER_PREFIX_KEY,
     "session_id",
     "state",
@@ -100,7 +106,7 @@ def _resolve_namespace_match(ns: Namespace, *, session_scope: str | None) -> tup
       the user's sessions, not only the query's own) — "exactly like today".
     """
     if ns.visibility is Visibility.SHARED:
-        return "namespace", ns.to_prefix()
+        return NAMESPACE_PAYLOAD_KEY, ns.to_prefix()
     if session_scope is None:
         return _USER_PREFIX_KEY, _user_prefix(ns)
     scoped_ns = (
@@ -114,7 +120,55 @@ def _resolve_namespace_match(ns: Namespace, *, session_scope: str | None) -> tup
             visibility=ns.visibility,
         )
     )
-    return "namespace", scoped_ns.to_prefix()
+    return NAMESPACE_PAYLOAD_KEY, scoped_ns.to_prefix()
+
+
+def _scoped_point_selector(ns: Namespace, memory_id: str) -> models.Filter:
+    """The ONE selector every by-id WRITE verb addresses a point through — an id condition
+    ``AND``-ed with an exact ``namespace`` equality, evaluated SERVER-SIDE by Qdrant.
+
+    ⚠ **Neither of the two keys a by-id write used to carry is namespace-scoped.** The collection
+    is ``mu_mtm__{workspace}__{visibility}__{dim}`` (no org, no user — ``qdrant_mapper.py``) and
+    the point id is ``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt), so ``expire`` /
+    ``invalidate`` / ``set_entity_uids`` / ``remove`` handed a bare ``memory_id`` from ANOTHER org
+    or ANOTHER user addressed a real point in the same collection — and ``remove`` is a hard
+    ``delete``. Isolation in this tier is FILTER-based by design (CANONICAL §1 rule 5;
+    ``storage-pluggable-spec.md §483-485``: every adapter applies the exact-equality tenancy
+    predicate unconditionally on every read **and write**, and no adapter composes its own tenant
+    string). Until now the write half of that rule was held only by call-site convention in
+    ANOTHER package — ``SurfaceFacade`` pre-gating on the guarded ``get`` — which a new caller or a
+    dropped pre-gate silently reintroduces.
+
+    **A server-side filter rather than the post-read comparison ``_get_impl`` uses, deliberately.**
+    That comparison is right for a READ: ``retrieve`` hands back a RECONSTRUCTED item, so comparing
+    ``item.namespace`` cannot be defeated by a payload whose index key and canonical
+    ``namespace_parts`` disagree. A WRITE has nothing to reconstruct: the only way to post-check it
+    is to read first and then write, which is two round-trips AND a TOCTOU window in which the
+    point can be re-upserted between the check and the write — destructive for the hard ``delete``.
+    Qdrant accepts a ``Filter`` wherever it accepts point ids (``set_payload(points=...)``,
+    ``delete(points_selector=...)``), so the predicate rides INSIDE the single atomic write. It
+    needs no new payload index either: ``namespace`` is already in :data:`_KEYWORD_INDEXES` and is
+    created on every collection this adapter has ever made.
+
+    **The predicate is exactly the read path's, not a looser one.** ``Namespace`` is frozen with
+    exactly five fields, SHARED pins ``user='*'``, and every component rejects the ``/`` separator
+    (``mu_contracts.domain.model.memory``), so ``to_prefix()`` is injective and
+    ``namespace == ns.to_prefix()`` selects precisely the points for which ``item.namespace == ns``
+    — the very comparison ``_get_impl`` makes. Scoping the writes therefore refuses exactly what
+    the pre-gate already refused and permits exactly what it already permitted.
+
+    A non-matching id simply matches zero points: the write is a silent no-op, which is the same
+    answer these verbs already give for an absent id (they are idempotent by contract) and leaks
+    nothing about whether the id exists elsewhere.
+    """
+    return models.Filter(
+        must=[
+            models.HasIdCondition(has_id=[point_id(memory_id)]),
+            models.FieldCondition(
+                key=NAMESPACE_PAYLOAD_KEY, match=models.MatchValue(value=ns.to_prefix())
+            ),
+        ]
+    )
 
 
 class QdrantMtmAdapter:
@@ -156,6 +210,40 @@ class QdrantMtmAdapter:
                 )
         self._ensured.add(name)
         return name
+
+    async def _raise_if_write_missed(
+        self, name: str, ns: Namespace, memory_id: str, *, verb: str
+    ) -> None:
+        """The ABSENCE signal a namespace-scoped payload write would otherwise mute — checked
+        AFTER the write, never before it.
+
+        The three ``set_payload`` verbs used to name a bare point id, and Qdrant answered a
+        missing point with a 404 (``UnexpectedResponse``). Two callers depend on that signal to
+        survive the MTM write-after-read visibility lag: ``DistillPipeline
+        ._invalidate_mtm_guarded`` (named degrade + bounded next-tick retry, so a supersede is
+        never silently lost) and ``FalkorLtmAdapter._backfill_mtm_entity_uids`` (best-effort log).
+        A scoped selector that matches nothing is instead a SILENT success, which would have
+        turned both into silent data loss — so absence is re-raised as the typed
+        :class:`MtmPointAbsentError` (DEV-STANDARDS rule 8: never a silent wrong answer).
+
+        **Order is load-bearing.** This runs AFTER the write, so the write's own
+        :func:`_scoped_point_selector` remains the ONLY thing standing between a foreign id and a
+        foreign point — this probe is pure reporting and carries no part of the tenancy
+        guarantee. Probing FIRST would have quietly moved the guarantee back into a
+        check-then-write pair (a TOCTOU shape, and one that makes the write's predicate
+        untestable, since the check would refuse before the write could misfire).
+
+        It re-uses the SAME selector the write used — one mechanism, not two. "Absent" and "in
+        another namespace" are deliberately indistinguishable, exactly as :meth:`get` already
+        conflates them into ``None``.
+        """
+        matched = await self._qdrant.count(
+            collection_name=name, count_filter=_scoped_point_selector(ns, memory_id), exact=True
+        )
+        if matched.count == 0:
+            raise MtmPointAbsentError(
+                f"{verb}: no MTM point {memory_id!r} in this namespace's partition"
+            )
 
     async def upsert(self, item: MemoryItem) -> None:
         return await self._retry(self._upsert_impl)(item)
@@ -244,8 +332,12 @@ class QdrantMtmAdapter:
                 "state": MemoryState.EXPIRED.value,
                 "invalid_at": at.isoformat(),
             },
-            points=[point_id(memory_id)],
+            # Namespace-scoped selector, NOT a bare point id (see `_scoped_point_selector`):
+            # a foreign `memory_id` matches zero points and nothing is written.
+            points=_scoped_point_selector(ns, memory_id),
         )
+        # ...and a write that matched nothing is reported ABSENT rather than silently succeeding.
+        await self._raise_if_write_missed(name, ns, memory_id, verb="expire")
 
     def _recall_filter(
         self,
@@ -362,8 +454,13 @@ class QdrantMtmAdapter:
                 "superseded_by": winner_id,
                 "supersede_reason": reason,
             },
-            points=[point_id(loser_id)],
+            # Namespace-scoped selector (see `_scoped_point_selector`): a loser id belonging to
+            # another partition matches nothing, so no foreign point is ever superseded.
+            points=_scoped_point_selector(ns, loser_id),
         )
+        # A write that matched nothing is reported ABSENT, so `DistillPipeline
+        # ._invalidate_mtm_guarded` still degrades-and-retries instead of losing the supersede.
+        await self._raise_if_write_missed(name, ns, loser_id, verb="invalidate")
 
     async def set_entity_uids(self, ns: Namespace, memory_id: str, entity_uids: list[str]) -> None:
         return await self._retry(self._set_entity_uids_impl)(ns, memory_id, entity_uids)
@@ -384,8 +481,13 @@ class QdrantMtmAdapter:
         await self._qdrant.set_payload(
             collection_name=name,
             payload={"entity_uids": entity_uids},
-            points=[point_id(memory_id)],
+            # Namespace-scoped selector (see `_scoped_point_selector`) — this backfill reaches
+            # only points genuinely in `ns`'s partition.
+            points=_scoped_point_selector(ns, memory_id),
         )
+        # A miss is reported ABSENT so `FalkorLtmAdapter._backfill_mtm_entity_uids` still logs
+        # its named degrade instead of believing the backfill landed.
+        await self._raise_if_write_missed(name, ns, memory_id, verb="set_entity_uids")
 
     async def scan_for_demotion(self, ns: Namespace, *, limit: int) -> list[MemoryItem]:
         return await self._retry(self._scan_for_demotion_impl)(ns, limit=limit)
@@ -455,5 +557,8 @@ class QdrantMtmAdapter:
             return
         await self._qdrant.delete(
             collection_name=name,
-            points_selector=models.PointIdsList(points=[point_id(memory_id)]),
+            # ⚠ The one HARD deletion in this adapter — so the namespace predicate rides INSIDE
+            # the delete itself (`_scoped_point_selector`), never as a caller-side pre-check that
+            # a race or a new call site could step around. A foreign id deletes nothing.
+            points_selector=models.FilterSelector(filter=_scoped_point_selector(ns, memory_id)),
         )

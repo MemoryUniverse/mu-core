@@ -268,12 +268,22 @@ class PgVectorMtmAdapter:
             if not exists:
                 return
             # id-stable supersede write (spec §3.3): flip state + merge payload, vector intact.
+            #
+            # ⚠ `namespace = $4` is the TENANCY predicate, not an optimization. The table is
+            # `pgvector_table_name(ns, dim)` — a hash of the WORKSPACE only, no org and no user —
+            # and `point_id` is `uuid5(NAMESPACE_URL, memory_id)`, unsalted by namespace, so a
+            # bare `loser_id` from another org/user addresses a real row of the same table. The
+            # adapter, not the caller, applies the exact-equality scope on every write
+            # (`storage-pluggable-spec.md §483-485`; CANONICAL §1 rule 5) — the identical
+            # `namespace = to_prefix()` predicate `_semantic_impl` above compiles for reads,
+            # server-side and inside the same atomic statement (no read-then-write race), over
+            # the real `namespace` column this table's own `{table}_ns_idx` indexes.
             await conn.execute(
                 f"""
                 UPDATE {table}
                 SET state = $2,
                     payload = payload || $3
-                WHERE point_id = $1
+                WHERE point_id = $1 AND namespace = $4
                 """,  # noqa: S608 -- `table` is hash-derived (pgvector_table_name), never raw input
                 point_id(loser_id),
                 MemoryState.SUPERSEDED.value,
@@ -283,4 +293,5 @@ class PgVectorMtmAdapter:
                     "superseded_by": winner_id,
                     "supersede_reason": reason,
                 },
+                ns.to_prefix(),
             )

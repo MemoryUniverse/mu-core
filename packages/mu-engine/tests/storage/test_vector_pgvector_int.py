@@ -19,9 +19,10 @@ import pytest_asyncio
 
 from mu_contracts.config import Settings
 from mu_engine.storage.adapters.pgvector_mtm import PgVectorMtmAdapter
-from mu_engine.storage.domain.memory import MemoryItem
+from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.mappers.pgvector_mapper import pgvector_table_name
+from mu_engine.storage.mappers.qdrant_mapper import point_id
 
 from .conftest import VECTOR_DIM
 
@@ -138,3 +139,81 @@ async def test_extension_and_table_are_provisioned(settings: Settings) -> None:
         assert version is not None, "the 'vector' extension is not installed on mu-dev-pgvector"
     finally:
         await conn.close()
+
+
+async def test_invalidate_refuses_another_namespaces_memory(
+    mtm: PgVectorMtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """C3 on the pgvector backend: the by-id supersede WRITE must carry the tenancy predicate.
+
+    ``pgvector_table_name(ns, dim)`` hashes the WORKSPACE only — no org, no user — and
+    ``point_id`` is ``uuid5(NAMESPACE_URL, memory_id)``, unsalted by namespace, so a bare
+    ``loser_id`` from another principal names a real row of the same table. The adapter must
+    apply the exact-equality scope itself (``storage-pluggable-spec.md:483-485``), not rely on a
+    caller in another package pre-gating on a read — this test calls ``invalidate`` DIRECTLY.
+    """
+    victim_ns = make_ns(user="u_victim")
+    caller_ns = make_ns(user="u_caller")
+    # PRECONDITION: without a shared table this proves nothing about namespace scoping.
+    assert pgvector_table_name(victim_ns, VECTOR_DIM) == pgvector_table_name(
+        caller_ns, VECTOR_DIM
+    ), "precondition failed: the two namespaces are in different pgvector tables"
+    assert victim_ns.to_prefix() != caller_ns.to_prefix()
+    victim = make_item(victim_ns, "the victim's current truth")
+    winner = make_item(caller_ns, "the caller's replacement truth")
+    await mtm.upsert(victim)
+    await mtm.upsert(winner)
+
+    await mtm.invalidate(
+        caller_ns, victim.id, winner.id, at=datetime.now(UTC), reason="cross-tenant-supersede"
+    )
+
+    # raw row, not `semantic` — the state column IS the store state.
+    pool = await mtm._ensure_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f'SELECT state, payload FROM "{pgvector_table_name(victim_ns, VECTOR_DIM)}" '  # noqa: S608
+            "WHERE point_id = $1",
+            point_id(victim.id),
+        )
+    assert row is not None, "a foreign invalidate deleted the victim's row"
+    assert row["state"] == MemoryState.ACTIVE.value, (
+        "a foreign namespace superseded the victim's memory — it is now dropped from its "
+        "owner's active recall"
+    )
+    assert "superseded_by" not in dict(
+        row["payload"]
+    ), "a foreign invalidate wrote a supersession edge onto the victim's row"
+
+
+async def test_invalidate_in_its_own_namespace_still_supersedes(
+    mtm: PgVectorMtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """The control for the test above: without it, an ``invalidate`` hard-wired to a no-op would
+    pass the refusal test while breaking every real supersede."""
+    ns = make_ns()
+    loser = make_item(ns, "old truth")
+    winner = make_item(ns, "new truth")
+    await mtm.upsert(loser)
+    await mtm.upsert(winner)
+    at = datetime.now(UTC)
+
+    await mtm.invalidate(ns, loser.id, winner.id, at=at, reason="legitimate-supersede")
+
+    pool = await mtm._ensure_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f'SELECT state, payload FROM "{pgvector_table_name(ns, VECTOR_DIM)}" '  # noqa: S608
+            "WHERE point_id = $1",
+            point_id(loser.id),
+        )
+    assert row is not None, "invalidate must overwrite the row, never delete it"
+    assert row["state"] == MemoryState.SUPERSEDED.value
+    payload = dict(row["payload"])
+    assert payload["superseded_by"] == winner.id
+    assert payload["supersede_reason"] == "legitimate-supersede"
+    assert payload["invalid_at"] == at.isoformat()

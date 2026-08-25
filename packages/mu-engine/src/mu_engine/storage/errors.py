@@ -17,6 +17,7 @@ __all__ = [
     "DegradeReason",
     "InvalidBackendError",
     "MandatoryBackendMissingError",
+    "MtmPointAbsentError",
     "StorageError",
     "TierRepositoryUnavailableError",
     "UnknownBackendError",
@@ -46,6 +47,27 @@ class UnknownBackendError(StorageError):
 
 
 # ---- runtime ----
+class MtmPointAbsentError(StorageError):
+    """A by-id MTM payload write found no point in the caller's namespace partition.
+
+    The write-after-read visibility lag the MTM tier really exhibits: a point promoted into
+    Qdrant is not yet visible when a supersede (``invalidate``) or an ``entity_uids`` backfill
+    tries to patch it. Qdrant itself used to surface that as a raw ``UnexpectedResponse`` 404,
+    because the payload write named a bare point id; now that the write carries the mandatory
+    namespace predicate (C3 — ``qdrant_mtm._scoped_point_selector``), a selector matching nothing
+    is a SILENT no-op, and a silently-lost supersede is exactly the failure the named degrade +
+    bounded retry exists to prevent. So the adapter raises this instead: a TYPED absence signal
+    that survives the scoping (DEV-STANDARDS rule 8 — never a silent wrong answer).
+
+    Deliberately indistinguishable between "absent" and "in another namespace" — the same answer
+    :meth:`MtmTierRepository.get` already gives (``None``), so it leaks nothing about ids the
+    caller cannot see. TERMINAL, never retried in-adapter: the fix is time (the point becoming
+    visible), which the CALLER's next-tick retry queue supplies, not an immediate backoff loop.
+    """
+
+    retryable = False
+
+
 class TierRepositoryUnavailableError(StorageError):
     """A store cannot serve; the CALLER maps this to a 4-field DegradedModeEntered
     (the store/mapper never emits it — platform is the sole consumer, CANONICAL §2)."""

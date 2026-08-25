@@ -18,10 +18,12 @@ from pathlib import Path
 
 import pytest
 
-from mu_engine.storage.adapters.faiss_mtm import FaissMtmAdapter
-from mu_engine.storage.domain.memory import MemoryItem
+from mu_engine.storage.adapters.faiss_mtm import FaissMtmAdapter, _int_id
+from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.errors import VectorNotFilterableError
+from mu_engine.storage.mappers.faiss_mapper import faiss_collection_name
+from mu_engine.storage.mappers.qdrant_mapper import point_id
 
 from .conftest import VECTOR_DIM
 
@@ -120,3 +122,69 @@ async def test_persists_across_adapter_instances(
     second = FaissMtmAdapter(path=path, dim=VECTOR_DIM)
     hits = await second.semantic(ns, item.embedding or [], limit=5)
     assert [h.item.id for h in hits] == [item.id]
+
+
+async def test_invalidate_refuses_another_namespaces_memory(
+    mtm: FaissMtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """C3 on the FAISS backend: the by-id supersede WRITE must carry the tenancy predicate.
+
+    ``faiss_collection_name(ns, dim)`` hashes the WORKSPACE + visibility only — no org, no user —
+    and the docstore key derives from ``uuid5(NAMESPACE_URL, memory_id)``, unsalted by namespace,
+    so a bare ``loser_id`` from another principal resolves to a real entry of the same docstore.
+    FAISS has no server to push a filter to, so the adapter applies the same
+    ``payload["namespace"] != to_prefix()`` predicate its own search path uses — in the adapter
+    (``storage-pluggable-spec.md:483-485``), not at a call site in another package. This test
+    calls ``invalidate`` DIRECTLY, with no read pre-gate.
+    """
+    victim_ns = make_ns(user="u_victim")
+    caller_ns = make_ns(user="u_caller")
+    # PRECONDITION: without a shared index this proves nothing about namespace scoping.
+    assert faiss_collection_name(victim_ns, VECTOR_DIM) == faiss_collection_name(
+        caller_ns, VECTOR_DIM
+    ), "precondition failed: the two namespaces are in different FAISS indices"
+    assert victim_ns.to_prefix() != caller_ns.to_prefix()
+    victim = make_item(victim_ns, "the victim's current truth")
+    winner = make_item(caller_ns, "the caller's replacement truth")
+    await mtm.upsert(victim)
+    await mtm.upsert(winner)
+
+    await mtm.invalidate(
+        caller_ns, victim.id, winner.id, at=datetime.now(UTC), reason="cross-tenant-supersede"
+    )
+
+    _, idx = await mtm._index_for(victim_ns)
+    entry = idx.docstore[_int_id(point_id(victim.id))]
+    assert entry["payload"]["state"] == MemoryState.ACTIVE.value, (
+        "a foreign namespace superseded the victim's memory — it is now dropped from its "
+        "owner's active recall"
+    )
+    assert (
+        "superseded_by" not in entry["payload"]
+    ), "a foreign invalidate wrote a supersession edge onto the victim's docstore entry"
+
+
+async def test_invalidate_in_its_own_namespace_still_supersedes(
+    mtm: FaissMtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """The control for the test above: without it, an ``invalidate`` hard-wired to a no-op would
+    pass the refusal test while breaking every real supersede."""
+    ns = make_ns()
+    loser = make_item(ns, "old truth")
+    winner = make_item(ns, "new truth")
+    await mtm.upsert(loser)
+    await mtm.upsert(winner)
+    at = datetime.now(UTC)
+
+    await mtm.invalidate(ns, loser.id, winner.id, at=at, reason="legitimate-supersede")
+
+    _, idx = await mtm._index_for(ns)
+    payload = idx.docstore[_int_id(point_id(loser.id))]["payload"]
+    assert payload["state"] == MemoryState.SUPERSEDED.value
+    assert payload["superseded_by"] == winner.id
+    assert payload["supersede_reason"] == "legitimate-supersede"
+    assert payload["invalid_at"] == at.isoformat()

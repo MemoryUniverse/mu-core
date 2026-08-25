@@ -41,7 +41,7 @@ from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
 from mu_engine.storage.errors import VectorNotFilterableError
 from mu_engine.storage.mappers.faiss_mapper import FaissMapper, faiss_collection_name
-from mu_engine.storage.mappers.qdrant_mapper import point_id
+from mu_engine.storage.mappers.qdrant_mapper import NAMESPACE_PAYLOAD_KEY, point_id
 from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["FaissMtmAdapter"]
@@ -211,11 +211,23 @@ class FaissMtmAdapter:
         async with self._lock:
             name, idx = await self._index_for(ns)
             int_id = _int_id(point_id(loser_id))
+            ns_prefix = ns.to_prefix()
 
             def _write() -> None:
                 entry = idx.docstore.get(int_id)
                 if entry is None:
                     return  # nothing to supersede (already absent) — idempotent no-op
+                # ⚠ The namespace predicate is the TENANCY scope, not a sanity check. The index is
+                # `faiss_collection_name(ns, dim)` — workspace + visibility only, no org and no
+                # user — and the docstore key derives from `uuid5(NAMESPACE_URL, memory_id)`,
+                # unsalted by namespace, so a bare `loser_id` from another org/user resolves to a
+                # real entry of this same docstore. FAISS has no server to push a filter to (spec
+                # §3.3 "no" filterable), so the exact-equality scope is applied where every other
+                # read in this adapter applies it — the SAME `payload["namespace"] != ns_prefix`
+                # predicate `_search` above uses — on the docstore lookup that IS the addressing
+                # step, inside the adapter's own lock and thread offload, before any mutation.
+                if entry["payload"].get(NAMESPACE_PAYLOAD_KEY) != ns_prefix:
+                    return
                 entry["payload"].update(
                     {
                         "state": MemoryState.SUPERSEDED.value,

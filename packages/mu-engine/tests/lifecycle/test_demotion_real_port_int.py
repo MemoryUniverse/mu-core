@@ -15,6 +15,7 @@ Covers CF-2's acceptance item: "demotion end-to-end via the real port."
 
 from __future__ import annotations
 
+import socket
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
@@ -175,3 +176,138 @@ async def test_rescued_item_leaves_the_real_mtm_point_untouched_via_the_real_por
     assert await stm.get(ns, fresh.id) is None
     assert await _mtm_point_exists(qdrant_client, ns, fresh.id, dim=_DIM)  # untouched
     assert recorder.events == []
+
+
+async def test_federated_sweep_demotes_a_candidate_from_another_session_of_the_same_user(
+    make_ns: Callable[..., Namespace],
+    make_stm: Callable[..., ValkeyStmAdapter],
+    mtm: QdrantMtmAdapter,
+    qdrant_client: AsyncQdrantClient,
+) -> None:
+    """The MTM WRITE verbs are namespace-scoped in the adapter (C3) — so this sweep must hand
+    ``remove`` the ITEM's namespace, not its own.
+
+    ``LifecycleManager`` sources candidates from ``MtmTierRepository.scan_for_demotion(ns, ...)``,
+    which for PRIVATE is deliberately session-FEDERATED (BQ3/ADR 0030: it matches the session-less
+    user prefix, so one sweep sees every one of the user's sessions). The sweep's own ``ns``
+    therefore names ONE session while a legitimate candidate may belong to ANOTHER — exactly the
+    shape reproduced here.
+
+    Before C3 that mismatch was invisible: ``remove`` carried a bare, unsalted point id and
+    deleted the point regardless of which partition was named. Now that the delete carries the
+    tenancy predicate, passing the sweep's ``ns`` would match ZERO points and — because a scoped
+    miss is a silent no-op, not an exception — step 1's STM write-ahead copy would become a
+    permanent cross-tier DUPLICATE with the rollback never firing. This test fails if
+    ``_demote_one`` regresses to the sweep's ``ns``.
+    """
+    sweep_ns = make_ns(session="s_sweep")
+    item_ns = make_ns(session="s_other")  # same org/workspace/user, DIFFERENT session
+    assert sweep_ns.to_prefix() != item_ns.to_prefix()
+    assert collection_name(sweep_ns, _DIM) == collection_name(item_ns, _DIM), (
+        "precondition failed: the two sessions are in different Qdrant collections, so this "
+        "test would not exercise the scoped-write path at all"
+    )
+
+    item = MemoryItem(
+        content="stale fact belonging to another session of the same user",
+        kind=MemoryKind.PROPOSITION,
+        namespace=item_ns,
+        owner_id=item_ns.user,
+        workspace_id=item_ns.workspace,
+        session_id=item_ns.session,
+        tier=MemoryTier.MTM,
+        importance_score=0.1,
+        access_count=0,
+        created_at=_EPOCH,
+        embedding=[0.1] * _DIM,
+        embedding_model="test-fixture",
+    )
+    await mtm.upsert(item)
+    assert await _mtm_point_exists(qdrant_client, item_ns, item.id, dim=_DIM)
+
+    stm = make_stm()
+    service = DemotionService(
+        stm=stm,
+        mtm_remove=mtm,
+        salience=SalienceStrategy(SalienceSettings()),
+        settings=LifecycleSettings(),
+        clock=FrozenClock(_EPOCH + timedelta(hours=200)),
+        bus=_EventRecorder(),
+    )
+
+    report = await service.demote(sweep_ns, [item])
+
+    assert report.demoted == 1
+    # The write-ahead copy lands under the ITEM's namespace (STM is key-prefixed by to_prefix()).
+    assert await stm.get(item_ns, item.id) is not None
+    # And the MTM point is GENUINELY gone — not left behind as a silent cross-tier duplicate.
+    assert not await _mtm_point_exists(qdrant_client, item_ns, item.id, dim=_DIM), (
+        "the demotion left the MTM point in place while STM already holds the copy — a silent "
+        "cross-tier duplicate: the scoped remove was aimed at the sweep's namespace, not the "
+        "item's"
+    )
+
+
+async def test_rollback_after_a_failed_remove_evicts_the_copy_from_the_items_own_namespace(
+    make_ns: Callable[..., Namespace],
+    make_stm: Callable[..., ValkeyStmAdapter],
+) -> None:
+    """The compensating rollback must evict under the ITEM's namespace, for the same reason the
+    commit-delete does.
+
+    STM is key-prefixed by ``Namespace.to_prefix()`` and step 1 writes the copy under
+    ``stm_copy.namespace`` — the ITEM's. Under the session-federated sweep (see the test above)
+    the service's own ``ns`` names a different session, so evicting under it would silently miss
+    the copy and leave the very cross-tier duplicate this rollback exists to prevent, while still
+    reporting ``mtm_remove_failed_rolled_back``.
+
+    The removal failure is REAL, not injected: a genuine ``QdrantMtmAdapter`` over a genuine
+    ``AsyncQdrantClient`` pointed at a closed local port, so ``remove`` raises a real connection
+    error out of the real client (Valkey/STM below is the real ``mu-dev-cache``). Nothing is
+    mocked; this branch simply has no other way to be reached.
+    """
+    sweep_ns = make_ns(session="s_sweep")
+    item_ns = make_ns(session="s_other")
+    assert sweep_ns.to_prefix() != item_ns.to_prefix()
+
+    with socket.socket() as probe:  # a port nothing is listening on, chosen by the OS
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+    dead_mtm = QdrantMtmAdapter(
+        AsyncQdrantClient(url=f"http://127.0.0.1:{dead_port}", check_compatibility=False),
+        dim=_DIM,
+        store_io_timeout_s=1.0,
+    )
+
+    item = MemoryItem(
+        content="stale fact whose MTM removal will genuinely fail",
+        kind=MemoryKind.PROPOSITION,
+        namespace=item_ns,
+        owner_id=item_ns.user,
+        workspace_id=item_ns.workspace,
+        session_id=item_ns.session,
+        tier=MemoryTier.MTM,
+        importance_score=0.1,
+        access_count=0,
+        created_at=_EPOCH,
+        embedding=[0.1] * _DIM,
+        embedding_model="test-fixture",
+    )
+    stm = make_stm()
+    service = DemotionService(
+        stm=stm,
+        mtm_remove=dead_mtm,
+        salience=SalienceStrategy(SalienceSettings()),
+        settings=LifecycleSettings(),
+        clock=FrozenClock(_EPOCH + timedelta(hours=200)),
+        bus=_EventRecorder(),
+    )
+
+    report = await service.demote(sweep_ns, [item])
+
+    assert report.demoted == 0
+    assert report.outcomes[0].reason == "mtm_remove_failed_rolled_back"
+    assert await stm.get(item_ns, item.id) is None, (
+        "the rollback reported success while the STM write-ahead copy is still there — it was "
+        "evicted under the sweep's namespace instead of the item's"
+    )
