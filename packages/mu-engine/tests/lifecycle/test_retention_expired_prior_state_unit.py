@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from mu_contracts.domain.events import MemoryGarbageCollected
 from mu_contracts.domain.model.memory import State as ContractState
 from mu_engine.lifecycle.retention import RetentionService
@@ -43,6 +45,8 @@ from mu_engine.storage.domain.memory import (
     RetentionClass,
 )
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+
+pytestmark = pytest.mark.unit
 
 _T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
