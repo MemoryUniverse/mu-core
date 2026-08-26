@@ -99,6 +99,39 @@ def test_naming_differs_by_workspace(namer: object) -> None:
     assert namer(ns_a, 8) != namer(ns_b, 8)  # type: ignore[operator]
 
 
+@pytest.mark.parametrize(
+    "namer",
+    [pgvector_table_name, chroma_collection_name, faiss_collection_name],
+)
+def test_naming_differs_by_org(namer: object) -> None:
+    """CANONICAL §1 rule 6 pins the collection/graph grain at ``org``: two namespaces identical
+    except for ``org`` must resolve to different physical partitions here too, on every one of
+    the three backends that DELEGATE to ``QdrantMapper``'s payload shape but derive their OWN
+    partition name (``ARCHITECTURE-CONFORMANCE.md`` §8/§10.4 — the org-missing defect was not
+    unique to Qdrant's own ``collection_name``)."""
+    ns_a = Namespace(
+        org="org-a", workspace="w", user="u", session="s", visibility=Visibility.PRIVATE
+    )
+    ns_b = Namespace(
+        org="org-b", workspace="w", user="u", session="s", visibility=Visibility.PRIVATE
+    )
+    assert namer(ns_a, 8) != namer(ns_b, 8)  # type: ignore[operator]
+
+
+# NOTE: no ``test_naming_survives_underscore_boundary_ambiguity`` parametrization here. It existed
+# for one round and was deleted (not fixed) after the verifier proved it could not fail: swapping
+# in the PRE-REWORK pgvector/chroma/faiss namers (each of which hashed ``ns.workspace`` ALONE —
+# ``org`` was entirely absent, the tracked §8 defect, not a "__"-join ambiguity) still passed it,
+# because the adversarial pair's WORKSPACE strings ("ws" vs "eu__ws") already differ on their own —
+# the test never needed ``org`` to participate in the digest at all. These three mappers never had
+# the qdrant-side D-6 join-ambiguity bug (they had no ``org`` in the name pre-rework, so there was
+# no two-segment join to be ambiguous), so there is no genuine regression here to pin; org-presence
+# is already covered by ``test_naming_differs_by_org`` above. The Qdrant twin
+# (``test_mappers_unit.py::test_qdrant_collection_name_survives_underscore_boundary_ambiguity``)
+# stays — it DOES fail against Qdrant's actual pre-rework namer, which joined ``org``+``workspace``
+# with a literal ``"__"`` before either was hashed.
+
+
 def test_pgvector_table_name_is_sql_identifier_safe() -> None:
     ns = Namespace(
         org="o", workspace=_HOSTILE_WORKSPACE, user="u", session="s", visibility=Visibility.PRIVATE

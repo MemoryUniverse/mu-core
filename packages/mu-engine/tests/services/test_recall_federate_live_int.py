@@ -59,6 +59,7 @@ from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, MemoryState, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.mappers.qdrant_mapper import collection_name
 
 pytestmark = pytest.mark.integration
 
@@ -159,18 +160,26 @@ async def _teardown(
     falkor_db: FalkorDB,
     redis_client: Redis,
     *,
-    workspace: str,
+    priv: Namespace,
     dim: int,
-    user: str,
 ) -> None:
-    for visibility in (Visibility.PRIVATE, Visibility.SHARED):
-        coll = f"mu_mtm__{workspace}__{visibility.value}__{dim}"
+    # Computed through the REAL mapper/adapter functions, never re-hardcoded: `org` is a leading
+    # partition segment of both `qdrant_mapper.collection_name` (CANONICAL §1 rule 6;
+    # ARCHITECTURE-CONFORMANCE.md §8/§10.4) and `FalkorLtmAdapter.graph_name_for` — omitting it
+    # from EITHER (as a hand-built f-string previously did for the graph names here) silently
+    # misses every collection/graph this test created and leaks debris into the shared
+    # mu-dev-qdrant/mu-dev-falkordb. Re-deriving through the real functions also means a future
+    # rename of either naming scheme cannot silently break this teardown again.
+    shared = Namespace.shared(org=priv.org, workspace=priv.workspace, session=priv.session)
+    for ns in (priv, shared):
+        coll = collection_name(ns, dim)
         if await qdrant_client.collection_exists(coll):
             await qdrant_client.delete_collection(coll)
-    for graph in (f"mu_g__{workspace}__{user}", f"mu_g__{workspace}__shared"):
+    ltm = FalkorLtmAdapter(falkor_db)
+    for graph in (ltm.graph_name_for(priv), ltm.graph_name_for(shared)):
         with contextlib.suppress(Exception):  # best-effort drop; a missing graph raises
             await falkor_db.select_graph(graph).delete()
-    keys = [k async for k in redis_client.scan_iter(match=f"mu/mu/*{workspace}*".encode())]
+    keys = [k async for k in redis_client.scan_iter(match=f"mu/mu/*{priv.workspace}*".encode())]
     if keys:
         await redis_client.delete(*keys)
 
@@ -294,7 +303,11 @@ async def test_federate_live_recall_fuses_and_isolates(
         }
     finally:
         await _teardown(
-            qdrant_client, falkor_db, redis_client, workspace=ws, dim=embedder.dimension, user="u1"
+            qdrant_client,
+            falkor_db,
+            redis_client,
+            priv=priv,
+            dim=embedder.dimension,
         )
 
 
@@ -346,5 +359,9 @@ async def test_shared_arm_unavailable_is_named_degrade_not_silent_drop(
         assert p_item.id in set(result.memory_ids), "private arm dropped on shared-arm failure"
     finally:
         await _teardown(
-            qdrant_client, falkor_db, redis_client, workspace=ws, dim=embedder.dimension, user="u1"
+            qdrant_client,
+            falkor_db,
+            redis_client,
+            priv=priv,
+            dim=embedder.dimension,
         )

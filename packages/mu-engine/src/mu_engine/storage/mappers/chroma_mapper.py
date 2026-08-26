@@ -8,26 +8,28 @@ shape (``other_repos/mem0/mem0/vector_stores/chroma.py:23-74`` — collection-pe
 
 Chroma collection names have their OWN charset/length rule (3-63 chars, alnum + ``.``/``_``/``-``,
 must start and end alnum, no consecutive dots) distinct from Qdrant's — so, like pgvector, the
-workspace is hashed rather than embedded raw (safe regardless of what characters
-``Namespace._FORBIDDEN_NS_CHARS`` happens to still allow through).
+``org``+``workspace`` pair is hashed jointly (via the shared
+:func:`~mu_engine.storage.mappers.qdrant_mapper.tenant_partition_digest` helper — see its
+docstring for what the digest derives and why it is collision-resistant rather than
+collision-resistant) rather than embedded raw.
 """
 
 from __future__ import annotations
 
-from hashlib import sha256
-
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
-from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper
+from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper, tenant_partition_digest
 from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["ChromaMapper", "chroma_collection_name"]
 
 
 def chroma_collection_name(ns: Namespace, dim: int) -> str:
-    """Deterministic Chroma-legal collection name for the (workspace, visibility, dim) partition."""
-    digest = sha256(ns.workspace.encode("utf-8")).hexdigest()[:16]
-    return f"mu-mtm-chroma-{digest}-{ns.visibility.value}-{dim}"
+    """Deterministic Chroma-legal collection name for the (org, workspace, visibility, dim)
+    partition — uses the shared :func:`tenant_partition_digest` (org+workspace hashed jointly, so
+    two orgs sharing a workspace slug land in DIFFERENT physical collections; CANONICAL §1 rule 6;
+    the org-missing form was the tracked defect — ``ARCHITECTURE-CONFORMANCE.md`` §8/§10.4)."""
+    return f"mu-mtm-chroma-{tenant_partition_digest(ns)}-{ns.visibility.value}-{dim}"
 
 
 class ChromaMapper:

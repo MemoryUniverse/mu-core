@@ -118,8 +118,10 @@ async def test_invalidate_refuses_another_namespaces_memory(
 ) -> None:
     """C3 on the Chroma backend: the by-id supersede WRITE must carry the tenancy predicate.
 
-    ``chroma_collection_name(ns, dim)`` hashes the WORKSPACE + visibility only — no org, no user
-    — and the id is ``uuid5(NAMESPACE_URL, memory_id)``, unsalted by namespace, so a bare
+    ``chroma_collection_name(ns, dim)`` hashes ``org``+``workspace`` (jointly, since the fix for the
+    cross-org collision — see that function's docstring) + visibility — still no ``user`` — so
+    same-org-same-workspace-different-user still land in the SAME collection. The id is
+    ``uuid5(NAMESPACE_URL, memory_id)``, unsalted by namespace, so a bare
     ``loser_id`` from another principal names a real row of the same collection. The adapter must
     apply the exact-equality scope itself (``storage-pluggable-spec.md:483-485``); this test
     calls ``invalidate`` DIRECTLY, with no read pre-gate.

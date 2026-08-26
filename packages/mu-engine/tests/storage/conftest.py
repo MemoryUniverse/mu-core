@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from mu_contracts.config import Settings
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, Polarity
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.mappers.qdrant_mapper import collection_name
 from mu_engine.storage.relational.schema import Base
 
 VECTOR_DIM = 8  # tiny deterministic vectors — no ML dep needed to test store/filter/recall
@@ -41,29 +42,44 @@ def uid() -> str:
     return uuid.uuid4().hex[:12]
 
 
-@pytest.fixture
-def make_ns(uid: str) -> Callable[..., Namespace]:
-    """A per-test-unique namespace factory (isolation by construction)."""
+class NamespaceFactory:
+    """A per-test-unique namespace factory (isolation by construction) that RECORDS every
+    ``Namespace`` it produces on ``.created`` — so a teardown fixture can compute the EXACT
+    physical partitions a test actually touched from the real objects, instead of reconstructing a
+    guess from ``uid`` + assumed defaults (a guess drifts silently the moment a test overrides
+    ``workspace``; see ``qdrant_teardown_collections``). Structurally satisfies
+    ``Callable[..., Namespace]``, so every existing call site typed that way is unaffected."""
 
-    def _make(
+    def __init__(self, uid: str) -> None:
+        self._uid = uid
+        self.created: list[Namespace] = []
+
+    def __call__(
+        self,
         *,
         visibility: Visibility = Visibility.PRIVATE,
         user: str = "u1",
         session: str = "s1",
         workspace: str | None = None,
     ) -> Namespace:
-        ws = workspace or f"ws{uid}"
+        ws = workspace or f"ws{self._uid}"
         if visibility is Visibility.SHARED:
-            return Namespace.shared(org=f"org{uid}", workspace=ws, session=session)
-        return Namespace(
-            org=f"org{uid}",
-            workspace=ws,
-            user=user,
-            session=session,
-            visibility=Visibility.PRIVATE,
-        )
+            ns = Namespace.shared(org=f"org{self._uid}", workspace=ws, session=session)
+        else:
+            ns = Namespace(
+                org=f"org{self._uid}",
+                workspace=ws,
+                user=user,
+                session=session,
+                visibility=Visibility.PRIVATE,
+            )
+        self.created.append(ns)
+        return ns
 
-    return _make
+
+@pytest.fixture
+def make_ns(uid: str) -> NamespaceFactory:
+    return NamespaceFactory(uid)
 
 
 @pytest.fixture
@@ -105,6 +121,34 @@ def make_item() -> Callable[..., MemoryItem]:
         )
 
     return _make
+
+
+@pytest.fixture
+def qdrant_teardown_collections(make_ns: NamespaceFactory) -> Callable[[], list[str]]:
+    """The Qdrant collection names this test ACTUALLY occupied — computed through the REAL mapper
+    from every ``Namespace`` ``make_ns`` produced during the test (``make_ns.created``), never
+    reconstructed from ``uid`` + assumed defaults.
+
+    ``qdrant_mapper.collection_name`` HASHES ``org``+``workspace`` together (see that function's
+    docstring), so ``uid`` no longer appears as a literal substring inside the collection name the
+    way it did when the name was a raw ``__``-joined string, and a
+    ``name.startswith("mu_mtm__org")`` sweep can no longer find them. The PREVIOUS fix for that
+    reconstructed exactly two names (PRIVATE + SHARED) from ``org=f"org{uid}"``/
+    ``workspace=f"ws{uid}"`` — hardcoded assumptions that silently stop matching the moment a test
+    calls ``make_ns(workspace=...)`` with an override, or creates only one visibility, or creates
+    more than two namespaces: the recomputed names would miss the real collection with no error,
+    exactly the kind of silent teardown gap that let 283 orphaned collections accumulate before
+    this session's cleanup. Reading the actual ``.created`` list instead cannot drift out of sync
+    with what the test really made, because it IS what the test really made — not a second,
+    independent guess at it.
+    """
+
+    def _names() -> list[str]:
+        # dedup (multiple namespaces can legitimately hash to the same collection, e.g. two
+        # PRIVATE namespaces differing only by user/session) without losing any distinct target.
+        return list({collection_name(ns, VECTOR_DIM) for ns in make_ns.created})
+
+    return _names
 
 
 @pytest_asyncio.fixture

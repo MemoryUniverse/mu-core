@@ -218,10 +218,13 @@ class FaissMtmAdapter:
                 if entry is None:
                     return  # nothing to supersede (already absent) — idempotent no-op
                 # ⚠ The namespace predicate is the TENANCY scope, not a sanity check. The index is
-                # `faiss_collection_name(ns, dim)` — workspace + visibility only, no org and no
-                # user — and the docstore key derives from `uuid5(NAMESPACE_URL, memory_id)`,
-                # unsalted by namespace, so a bare `loser_id` from another org/user resolves to a
-                # real entry of this same docstore. FAISS has no server to push a filter to (spec
+                # `faiss_collection_name(ns, dim)` — (org, workspace) hashed together + visibility,
+                # no user or session (the org-missing form of this hash was a tracked defect,
+                # `ARCHITECTURE-CONFORMANCE.md` §8/§10.4) — and the docstore key derives from
+                # `uuid5(NAMESPACE_URL, memory_id)`, unsalted by namespace, so a bare `loser_id`
+                # from another user IN THE SAME org+workspace still resolves to a real entry of
+                # this same docstore (a different org no longer can — different physical index).
+                # FAISS has no server to push a filter to (spec
                 # §3.3 "no" filterable), so the exact-equality scope is applied where every other
                 # read in this adapter applies it — the SAME `payload["namespace"] != ns_prefix`
                 # predicate `_search` above uses — on the docstore lookup that IS the addressing

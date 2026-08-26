@@ -10,11 +10,13 @@ Requires the real ``mu-dev-qdrant`` container (marked ``integration``); Chroma i
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from mu_contracts.config import Settings
 from mu_engine.storage.adapters.chroma_mtm import ChromaMtmAdapter
@@ -29,16 +31,21 @@ pytestmark = pytest.mark.integration
 
 
 @pytest_asyncio.fixture
-async def qdrant_backend(settings: Settings) -> AsyncIterator[QdrantMtmAdapter]:
+async def qdrant_backend(
+    settings: Settings, qdrant_teardown_collections: Callable[[], list[str]]
+) -> AsyncIterator[QdrantMtmAdapter]:
     # built THROUGH the STORE_REGISTRY seam by (role, backend) key — exactly as a real
     # composition root selects a backend BY CONFIG, never a hardcoded import (spec §4.2/§4.3).
     adapter: QdrantMtmAdapter = STORE_REGISTRY.build(
         "vector", "qdrant", dim=VECTOR_DIM, url=settings.storage.vector.url
     )
     yield adapter
-    existing = {c.name for c in (await adapter._qdrant.get_collections()).collections}
-    for name in existing:
-        if name.startswith("mu_mtm__ws"):
+    # `qdrant_mapper.collection_name` HASHES org+workspace together (collision-resistant, not a
+    # literal substring), so a `startswith("mu_mtm__org")` sweep can no longer find it; teardown
+    # instead reads the exact names `make_ns` actually produced this test (see
+    # `qdrant_teardown_collections`).
+    for name in qdrant_teardown_collections():
+        with contextlib.suppress(UnexpectedResponse):  # collection already absent / never created
             await adapter._qdrant.delete_collection(name)
     await adapter._qdrant.close()
 

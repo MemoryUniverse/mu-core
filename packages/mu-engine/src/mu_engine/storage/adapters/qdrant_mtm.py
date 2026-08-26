@@ -127,17 +127,30 @@ def _scoped_point_selector(ns: Namespace, memory_id: str) -> models.Filter:
     """The ONE selector every by-id WRITE verb addresses a point through — an id condition
     ``AND``-ed with an exact ``namespace`` equality, evaluated SERVER-SIDE by Qdrant.
 
-    ⚠ **Neither of the two keys a by-id write used to carry is namespace-scoped.** The collection
-    is ``mu_mtm__{workspace}__{visibility}__{dim}`` (no org, no user — ``qdrant_mapper.py``) and
-    the point id is ``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt), so ``expire`` /
-    ``invalidate`` / ``set_entity_uids`` / ``remove`` handed a bare ``memory_id`` from ANOTHER org
-    or ANOTHER user addressed a real point in the same collection — and ``remove`` is a hard
-    ``delete``. Isolation in this tier is FILTER-based by design (CANONICAL §1 rule 5;
-    ``storage-pluggable-spec.md §483-485``: every adapter applies the exact-equality tenancy
-    predicate unconditionally on every read **and write**, and no adapter composes its own tenant
-    string). Until now the write half of that rule was held only by call-site convention in
-    ANOTHER package — ``SurfaceFacade`` pre-gating on the guarded ``get`` — which a new caller or a
-    dropped pre-gate silently reintroduces.
+    ⚠ **The point id carries no namespace salt.** The collection is
+    ``mu_mtm__{sha256(org:workspace)[:16]}__{visibility}__{dim}`` (``qdrant_mapper.collection_name``
+    — physically partitioned by a HASH of ``org`` joined with ``workspace``, CANONICAL §1 rule 6;
+    the org-missing form of this name was a tracked defect, ``ARCHITECTURE-CONFORMANCE.md``
+    §8/§10.4, fixed alongside this docstring — see ``qdrant_mapper.collection_name`` for why the
+    join is hashed rather than a literal ``__``-joined string), so
+    a bare ``memory_id`` from ANOTHER org cannot even resolve to a point in this collection. But the
+    point id itself is ``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt), and one collection
+    is still shared by every user/session within the same ``(org, workspace, visibility)``, so
+    ``expire`` / ``invalidate`` / ``set_entity_uids`` / ``remove`` handed a bare ``memory_id`` from
+    ANOTHER user or session **in that same org+workspace** could still address a real point here —
+    and ``remove`` is a hard ``delete``.
+
+    **Isolation in this tier is TWO-LAYERED BY DESIGN — a physical partition AND a filter, never
+    the filter alone.** ``storage-pluggable-spec.md §6`` item 1 requires BOTH: the adapter derives
+    its coarse physical partition from ``to_prefix()`` (the collection name, above) **and** applies
+    the exact-equality tenancy predicate unconditionally on every read **and** write. CANONICAL §1
+    rule 5 — *"a query-filter bug cannot leak across tenants. Not a filter."* — forbids the filter
+    being the ONLY thing separating two tenants; it does not forbid a filter, and citing it as
+    authority for filter-ONLY isolation (the previous wording here) was exactly backwards, and is
+    also what let the org-missing collection name above survive review. Until now the write half of
+    the FILTER layer was held only by call-site convention in ANOTHER package — ``SurfaceFacade``
+    pre-gating on the guarded ``get`` — which a new caller or a dropped pre-gate silently
+    reintroduces; this selector is what makes the filter layer hold in the adapter itself.
 
     **A server-side filter rather than the post-read comparison ``_get_impl`` uses, deliberately.**
     That comparison is right for a READ: ``retrieve`` hands back a RECONSTRUCTED item, so comparing
@@ -296,16 +309,23 @@ class QdrantMtmAdapter:
         )
         # ⚠ **The namespace check is what makes this a read "from ``ns``'s partition"**, which is
         # what ``MtmTierRepository.get``'s port promises — and without it the promise was FALSE.
-        # Neither of the two things this point-get keys on is namespace-scoped: the collection is
-        # ``mu_mtm__{workspace}__{visibility}__{dim}`` (no org, no user) and the point id is
-        # ``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt). Isolation in this tier is
-        # FILTER-based by design, and the filter lives in ``semantic()``; ``retrieve`` takes none.
-        # So a bare id from ANOTHER org or ANOTHER user, sharing only the workspace string and the
-        # visibility, came back here as a hit — reproduced end-to-end against real Qdrant, where a
-        # victim's ``content_hash`` and ``provenance_id`` crossed into another principal's data.
-        # STM (key-prefixed by ``Namespace.to_prefix()``) and LTM (``MATCH (m:Memory {namespace,
-        # id})``) were already scoped; this tier was the one hole, and it is the tier every
-        # id-resolving lifecycle verb probes.
+        # Neither of the two things this point-get keys on carries a namespace comparison of its
+        # own: the point id is ``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt) and
+        # ``retrieve`` takes no payload filter at all — the collection, ``qdrant_mapper.
+        # collection_name`` (``mu_mtm__{sha256(org:workspace)[:16]}__{visibility}__{dim}``,
+        # physically partitioned by a hash of ``org``+``workspace`` per CANONICAL §1 rule 6; see
+        # that function's docstring for why the join is hashed, not a literal ``__``-joined
+        # string), only narrows the search to one
+        # org+workspace+visibility+dim; every user/session within that stays in the SAME
+        # collection. At the time this was reproduced end-to-end against real Qdrant, the
+        # collection name did not include ``org`` either (``ARCHITECTURE-CONFORMANCE.md`` §8/§10.4
+        # — fixed alongside this comment), so a bare id from ANOTHER org, sharing only the
+        # workspace string and the visibility, could come back here as a hit too; a victim's
+        # ``content_hash`` and ``provenance_id`` crossed into another principal's data. This
+        # ``item.namespace == ns`` check is what refuses that regardless of which layer (partition
+        # or filter) a future regression drops. STM (key-prefixed by ``Namespace.to_prefix()``) and
+        # LTM (``MATCH (m:Memory {namespace, id})``) were already scoped; this tier was the one
+        # hole, and it is the tier every id-resolving lifecycle verb probes.
         #
         # Enforced post-read rather than as a Qdrant filter deliberately: ``retrieve`` compares the
         # RECONSTRUCTED item, so it cannot be defeated by a payload whose index keys and canonical

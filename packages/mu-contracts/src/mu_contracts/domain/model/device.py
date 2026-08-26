@@ -97,6 +97,20 @@ class DeviceRecord(BaseModel):
     state: DeviceState = DeviceState.PENDING
     enrolled_at: datetime
     last_seen_at: datetime | None = None
+    #: **Phase-3 spec §7 / `DeviceSyncStatus.last_synced_at`'s data source** — added because
+    #: `DeviceSyncStatus.last_synced_at` (``sync_status.py``, CANONICAL §7.15) has no honest field
+    #: to project from without it: `last_seen_at` is "any contact" (heartbeat/IPC), `last_lamport`
+    #: is the hub's VC entry with no timestamp, and neither answers "when did a sync last land."
+    #: HUB-advanced only, same discipline as `last_synced_seq`/`last_lamport` — never
+    #: device-asserted forward.
+    #:
+    #: ⚠ **NOT YET PERSISTED — always `None` in production today.** ``DeviceRow`` (``mu-engine``'s
+    #: ``schema.py``, same row referenced above) has no `last_synced_at` column (verified: its
+    #: field list runs `last_seen_at` → `last_synced_seq` directly, nothing between them) and no
+    #: writer sets this field. Adding the column is a migration in the storage layer, outside this
+    #: package's ownership (`mu-contracts` is DTOs only) — tracked as an open gap, not fixed here.
+    #: Do not read this field as carrying real data until that column and its writer exist.
+    last_synced_at: datetime | None = None
     last_synced_seq: int = Field(default=0, ge=0)  # HUB-advanced cursor, never device-asserted
     last_lamport: int = Field(default=0, ge=0)  # §7.17-5: hub's durable VC entry
     key_epoch: int = Field(default=0, ge=0)  # RESERVED §7.18 — no shipping path writes it

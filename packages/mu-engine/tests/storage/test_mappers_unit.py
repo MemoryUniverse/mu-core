@@ -7,7 +7,7 @@ import pytest
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, Polarity
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.mappers.graph_mapper import GraphMapper
-from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper, point_id
+from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper, collection_name, point_id
 from mu_engine.storage.mappers.redis_mapper import RedisMapper
 from mu_engine.storage.mappers.relational_mapper import CONTENT_FREE_SHELL, RelationalMapper
 
@@ -55,6 +55,92 @@ def test_qdrant_roundtrip_and_id_stability() -> None:
     assert "embedding" not in row.payload  # vector nulled out of payload
     back = m.from_store(row)
     assert back == item  # round-trip on the common field set
+
+
+def test_qdrant_collection_name_differs_by_org() -> None:
+    """CANONICAL §1 rule 6 pins the collection/graph grain at ``org`` — two namespaces identical
+    except for ``org`` MUST resolve to different physical Qdrant collections, or tenancy in this
+    tier rests on the payload filter alone (the exact violation `ARCHITECTURE-CONFORMANCE.md`
+    §8/§10.4 tracked: `org` was absent from `collection_name`)."""
+    ns_a = Namespace(
+        org="org-a", workspace="w", user="u", session="s", visibility=Visibility.PRIVATE
+    )
+    ns_b = Namespace(
+        org="org-b", workspace="w", user="u", session="s", visibility=Visibility.PRIVATE
+    )
+    assert collection_name(ns_a, 4) != collection_name(ns_b, 4)
+
+
+def test_qdrant_collection_name_survives_underscore_boundary_ambiguity() -> None:
+    """REGRESSION for the fix that replaced this repo's PREVIOUS (refuted) attempt at D-6.
+
+    That attempt produced ``f"mu_mtm__{org}__{workspace}__{visibility}__{dim}"`` — joining two
+    caller-controlled segments on the literal string ``"__"``. ``Namespace._FORBIDDEN_NS_CHARS``
+    does NOT forbid ``_``, so ``"__"`` can legally occur INSIDE a single ``org`` or ``workspace``
+    value, and two namespaces that split the same underlying text at a different point collided
+    into the identical collection name — the exact cross-tenant leak this fix exists to close:
+
+        org="acme__eu", workspace="ws"     -> mu_mtm__acme__eu__ws__shared__384
+        org="acme",     workspace="eu__ws" -> mu_mtm__acme__eu__ws__shared__384   COLLIDE
+
+    ``to_prefix()`` (the tenancy GUARANTEE, CANONICAL §1 rule 5) correctly distinguishes these two
+    namespaces; a `collection_name` that does not is a physical-partition regression regardless of
+    what the payload filter does on top of it. Adversarial `__`-boundary slugs beyond the exact
+    historical counterexample are included so this cannot pass by accident on one lucky pair.
+    """
+    adversarial_pairs = [
+        (("acme__eu", "ws"), ("acme", "eu__ws")),  # the exact counterexample this fix closes
+        (("a__b__c", "w"), ("a", "b__c__w")),
+        (("x_", "_y"), ("x", "__y")),
+        (("a__", "b"), ("a", "__b")),  # trailing/leading underscore runs
+    ]
+    for (org_a, ws_a), (org_b, ws_b) in adversarial_pairs:
+        ns_a = Namespace.shared(org=org_a, workspace=ws_a, session="s")
+        ns_b = Namespace.shared(org=org_b, workspace=ws_b, session="s")
+        assert ns_a.to_prefix() != ns_b.to_prefix(), "test bug: the pair is not actually distinct"
+        assert collection_name(ns_a, 384) != collection_name(ns_b, 384), (
+            f"COLLISION: org={org_a!r}/workspace={ws_a!r} and org={org_b!r}/workspace={ws_b!r} "
+            "resolved to the same physical Qdrant collection"
+        )
+
+
+def test_qdrant_mapper_places_same_id_in_disjoint_org_collections() -> None:
+    """The mapper-level PRECONDITION a real by-id-write cross-org test depends on.
+
+    ⚠ This test performs no write and touches no adapter — it calls `QdrantMapper.to_store` twice
+    (pure, in-process) and compares the resulting `.collection` values. It does NOT itself prove a
+    by-id write "cannot address another org's point" (that requires the live
+    `_scoped_point_selector` predicate hitting a real/fake Qdrant instance, which is
+    `test_qdrant_mtm_write_scoping_int.py`'s job). What it DOES prove, cheaply and without a store:
+    the point id is `uuid5(NAMESPACE_URL, memory_id)` — UNSALTED by namespace (`qdrant_mapper.
+    point_id`) — so two orgs writing the SAME `memory_id` produce the IDENTICAL point id, and the
+    only thing that can then stop one org's write from addressing the other's point is the two
+    points living in DIFFERENT physical collections. This pins that `QdrantMapper.to_store` sends
+    them to disjoint collections — the precondition the integration test's docstring cites instead
+    of re-proving it live.
+    """
+    m = QdrantMapper(dim=4)
+    ns_a = Namespace(
+        org="org-a", workspace="w", user="u", session="s", visibility=Visibility.PRIVATE
+    )
+    ns_b = Namespace(
+        org="org-b", workspace="w", user="u", session="s", visibility=Visibility.PRIVATE
+    )
+    item_a = MemoryItem(
+        id="shared-memory-id",
+        content="org-a secret",
+        kind=MemoryKind.PROPOSITION,
+        namespace=ns_a,
+        owner_id="u",
+        workspace_id="w",
+        session_id="s",
+        polarity=Polarity.POSITIVE,
+    )
+    item_b = item_a.model_copy(update={"namespace": ns_b, "content": "org-b secret"})
+    row_a = m.to_store(item_a)
+    row_b = m.to_store(item_b)
+    assert row_a.point_id == row_b.point_id  # same id, no namespace salt (by design elsewhere)
+    assert row_a.collection != row_b.collection  # ...but disjoint physical partitions
 
 
 def test_graph_roundtrip_lossless() -> None:

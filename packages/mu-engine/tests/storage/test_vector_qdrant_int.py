@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 import pytest
 import pytest_asyncio
 from qdrant_client import AsyncQdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem
@@ -26,16 +27,18 @@ pytestmark = pytest.mark.integration
 
 @pytest_asyncio.fixture
 async def mtm(
-    qdrant_client: AsyncQdrantClient, make_ns: Callable[..., Namespace]
+    qdrant_client: AsyncQdrantClient,
+    make_ns: Callable[..., Namespace],
+    qdrant_teardown_collections: Callable[[], list[str]],
 ) -> AsyncIterator[QdrantMtmAdapter]:
     adapter = QdrantMtmAdapter(qdrant_client, dim=VECTOR_DIM)
     yield adapter
-    # teardown: drop any collections this test created (unique workspace per test).
-    existing = {c.name for c in (await qdrant_client.get_collections()).collections}
-    for name in list(existing):
-        if name.startswith("mu_mtm__ws"):
-            with contextlib.suppress(Exception):  # best-effort teardown only
-                await qdrant_client.delete_collection(name)
+    # teardown: drop the exact collections this test's unique org+workspace hash to (see
+    # `qdrant_teardown_collections` — `collection_name` now HASHES org+workspace, so a
+    # `startswith` prefix sweep can no longer find them).
+    for name in qdrant_teardown_collections():
+        with contextlib.suppress(UnexpectedResponse):  # collection already absent / never created
+            await qdrant_client.delete_collection(name)
 
 
 async def test_upsert_and_semantic_recall(
@@ -111,20 +114,26 @@ async def test_point_get_refuses_another_namespaces_memory(
     """``get`` must read *from ``ns``'s partition* — the port's own words — and it did not.
 
     ⚠ **This was a live cross-tenant read, not a hypothetical.** Neither key this point-get uses
-    is namespace-scoped: the collection is ``mu_mtm__{workspace}__{visibility}__{dim}`` (no org,
-    no user) and the point id is ``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt), and
-    ``retrieve`` carries no payload filter — isolation in this tier is filter-based and the filter
-    lives in ``semantic()`` (see :func:`test_namespace_filter`, which pins that for the search
-    path and says nothing about this one). So a bare id belonging to another user — or another
-    ORG, since the org is not in the collection name either — resolved here. Every id-resolving
-    lifecycle verb on ``MemoryFacade`` (get / promote / demote / update / delete) probes this
-    method, and ``mu-server``'s appender B was demonstrated appending a foreign memory's
-    ``content_hash`` and ``provenance_id`` into another principal's private sync log through it.
+    carries its own namespace comparison: the point id is ``uuid5(NAMESPACE_URL, memory_id)`` (no
+    namespace salt) and ``retrieve`` carries no payload filter at all — the collection,
+    ``mu_mtm__{sha256(org:workspace)[:16]}__{visibility}__{dim}`` (physically partitioned by a
+    HASH of ``org``+``workspace`` per CANONICAL §1 rule 6, ``ARCHITECTURE-CONFORMANCE.md``
+    §8/§10.4 — see ``qdrant_mapper.collection_name`` for why the join is hashed), only narrows to
+    one
+    org+workspace+visibility+dim; every user/session inside THAT partition shares one collection.
+    So a bare id belonging to another user **in the same org+workspace** resolved here (a bare id
+    from another ORG cannot: the collections are physically disjoint, proved at the mapper level
+    by
+    ``test_mappers_unit.py::test_qdrant_mapper_places_same_id_in_disjoint_org_collections``).
+    Every id-resolving lifecycle verb on ``MemoryFacade`` (get / promote / demote / update / delete)
+    probes this method, and ``mu-server``'s appender B was demonstrated appending a foreign
+    memory's ``content_hash`` and ``provenance_id`` into another principal's private sync log
+    through it.
 
     **What breaks it:** removing the ``item.namespace == ns`` comparison at the end of
-    ``_get_impl``. The two namespaces here deliberately share a collection — same workspace, same
-    PRIVATE visibility, different user slot — so the store genuinely returns the point and only
-    the adapter can refuse it.
+    ``_get_impl``. The two namespaces here deliberately share a collection — same org, same
+    workspace, same PRIVATE visibility, different user slot — so the store genuinely returns the
+    point and only the adapter can refuse it.
     """
     victim_ns = make_ns(user="u_victim")
     caller_ns = make_ns(user="u_caller")

@@ -131,8 +131,10 @@ async def test_invalidate_refuses_another_namespaces_memory(
 ) -> None:
     """C3 on the FAISS backend: the by-id supersede WRITE must carry the tenancy predicate.
 
-    ``faiss_collection_name(ns, dim)`` hashes the WORKSPACE + visibility only — no org, no user —
-    and the docstore key derives from ``uuid5(NAMESPACE_URL, memory_id)``, unsalted by namespace,
+    ``faiss_collection_name(ns, dim)`` hashes ``org``+``workspace`` (jointly, since the fix for the
+    cross-org collision — see that function's docstring) + visibility — still no ``user`` — so
+    same-org-same-workspace-different-user still land in the SAME index. The docstore key derives
+    from ``uuid5(NAMESPACE_URL, memory_id)``, unsalted by namespace,
     so a bare ``loser_id`` from another principal resolves to a real entry of the same docstore.
     FAISS has no server to push a filter to, so the adapter applies the same
     ``payload["namespace"] != to_prefix()`` predicate its own search path uses — in the adapter

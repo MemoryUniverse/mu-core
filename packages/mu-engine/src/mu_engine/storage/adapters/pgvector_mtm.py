@@ -19,8 +19,8 @@ primary key (spec §6 invariant 5).
 
 Table/index identifiers are NEVER built from raw caller input (see
 ``mu_engine.storage.mappers.pgvector_mapper.pgvector_table_name`` — a SHA-256 hash of the
-workspace), so the f-string DDL/DML below is injection-safe by construction; each such statement
-carries a ``# noqa: S608`` with that justification inline.
+``(org, workspace)`` pair), so the f-string DDL/DML below is injection-safe by construction; each
+such statement carries a ``# noqa: S608`` with that justification inline.
 """
 
 from __future__ import annotations
@@ -270,11 +270,14 @@ class PgVectorMtmAdapter:
             # id-stable supersede write (spec §3.3): flip state + merge payload, vector intact.
             #
             # ⚠ `namespace = $4` is the TENANCY predicate, not an optimization. The table is
-            # `pgvector_table_name(ns, dim)` — a hash of the WORKSPACE only, no org and no user —
-            # and `point_id` is `uuid5(NAMESPACE_URL, memory_id)`, unsalted by namespace, so a
-            # bare `loser_id` from another org/user addresses a real row of the same table. The
+            # `pgvector_table_name(ns, dim)` — a hash of the (org, workspace) PAIR, no user or
+            # session (the org-missing, workspace-only form of this hash was a tracked defect,
+            # `ARCHITECTURE-CONFORMANCE.md` §8/§10.4) — and `point_id` is
+            # `uuid5(NAMESPACE_URL, memory_id)`, unsalted by namespace, so a bare `loser_id` from
+            # another user IN THE SAME org+workspace still addresses a real row of the same table
+            # (a different org no longer can — different physical table). The
             # adapter, not the caller, applies the exact-equality scope on every write
-            # (`storage-pluggable-spec.md §483-485`; CANONICAL §1 rule 5) — the identical
+            # (`storage-pluggable-spec.md §6`; CANONICAL §1 rule 5) — the identical
             # `namespace = to_prefix()` predicate `_semantic_impl` above compiles for reads,
             # server-side and inside the same atomic statement (no read-then-write race), over
             # the real `namespace` column this table's own `{table}_ns_idx` indexes.
