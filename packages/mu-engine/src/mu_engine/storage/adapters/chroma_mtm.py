@@ -227,11 +227,14 @@ class ChromaMtmAdapter:
             col = await self._collection(ns)
             pid = point_id(loser_id)
             # ⚠ The `where` clause is the TENANCY predicate, not a convenience. The collection is
-            # `chroma_collection_name(ns, dim)` — workspace + visibility only, no org and no user
-            # — and `pid` is `uuid5(NAMESPACE_URL, memory_id)`, unsalted by namespace, so a bare
-            # `loser_id` from another org/user names a real row of this same collection. The
+            # `chroma_collection_name(ns, dim)` — (org, workspace) hashed together + visibility,
+            # no user or session (the org-missing form of this hash was a tracked defect,
+            # `ARCHITECTURE-CONFORMANCE.md` §8/§10.4) — and `pid` is
+            # `uuid5(NAMESPACE_URL, memory_id)`, unsalted by namespace, so a bare `loser_id` from
+            # another user IN THE SAME org+workspace still names a real row of this same
+            # collection (a different org no longer can — different physical collection). The
             # adapter applies the exact-equality scope itself, on the write path as well as the
-            # read (`storage-pluggable-spec.md §483-485`; CANONICAL §1 rule 5), reusing the
+            # read (`storage-pluggable-spec.md §6`; CANONICAL §1 rule 5), reusing the
             # SAME `namespace == to_prefix()` metadata pre-filter `_semantic_impl` pushes down.
             # It gates the `col.update` below: a foreign id matches nothing, `metas` is empty,
             # and this returns as the ordinary already-absent no-op. Chroma has no single atomic

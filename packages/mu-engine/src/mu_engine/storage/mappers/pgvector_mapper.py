@@ -14,28 +14,32 @@ PORT of mem0's pgvector table shape (``other_repos/mem0/mem0/vector_stores/pgvec
 the caller pick a raw ``collection_name`` string and interpolates it directly into DDL, which is
 NOT safe here: ``Namespace`` only forbids separator characters
 (``mu_contracts.domain.model.memory._FORBIDDEN_NS_CHARS``), not arbitrary SQL metacharacters, and a
-Postgres table name cannot be bound as a query parameter). The table name is therefore a
-deterministic SHA-256 hash of the workspace — never the raw string — so it is injection-safe by
-construction regardless of what characters a workspace id legally contains.
+Postgres table name cannot be bound as a query parameter). The table name is therefore the shared
+:func:`~mu_engine.storage.mappers.qdrant_mapper.tenant_partition_digest` — a deterministic SHA-256
+hash of ``org``+``workspace`` jointly (see that function's docstring for why the two are joined on
+``":"`` before hashing, and why the resulting digest is collision-resistant rather than
+collision-resistant) — never the raw string — so it is injection-safe by construction regardless of
+what characters an org/workspace id legally contains.
 """
 
 from __future__ import annotations
 
-from hashlib import sha256
-
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
-from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper
+from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper, tenant_partition_digest
 from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["PgVectorMapper", "pgvector_table_name"]
 
 
 def pgvector_table_name(ns: Namespace, dim: int) -> str:
-    """Deterministic, injection-safe Postgres identifier for the (workspace, visibility, dim)
-    physical partition (mirrors ``qdrant_mapper.collection_name``'s partition grain, spec §3.1)."""
-    digest = sha256(ns.workspace.encode("utf-8")).hexdigest()[:16]
-    return f"mu_mtm_pgv__{digest}__{ns.visibility.value}__{dim}"
+    """Deterministic, injection-safe Postgres identifier for the (org, workspace, visibility, dim)
+    physical partition (mirrors ``qdrant_mapper.collection_name``'s partition grain) — uses the
+    shared :func:`~mu_engine.storage.mappers.qdrant_mapper.tenant_partition_digest` (org+workspace
+    hashed jointly, so two orgs sharing a workspace slug get DIFFERENT physical tables; CANONICAL
+    §1 rule 6; the org-missing form was the tracked defect —
+    ``ARCHITECTURE-CONFORMANCE.md`` §8/§10.4)."""
+    return f"mu_mtm_pgv__{tenant_partition_digest(ns)}__{ns.visibility.value}__{dim}"
 
 
 class PgVectorMapper:

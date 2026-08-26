@@ -148,8 +148,10 @@ async def test_invalidate_refuses_another_namespaces_memory(
 ) -> None:
     """C3 on the pgvector backend: the by-id supersede WRITE must carry the tenancy predicate.
 
-    ``pgvector_table_name(ns, dim)`` hashes the WORKSPACE only — no org, no user — and
-    ``point_id`` is ``uuid5(NAMESPACE_URL, memory_id)``, unsalted by namespace, so a bare
+    ``pgvector_table_name(ns, dim)`` hashes ``org``+``workspace`` (jointly, since the fix for the
+    cross-org collision — see that function's docstring) — still no ``user`` — so
+    same-org-same-workspace-different-user still land in the SAME table. ``point_id`` is
+    ``uuid5(NAMESPACE_URL, memory_id)``, unsalted by namespace, so a bare
     ``loser_id`` from another principal names a real row of the same table. The adapter must
     apply the exact-equality scope itself (``storage-pluggable-spec.md:483-485``), not rely on a
     caller in another package pre-gating on a read — this test calls ``invalidate`` DIRECTLY.

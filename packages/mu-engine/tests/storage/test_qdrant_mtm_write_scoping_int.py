@@ -2,11 +2,20 @@
 ``mu-dev-qdrant``, ZERO mocks (C3, ARCHITECTURE-CONFORMANCE audit).
 
 ``expire`` / ``invalidate`` / ``set_entity_uids`` / ``remove`` each resolved a point through two
-keys, NEITHER of which is namespace-scoped: the collection is
-``mu_mtm__{workspace}__{visibility}__{dim}`` (no org, no user — ``qdrant_mapper.collection_name``)
-and the point id is ``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt). A bare ``memory_id``
-from another org or another user therefore addressed a REAL point of the same collection, and
-``remove`` is a hard ``AsyncQdrantClient.delete``.
+keys, NEITHER of which carries its own namespace comparison: the point id is
+``uuid5(NAMESPACE_URL, memory_id)`` (no namespace salt), and the collection —
+``mu_mtm__{sha256(org:workspace)[:16]}__{visibility}__{dim}`` (``qdrant_mapper.collection_name``,
+physically partitioned by a HASH of ``org``+``workspace`` per CANONICAL §1 rule 6 since the
+org-missing form of this name was fixed, ``ARCHITECTURE-CONFORMANCE.md`` §8/§10.4 — see that
+function's docstring for why the join is hashed rather than a literal ``__``-joined string) —
+narrows only to one org+workspace+visibility+dim, with
+every user/session inside that partition sharing the SAME collection. A bare ``memory_id`` from
+another user or session **in that same org+workspace** therefore addressed a REAL point of the
+same collection, and ``remove`` is a hard ``AsyncQdrantClient.delete``. (A bare ``memory_id`` from
+ANOTHER org can no longer reach a point here at all — the collections are now physically disjoint;
+that boundary is proved once, cheaply, at the mapper level by
+``test_mappers_unit.py::test_qdrant_mapper_places_same_id_in_disjoint_org_collections``, not
+repeated against the live store here.)
 
 It was not a live leak, because every caller pre-gated on the guarded read
 (``surface/facade.py`` calls ``mtm.get`` first, and ``_get_impl`` compares namespaces). That is
@@ -37,6 +46,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from qdrant_client import AsyncQdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
@@ -50,15 +60,17 @@ pytestmark = pytest.mark.integration
 
 
 @pytest_asyncio.fixture
-async def mtm(qdrant_client: AsyncQdrantClient) -> AsyncIterator[QdrantMtmAdapter]:
+async def mtm(
+    qdrant_client: AsyncQdrantClient, qdrant_teardown_collections: Callable[[], list[str]]
+) -> AsyncIterator[QdrantMtmAdapter]:
     adapter = QdrantMtmAdapter(qdrant_client, dim=VECTOR_DIM)
     yield adapter
-    # teardown: drop any collection this test created (unique workspace per test).
-    existing = {c.name for c in (await qdrant_client.get_collections()).collections}
-    for name in list(existing):
-        if name.startswith("mu_mtm__ws"):
-            with contextlib.suppress(Exception):  # best-effort teardown only
-                await qdrant_client.delete_collection(name)
+    # teardown: drop the exact collections this test's unique org+workspace hash to (see
+    # `qdrant_teardown_collections` — `collection_name` now HASHES org+workspace, so a
+    # `startswith` prefix sweep can no longer find them).
+    for name in qdrant_teardown_collections():
+        with contextlib.suppress(UnexpectedResponse):  # collection already absent / never created
+            await qdrant_client.delete_collection(name)
 
 
 async def _raw(client: AsyncQdrantClient, ns: Namespace, memory_id: str) -> dict[str, Any] | None:
@@ -76,8 +88,9 @@ def _shared_collection(victim_ns: Namespace, caller_ns: Namespace) -> None:
 
     If the two namespaces landed in DIFFERENT collections, every refusal test below would pass
     for a reason that has nothing to do with namespace scoping — the write would simply have been
-    aimed at another collection. Same workspace, same visibility, different user slot puts them in
-    one collection with two different ``to_prefix()`` values, which is the only configuration in
+    aimed at another collection. Same org, same workspace, same visibility, different user slot
+    (``make_ns`` fixes org+workspace per test via the shared ``uid`` fixture) puts them in one
+    collection with two different ``to_prefix()`` values, which is the only configuration in
     which the adapter itself is what refuses.
     """
     assert collection_name(victim_ns, VECTOR_DIM) == collection_name(caller_ns, VECTOR_DIM), (
