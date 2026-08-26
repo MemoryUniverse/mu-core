@@ -1,7 +1,9 @@
 """``FalkorLtmAdapter`` — pure unit coverage, ZERO real store I/O.
 
 Covers the multi-org partition-naming rule and the Settings DI-threading through the
-``STORE_REGISTRY`` factory (spec: multi-org harden + constants->Settings, owner 2026-07-27).
+``STORE_REGISTRY`` factory (spec: multi-org harden + constants->Settings, owner 2026-07-27), and
+(D-8) the digest-based collision-proofing of ``graph_name_for`` against adversarial ``__``-boundary
+org/workspace/user slugs.
 
 A real ``FalkorDB()`` (even the async client) eagerly opens a SYNC probe socket in
 ``__init__`` (cluster detection) — constructing one against an unreachable host is a real
@@ -23,6 +25,7 @@ from mu_engine.storage.adapters.falkor_ltm import (
     FalkorLtmAdapter,
 )
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.mappers.tenancy import tenant_partition_digest
 
 pytestmark = pytest.mark.unit
 
@@ -41,18 +44,69 @@ def _ns(
 
 def test_graph_name_includes_org_not_just_workspace() -> None:
     adapter = FalkorLtmAdapter(MagicMock())
-    same_workspace_org_a = adapter.graph_name_for(_ns(org="orgA", workspace="w1"))
-    same_workspace_org_b = adapter.graph_name_for(_ns(org="orgB", workspace="w1"))
+    ns_a = _ns(org="orgA", workspace="w1")
+    ns_b = _ns(org="orgB", workspace="w1")
+    same_workspace_org_a = adapter.graph_name_for(ns_a)
+    same_workspace_org_b = adapter.graph_name_for(ns_b)
     # SAME workspace name, DIFFERENT org -> DIFFERENT physical graph name.
     assert same_workspace_org_a != same_workspace_org_b
-    assert same_workspace_org_a == "mu_g__orgA__w1__u1"
-    assert same_workspace_org_b == "mu_g__orgB__w1__u1"
+    assert same_workspace_org_a == f"mu_g__{tenant_partition_digest(ns_a)}__u_u1"
+    assert same_workspace_org_b == f"mu_g__{tenant_partition_digest(ns_b)}__u_u1"
 
 
 def test_graph_name_shared_plane_zeroes_user_slot() -> None:
     adapter = FalkorLtmAdapter(MagicMock())
-    name = adapter.graph_name_for(_ns(org="orgA", workspace="w1", visibility=Visibility.SHARED))
-    assert name == "mu_g__orgA__w1__shared"
+    ns = _ns(org="orgA", workspace="w1", visibility=Visibility.SHARED)
+    name = adapter.graph_name_for(ns)
+    assert name == f"mu_g__{tenant_partition_digest(ns)}__shared"
+
+
+def test_graph_name_survives_underscore_boundary_ambiguity_on_org_workspace() -> None:
+    """D-8: pre-fix, ``graph_name_for`` joined ``org``/``workspace`` with a raw ``"__"`` —
+    ``_`` is not in ``Namespace._FORBIDDEN_NS_CHARS``, so a slug carrying its own ``"__"`` could
+    shift the join boundary and collide two DIFFERENT orgs onto the SAME physical graph. This
+    OUTRANKS the identical (already-fixed) MTM vector-tier defect because CANONICAL §7.4
+    authorizes the PRIVATE graph-recall arm by partition alone — there is no property-filter
+    backstop here the way there is on the vector tier."""
+    adapter = FalkorLtmAdapter(MagicMock())
+    colliding_pairs = [
+        (("acme__eu", "ws"), ("acme", "eu__ws")),
+        (("a__b__c", "d"), ("a", "b__c__d")),
+        (("x_", "_y"), ("x", "__y")),
+    ]
+    for (org_a, ws_a), (org_b, ws_b) in colliding_pairs:
+        name_a = adapter.graph_name_for(_ns(org=org_a, workspace=ws_a))
+        name_b = adapter.graph_name_for(_ns(org=org_b, workspace=ws_b))
+        assert name_a != name_b, (
+            f"org={org_a!r}/workspace={ws_a!r} collided with "
+            f"org={org_b!r}/workspace={ws_b!r} -> both produced {name_a!r}"
+        )
+
+
+def test_graph_name_survives_underscore_boundary_ambiguity_on_user_segment() -> None:
+    """D-8 test scope item: adversarial ``__``-boundary pairs on the PRIVATE ``user`` segment.
+    The digest is a fixed-length (16 hex chars, never containing ``_``) prefix, so no content a
+    caller puts in ``user`` — however many ``_`` characters — can shift the digest/user boundary
+    into colliding with a DIFFERENT (org, workspace) pair's name. Two users under the SAME
+    (org, workspace) with different literal content must still resolve to different graphs."""
+    adapter = FalkorLtmAdapter(MagicMock())
+    user_pairs = [("alice__bob", "alice"), ("a_b", "a__b"), ("__x", "_x")]
+    for user_a, user_b in user_pairs:
+        name_a = adapter.graph_name_for(_ns(org="acme", workspace="ws", user=user_a))
+        name_b = adapter.graph_name_for(_ns(org="acme", workspace="ws", user=user_b))
+        assert name_a != name_b, f"user={user_a!r} collided with user={user_b!r} -> {name_a!r}"
+
+
+def test_graph_name_shared_plane_never_collides_with_a_user_literally_named_shared() -> None:
+    """Residual collision the PRE-D-8 code already carried: SHARED built
+    ``mu_g__{org}__{workspace}__shared`` while PRIVATE built
+    ``mu_g__{org}__{workspace}__{user}`` — a PRIVATE namespace whose ``user`` happens to be the
+    literal string ``"shared"`` produced the IDENTICAL name to the SHARED plane for the same
+    (org, workspace). The ``u_`` marker on the PRIVATE branch closes this at zero extra cost."""
+    adapter = FalkorLtmAdapter(MagicMock())
+    shared_ns = _ns(org="acme", workspace="ws", visibility=Visibility.SHARED)
+    private_ns = _ns(org="acme", workspace="ws", user="shared")
+    assert adapter.graph_name_for(shared_ns) != adapter.graph_name_for(private_ns)
 
 
 def test_constructor_defaults_are_named_not_silent() -> None:

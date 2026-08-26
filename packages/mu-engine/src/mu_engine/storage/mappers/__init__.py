@@ -10,5 +10,12 @@ from mu_engine.storage.mappers.graph_mapper import GraphMapper
 from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper
 from mu_engine.storage.mappers.redis_mapper import RedisMapper
 from mu_engine.storage.mappers.relational_mapper import RelationalMapper
+from mu_engine.storage.mappers.tenancy import tenant_partition_digest
 
-__all__ = ["GraphMapper", "QdrantMapper", "RedisMapper", "RelationalMapper"]
+__all__ = [
+    "GraphMapper",
+    "QdrantMapper",
+    "RedisMapper",
+    "RelationalMapper",
+    "tenant_partition_digest",
+]

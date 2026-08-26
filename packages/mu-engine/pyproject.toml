@@ -43,6 +43,16 @@ dependencies = [
     "chromadb>=0.5.20,<0.6",
     "faiss-cpu>=1.9,<2",
     "pgvector>=0.3.6,<1",
+    # ADR 0050: Weaviate, native multi-tenancy, the fifth registered vector backend (SHARED-plane).
+    # weaviate-client's typed `query.*`/`tenants.get_by_names`/`data.delete_many` surface is
+    # gRPC-only (verified live against the tunnelled dev instance: every gRPC-backed call hangs
+    # with no gRPC listener reachable) — `weaviate_mtm.py` therefore talks REST/GraphQL only
+    # (`client.graphql_raw_query`, `collection.data.*`), and needs `httpx` directly for the one
+    # primitive the typed SDK does not expose over REST: atomic filtered batch delete
+    # (`POST /v1/batch/objects`). Already a transitive pin via `weaviate-client`; declared
+    # explicitly here because the adapter imports it directly.
+    "weaviate-client>=4.9,<5",
+    "httpx>=0.27,<1",
 ]
 
 [build-system]

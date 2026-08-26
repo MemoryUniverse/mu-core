@@ -9,7 +9,7 @@ shape (``other_repos/mem0/mem0/vector_stores/chroma.py:23-74`` — collection-pe
 Chroma collection names have their OWN charset/length rule (3-63 chars, alnum + ``.``/``_``/``-``,
 must start and end alnum, no consecutive dots) distinct from Qdrant's — so, like pgvector, the
 ``org``+``workspace`` pair is hashed jointly (via the shared
-:func:`~mu_engine.storage.mappers.qdrant_mapper.tenant_partition_digest` helper — see its
+:func:`~mu_engine.storage.mappers.tenancy.tenant_partition_digest` helper — see its
 docstring for what the digest derives and why it is collision-resistant rather than
 collision-resistant) rather than embedded raw.
 """
@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
-from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper, tenant_partition_digest
+from mu_engine.storage.mappers.qdrant_mapper import QdrantMapper
+from mu_engine.storage.mappers.tenancy import tenant_partition_digest
 from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["ChromaMapper", "chroma_collection_name"]
