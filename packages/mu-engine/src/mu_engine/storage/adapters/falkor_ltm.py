@@ -35,6 +35,24 @@ OWNER DECISIONS (2026-07-27, AUTHORITATIVE):
    one shared graph. The ``m.namespace = $ns`` (org-scoped ``to_prefix()``) property filter on
    every query stays as mandatory defense-in-depth ON TOP of that physical partition, not
    instead of it.
+3. D-8 FIX (2026-08-27): ``graph_name_for`` originally built its name by RAW string join
+   (``mu_g__{org}__{workspace}__...``). ``_`` is not in ``Namespace._FORBIDDEN_NS_CHARS``, so
+   ``org="acme__eu", workspace="ws"`` and ``org="acme", workspace="eu__ws"`` produced the
+   IDENTICAL graph name — the same raw-join ambiguity already fixed in the four MTM vector
+   mappers (``mu_engine.storage.mappers.tenancy.tenant_partition_digest``), independently
+   present here because this adapter built its own name rather than reusing that helper. This
+   OUTRANKS the vector-tier version of the same defect: CANONICAL §7.4 authorizes the PRIVATE
+   graph-recall arm by physical partition ALONE (no payload-filter backstop), so a name
+   collision here is unmediated — the property filter that saves the vector tier from a
+   collision does not exist for this tier's PRIVATE reads. Fixed by reusing
+   ``tenant_partition_digest`` (``org``+``workspace`` hashed jointly on an unambiguous
+   ``"org:workspace"`` join, since ``":"`` IS forbidden in both) — see that function's
+   docstring for the full derivation. The per-user PRIVATE segment stays a readable suffix
+   (see :meth:`graph_name_for`'s own docstring) — CANONICAL §1 rule 6 as CLARIFIED 2026-08-26
+   holds a per-user graph to be rule 5's partition applied, not a new physical store, so
+   per-user separation is conformant and this fix PRESERVES it rather than folding it into the
+   digest. NOT a data migration: existing graphs under the old (collidable) names are orphaned
+   by this change — recorded as an open gap, not remediated here.
 """
 
 from __future__ import annotations
@@ -57,6 +75,7 @@ from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored
 from mu_engine.storage.errors import MtmPointAbsentError
 from mu_engine.storage.mappers.graph_mapper import GraphMapper
+from mu_engine.storage.mappers.tenancy import tenant_partition_digest
 
 __all__ = ["EntityUidsSink", "FalkorLtmAdapter"]
 
@@ -231,15 +250,49 @@ class FalkorLtmAdapter:
         """The physical FalkorDB graph a namespace resolves to — pure, no I/O.
 
         Partition key = ``(org, workspace, visibility|user)`` (multi-org harden, owner
-        directive 2026-07-27): ``mu_g__{org}__{workspace}__shared`` for the SHARED plane,
-        ``mu_g__{org}__{workspace}__{user}`` for PRIVATE. Public so tests/observability can
-        assert on — and print — the exact physical partition a namespace lands in without
-        duplicating this computation (e.g. proving two orgs sharing a workspace id land in
-        two distinct graphs).
+        directive 2026-07-27): ``mu_g__{digest}__shared`` for the SHARED plane,
+        ``mu_g__{digest}__u_{user}`` for PRIVATE, where ``digest`` is
+        :func:`~mu_engine.storage.mappers.tenancy.tenant_partition_digest` — the SAME
+        ``org``+``workspace`` SHA-256 digest the four MTM vector mappers already build their
+        collection/table names from (DEV-STANDARDS rule 6, DRY: one collision-resistant
+        derivation, not a second one re-typed here). Public so tests/observability can assert
+        on — and print — the exact physical partition a namespace lands in without duplicating
+        this computation (e.g. proving two orgs sharing a workspace id land in two distinct
+        graphs).
+
+        D-8 FIX: the previous implementation joined ``org``/``workspace`` RAW
+        (``mu_g__{org}__{workspace}__...``) — ``_`` is not forbidden in either segment
+        (``Namespace._FORBIDDEN_NS_CHARS``), so ``org="acme__eu", workspace="ws"`` and
+        ``org="acme", workspace="eu__ws"`` produced the IDENTICAL name, physically colliding
+        two different orgs' graphs. Hashing the two together (on the unambiguous ``":"``-joined
+        pre-image ``tenant_partition_digest`` builds) removes that ambiguity regardless of what
+        ``_`` patterns a caller's org/workspace slug contains. See the module docstring's
+        OWNER DECISION 3 for why this outranks the (already-fixed) vector-tier version of the
+        same defect.
+
+        The PRIVATE ``user`` segment deliberately stays a RAW, readable suffix — never folded
+        into the digest — for two reasons: (1) CANONICAL §1 rule 5 pins ``org``+``workspace`` as
+        the two tenancy segments the physical partition must key on; rule 6 as CLARIFIED
+        2026-08-26 holds that a per-user graph on the PRIVATE plane IS rule 5's partition
+        applied, not a "new physical" store needing its own collision-resistant treatment — so
+        widening the digest to cover ``user`` would over-apply a fix scoped to the tenancy
+        segments, not the per-user one. (2) it costs nothing to keep collision-free anyway: the
+        digest is a FIXED 16-hex-character string that can never itself contain ``_`` or
+        collide with a different ``(org, workspace)`` pair's digest at any real tenant count
+        (see :func:`tenant_partition_digest`'s own "collision-RESISTANT, not
+        collision-resistant" precision note), so no ``user`` value — however many ``_``
+        characters it contains — can ever cross the ``__`` boundary into ambiguity. The ``u_``
+        prefix on the user segment (rather than appending ``user`` bare) exists only to keep the
+        PRIVATE and SHARED branches themselves from colliding when a caller's literal ``user``
+        happens to equal the string ``"shared"`` — a residual ambiguity the PRE-D-8 code already
+        carried (``mu_g__{org}__{workspace}__shared`` for SHARED vs. a PRIVATE user literally
+        named ``"shared"`` produced the same string) and which this fix closes as a zero-cost
+        side effect of touching this method, not a new scope item.
         """
+        digest = tenant_partition_digest(ns)
         if ns.visibility is Visibility.SHARED:
-            return f"mu_g__{ns.org}__{ns.workspace}__shared"
-        return f"mu_g__{ns.org}__{ns.workspace}__{ns.user}"
+            return f"mu_g__{digest}__shared"
+        return f"mu_g__{digest}__u_{ns.user}"
 
     def _graph(self, ns: Namespace) -> Any:
         return self._db.select_graph(self.graph_name_for(ns))

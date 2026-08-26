@@ -19,6 +19,7 @@ from falkordb.asyncio import FalkorDB
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.mappers.tenancy import tenant_partition_digest
 
 pytestmark = pytest.mark.integration
 
@@ -163,8 +164,10 @@ async def test_multi_org_physical_isolation(
     name_b1 = ltm.graph_name_for(ns_org_b_w1)
     name_a2 = ltm.graph_name_for(ns_org_a_w2)
     assert len({name_a1, name_b1, name_a2}) == 3, (name_a1, name_b1, name_a2)
-    assert name_a1.startswith(f"mu_g__orgA{run}__")
-    assert name_b1.startswith(f"mu_g__orgB{run}__")
+    # D-8: org/workspace are now hashed (tenant_partition_digest), so the raw org slug no
+    # longer appears in the name — assert on the digest instead of a `startswith` on raw text.
+    assert name_a1 == f"mu_g__{tenant_partition_digest(ns_org_a_w1)}__u_alice"
+    assert name_b1 == f"mu_g__{tenant_partition_digest(ns_org_b_w1)}__u_alice"
 
     a1 = make_item(
         ns_org_a_w1, "Ada uses Postgres", subject="Ada", predicate="uses", obj="Postgres"

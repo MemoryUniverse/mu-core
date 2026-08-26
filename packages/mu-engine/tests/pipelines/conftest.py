@@ -124,7 +124,12 @@ async def ltm(falkor_db: FalkorDB) -> AsyncIterator[FalkorLtmAdapter]:
     finally:
         for g in await falkor_db.list_graphs():
             name = g.decode() if isinstance(g, bytes) else g
-            if name.startswith("mu_g__ws"):
+            # `mu_g__ws` has matched NOTHING since `org` entered the graph name, and matches
+            # nothing now that org+workspace are a digest — verified live: 20 `mu_g__` graphs
+            # on the dev store, 0 with this prefix. A teardown that silently sweeps nothing is
+            # how graph debris accumulates (cf. D-16, where 249 orphaned Qdrant collections
+            # made a tenancy test fail on a store timeout). Match the stable prefix instead.
+            if name.startswith("mu_g__"):
                 with contextlib.suppress(Exception):  # best-effort teardown only
                     await falkor_db.select_graph(name).delete()
 
