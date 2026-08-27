@@ -21,13 +21,23 @@ vendor client lives ONLY inside the adapter + this factory. Selecting the new ba
 a config change (``StorageSettings.graph.backend = "neo4j"``), never a code change.
 
 VECTOR ROLE (owner override 2026-07-27: "genuinely MULTI-backend NOW, mem0 pattern"): the
-``vector`` role now self-registers FOUR backends the exact same way — ``qdrant`` (reference,
+``vector`` role now self-registers FIVE backends the exact same way — ``qdrant`` (reference,
 SHARED-safe), ``pgvector`` (SHARED-safe, SQL WHERE + HNSW), ``chroma`` (embedded floor, partial
-filter — widened, never incomplete) and ``faiss`` (brute-force, PRIVATE-plane ONLY — the registry's
-``_BRUTE_FORCE_VECTOR_BACKENDS`` gate refuses it on SHARED at build time). Every one of them
-implements ``MtmTierRepository`` and none of them is imported by the engine directly — only through
-this factory, exactly like the graph seam above. Selecting a different vector backend is a
+filter — widened, never incomplete), ``faiss`` (brute-force, PRIVATE-plane ONLY — the registry's
+``_BRUTE_FORCE_VECTOR_BACKENDS`` gate refuses it on SHARED at build time), and ``weaviate`` (ADR
+0050: native multi-tenancy, the SHARED-plane MTM backend — filterable, gated on that ADR's own
+gate 0 authz-completeness spike before any migration is scheduled). Every one of them implements
+``MtmTierRepository`` and none of them is imported by the engine directly — only through this
+factory, exactly like the graph seam above. Selecting a different vector backend is a
 ``StorageSettings.vector`` / ``BackendChoice`` config change, never a code change.
+
+WEAVIATE FACTORY NOTE: no dedicated ``WeaviateSettings`` subtree exists on the central
+``Settings`` tree yet (``mu_contracts.config.settings`` was out of scope for the task that added
+this backend). ``_build_weaviate`` therefore takes ``host``/``http_port``/``store_io_timeout_s``
+straight from ``cfg`` with local, named defaults — the SAME pattern ``_build_sqlite`` above
+already uses for the one other backend with no Settings subtree of its own. A future change
+should add ``WeaviateSettings`` mirroring ``QdrantSettings``/``PgVectorSettings`` and fold that
+fallback in here, the way every other vector factory already does.
 
 KV + RELATIONAL ROLES (owner stage 2026-07-27, same mem0-pattern multi-backend requirement):
 ``kv`` now self-registers FOUR backends — ``redis``/``valkey`` (wire-identical, real
@@ -54,6 +64,7 @@ from __future__ import annotations
 from typing import Any
 
 import aiomcache
+import weaviate
 from falkordb.asyncio import FalkorDB
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
@@ -72,6 +83,7 @@ from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
 from mu_engine.storage.adapters.relational_control import RelationalControlPlaneAdapter
 from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
+from mu_engine.storage.adapters.weaviate_mtm import WeaviateMtmAdapter
 from mu_engine.storage.registry import StoreRegistry
 
 __all__ = ["STORE_REGISTRY"]
@@ -284,6 +296,39 @@ def _build_artifact_fs(**cfg: Any) -> FsContextRepositoryAdapter:
     artifact_settings = get_settings().storage.artifact
     content_root = cfg.get("content_root") or artifact_settings.content_root
     return FsContextRepositoryAdapter(content_root=str(content_root))
+
+
+@STORE_REGISTRY.register("vector", "weaviate")
+def _build_weaviate(*, dim: int, **cfg: Any) -> WeaviateMtmAdapter:
+    """ADR 0050: Weaviate, native multi-tenancy, the SHARED-plane MTM vector backend.
+
+    ``skip_init_checks=True`` is UNCONDITIONAL, not caller-configurable — this adapter never
+    issues a single gRPC call (see ``weaviate_mtm.py``'s module docstring for why: verified live,
+    every gRPC-backed SDK method hangs against an HTTP-only deployment), so gating connection
+    success on a gRPC health probe would refuse a perfectly usable REST-only deployment for a
+    capability this adapter does not use. ``grpc_host``/``grpc_port`` are still required
+    constructor args of ``use_async_with_custom`` even though never dialed; defaulted to the same
+    host and Weaviate's own conventional gRPC port so a caller need not think about them.
+    """
+    host = cfg["host"]
+    http_port = int(cfg.get("http_port", 8080))
+    http_secure = bool(cfg.get("http_secure", False))
+    client = weaviate.use_async_with_custom(
+        http_host=host,
+        http_port=http_port,
+        http_secure=http_secure,
+        grpc_host=cfg.get("grpc_host", host),
+        grpc_port=int(cfg.get("grpc_port", 50051)),
+        grpc_secure=bool(cfg.get("grpc_secure", False)),
+        skip_init_checks=True,
+    )
+    kwargs: dict[str, Any] = {
+        "http_url": f"{'https' if http_secure else 'http'}://{host}:{http_port}",
+        "dim": dim,
+    }
+    if "store_io_timeout_s" in cfg:
+        kwargs["store_io_timeout_s"] = cfg["store_io_timeout_s"]
+    return WeaviateMtmAdapter(client, **kwargs)
 
 
 @STORE_REGISTRY.register("vector", "faiss")
