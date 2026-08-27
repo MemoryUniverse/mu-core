@@ -49,16 +49,21 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Float,
+    ForeignKeyConstraint,
     Index,
     Integer,
     PrimaryKeyConstraint,
     String,
+    Text,
     UniqueConstraint,
     event,
     text,
 )
+from sqlalchemy.dialects.mysql import MEDIUMTEXT as _MYSQL_MEDIUMTEXT
 from sqlalchemy.dialects.postgresql import JSONB as _PG_JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from mu_contracts.domain.model.room import MAX_DEDUPE_KEY_CHARS
 
 __all__ = ["Base"]
 
@@ -648,6 +653,177 @@ class TrustLedgerEntryRow(Base):
         PrimaryKeyConstraint("workspace_id", "seq"),
         Index("ix_trust_object", "workspace_id", "object_ref"),
         Index("ix_trust_principal", "workspace_id", "subject_principal_id"),
+    )
+
+
+# ============================================================ §2.x ROOMS — the S3 room runtime
+# ``rooms-sessions-subscriptions-spec.md`` §2.2/§3.2, ``ARCHITECTURE-DELTAS.md`` AD-28 items (1)
+# and (2)/(3). Three tables, added together by revision ``b3d47c9a1e02``, because they are one
+# aggregate: ``room_session`` + ``room_participant`` are the roster half (``SessionRepository``)
+# and ``room_log`` is the append-only ordering authority (``RoomLogRepository``).
+#
+# **Why NEW tables rather than widening the shipped ``sessions``/``session_participants``.** AD-28
+# item (3) is phrased as missing COLUMNS on those two tables, and that phrasing is not what was
+# built — deliberately. ``sessions`` is the control-plane home of ``SessionDefinition``, whose
+# ``SessionState`` has exactly ``{OPEN, CLOSED}``; the room's ``RoomState`` also has ``PAUSED``,
+# and ``Session.to_definition()`` projects ``PAUSED`` *down* to ``OPEN`` on purpose (a store
+# outage is not an end-of-session for authorization or billing). Carrying two different state
+# axes on one row would make that projection lossy in the store, and would widen a shipped table
+# that other components already read. The room tables are a different concept on a different
+# axis, so they get their own rows. This is also the shape the only existing implementation
+# assumes — ``mu_server.rooms.session_pg.PostgresSessionRepository`` and its ``REQUIRED_DDL``
+# target ``room_session``/``room_participant`` verbatim, and ``mu_server.rooms.room_log_pg``
+# targets ``room_log`` — so the migration and the adapters cannot silently disagree.
+#
+# **Tenancy** (CANONICAL §1 rule 5): every primary key here BEGINS at ``(org_id, workspace_id)``.
+# A room id is never a key on its own, so a cross-tenant read is not a filter bug away.
+#
+# **Content-free** (CANONICAL §3.1): ``room_log.body`` is the ONE column in this schema that holds
+# message text, and it is legitimate — ``RoomMessage`` is the STORED object and the discipline
+# binds the bus/logs/traces/metering, not the store. Everything else here is ids, hashes, enum
+# values, counts and timestamps. ``room_participant.display_name`` is principal-supplied identity,
+# not memory content.
+class RoomSessionRow(Base):
+    """The room aggregate's durable row — ``Session`` minus the roster (spec:79-82)."""
+
+    __tablename__ = "room_session"
+
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    id: Mapped[str] = mapped_column(String(128), nullable=False)  # == room_id == session_id
+    namespace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    visibility: Mapped[str] = mapped_column(String(32), nullable=False)  # always 'shared'
+    state: Mapped[str] = mapped_column(String(32), nullable=False)  # open|paused|closed
+    floor_policy: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: A HINT (spec:82) — ``room_log`` is the ordering authority. Stored so a room reloaded after a
+    #: crash does not have to scan the log to answer "roughly where were we".
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: The bus-announce cursor: ``seq > announced_through_seq`` is a durable statement that the
+    #: ``RoomMessagePosted`` announce is still OWED, which is what makes a crash between append and
+    #: publish recoverable instead of a permanent interior hole in the bus stream.
+    announced_through_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: Optimistic-concurrency guard for spec:132's whole-aggregate save. ``UPDATE ... WHERE
+    #: version = :expected``; zero rows updated is a concurrent commit, not a missing room.
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = _dt()
+
+    __table_args__ = (PrimaryKeyConstraint("org_id", "workspace_id", "id", name="pk_room_session"),)
+
+
+class RoomParticipantRow(Base):
+    """One roster row (spec:74). Rewritten wholesale inside the aggregate's save transaction."""
+
+    __tablename__ = "room_participant"
+
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    room_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(200))
+    joined_at: Mapped[datetime] = _dt()
+    #: Set = the offboarding re-stamp trigger (CANONICAL §7.4/M15). The row is KEPT so the
+    #: provenance of every message the principal authored survives the departure.
+    left_at: Mapped[datetime | None] = _dt_opt()
+    presence: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: Authorizes a BOUND_AGENT (``scope.py:186`` ``AgentBinding``); ``None`` for everyone else.
+    binding_id: Mapped[str | None] = mapped_column(String(128))
+    #: ``frozenset[str]``, JSON-encoded. TEXT rather than JSON because MySQL 8 cannot index or
+    #: default a raw JSON column and nothing here queries INTO the value — it is read back whole.
+    capabilities: Mapped[str] = mapped_column(Text, nullable=False)
+    #: **Roster ORDER, and it is load-bearing.** ``Session.join`` appends, and the bootstrap rule
+    #: that admits the first member reads "a room with NO participant rows"; without an explicit
+    #: ordinal the roster comes back in whatever order the planner chose and the aggregate is
+    #: reconstructed differently on every load.
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint(
+            "org_id", "workspace_id", "room_id", "principal_id", name="pk_room_participant"
+        ),
+        ForeignKeyConstraint(
+            ["org_id", "workspace_id", "room_id"],
+            ["room_session.org_id", "room_session.workspace_id", "room_session.id"],
+            name="fk_room_participant_session",
+            ondelete="CASCADE",
+        ),
+    )
+
+
+class RoomLogRow(Base):
+    """The append-only per-room event store — **and the sole ``seq`` ordering authority**.
+
+    ``seq`` is not a counter: a client applies a frame only if ``seq == last_applied + 1``
+    (CONTIGUITY, CANONICAL:566), so the sequence must be gap-free and duplicate-free per room. The
+    primary key is what makes "duplicate-free" a property of the DATABASE rather than of the
+    appender's care, and ``ux_roomlog_dedupe`` is what makes an idempotent replay resolvable in
+    one statement (``ON CONFLICT ON CONSTRAINT ux_roomlog_dedupe DO NOTHING``).
+    """
+
+    __tablename__ = "room_log"
+
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    room_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: spec:76's ``msg_<uuid>`` surrogate. **NULLABLE, and the reason is worth stating:** the
+    #: shipped appender (``mu_server.rooms.room_log_pg._APPEND_SQL``) is a fixed thirteen-column
+    #: INSERT that does not mention this column and lives in a repo this lane may not edit, so a
+    #: ``NOT NULL`` here would make every existing append fail at the database. There is no
+    #: portable server default either — ``gen_random_uuid()`` is Postgres-only and this schema
+    #: also binds SQLite and MySQL. NULL therefore means "written by an appender that predates
+    #: the column", and the durable identity remains the primary key below.
+    id: Mapped[str | None] = mapped_column(String(160))
+    author_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    author_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: Width is :data:`mu_contracts.domain.model.room.MAX_DEDUPE_KEY_CHARS`, IMPORTED rather than
+    #: retyped: the REST edge bounds the ``Idempotency-Key`` header to the same number, and when
+    #: the two drifted an over-long header reached this column, Postgres answered ``22001``, and a
+    #: pure client-input error was re-labelled a store outage that PAUSED a room.
+    dedupe_key: Mapped[str] = mapped_column(String(MAX_DEDUPE_KEY_CHARS), nullable=False)
+    #: **``Addressing.to_principal_ids`` — AD-28 item (1), the whole point of the delta.** Before
+    #: this column a DIRECTED post had nowhere durable to record who it was for: the recipients
+    #: were accepted by the service and then lost. JSON-encoded list of principal ids (ids, not
+    #: content). NULLABLE with NULL ≡ ``()`` ≡ BROADCAST — which is a real domain value, not a
+    #: missing-data sentinel (spec:78: "empty = broadcast"), so nullability costs no information
+    #: here. It also has to be nullable: the thirteen-column appender above cannot write it, and a
+    #: TEXT column cannot carry a literal DEFAULT on MySQL.
+    to_principal_ids: Mapped[str | None] = mapped_column(Text)
+    #: ``Addressing.reply_to_seq`` — the thread pointer, and one of spec:77's four dedupe inputs.
+    #: NULL = not a reply.
+    reply_to_seq: Mapped[int | None] = mapped_column(BigInteger)
+    #: The one column in this schema that holds message text, and legitimately so (CANONICAL §3.1
+    #: binds the bus, not the store). ``MEDIUMTEXT`` on MySQL because :data:`MAX_BODY_CHARS` is
+    #: 32 000 CHARACTERS and MySQL's ``TEXT`` holds 65 535 BYTES — a body of multi-byte text would
+    #: be silently truncated at the ~21 800-character mark on that dialect.
+    body: Mapped[str] = mapped_column(
+        Text().with_variant(_MYSQL_MEDIUMTEXT, "mysql"), nullable=False
+    )
+    #: When the author posted it (``RoomMessage.posted_at``). NOT ``created_at``: ``room_session``
+    #: one table up already means "when the room was opened" by that name — see the name-drift
+    #: ruling in ``mu_contracts/domain/model/room.py``'s module docstring.
+    posted_at: Mapped[datetime] = _dt()
+    #: When the LOG committed it. Distinct from ``posted_at`` on purpose: the gap between them is
+    #: the append latency, and only the second one is monotonic with ``seq``.
+    appended_at: Mapped[datetime] = _dt()
+
+    __table_args__ = (
+        PrimaryKeyConstraint("org_id", "workspace_id", "room_id", "seq", name="pk_room_log"),
+        # Named LITERALLY because `ON CONFLICT ON CONSTRAINT ux_roomlog_dedupe` names it: a
+        # rename here turns the idempotent-replay branch into an unhandled IntegrityError on the
+        # first client retry in production. The backfill read (`after_seq` + ORDER BY seq) is
+        # served by the primary key's leading columns and needs no index of its own.
+        UniqueConstraint(
+            "org_id", "workspace_id", "room_id", "dedupe_key", name="ux_roomlog_dedupe"
+        ),
+        # The surrogate id is an IDENTITY, so it is unique per room where it is present at all.
+        # Multi-NULL is permitted by every dialect here, which is what lets the pre-column rows
+        # above coexist with written ones.
+        UniqueConstraint("org_id", "workspace_id", "room_id", "id", name="ux_roomlog_message_id"),
     )
 
 

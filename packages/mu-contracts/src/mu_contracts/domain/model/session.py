@@ -33,7 +33,12 @@ here is synchronous, touches no store and no clock it was not handed.
    ``mu_contracts/domain/errors.py``** (spec:379). It is here only because the lane that built it
    did not own ``errors.py``; the classes are otherwise exactly §11's. Moving them there and
    re-exporting from here is a mechanical follow-up — see ``ROOM_ERRORS_BELONG_IN`` below.
-3. **``FloorPolicyKind`` ships all three members and only ``FREE_FOR_ALL`` has a strategy.**
+3. **``Addressing`` and ``canonical_dedupe_key`` moved NEXT DOOR to ``domain/model/room.py``**
+   (AD-28 item 1). ``RoomMessage`` gained the ``addressing`` field spec:76 always specified, and
+   this module already imports ``RoomMessage`` — so the value object had to move to the side of the
+   edge that has no cycle. Both names are re-exported here and stay in ``__all__``: every existing
+   import (``mu_server.ports`` takes ``Addressing`` from this module) is unchanged.
+4. **``FloorPolicyKind`` ships all three members and only ``FREE_FOR_ALL`` has a strategy.**
    ROUND_ROBIN and MODERATED are RESERVED wire vocabulary (spec:69, ``MU-SERVER-BUILD-PLAN.md:29``
    "the enum keeps the other members RESERVED"): selecting one raises at resolve time. There is no
    stub and no ``NotImplementedError`` body — absence is the house rule.
@@ -41,7 +46,6 @@ here is synchronous, touches no store and no clock it was not handed.
 
 from __future__ import annotations
 
-import hashlib
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Final, Protocol
@@ -50,7 +54,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mu_contracts.domain.errors import MemoryUniverseError, SettingsValidationError
 from mu_contracts.domain.model.memory import Namespace, Visibility
-from mu_contracts.domain.model.room import ParticipantKind, RoomMessage
+from mu_contracts.domain.model.room import (
+    Addressing,
+    ParticipantKind,
+    RoomMessage,
+    canonical_dedupe_key,
+)
 
 __all__ = [
     "ROOM_ERRORS_BELONG_IN",
@@ -272,14 +281,17 @@ class RoomVersionConflictError(RoomError):
 class AddressingNotStorableError(RoomError):
     """A caller supplied :class:`Addressing` this build cannot persist. HTTP 422.
 
-    ⚠ **This error exists because of a REPORTED gap, not a design choice.** spec:76 lists
-    ``addressing: Addressing`` as a ``RoomMessage`` field; the shipped ``RoomMessage``
-    (``mu_contracts/domain/model/room.py:36-51``) has no such field and lives in a module this lane
-    does not own, so a directed message's ``to_principal_ids`` has nowhere durable to go. Accepting
-    one and dropping it would tell the caller a message was delivered to a named recipient when
+    ⚠ **This error exists because of a REPORTED gap, not a design choice — and the gap is now
+    HALF closed.** spec:76 lists ``addressing: Addressing`` as a ``RoomMessage`` field. The field
+    (and the ``room_log.to_principal_ids``/``reply_to_seq`` columns behind it) landed with AD-28
+    item (1) / revision ``b3d47c9a1e02``, so the CONTRACT and the STORE can both hold recipients
+    now. What still cannot write them is the shipped appender: ``PostgresRoomLog._APPEND_SQL`` is a
+    fixed thirteen-column INSERT and ``_ROW_COLUMNS`` selects eight, neither mentioning the new
+    columns, and both live in ``mu-server``. Until that adapter widens, refusing remains correct:
+    accepting a directed post would tell the caller a message reached a named recipient when
     nothing recorded who that was — and spec:280 makes the roster/addressing surface the thing an
-    agent principal is stamped from. So it is REFUSED until the field lands, rather than accepted
-    and lost. ``reply_to_seq`` IS honoured: it is part of spec:77's dedupe key, which is durable.
+    agent principal is stamped from. ``reply_to_seq`` IS honoured: it is part of spec:77's dedupe
+    key, which is durable.
     """
 
 
@@ -295,44 +307,12 @@ class StaleRoomOwnerError(RoomError):
 # ==============================================================================================
 # ROOMS §2.2 — value objects (spec:74-82)
 # ==============================================================================================
-class Addressing(BaseModel):
-    """Who a message is for (spec:78). Empty ``to_principal_ids`` = broadcast.
-
-    Addressing is NOT authorization: everyone in the room reads every message (one room = one
-    shared partition, spec:268). It selects who is DISPATCHED to, and ``reply_to_seq`` threads the
-    conversation — which is why it is part of the dedupe key (spec:77): the same sentence said
-    twice in reply to two different turns is two different messages."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    to_principal_ids: tuple[str, ...] = ()
-    reply_to_seq: int | None = Field(default=None, ge=0)
-
-
-def canonical_dedupe_key(
-    *,
-    author_principal_id: str,
-    room_id: str,
-    content_hash: str,
-    reply_to_seq: int | None,
-) -> str:
-    """spec:77 — ``author + room + content_hash + reply_to``, as a stable hex digest.
-
-    A FUNCTION rather than ``RoomMessage.canonical_dedupe_key()`` (which is where spec:77 puts it)
-    because ``RoomMessage`` ships in ``domain/model/room.py``, which this lane does not own — see
-    the module docstring. The inputs are exactly §11's four, the separator is a character the
-    namespace validator already forbids inside any component, and the digest is content-free: it
-    is built from a CONTENT HASH, never from the body.
-    """
-    material = "\x1f".join(
-        (
-            author_principal_id,
-            room_id,
-            content_hash,
-            "" if reply_to_seq is None else str(reply_to_seq),
-        )
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+# ``Addressing`` and ``canonical_dedupe_key`` are DECLARED in ``domain/model/room.py`` and
+# RE-EXPORTED here (they stay in this module's ``__all__``, so every existing import path is
+# byte-identical). spec:78 lists ``Addressing`` under this module's header, but ``RoomMessage``
+# now carries an ``addressing`` field (AD-28 item 1) and this module already imports
+# ``RoomMessage`` — declaring ``Addressing`` here would be an import cycle. One declaration, one
+# vocabulary; see ``room.py``'s module docstring for the full reasoning.
 
 
 class Participant(BaseModel):

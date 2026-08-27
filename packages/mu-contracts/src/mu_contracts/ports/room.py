@@ -35,11 +35,24 @@ caller in this build, so it lands with the lane that gives it one:
    the substitution rule 5 exists to forbid. ADR 0026 un-collapsed ``org`` from ``workspace``, so
    both segments have to be on the wire.
 2. **``append`` takes ``dedupe_key`` as a keyword instead of reading
-   ``RoomMessage.canonical_dedupe_key()``** (spec:77). ``RoomMessage`` ships in
-   ``mu_contracts/domain/model/room.py:38-51`` WITHOUT ``id``/``addressing``/``dedupe_key``, and the
-   lane that built these ports does not own that file. When those fields land, this keyword
-   collapses back into the message and this note goes with it. The dedupe VALUE is unchanged —
-   :func:`mu_contracts.domain.model.session.canonical_dedupe_key` computes spec:77's four inputs.
+   ``RoomMessage.canonical_dedupe_key()``** (spec:77). ⚠ **The reason this deviation was recorded
+   is GONE; the deviation itself is not, and the difference matters.** ``RoomMessage`` now carries
+   spec:76-77's ``id``, ``addressing`` and ``dedupe_key`` (AD-28 item 1), and
+   :meth:`mu_contracts.domain.model.room.RoomMessage.canonical_dedupe_key` is the method spec:77
+   names. The keyword stays because collapsing it is a signature change to a Protocol whose only
+   implementation and only caller (``PostgresRoomLog.append`` / ``RoomService._append_with_retry``)
+   live in ``mu-server``, which this lane may not edit: dropping the keyword here would red the
+   other repo's type gate without changing a single behaviour. **The collapse is now a mu-server
+   edit, not a mu-core one**, and it has a PRECONDITION: ``message.canonical_dedupe_key()`` raises
+   unless the message carries its :class:`~mu_contracts.domain.model.room.Addressing`, because
+   ``reply_to_seq`` is one of spec:77's four inputs and reading a missing addressing as "not a
+   reply" returns a key that differs from the one the row is stored under. So the collapse is
+   ``message.dedupe_key or message.canonical_dedupe_key()`` **only once ``RoomService.post`` passes
+   ``addressing=`` into the draft** — which is the same one-line mu-server edit AD-28 item (1)
+   still waits on. Until then the caller-supplied keyword, derived from the module-level
+   :func:`mu_contracts.domain.model.room.canonical_dedupe_key` with the reply target it already
+   holds, is the only form that can be right. The dedupe VALUE is identical either way: the
+   function and the method compute the same spec:77 digest from the same four inputs.
 """
 
 from __future__ import annotations
