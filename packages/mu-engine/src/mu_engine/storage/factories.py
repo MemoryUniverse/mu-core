@@ -31,13 +31,15 @@ gate 0 authz-completeness spike before any migration is scheduled). Every one of
 factory, exactly like the graph seam above. Selecting a different vector backend is a
 ``StorageSettings.vector`` / ``BackendChoice`` config change, never a code change.
 
-WEAVIATE FACTORY NOTE: no dedicated ``WeaviateSettings`` subtree exists on the central
-``Settings`` tree yet (``mu_contracts.config.settings`` was out of scope for the task that added
-this backend). ``_build_weaviate`` therefore takes ``host``/``http_port``/``store_io_timeout_s``
-straight from ``cfg`` with local, named defaults — the SAME pattern ``_build_sqlite`` above
-already uses for the one other backend with no Settings subtree of its own. A future change
-should add ``WeaviateSettings`` mirroring ``QdrantSettings``/``PgVectorSettings`` and fold that
-fallback in here, the way every other vector factory already does.
+WEAVIATE FACTORY NOTE (delta CLOSED): ``WeaviateSettings`` now exists on the central ``Settings``
+tree, mirroring ``QdrantSettings``/``PgVectorSettings``, so ``_build_weaviate`` resolves EVERY
+knob it threads — connection (``host``/``http_port``/``http_secure``/``grpc_*``), the I/O budget,
+and the two recall over-fetch tunables (``semantic_overfetch_factor``/
+``semantic_overfetch_max_extra``) — from that subtree, with ``cfg`` (a ``BackendChoice.config``
+override) taking precedence, exactly like every other vector factory. The adapter's module
+constants survive only as its documented CONSTRUCTOR DEFAULTS for a caller that builds it
+directly; nothing reachable through the registry is a fixed literal any more (DEV-STANDARDS
+rule 3).
 
 KV + RELATIONAL ROLES (owner stage 2026-07-27, same mem0-pattern multi-backend requirement):
 ``kv`` now self-registers FOUR backends — ``redis``/``valkey`` (wire-identical, real
@@ -307,28 +309,45 @@ def _build_weaviate(*, dim: int, **cfg: Any) -> WeaviateMtmAdapter:
     every gRPC-backed SDK method hangs against an HTTP-only deployment), so gating connection
     success on a gRPC health probe would refuse a perfectly usable REST-only deployment for a
     capability this adapter does not use. ``grpc_host``/``grpc_port`` are still required
-    constructor args of ``use_async_with_custom`` even though never dialed; defaulted to the same
-    host and Weaviate's own conventional gRPC port so a caller need not think about them.
+    constructor args of ``use_async_with_custom`` even though never dialed; they default to the
+    same host and Weaviate's own conventional gRPC port so a caller need not think about them.
+
+    Every other knob resolves ``cfg`` (a ``BackendChoice.config`` override) FIRST, then the
+    central ``WeaviateSettings`` subtree — connection, the I/O budget, and the two recall
+    over-fetch tunables — so nothing reachable through the registry is a fixed literal
+    (DEV-STANDARDS rule 3; see this module's WEAVIATE FACTORY NOTE).
     """
-    host = cfg["host"]
-    http_port = int(cfg.get("http_port", 8080))
-    http_secure = bool(cfg.get("http_secure", False))
+    wv_settings = get_settings().storage.weaviate
+    host = str(cfg.get("host") or wv_settings.host)
+    http_port = int(cfg.get("http_port", wv_settings.http_port))
+    http_secure = bool(cfg.get("http_secure", wv_settings.http_secure))
     client = weaviate.use_async_with_custom(
         http_host=host,
         http_port=http_port,
         http_secure=http_secure,
-        grpc_host=cfg.get("grpc_host", host),
-        grpc_port=int(cfg.get("grpc_port", 50051)),
-        grpc_secure=bool(cfg.get("grpc_secure", False)),
+        # ``grpc_host=None`` in Settings means "same host as HTTP" — resolved here, not in the
+        # adapter, so the never-dialed gRPC args stay a factory concern (see WeaviateSettings).
+        grpc_host=str(cfg.get("grpc_host") or wv_settings.grpc_host or host),
+        grpc_port=int(cfg.get("grpc_port", wv_settings.grpc_port)),
+        grpc_secure=bool(cfg.get("grpc_secure", wv_settings.grpc_secure)),
         skip_init_checks=True,
     )
-    kwargs: dict[str, Any] = {
-        "http_url": f"{'https' if http_secure else 'http'}://{host}:{http_port}",
-        "dim": dim,
-    }
-    if "store_io_timeout_s" in cfg:
-        kwargs["store_io_timeout_s"] = cfg["store_io_timeout_s"]
-    return WeaviateMtmAdapter(client, **kwargs)
+    return WeaviateMtmAdapter(
+        client,
+        http_url=f"{'https' if http_secure else 'http'}://{host}:{http_port}",
+        dim=dim,
+        store_io_timeout_s=float(cfg.get("store_io_timeout_s", wv_settings.store_io_timeout_s)),
+        # The two WORD-tokenization over-fetch knobs — DI-threaded like every other adapter
+        # tunable (DEV-STANDARDS rule 3). Before this, they were reachable ONLY by constructing
+        # the adapter directly, i.e. fixed constants for every caller coming through the
+        # registry.
+        semantic_overfetch_factor=int(
+            cfg.get("semantic_overfetch_factor", wv_settings.semantic_overfetch_factor)
+        ),
+        semantic_overfetch_max_extra=int(
+            cfg.get("semantic_overfetch_max_extra", wv_settings.semantic_overfetch_max_extra)
+        ),
+    )
 
 
 @STORE_REGISTRY.register("vector", "faiss")

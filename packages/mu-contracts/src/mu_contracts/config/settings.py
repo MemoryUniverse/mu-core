@@ -255,6 +255,47 @@ class FaissSettings(BaseModel):
     path: str | None = "./.mu_data/faiss"
 
 
+class WeaviateSettings(BaseModel):
+    """Weaviate — the SHARED-plane MTM vector backend (ADR 0050: native multi-tenancy, one
+    physical shard per ``tenant_partition_digest``). Mirrors :class:`QdrantSettings` (the
+    reference vector backend) field-for-field on the connection knobs, plus the two over-fetch
+    tunables that are specific to this adapter.
+
+    ``grpc_host``/``grpc_port``/``grpc_secure`` are required constructor arguments of
+    ``weaviate.use_async_with_custom`` even though this adapter never dials gRPC (see
+    ``mu_engine.storage.adapters.weaviate_mtm``'s module docstring: it is REST/GraphQL-only by
+    design, because every gRPC-backed SDK call hangs against an HTTP-only deployment). A
+    ``grpc_host`` of ``None`` means "the same host as HTTP" — the factory's own default.
+
+    ``semantic_overfetch_factor``/``semantic_overfetch_max_extra`` are the
+    :class:`~mu_engine.storage.adapters.weaviate_mtm.WeaviateMtmAdapter` recall tunables: the
+    already-live ``MuMtm8``/``MuMtm16`` classes have ``namespace``/``user_prefix`` stuck at
+    ``Tokenization.WORD`` (IMMUTABLE), where a GraphQL ``Equal`` is a token-SUBSET match, so the
+    adapter over-fetches, re-checks the namespace exactly in Python, then truncates. The factor
+    is multiplicative in the small-``limit`` band; ``max_extra`` is the hard additive cap that
+    keeps a large ``limit`` from turning one recall into a full-shard scan. Both are DI-threaded
+    into the adapter by ``mu_engine.storage.factories._build_weaviate`` — never read from a
+    global by the adapter itself (DEV-STANDARDS rule 3); the adapter's module constants remain
+    only as its documented CONSTRUCTOR DEFAULTS for a caller that builds it directly.
+    """
+
+    host: str = "localhost"
+    http_port: int = 8080
+    http_secure: bool = False
+    grpc_host: str | None = None  # None -> reuse ``host`` (never dialed; see the docstring)
+    grpc_port: int = 50051
+    grpc_secure: bool = False
+    semantic_overfetch_factor: int = 3  # <=1 degrades to no over-fetch (_overfetch_limit)
+    semantic_overfetch_max_extra: int = 512  # absolute cap on the extra rows one recall fetches
+    # Per-attempt I/O budget for WeaviateMtmAdapter's retry_io wrapper + its httpx client —
+    # DI-threaded by mu_engine.storage.factories._build_weaviate.
+    store_io_timeout_s: float = 10.0
+
+    @property
+    def url(self) -> str:
+        return f"{'https' if self.http_secure else 'http'}://{self.host}:{self.http_port}"
+
+
 class ArtifactFsSettings(BaseModel):
     """Artifact / ``ContextRepository`` role — the LOCAL-plane filesystem content store
     (``mu_engine.storage.adapters.content_fs.FsContextRepositoryAdapter``; software-arch spec
@@ -269,10 +310,11 @@ class ArtifactFsSettings(BaseModel):
 
 class StorageSettings(BaseModel):
     """The decided stores, each behind a pluggable port (DEV-STANDARDS rule 5). ``vector``
-    (Qdrant) is the SHARED-plane reference; ``pgvector``/``chroma``/``faiss`` are the additional
-    MTM backends the ``STORE_REGISTRY`` self-registers under the SAME ``vector`` role
+    (Qdrant) is the SHARED-plane reference; ``pgvector``/``chroma``/``faiss``/``weaviate`` are the
+    additional MTM backends the ``STORE_REGISTRY`` self-registers under the SAME ``vector`` role
     (``storage-pluggable-spec.md §2.3`` — mem0's ``VectorStoreFactory`` pattern, one config value
-    picks which binds; ``faiss`` is PRIVATE-only, D3)."""
+    picks which binds; ``faiss`` is PRIVATE-only, D3; ``weaviate`` is ADR 0050's natively
+    multi-tenant SHARED-plane backend)."""
 
     postgres: PostgresSettings = Field(default_factory=PostgresSettings)
     mysql: MySQLSettings = Field(default_factory=MySQLSettings)
@@ -285,6 +327,7 @@ class StorageSettings(BaseModel):
     pgvector: PgVectorSettings = Field(default_factory=PgVectorSettings)
     chroma: ChromaSettings = Field(default_factory=ChromaSettings)
     faiss: FaissSettings = Field(default_factory=FaissSettings)
+    weaviate: WeaviateSettings = Field(default_factory=WeaviateSettings)
     artifact: ArtifactFsSettings = Field(default_factory=ArtifactFsSettings)
 
 

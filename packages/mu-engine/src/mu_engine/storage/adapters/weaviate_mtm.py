@@ -91,14 +91,12 @@ from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["WeaviateMtmAdapter"]
 
-# Constructor DEFAULT only (DEV-STANDARDS rule 3) — see qdrant_mtm.py's identical note. There is
-# no dedicated ``WeaviateSettings`` subtree on the central ``Settings`` tree yet (out of THIS
-# task's owned-file set — ``mu_contracts.config.settings`` is not one of the five files this ADR
-# assigned); the ``STORE_REGISTRY`` factory (``factories._build_weaviate``) therefore threads
-# ``store_io_timeout_s`` straight from ``cfg`` when supplied, falling back to this constant
-# exactly like ``_build_sqlite`` already does for the one other backend with no Settings subtree
-# of its own. Recorded as a delta: a future change should add ``WeaviateSettings`` mirroring
-# ``QdrantSettings``/``PgVectorSettings`` so this stops being the exception.
+# Constructor DEFAULT only (DEV-STANDARDS rule 3) — see qdrant_mtm.py's identical note. The
+# central ``WeaviateSettings.store_io_timeout_s`` (``mu_contracts.config.settings``, mirroring
+# ``QdrantSettings``) is the value that actually governs every adapter the ``STORE_REGISTRY``
+# builds: ``factories._build_weaviate`` DI-threads it on every construction. This constant is
+# what a caller who instantiates ``WeaviateMtmAdapter`` DIRECTLY (tests, a one-off script) gets,
+# nothing more — the adapter still never reads a global itself.
 _DEFAULT_STORE_IO_TIMEOUT_S = 10.0
 
 # The one named-vector space every class this adapter creates uses (ADR 0050: ``target_vector``
@@ -112,9 +110,11 @@ _SCROLL_PAGE_SIZE = 256
 
 # ---------------------------------------------------------------- recall over-fetch (DEV-STANDARDS
 # rule 3: named, documented CONSTRUCTOR DEFAULTS threaded by DI — the SAME seam and the same
-# rationale as ``_DEFAULT_STORE_IO_TIMEOUT_S`` above, because there is still no ``WeaviateSettings``
-# subtree on the central ``Settings`` tree to hang them off; ``factories._build_weaviate`` passes
-# whatever the caller's ``cfg`` supplies and these are the fallbacks. Recorded as the same delta.)
+# rationale as ``_DEFAULT_STORE_IO_TIMEOUT_S`` above. The values that govern a registry-built
+# adapter live on the central ``WeaviateSettings`` subtree
+# (``semantic_overfetch_factor``/``semantic_overfetch_max_extra``), which
+# ``factories._build_weaviate`` DI-threads on every construction — ``cfg`` first, that subtree
+# second. These constants remain the documented defaults for a DIRECT construction only.)
 #
 # WHY ``semantic`` must ask Weaviate for MORE rows than the caller's ``limit``: the GraphQL
 # ``where`` clause is a PRE-filter only, never a correctness guarantee, on the already-live
