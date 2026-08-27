@@ -72,6 +72,7 @@ from mu_contracts.domain.model.memory import State
 from mu_contracts.domain.model.memory import Tier as ContractTier
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
 from mu_contracts.ports.time import Clock
+from mu_engine.lifecycle.policy import LifecyclePolicy
 from mu_engine.lifecycle.salience import SalienceStrategy
 from mu_engine.lifecycle.settings import LifecycleSettings
 from mu_engine.pipelines.distill import EventPublisher
@@ -97,6 +98,14 @@ _log = structlog.get_logger("mu_engine.lifecycle.demotion")
 _OP = "lifecycle.demote"
 _LATENCY_METRIC = "mu_operation_latency_seconds"
 _ERROR_METRIC = "mu_operation_errors_total"
+
+
+#: The ``score`` stamped on a pin-skipped outcome. A pinned item is skipped BEFORE the salience
+#: math runs (memory-health §6.2 line 291: "First line, before any retention math"), so there is
+#: no score to report; ``-1.0`` is out of ``S(m)``'s ``[0, 1]`` range and therefore cannot be
+#: mistaken for a real one. Never a hardcoded THRESHOLD (DEV-STANDARDS rule 3 governs decision
+#: constants) — it is a sentinel for "not evaluated".
+_PINNED_UNSCORED = -1.0
 
 
 class DemotionOutcome(BaseModel):
@@ -153,6 +162,9 @@ class DemotionService:
         self._mtm_remove = mtm_remove
         self._settings = settings or LifecycleSettings()
         self._salience = salience or SalienceStrategy(self._settings.salience)
+        # The central FSM/pin guard (memory-health §6.1). Stateless and pure, so it is
+        # constructed rather than injected — there is exactly one policy, not a swappable one.
+        self._policy = LifecyclePolicy()
         self._clock: Clock = clock or SystemClock()
         self._bus = bus
         # Central observability (DEV-STANDARDS rule 4): span + latency/error metrics + content-
@@ -207,6 +219,20 @@ class DemotionService:
         for item in candidates:
             if item.state != MemoryState.ACTIVE:
                 continue  # only a live MTM item is a demotion candidate (MMA _run_demotion:1157)
+            # memory-health §6.2, FIRST — before any retention/salience math: "pin overrides the
+            # forgetting curve entirely". Asked of the CENTRAL guard (LifecyclePolicy), never
+            # re-decided here, so no other demotion caller can bypass it. An automatic sweep
+            # treats the refusal as "skip, keep" and never escalates it (spec §9 line 381).
+            if not self._policy.permits_tier_demotion(item):
+                outcomes.append(
+                    DemotionOutcome(
+                        memory_id=item.id,
+                        demoted=False,
+                        score=_PINNED_UNSCORED,
+                        reason="pinned_lifecycle_override",
+                    )
+                )
+                continue
             score = self._salience.score(item, clock=self._clock)
             if score < self._settings.demote_mtm:
                 outcome = await self._demote_one(ns, item, score)

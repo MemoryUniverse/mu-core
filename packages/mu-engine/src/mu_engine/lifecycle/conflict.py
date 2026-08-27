@@ -69,11 +69,13 @@ from mu_contracts.domain.events import DegradedModeEntered, DegradeReason
 from mu_contracts.domain.model.conflict import ConflictRecord, ConflictState
 from mu_contracts.ports.governance import ConflictRecordRepository
 from mu_contracts.ports.time import Clock
+from mu_engine.lifecycle.policy import LifecyclePolicy
 from mu_engine.lifecycle.settings import LifecycleSettings
+from mu_engine.pipelines.distill import asserted_later
 from mu_engine.platform.clock import SystemClock
 from mu_engine.providers._contracts import Completion, Message, MessageRole
 from mu_engine.providers.catalog import Task
-from mu_engine.storage.domain.memory import MemoryItem
+from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace
 
 __all__ = [
@@ -233,6 +235,11 @@ class AdjudicationVerdict(BaseModel):
     kind: AdjudicationKind
     apply: bool
     used_llm: bool
+    #: True iff the automatic winner-picker was REFUSED because the item it would have made the
+    #: loser is ``pinned`` (memory-health §6.4; CANONICAL §7.17 item 4a(b)). ``kind`` is forced to
+    #: ``PENDING`` and ``apply`` to ``False`` in that case, so the pinned item stays ACTIVE and
+    #: the conflict is PARKED rather than lost.
+    pin_blocked: bool = False
     confidence: float = Field(ge=0.0, le=1.0)
     reason: str
     model_id: str | None = None
@@ -383,6 +390,9 @@ class ConflictAdjudicator:
         self._clock: Clock = clock or SystemClock()
         self._bus = bus
         self._conflict_records = conflict_records
+        # The central FSM/pin guard (memory-health §6.1). Consulted — never re-decided here — so
+        # the "a pinned item is never the auto-loser" rule has exactly one owner.
+        self._lifecycle = LifecyclePolicy()
 
     def new_budget(self) -> AdjudicationBudget:
         """One fresh budget per sweep tick — ``DistillPipeline._distill`` calls this ONCE per
@@ -451,6 +461,15 @@ class ConflictAdjudicator:
                     winner, candidate, heuristic_contradicts
                 )
 
+        # memory-health §6.4 — the pinned side is NEVER the automatic loser (CANONICAL §7.17
+        # item 4a(b)). Applied AFTER the verdict is formed, deliberately: the adjudicator still
+        # records what it thought, so the conflict is parked with an honest proposed winner
+        # instead of being silently dropped.
+        pin_blocked = self._pin_blocks_loser(winner, candidate, kind)
+        if pin_blocked:
+            kind = AdjudicationKind.PENDING
+            reason = "pin_blocked_pinned_item_is_never_the_auto_loser"
+
         apply = self._decide_apply(kind)
         conflict_record: ConflictRecord | None = None
         if not apply:
@@ -461,6 +480,7 @@ class ConflictAdjudicator:
                 kind=kind,
                 confidence=confidence,
                 used_llm=used_llm,
+                pin_blocked=pin_blocked,
             )
         return AdjudicationVerdict(
             kind=kind,
@@ -470,7 +490,35 @@ class ConflictAdjudicator:
             reason=reason,
             model_id=model_id,
             conflict_record=conflict_record,
+            pin_blocked=pin_blocked,
         )
+
+    def _pin_blocks_loser(
+        self, winner: MemoryItem, candidate: MemoryItem, kind: AdjudicationKind
+    ) -> bool:
+        """Would applying ``kind`` drive a PINNED item out of ``ACTIVE`` automatically?
+
+        ``COEXIST``/``PENDING`` assert no loser at all, so there is nothing to block.
+
+        **The loser is NOT read off ``kind``.** ``DistillPipeline._resolve`` — the only caller,
+        and the only writer of ``state=SUPERSEDED`` in the engine — deliberately discards this
+        verdict's SELF_EXPIRE-vs-SUPERSEDE polarity and re-derives the direction from ASSERTION
+        recency (``distill.asserted_later``; the BUG1 fix, because the small adjudicator model
+        inverts the EXISTING-vs-NEW framing often enough to have been live-reproduced). Keying
+        the pin check on ``kind`` would therefore consult the pin of an item that is not the one
+        about to be written, and a pinned memory would be superseded whenever the two disagreed.
+        The SAME predicate the writer uses is used here, so the two can never diverge.
+
+        The pin answer itself is the CENTRAL guard's, not this class's: ``LifecyclePolicy.permits``
+        owns the "pinned ⇒ no automatic adjudicated exit" rule, so an explicit, user-driven
+        supersede of a pinned item stays legal exactly as CANONICAL §7.10 requires. This check is
+        a BACK-STOP that makes the parked ``ConflictRecord`` honest (``pin_blocked``, which the
+        health view projects); the load-bearing refusal is the writer's own, at the write site.
+        """
+        if kind not in (AdjudicationKind.SUPERSEDE, AdjudicationKind.SELF_EXPIRE):
+            return False
+        loser = winner if asserted_later(candidate, winner) else candidate
+        return not self._lifecycle.permits(loser, MemoryState.SUPERSEDED)
 
     def _decide_apply(self, kind: AdjudicationKind) -> bool:
         if kind is AdjudicationKind.PENDING:
@@ -513,6 +561,7 @@ class ConflictAdjudicator:
         kind: AdjudicationKind,
         confidence: float,
         used_llm: bool,
+        pin_blocked: bool = False,
     ) -> ConflictRecord:
         proposed_winner_id = (
             winner.id
@@ -532,6 +581,7 @@ class ConflictAdjudicator:
             proposed_winner_id=proposed_winner_id,
             state=ConflictState.MANUAL_PENDING,
             detected_at=self._clock.now(),
+            pin_blocked=pin_blocked,
         )
         if self._conflict_records is not None:
             try:

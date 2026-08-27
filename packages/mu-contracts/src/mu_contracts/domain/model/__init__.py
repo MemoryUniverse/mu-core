@@ -57,6 +57,12 @@ from mu_contracts.domain.model.governance import (
     TransferClass,
     TransferState,
 )
+from mu_contracts.domain.model.health import (
+    MemoryHealthEntry,
+    MemoryHealthFlag,
+    MemoryHealthSummary,
+    MemoryHealthView,
+)
 from mu_contracts.domain.model.lifecycle import (
     JobHandle,
     JobResult,
@@ -90,6 +96,7 @@ from mu_contracts.domain.model.notification import (
     QuietHours,
 )
 from mu_contracts.domain.model.persona import PersonaProfile, PersonaSlot, SlotValue
+from mu_contracts.domain.model.pin import PinRequest, PinResult
 from mu_contracts.domain.model.recall import (
     CallerIdentitySet,
     RecallChannel,
@@ -154,6 +161,10 @@ __all__ = [
     "LifecycleJob",
     "LifecycleJobKind",
     "MembershipStatus",
+    "MemoryHealthEntry",
+    "MemoryHealthFlag",
+    "MemoryHealthSummary",
+    "MemoryHealthView",
     "MemoryItem",
     "MemoryKind",
     "MessageKind",
@@ -170,6 +181,8 @@ __all__ = [
     "Permission",
     "PersonaProfile",
     "PersonaSlot",
+    "PinRequest",
+    "PinResult",
     "Polarity",
     "Principal",
     "PrincipalKind",

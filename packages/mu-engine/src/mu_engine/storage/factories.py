@@ -21,13 +21,25 @@ vendor client lives ONLY inside the adapter + this factory. Selecting the new ba
 a config change (``StorageSettings.graph.backend = "neo4j"``), never a code change.
 
 VECTOR ROLE (owner override 2026-07-27: "genuinely MULTI-backend NOW, mem0 pattern"): the
-``vector`` role now self-registers FOUR backends the exact same way — ``qdrant`` (reference,
+``vector`` role now self-registers FIVE backends the exact same way — ``qdrant`` (reference,
 SHARED-safe), ``pgvector`` (SHARED-safe, SQL WHERE + HNSW), ``chroma`` (embedded floor, partial
-filter — widened, never incomplete) and ``faiss`` (brute-force, PRIVATE-plane ONLY — the registry's
-``_BRUTE_FORCE_VECTOR_BACKENDS`` gate refuses it on SHARED at build time). Every one of them
-implements ``MtmTierRepository`` and none of them is imported by the engine directly — only through
-this factory, exactly like the graph seam above. Selecting a different vector backend is a
+filter — widened, never incomplete), ``faiss`` (brute-force, PRIVATE-plane ONLY — the registry's
+``_BRUTE_FORCE_VECTOR_BACKENDS`` gate refuses it on SHARED at build time), and ``weaviate`` (ADR
+0050: native multi-tenancy, the SHARED-plane MTM backend — filterable, gated on that ADR's own
+gate 0 authz-completeness spike before any migration is scheduled). Every one of them implements
+``MtmTierRepository`` and none of them is imported by the engine directly — only through this
+factory, exactly like the graph seam above. Selecting a different vector backend is a
 ``StorageSettings.vector`` / ``BackendChoice`` config change, never a code change.
+
+WEAVIATE FACTORY NOTE (delta CLOSED): ``WeaviateSettings`` now exists on the central ``Settings``
+tree, mirroring ``QdrantSettings``/``PgVectorSettings``, so ``_build_weaviate`` resolves EVERY
+knob it threads — connection (``host``/``http_port``/``http_secure``/``grpc_*``), the I/O budget,
+and the two recall over-fetch tunables (``semantic_overfetch_factor``/
+``semantic_overfetch_max_extra``) — from that subtree, with ``cfg`` (a ``BackendChoice.config``
+override) taking precedence, exactly like every other vector factory. The adapter's module
+constants survive only as its documented CONSTRUCTOR DEFAULTS for a caller that builds it
+directly; nothing reachable through the registry is a fixed literal any more (DEV-STANDARDS
+rule 3).
 
 KV + RELATIONAL ROLES (owner stage 2026-07-27, same mem0-pattern multi-backend requirement):
 ``kv`` now self-registers FOUR backends — ``redis``/``valkey`` (wire-identical, real
@@ -54,6 +66,7 @@ from __future__ import annotations
 from typing import Any
 
 import aiomcache
+import weaviate
 from falkordb.asyncio import FalkorDB
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
@@ -72,6 +85,7 @@ from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
 from mu_engine.storage.adapters.relational_control import RelationalControlPlaneAdapter
 from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
+from mu_engine.storage.adapters.weaviate_mtm import WeaviateMtmAdapter
 from mu_engine.storage.registry import StoreRegistry
 
 __all__ = ["STORE_REGISTRY"]
@@ -284,6 +298,56 @@ def _build_artifact_fs(**cfg: Any) -> FsContextRepositoryAdapter:
     artifact_settings = get_settings().storage.artifact
     content_root = cfg.get("content_root") or artifact_settings.content_root
     return FsContextRepositoryAdapter(content_root=str(content_root))
+
+
+@STORE_REGISTRY.register("vector", "weaviate")
+def _build_weaviate(*, dim: int, **cfg: Any) -> WeaviateMtmAdapter:
+    """ADR 0050: Weaviate, native multi-tenancy, the SHARED-plane MTM vector backend.
+
+    ``skip_init_checks=True`` is UNCONDITIONAL, not caller-configurable — this adapter never
+    issues a single gRPC call (see ``weaviate_mtm.py``'s module docstring for why: verified live,
+    every gRPC-backed SDK method hangs against an HTTP-only deployment), so gating connection
+    success on a gRPC health probe would refuse a perfectly usable REST-only deployment for a
+    capability this adapter does not use. ``grpc_host``/``grpc_port`` are still required
+    constructor args of ``use_async_with_custom`` even though never dialed; they default to the
+    same host and Weaviate's own conventional gRPC port so a caller need not think about them.
+
+    Every other knob resolves ``cfg`` (a ``BackendChoice.config`` override) FIRST, then the
+    central ``WeaviateSettings`` subtree — connection, the I/O budget, and the two recall
+    over-fetch tunables — so nothing reachable through the registry is a fixed literal
+    (DEV-STANDARDS rule 3; see this module's WEAVIATE FACTORY NOTE).
+    """
+    wv_settings = get_settings().storage.weaviate
+    host = str(cfg.get("host") or wv_settings.host)
+    http_port = int(cfg.get("http_port", wv_settings.http_port))
+    http_secure = bool(cfg.get("http_secure", wv_settings.http_secure))
+    client = weaviate.use_async_with_custom(
+        http_host=host,
+        http_port=http_port,
+        http_secure=http_secure,
+        # ``grpc_host=None`` in Settings means "same host as HTTP" — resolved here, not in the
+        # adapter, so the never-dialed gRPC args stay a factory concern (see WeaviateSettings).
+        grpc_host=str(cfg.get("grpc_host") or wv_settings.grpc_host or host),
+        grpc_port=int(cfg.get("grpc_port", wv_settings.grpc_port)),
+        grpc_secure=bool(cfg.get("grpc_secure", wv_settings.grpc_secure)),
+        skip_init_checks=True,
+    )
+    return WeaviateMtmAdapter(
+        client,
+        http_url=f"{'https' if http_secure else 'http'}://{host}:{http_port}",
+        dim=dim,
+        store_io_timeout_s=float(cfg.get("store_io_timeout_s", wv_settings.store_io_timeout_s)),
+        # The two WORD-tokenization over-fetch knobs — DI-threaded like every other adapter
+        # tunable (DEV-STANDARDS rule 3). Before this, they were reachable ONLY by constructing
+        # the adapter directly, i.e. fixed constants for every caller coming through the
+        # registry.
+        semantic_overfetch_factor=int(
+            cfg.get("semantic_overfetch_factor", wv_settings.semantic_overfetch_factor)
+        ),
+        semantic_overfetch_max_extra=int(
+            cfg.get("semantic_overfetch_max_extra", wv_settings.semantic_overfetch_max_extra)
+        ),
+    )
 
 
 @STORE_REGISTRY.register("vector", "faiss")

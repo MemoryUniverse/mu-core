@@ -11,6 +11,7 @@ from mu_contracts.ports.device import ClientMetadata, DeviceRegistryPort
 from mu_contracts.ports.device_sync import PrivateSyncLogPort
 from mu_contracts.ports.governance import ConflictRecordRepository, GrantRepository
 from mu_contracts.ports.health import HealthStatus
+from mu_contracts.ports.health_assessor import HealthAssessor
 from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
 from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
 from mu_contracts.ports.memory import (
@@ -60,6 +61,7 @@ __all__ = [
     "GrantRepository",
     "GraphNodeRow",
     "Handler",
+    "HealthAssessor",
     "HealthStatus",
     "LLMProviderPort",
     "LifecycleLeasePort",

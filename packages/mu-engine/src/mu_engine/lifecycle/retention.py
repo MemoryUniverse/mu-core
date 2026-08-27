@@ -78,6 +78,7 @@ from mu_contracts.domain.events import MemoryGarbageCollected
 from mu_contracts.domain.model.memory import State as ContractState
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
 from mu_contracts.ports.time import Clock
+from mu_engine.lifecycle.policy import LifecyclePolicy
 from mu_engine.lifecycle.settings import LifecycleSettings
 from mu_engine.pipelines.distill import EventPublisher
 from mu_engine.platform.clock import SystemClock
@@ -187,6 +188,9 @@ class RetentionService:
         self._settings = settings or LifecycleSettings()
         self._clock: Clock = clock or SystemClock()
         self._bus = bus
+        # The central FSM/pin guard (memory-health §6.1). Stateless + pure, so constructed here:
+        # there is exactly one lifecycle policy, not a swappable strategy.
+        self._policy = LifecyclePolicy()
         # Central observability (DEV-STANDARDS rule 4): span + latency/error metrics + content-
         # free audit, same as DistillPipeline/DemotionService. Sinks default no-op so the
         # service is testable unwired.
@@ -252,6 +256,15 @@ class RetentionService:
             if item.retention_class is RetentionClass.EPHEMERAL and item.invalid_at is not None:
                 grace = timedelta(seconds=retention.ephemeral_grace_s)
                 if now >= item.invalid_at + grace:
+                    # CENTRAL GUARD (memory-health §6.1/§6.3). ACTIVE -> EXPIRED is a
+                    # retention-class exit, and a pinned item may never take one — CANONICAL §7.10
+                    # "never garbage-collected regardless". Asked here, at the flip itself, and
+                    # NOT gated on `respect_pins`: a settings flip must not be able to re-enable
+                    # an exit CANONICAL calls unconditional. The `respect_pins` pre-filter above
+                    # stays as the cheap skip; this is the authority. An automatic sweep treats
+                    # the refusal as "skip, keep", never an error escalation (spec §9 line 381).
+                    if not self._policy.permits_retention_exit(item, MemoryState.EXPIRED):
+                        continue
                     expired = item.model_copy(deep=True)
                     expired.state = MemoryState.EXPIRED
                     expired.updated_at = now
@@ -300,6 +313,20 @@ class RetentionService:
             head_state = await self._ltm_retention.chain_head_state(ns, item.id)
             if head_state is MemoryState.ACTIVE:
                 continue  # chain head still alive (spec §9 mermaid) — keep the whole history
+            # CENTRAL GUARD (memory-health §6.3; CANONICAL §7.10 "and not item.pinned").
+            # Deliberately NOT gated on `retention.respect_pins`: that knob is a cheap pre-filter
+            # (above), while GC-ineligibility for a pinned item is unconditional in CANONICAL, so
+            # the authoritative refusal lives here where no settings value can lift it. Any other
+            # caller reaching `gc_delete` without asking this guard is the defect §6 warns about.
+            #
+            # `permits_gc`, NOT `permits(item, DELETED)`: the item's carried `state` is NOT
+            # trustworthy here. `facts_by_state` rebuilds each row from the node's `memory_json`
+            # blob while `expire`/`invalidate` flip only the node's `state` PROPERTY, so a dead
+            # row still reads `state=ACTIVE` — and an edge-checking guard would raise
+            # `IllegalTransitionError` (ACTIVE -> DELETED is not a legal edge) and abort the whole
+            # sweep. See `LifecyclePolicy.assert_retention_exit`; staleness reported separately.
+            if not self._policy.permits_retention_exit(item, MemoryState.DELETED):
+                continue  # skip, keep — never an error escalation (spec §9 line 381)
             # Mapped BEFORE the irreversible delete, deliberately. ``_to_contract_state`` is
             # exhaustive and raises ``KeyError`` on an unmapped member rather than guessing (see
             # ``_STATE_MAP``). Computing it after ``gc_delete`` would make that loud failure

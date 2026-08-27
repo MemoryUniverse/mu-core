@@ -19,6 +19,7 @@ Artifact/Provenance-links group is FIRST-CLASS (CANONICAL §7.1, NOT metadata ov
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from enum import StrEnum
 from typing import ClassVar
@@ -207,6 +208,52 @@ class SalienceComponents(BaseModel):
     strength: float  # Ebbinghaus memory-strength S (for demotion)
     scored_at: datetime
 
+    def strength_retention(self, now: datetime, *, min_strength: float) -> float:
+        """R(Δt) = exp(-Δt_days / max(strength, min_strength)) — the Ebbinghaus retention the
+        demotion gate and the health lens BOTH read (memory-health §4, line 232: *"the one place
+        the curve lives"*). Pure, ``Clock``-supplied ``now``, no I/O.
+
+        **PORT-FROM (CODE-ADOPTION-METHODOLOGY step 3), verified line-by-line against the actual
+        vendored source** ``/home/user/D/abstract_project/mma/other_repos/MemoryBank/memory_bank/
+        memory_retrieval/forget_memory.py`` (MIT, © 2023 Wanjun Zhong; paper arXiv:2305.10250;
+        upstream ``github.com/zhongwanjun/MemoryBank-SiliconFriend``):
+
+        * ``forget_memory.py:20`` ``def forgetting_curve(t, S)`` — the primitive.
+        * ``forget_memory.py:30-34`` — its docstring: *"The higher the memory strength, the
+          slower the rate of forgetting."*
+        * ``forget_memory.py:36`` — the literal body ``return math.exp(-t / 5*S)``.
+        * ``forget_memory.py:106-107`` — the defaults ``memory_strength = dialog.get(
+          'memory_strength', 1)`` / ``last_recall_date = dialog.get('last_recall_date', date)``.
+        * ``forget_memory.py:115-119`` — the decision: ``days_diff`` → ``retention_probability``
+          → ``if random.random() > retention_probability:`` (a PROBABILISTIC drop).
+
+        **DEVIATION 1 (deliberate, methodology step 4) — docstring semantics over the upstream
+        precedence bug.** Python parses ``-t / 5*S`` as ``(-t / 5) * S``, so upstream a HIGHER
+        strength forgets FASTER — the exact opposite of its own docstring at ``:30-34``. We adopt
+        the docstring-INTENDED ``exp(-Δt / S)``. The ``/5`` constant is folded into the strength
+        UNITS (days), which is why ``min_strength`` is a caller-supplied setting rather than a
+        literal here.
+
+        **DEVIATION 2 — deterministic, not probabilistic.** Upstream draws ``random.random()``
+        (``:119``); we return the retention VALUE and let a deterministic threshold decide, so
+        the sweep is unit-testable and the health view can show the user the same number the
+        sweep will act on (memory-health §4 item 4).
+
+        **DEVIATION 3 — invalidate-don't-delete.** Upstream drops the row; a low retention here
+        can at most drive an ARCHIVE (memory-layer §7.3 / CANONICAL §7.5).
+
+        ``min_strength`` floors the divisor so a zero/negative recorded strength cannot divide by
+        zero or invert the curve; it is REQUIRED keyword (never defaulted here) because
+        DEV-STANDARDS rule 3 forbids a threshold literal at the point of use — it comes from
+        ``ForgettingCurveSettings`` (mu-engine).
+        """
+        if min_strength <= 0.0:
+            raise ValueError("min_strength must be > 0 (it is the divisor floor of exp(-dt/S))")
+        elapsed_days = (now - self.scored_at).total_seconds() / 86_400.0
+        if elapsed_days <= 0.0:
+            return 1.0  # not yet elapsed (or a clock that went backwards): nothing has decayed
+        return math.exp(-elapsed_days / max(self.strength, min_strength))
+
 
 class MemoryItem(BaseModel):
     """The rich memory aggregate (behaviour + data). Lifecycle transitions are pure functions
@@ -235,6 +282,14 @@ class MemoryItem(BaseModel):
     # dominant term of it (§7.17 item 4a(b)) — a pinned item is simply never the auto-loser.
     # Defaulted False so every existing constructor/row stays valid (additive field).
     pinned: bool = False
+    # ---- the rest of the Lifecycle-override group (memory-health §2.1, spec lines 69-73) ----
+    # FIRST-CLASS mapped fields, NOT `metadata` overflow — the same stance §7.1 pins for
+    # `artifact_ref`/`provenance_id`. All three are audit/provenance for the pin itself and are
+    # NEVER read by authz: `pinned_by` is the principal that pinned, never an authz principal,
+    # never a term in `authorized_ids` (CANONICAL §7.4 / memory-health §6.5 rule 1).
+    pinned_at: datetime | None = None
+    pinned_by: str | None = None  # principal_id that pinned; AUDIT ONLY, never an authz principal
+    pin_reason: str | None = None  # short named classification; content-free, never memory text
     # ---- Artifact/Provenance-links group (FIRST-CLASS mapped, NOT metadata overflow; §7.1) ----
     artifact_ref: str | None = None  # -> ContextArtifact.id when kind=REFERENCE; reverse-queryable
     provenance_id: str = Field(
@@ -281,3 +336,26 @@ class MemoryItem(BaseModel):
     def archived(self, *, at: datetime) -> MemoryItem:
         """* -> ARCHIVED (forgetting-curve demotion). Retained for recall exclusion, not deleted."""
         return self.model_copy(update={"state": State.ARCHIVED, "last_seen": at})
+
+    def with_pin(self, *, by: str, at: datetime, reason: str | None = None) -> MemoryItem:
+        """Return a copy carrying the full pin group (memory-health §2.1, spec line 76).
+
+        Pure — no I/O, no event, no store write: :class:`~mu_engine.services.pin.PinService` owns
+        those. Deliberately does NOT touch ``last_seen``: pinning is not a recall and must not
+        reinforce the item (that would let pin leak into relevance, which §6.5 rule 2 forbids).
+        """
+        return self.model_copy(
+            update={"pinned": True, "pinned_at": at, "pinned_by": by, "pin_reason": reason}
+        )
+
+    def without_pin(self, *, at: datetime) -> MemoryItem:
+        """Return an unpinned copy, clearing the whole group (memory-health §2.1, spec line 77).
+
+        ``at`` is accepted for signature symmetry with :meth:`with_pin` and to keep the call site
+        Clock-injected (spec §19 Rule 1), but nothing is stamped with it: an unpinned item has no
+        pin audit trail to carry, and stamping ``last_seen`` would reinforce on unpin.
+        """
+        del at
+        return self.model_copy(
+            update={"pinned": False, "pinned_at": None, "pinned_by": None, "pin_reason": None}
+        )

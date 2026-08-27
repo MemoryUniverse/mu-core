@@ -70,6 +70,12 @@ class ConflictRecord(BaseModel):
     detected_at: datetime
     resolved_at: datetime | None = None
     superseded_valid_at: datetime | None = None  # the loser's bi-temporal close, when resolved
+    #: True iff the automatic winner-picker was REFUSED because the item it would have made the
+    #: loser is ``pinned`` (memory-health §6.4; CANONICAL §7.17 item 4a(b) — a pinned item is
+    #: never the auto-supersede/quarantine loser). The pinned item stays ACTIVE and the conflict
+    #: is PARKED rather than lost; ``ConflictEdgeRow.pin_blocked`` projects this onto the
+    #: health-view page, where it surfaces as ``MemoryHealthFlag.CONFLICTING``.
+    pin_blocked: bool = False
 
 
 class ConflictEdgeRow(BaseModel):
@@ -82,6 +88,12 @@ class ConflictEdgeRow(BaseModel):
     conflict_id: str = Field(min_length=1)
     state: ConflictState
     pin_blocked: bool = False  # a pin is blocked by this unresolved conflict (memory-health §5.2)
+    #: The conflict's ``detected_confidence``, carried onto the adjacency row so the pure
+    #: ``HealthAssessor`` can raise ``LOW_CONFIDENCE`` without a per-item DB round-trip.
+    #: Confidence is a property of the CONFLICT (``ConflictRecord.detected_confidence`` /
+    #: ``AdjudicationVerdict.confidence``), never of the memory — there is no ``MemoryItem
+    #: .confidence`` field and memory-health §4 line 228's ``item.confidence`` has no referent.
+    detected_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class ConflictEdges(BaseModel):
@@ -104,3 +116,15 @@ class ConflictEdges(BaseModel):
     def pin_blocked_for(self, memory_id: str) -> bool:
         row = self.rows_by_memory.get(memory_id)
         return row is not None and row.pin_blocked
+
+    def confidence_for(self, memory_id: str) -> float | None:
+        """The conflict confidence attached to ``memory_id``, or ``None`` if it is in no
+        conflict (or the row carries none). The source of ``MemoryHealthEntry.confidence``."""
+        row = self.rows_by_memory.get(memory_id)
+        return None if row is None else row.detected_confidence
+
+    def peers_for(self, memory_id: str) -> tuple[str, ...]:
+        """The other members of ``memory_id``'s conflict, sorted for determinism — ids only
+        (content-free even here: the pair is a link, not text). Empty when unconflicted."""
+        row = self.rows_by_memory.get(memory_id)
+        return () if row is None else tuple(sorted(row.peer_ids))
