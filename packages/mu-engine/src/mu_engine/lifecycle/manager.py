@@ -111,29 +111,36 @@ conformance permits extra public methods" convention ``SqliteWalRunner`` already
   needs either a re-fetch-by-id capability this manager does not have, or
   ``PromotionService``/``DemotionService`` returning the full breakdown directly — flagged, not
   papered over.
-* ``get_state(ns)``'s ``stm_count``/``mtm_count``/``ltm_count`` are documented `0` stubs — NOT
-  merely because this constructor receives services rather than raw per-tier read ports, but
-  because spec §5 types ``get_state`` as a SYNCHRONOUS "instant" warm read; the only existing
-  ports that could count STM/LTM items (``StmTierRepository.recent``/``GraphStorePort.
-  graph_recall``) are ``async`` I/O, and blocking a sync method on real store I/O would violate
-  DEV-STANDARDS rule 1. **The fix is NOT ``WarmRecallCacheService`` — that claim was measured
-  wrong and is recorded as ARCHITECTURE-DELTAS AD-24.** S3-02 HAS landed and the bridge is fully
-  wired on the daemon path, and these counts are still ``0``: ``WarmRecallCacheServicePort``
-  (below) declares only ``invalidate()``/``last_rendered()`` — there is no count method — and
-  ``get_state`` never consults ``_warm_cache`` at all. The bridge caches rendered BODIES keyed by
-  session; tier counts are per-user-prefix CARDINALITIES: different key, different shape,
-  different lifetime. Real counts need a COUNT cache in mu-core fed by ``InprocBus``
-  (``platform/adapters/bus_inproc.py``), on which the real ingest/distill/promotion/demotion/
-  retention services already publish tier transitions IN-PROCESS — so the daemonless path is not
-  the obstacle it was assumed to be. Whatever is built must stay synchronously readable, because
-  ``get_state``'s sync contract is itself load-bearing.
-  ``ready_context(session_id)`` is the identical, spec-sanctioned stub (task packet: "may return
-  a documented not-yet-wired stub until S3-02 lands"). NOTE: a pre-existing sibling test,
+* **``get_state(ns)``'s tier counts are an OBSERVED DELTA now, never again a hardcoded ``0,0,0``
+  (AD-24).** The old ``0,0,0`` was FALSE, not merely missing: a caller could not tell *"this user
+  has no memories"* from *"we did not look"*. They now come from an injected
+  ``mu_engine.lifecycle.counts.TierCountReaderPort`` — an in-memory, per-``UserPrefix`` cache the
+  composition root feeds from the plane's own ``EventBusPort``, read here with a plain dict lookup,
+  so ``get_state`` stays a sync ``def`` that never awaits (spec §5's "instant" warm read;
+  DEV-STANDARDS rule 1). **The reason previously written here was measured WRONG: the fix is NOT
+  ``WarmRecallCacheService``** — S3-02 has landed, the bridge is fully wired on the daemon path, and
+  the counts stayed ``0`` because ``WarmRecallCacheServicePort`` declares only
+  ``invalidate()``/``last_rendered()`` (no count method) and that bridge caches rendered BODIES
+  keyed by session, while tier counts are per-user-prefix CARDINALITIES. Do not re-introduce it.
+  **AD-24 is NOT fully closed, and this bullet must not say it is.** What ships is honest, not
+  complete: ``counts_basis`` is ``EVENT_DELTA`` — *net ids observed entering and not leaving each
+  tier on this process's bus since ``counts_observed_since``* — and explicitly NOT a store
+  cardinality, because nothing here can see a corpus written before this process attached to the
+  bus. An earlier draft did claim a cardinality (``EVENT_DERIVED``, "we looked") and it was measured
+  false after a plain daemon restart; ``mu_engine.lifecycle.counts``' module docstring carries the
+  transcript and the four structural consequences (removal-only events never create a bucket, SHARED
+  namespaces are refused, the STM window ages out, the LRU flags a truncated window). Store-backed
+  reconciliation — the only thing that would make these true cardinalities — needs a count primitive
+  on the tier ports in ``storage/**`` and is NOT built; no enum member pretends it is.
+* ``get_state``'s ``degraded`` is STILL a hardcoded ``None`` — nothing anywhere populates it. Same
+  class of defect as the counts were, outside AD-24's scope; reported, not quietly patched.
+* ``ready_context(session_id)`` is a spec-sanctioned stub only when no ``warm_cache`` is wired
+  (task packet: "may return a documented not-yet-wired stub until S3-02 lands"); with the real
+  ``RecallInjectBridge`` wired it returns a real rendered body. The sibling test
   ``mu-local/tests/test_lifecycle_gate_int.py::test_build_lifecycle_manager_get_state_matches_
-  real_store_counts`` (S1-05's own suite, not owned by this task), asserts real non-zero counts
-  and currently fails against this — flagged for the integrate phase to reconcile (mark it
-  xfail/skip pending S3-02, or redefine it against a warm-cache-backed count once that lands)
-  rather than this manager acquiring a blocking I/O call it should not have.
+  real_store_counts`` (S1-05's own suite) asserted real non-zero counts and was xfail against the
+  old ``0`` stub; with the count cache wired at the composition root it now passes for real and
+  the xfail has been removed.
 * ``consolidate``'s ``after_offset`` cursor (spec §13.1) is accepted on the wire (``LifecycleJob``
   carries it) but NOT applied by ``run_job``'s CONSOLIDATE branch this slice — it re-sweeps every
   namespace known to the ``user_prefix`` via the same ``sweep_namespace_now`` the periodic path
@@ -175,6 +182,7 @@ from mu_contracts.domain.model.memory import Namespace, Visibility
 from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
 from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
 from mu_contracts.ports.time import Clock
+from mu_engine.lifecycle.counts import CountsBasis, TierCountReaderPort, TierCounts
 from mu_engine.lifecycle.demotion import DemotionService
 from mu_engine.lifecycle.dto import LifecycleStateView, SalienceInputs, TransitionKind
 from mu_engine.lifecycle.explain import ExplainRecord
@@ -343,6 +351,7 @@ class MemoryLifecycleManager:
         settings: LifecycleSettings,
         clock: Clock | None = None,
         warm_cache: WarmRecallCacheServicePort | None = None,
+        counts: TierCountReaderPort | None = None,
     ) -> None:
         self._salience = salience
         self._promotion = promotion
@@ -356,6 +365,15 @@ class MemoryLifecycleManager:
         self._settings = settings
         self._clock: Clock = clock or SystemClock()
         self._warm_cache = warm_cache
+        # AD-24: the synchronously-readable tier-count cache behind get_state's three counts. A
+        # SEPARATE injected object, not this manager subscribing to its own bus, for two reasons:
+        # (a) `bus` here is typed `EventPublisher` (pipelines/distill.py:191-196), which declares
+        # only `publish` and has no `subscribe` — widening it would change the constructor contract
+        # at every call site; (b) a cache owned by the composition root can be built ONCE per
+        # container, while `build_lifecycle_manager` is a FACTORY that returns a fresh manager per
+        # call, and `InprocBus._handlers` is never pruned. `None` = not wired: get_state then
+        # reports UNOBSERVED, which is the honest answer, never a fabricated 0.
+        self._counts = counts
         # Runner/lease defaults reference self.run_job — safe: methods bind via the class the
         # instant `self` exists, well before __init__'s body needs to have finished (no attribute
         # on self is read until a coroutine actually calls run_job later).
@@ -406,24 +424,59 @@ class MemoryLifecycleManager:
         """Instant warm read — NEVER touches the runner (spec §5 read/write split: "``MLM.
         get_state(ns)``... synchronous warm reads (never enqueue, never await a job)").
 
-        Tier counts are a documented ``0`` stub THIS SLICE — not merely an unwired gap but an
-        architectural consequence of that same sync contract: ``StmTierRepository.recent``/
-        ``GraphStorePort.graph_recall`` (the only existing ports that COULD count STM/LTM items)
-        are ``async`` I/O calls, and synchronously blocking this ``def`` (not ``async def``) on
-        real store I/O would violate DEV-STANDARDS rule 1 (never block the event loop) while
-        also contradicting spec §5's own "instant" framing. The only spec-consistent way to give
-        ``get_state`` REAL tier counts is a proactively-maintained WARM CACHE
-        (a COUNT cache — NOT ``WarmRecallCacheService``, which has no count method; AD-24)
-        that this manager reads
-        synchronously from memory, refreshed asynchronously in the background on every real
-        transition — the identical reasoning this task's own acceptance list already applies to
-        ``ready_context``'s stub. See the module docstring's gap list."""
+        **The three tier counts are an OBSERVED DELTA, and ``counts_basis`` is the field that
+        says so.** They come from an injected
+        :class:`~mu_engine.lifecycle.counts.TierCountReaderPort` — an in-memory, per-``UserPrefix``
+        cache the composition root feeds from the plane's own ``EventBusPort``, read here with a
+        plain dict lookup: no await, no I/O, nothing that can block the event loop (DEV-STANDARDS
+        rule 1) and nothing that contradicts spec §5's "instant" framing.
+        ``StmTierRepository.recent``/``MtmTierRepository.scan_for_demotion``/
+        ``GraphStorePort.graph_recall`` — the only ports that could count a tier directly — are all
+        ``async`` I/O and are deliberately NOT reachable from here.
+
+        **What the numbers may and may not be read as.** ``EVENT_DELTA`` means *net ids observed
+        entering and not leaving each tier on THIS process's bus since ``counts_observed_since``*.
+        It is NOT a store cardinality, and ``ltm_count=0`` under it is NOT "this user has no
+        long-term memory": a corpus written before this process attached is invisible here by
+        construction. An earlier draft did ship a cardinality claim (``EVENT_DERIVED``) and it was
+        measured false one capture after a daemon restart over an existing store. Read
+        ``mu_engine.lifecycle.counts``' module docstring before touching any of this.
+
+        **The counts are USER-PREFIX-grained, not namespace-grained.** ``ns`` here selects the
+        user; the numbers span every SESSION of that user, exactly like the ``user_prefix`` field
+        returned beside them (``UserPrefix`` is the spec's §4b lease grain). Two sessions of one
+        user therefore return the SAME three counts, and a per-session cardinality is not something
+        this view offers. SHARED namespaces are refused outright by the cache and always read
+        ``UNOBSERVED`` — ``Namespace`` forces ``user='*'`` on them, so one ``UserPrefix`` would span
+        every member and every room of a workspace (counts.py, tenancy).
+
+        **The old reason written here was wrong and must not come back.** It said the counts become
+        real once ``WarmRecallCacheService`` (S3-02) lands. S3-02 landed, the bridge is fully wired
+        on the daemon path, and the counts stayed ``0``: ``WarmRecallCacheServicePort`` declares
+        only ``invalidate()``/``last_rendered()`` — no count method — and that bridge caches
+        rendered BODIES keyed by session, while a tier count is a per-user-prefix CARDINALITY.
+
+        **No cache wired, a SHARED namespace, or a prefix this process has never seen, reports
+        ``CountsBasis.UNOBSERVED`` with zeros — and those zeros are explicitly not a claim of
+        emptiness.** That distinction is the entire point of AD-24: a caller must never be unable to
+        tell *"this user has no memories"* from *"we did not look"*.
+
+        ``degraded`` remains a hardcoded ``None``: nothing anywhere populates it. That is a SECOND
+        false-not-merely-missing value of the same class as the counts were, outside AD-24's scope
+        and reported rather than quietly fixed."""
         prefix = UserPrefix(ns)
+        counts = (
+            self._counts.counts(prefix)
+            if self._counts is not None
+            else TierCounts(stm=0, mtm=0, ltm=0, basis=CountsBasis.UNOBSERVED)
+        )
         return LifecycleStateView(
             user_prefix=prefix,
-            stm_count=0,
-            mtm_count=0,
-            ltm_count=0,
+            stm_count=counts.stm,
+            mtm_count=counts.mtm,
+            ltm_count=counts.ltm,
+            counts_basis=counts.basis,
+            counts_observed_since=counts.observed_since,
             last_swept_at=self._last_swept_at.get(prefix),
             pending_job=self._pending_jobs.get(prefix),
             degraded=None,

@@ -346,6 +346,25 @@ class EngineContainer:
         #     is a real network-reachable server, never a bare-unit-test context).
         self._clock = SystemClock()
         self._bus = InprocBus()
+        # AD-24 — `mu_engine.lifecycle.counts.TierCountCache` is DELIBERATELY NOT WIRED HERE, and
+        # this comment exists so nobody wires it without reading why. It IS wired on mu-local
+        # (`mu_local/composition.py`), so `GET /profile` (`routes/lifecycle.py:64-74`) reports
+        # `counts_basis=UNOBSERVED` with zeros on this plane — an honest "we did not look", which
+        # is exactly the value AD-24 asks for when nothing has looked.
+        #
+        # An earlier cut DID attach it here, on the argument that leaving it unwired would "make
+        # that endpoint lie". Measured, the wiring was the worse lie on this plane, for two
+        # reasons that no amount of care inside the cache can fix:
+        #   (a) `self._bus = InprocBus()` above is PER-PROCESS and CANONICAL §4.1 makes the bus
+        #       plane-local, so two uvicorn workers can never converge: two identical `GET /profile`
+        #       calls would return DIFFERENT numbers under the same badge, and a plain restart
+        #       resets one of them to zero;
+        #   (b) `max_tracked_prefixes` is an LRU by WRITE recency across every tenant of a hosted
+        #       plane, so busy tenants evict quiet ones and most users would read UNOBSERVED anyway
+        #       — the feature degrading to the stub at precisely the scale this plane exists for.
+        # Wiring it here needs a SHARED counter (a Valkey/Postgres cardinality this container can
+        # read), not a second copy of an in-process cache. Until then, uniform and honest beats
+        # per-replica and confident.
         self.tracer = build_tracer(enabled=True, service_name="mu-engine-server")
         self.metrics = build_metrics(enabled=True)
         # C3: `settings=` threaded from the WIRED `EngineSettings.observability` so
@@ -558,6 +577,7 @@ class EngineContainer:
             bus=self._bus,
             settings=self.lifecycle_settings,
             clock=self._clock,
+            # counts=…: intentionally omitted on this plane — see the AD-24 note above.
         )
         self.lifecycle_runner: EngineLifecycleSweepRunner = EngineLifecycleSweepRunner(
             bus=self._bus,

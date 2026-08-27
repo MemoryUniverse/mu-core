@@ -36,6 +36,7 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
+from mu_engine.lifecycle.counts import CountsBasis
 from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate, ManagerOwnsLifecycleError
 from mu_engine.lifecycle.settings import LifecycleSettings, ManagerModeSettings
 from mu_engine.pipelines.concrete.ingest import IngestActivity
@@ -244,15 +245,34 @@ async def test_build_lifecycle_manager_get_state_matches_real_store_counts(
 
     BLOCKED (reported, not faked) if S1-03 has not landed yet.
 
-    INTEGRATE-PHASE RECONCILIATION (Stage-1 integrate): ``MemoryLifecycleManager.get_state`` has
-    landed (S1-03) but its ``stm_count``/``mtm_count``/``ltm_count`` are a documented, honest ``0``
-    stub THIS SLICE — a deliberate architectural consequence of ``get_state`` being a SYNCHRONOUS
-    "instant" warm read (spec §5) with no proactively-maintained warm cache to read real counts
-    from yet (``WarmRecallCacheService``, slice 3 / S3-02, not yet landed) — see
-    ``mu_engine.lifecycle.manager``'s own module docstring, "Known, honestly-flagged gaps" section,
-    for the full reasoning. This assertion is xfail (not skipped/deleted) so it starts passing
-    automatically, as a signal to remove the marker, the moment S3-02 lands a real warm-cache-backed
-    count."""
+    **The xfail is GONE and these are now real assertions** (AD-24: partly closed, honestly — see
+    below). They previously ran and
+    were caught by ``except AssertionError: pytest.xfail(...)``, because ``get_state`` returned a
+    hardcoded ``0,0,0``. ``LocalContainer`` now builds a ``TierCountCache``
+    (``mu_engine.lifecycle.counts``) once, attaches it to the SAME ``InprocBus`` that this
+    container's ingest/distill/promotion/demotion publish onto, and passes it to
+    ``build_lifecycle_manager()``; ``get_state`` reads it with a plain dict lookup, so it stays the
+    synchronous "instant" warm read spec §5 requires. **The old reason written here was measured
+    WRONG and must not come back**: the fix is not ``WarmRecallCacheService`` (it has no count
+    method and caches rendered bodies keyed by session, not per-user-prefix cardinalities).
+
+    Why this passes for REAL reasons, not by luck: the manager is built at line ~1 of the body,
+    BEFORE the ingest, so the cache observes ``MemoryCaptured`` (STM), ``MemoryPromoted`` STM->MTM
+    (``promote=True``) and ``MemoryPromoted`` MTM->LTM (the distill hand-off) as they are actually
+    published by the real services against the real stores.
+
+    **What is NOT claimed.** ``counts_basis`` is ``EVENT_DELTA``, not a cardinality: this process
+    attached to the bus before the ingest below, which is the only envelope where an event delta
+    and a store count coincide. A restarted daemon over an existing corpus reports a delta that is
+    smaller than the store, and says so — ``test_tier_counts_int.py::
+    test_a_restarted_process_never_claims_a_cardinality_it_cannot_have`` pins exactly that.
+
+    This test's own corpus is deliberately weak, too — ONE item and three ``>= 1`` bounds cannot
+    distinguish a per-tier counter from one that increments every tier, and cannot catch
+    over-counting at all. ``test_tier_counts_int.py`` carries the real proof: three DIFFERENT
+    non-zero counts, equality against raw redis/qdrant/falkordb clients, a second real user proving
+    η, the restart case, an unattended-sweep case and a pinned known-divergence case. This one is
+    left as the S1-05 acceptance item it always was."""
     container = LocalContainer(StorageSettings(), settings=settings, lifecycle=_manual_lifecycle())
     try:
         try:
@@ -282,22 +302,16 @@ async def test_build_lifecycle_manager_get_state_matches_real_store_counts(
         )
 
         state = manager.get_state(ns)
-        try:
-            assert state.stm_count >= 1
-            assert state.mtm_count >= 1
-            assert state.ltm_count >= 1
-        except AssertionError:
-            pytest.xfail(
-                "get_state() tier counts are a documented 0 stub. NOT 'pending S3-02' — that "
-                "reason was measured WRONG (ARCHITECTURE-DELTAS AD-24): S3-02 has landed and the "
-                "bridge is fully wired on the daemon path, and the counts are still 0,0,0, "
-                "because WarmRecallCacheServicePort declares only invalidate()/last_rendered() "
-                "-- no count method -- and get_state() never consults the warm cache at all. "
-                "The bridge caches rendered BODIES keyed by session; tier counts are "
-                "per-user-prefix CARDINALITIES. Real counts need a count cache in mu-core fed by "
-                "InprocBus, which get_state can read synchronously (its sync contract is "
-                "load-bearing: DEV-STANDARDS rule 1, never block the event loop)."
-            )
+        assert state.stm_count >= 1
+        assert state.mtm_count >= 1
+        assert state.ltm_count >= 1
+        # A count is only meaningful next to its basis. EVENT_DELTA is the strongest claim the
+        # cache is allowed to make — "net ids observed entering each tier since we attached" — and
+        # it is deliberately NOT a store cardinality; UNOBSERVED zeros would have satisfied neither
+        # this test nor the caller (AD-24). This container observed the bus BEFORE the ingest
+        # below, which is the one envelope where the delta and the store agree.
+        assert state.counts_basis is CountsBasis.EVENT_DELTA
+        assert state.counts_observed_since is not None
     finally:
         await _teardown(settings, uid)
         await container.close()

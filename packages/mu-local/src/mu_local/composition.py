@@ -68,6 +68,7 @@ from mu_engine.lifecycle.conflict import (
     build_conflict_adjudicator,
     conflict_adjudicator_settings_from_lifecycle,
 )
+from mu_engine.lifecycle.counts import TierCountCache, TierCountSettings
 from mu_engine.lifecycle.demotion import DemotionService
 from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate
 from mu_engine.lifecycle.promotion import PromotionService
@@ -240,6 +241,7 @@ class LocalContainer:
         lifecycle: LifecycleSettings | None = None,
         stage_ledger: StageLedger | None = None,
         conflict_records: ConflictRecordRepository | None = None,
+        tier_counts: TierCountSettings | None = None,
     ) -> None:
         self._settings: Settings = settings or get_settings()
         # CONFIG-AND-DATA-FIX-PLAN.md §1.2 C1: the ONE wired ``EngineSettings`` (C0) read here —
@@ -373,6 +375,46 @@ class LocalContainer:
         #     rule 4) — built once here from ObservabilitySettings and threaded into every service.
         self._clock = SystemClock()
         self._bus = InprocBus()
+        # (7c) AD-24 — the tier-count cache behind ``MemoryLifecycleManager.get_state``'s
+        #      stm/mtm/ltm counts, which were a hardcoded, FALSE ``0,0,0``. Built HERE, ONCE, and
+        #      attached to the SAME ``InprocBus`` above that ingest/distill/promotion/demotion/
+        #      retention already publish onto — not inside ``build_lifecycle_manager``, which is a
+        #      FACTORY that returns a fresh manager per call while ``InprocBus._handlers`` is a
+        #      plain list that is never pruned (subscribing per manager would leak a handler per
+        #      call). Its ``detach`` goes into ``self._closers`` so ``close()`` unsubscribes it.
+        #      Zero API keys, zero daemon: the events it folds are published in-process by the
+        #      services this same container builds (the FULL-LOCAL boundary rule).
+        #
+        #      Settings are INJECTABLE (``tier_counts=`` above) and, failing that, come from
+        #      ``TierCountSettings()`` — a ``BaseSettings`` reading ``MU_TIER_COUNTS_*``, so both
+        #      memory bounds are reachable by an operator (DEV-STANDARDS rule 3; the first cut was
+        #      a bare ``BaseModel`` with no seam and an unreachable ~4 GB ceiling).
+        #
+        #      ``stm_window_s`` must track the STM adapter's real TTL, because STM expiry publishes
+        #      no event and that window is the only thing keeping ``stm_count`` from converging to
+        #      "captures since process start". Two of the KV backends expose it in settings
+        #      (``InMemoryKvSettings``/``MemcachedSettings``: ``default_ttl_s``) and it is read from
+        #      there; ``RedisSettings``/``ValkeySettings`` do NOT — ``RedisStmAdapter.__init__``
+        #      builds a bare ``RedisMapper()`` whose ``default_ttl_s=3600`` no config can reach
+        #      (``storage/adapters/redis_stm.py``/``storage/mappers/redis_mapper.py``). That is a
+        #      real config gap in ``storage/**``, owned by another lane and REPORTED, not papered
+        #      over here: on those backends this falls back to ``TierCountSettings``' own 3600s
+        #      default, which matches the mapper today, and an operator who changes one must set
+        #      ``MU_TIER_COUNTS_STM_WINDOW_S`` to match.
+        _kv_ttl_s = getattr(self._settings.storage.cache, "default_ttl_s", None)
+        self._tier_count_settings: TierCountSettings = (
+            tier_counts
+            if tier_counts is not None
+            else (
+                TierCountSettings(stm_window_s=float(_kv_ttl_s))
+                if _kv_ttl_s is not None
+                else TierCountSettings()
+            )
+        )
+        self.tier_counts = TierCountCache(settings=self._tier_count_settings, clock=self._clock)
+        self.tier_counts.attach(self._bus)
+        self._closers.append(self.tier_counts.detach)
+
         self.tracer: Tracer = build_tracer(enabled=self._obs.otel_enabled, service_name="mu-local")
         self.metrics: MetricSink = build_metrics(enabled=self._obs.metrics_enabled)
         # C3: `settings=` threaded from the WIRED `EngineSettings.observability` so
@@ -768,6 +810,7 @@ class LocalContainer:
             runner=runner,
             clock=clock or self._clock,
             warm_cache=warm_cache,
+            counts=self.tier_counts,  # AD-24: SAME cache, attached to the SAME bus (see §7c)
         )
 
     # ---------------------------------------------------------------- backend guards + resolution
