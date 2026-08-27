@@ -34,3 +34,9 @@ graphify-out/
 .serena/
 .claude/
 .tools-venv/
+
+# Runtime artifact root (ContextRepository filesystem adapter). Test and demo runs fill this with
+# real transcript artifacts — memory CONTENT — and this repo is the OPEN one. Matches
+# mu-client/.gitignore:36 and mu-server/.gitignore:8, which have always had the rule; mu-core did
+# not, so 6884 artifact files sat one `git add .` away from a public commit.
+.mu_data/
