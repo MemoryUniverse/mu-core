@@ -30,9 +30,24 @@ import pytest_asyncio
 
 pytestmark = pytest.mark.integration
 
-mu_sdk = pytest.importorskip("mu_sdk", reason="F1 needs the public mu-sdk-python package installed")
+# Both guards are a STANDALONE-CLONE safety net, not the normal path. mu-core's own
+# `acceptance` dependency group (mu-core/pyproject.toml) path-links the sibling mu-sdk-python
+# repo as a TEST-ONLY editable dep, so the gate run — `uv sync --group acceptance`, which is what
+# infra/mu-vm/vm_test.sh does for this repo — has both importable and this file RUNS. They stay
+# `importorskip` only so that someone who cloned mu-core alone (the OPEN half; the sibling repo
+# is simply not on their disk) still gets a collectable suite instead of a collection error.
+# If you are seeing this skip on a gate run, the gate is not installing the group — fix that,
+# do not accept the skip: F1 is the portability-parity claim, and a claim that only ever skips
+# is not a proven claim.
+_SDK_REMEDIATION = (
+    "run `uv sync --group acceptance` from the mu-core root (test-only path dep on the sibling "
+    "mu-sdk-python repo)"
+)
+mu_sdk = pytest.importorskip(
+    "mu_sdk", reason=f"F1 needs the public mu-sdk-python package: {_SDK_REMEDIATION}"
+)
 mu_local = pytest.importorskip(
-    "mu_local", reason="F1's embedded leg needs the mu-sdk[embedded] extra (mu-local) installed"
+    "mu_local", reason=f"F1's embedded leg needs the mu-sdk[embedded] extra: {_SDK_REMEDIATION}"
 )
 
 from mu_sdk.auth import BearerAuth  # noqa: E402

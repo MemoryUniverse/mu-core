@@ -17,6 +17,15 @@ mu-contracts = { workspace = true }
 mu-engine = { workspace = true }
 mu-local = { workspace = true }
 mu-engine-server = { workspace = true }
+# TEST-ONLY, and deliberately kept out of every package's `[project.dependencies]`: mu-core is the
+# Apache-2.0 OPEN half and must never gain a RUNTIME dependency on its own client SDK. This source
+# backs the `acceptance` dependency group below ONLY. Sibling repo under mu_project/, not a
+# workspace member (the ratified 5-repo split, PACKAGING-v2 banner item 1) -> directory dep.
+# `editable = true` for the CO-6 reason mu-sdk-python's own pyproject records: mu-sdk pulls in
+# mu-contracts (+ mu-local via its `[embedded]` extra), which this workspace already resolves
+# editable via `{ workspace = true }`; a non-editable source for the same path would make uv report
+# "conflicting URLs for package `mu-contracts`" and refuse to resolve.
+mu-sdk = { path = "../mu-sdk-python", editable = true }
 
 # Dev toolchain (PEP 735 dependency-groups; installed with `uv sync`).
 [dependency-groups]
@@ -27,6 +36,26 @@ dev = [
     "ruff>=0.8,<0.9",
     "import-linter>=2.1,<3",
     "testcontainers>=4.9,<5",
+]
+
+# The Stage F acceptance gate (packages/mu-engine-server/tests/acceptance/) drives the PUBLIC
+# `mu_sdk.MemoryClient` against the containerized engine-server — F1's portability-parity claim
+# ("the same caller code works embedded and over the wire") cannot be proven without it, and it
+# was going unproven: both F1 and F3 sat behind `pytest.importorskip("mu_sdk")` and never ran.
+# mu-server already carries the identical test-only edge for the identical reason
+# (mu-server/pyproject.toml `dev` group: "a release-gate criterion that silently skips is exactly
+# the failure it was written to end", WIRE-CONFORMANCE-FINDING-0821.md §"mu-sdk is now test-only").
+#
+# NON-DEFAULT group ON PURPOSE (this is the one place mu-core differs from mu-server, and why):
+# mu-server is the private plane and never ships alone, but mu-core is the OPEN repo whose whole
+# promise is that it depends on nothing. Putting a hard `path = "../mu-sdk-python"` in the DEFAULT
+# `dev` group would make a plain `uv sync` FAIL for anyone who cloned mu-core by itself, because
+# the sibling directory is not on their disk — a worse regression than the skip it fixes. As a
+# non-default group, `uv sync` is untouched for them and `uv sync --group acceptance` installs the
+# gate's dependency for everyone who actually runs the gate (infra/mu-vm/vm_test.sh does exactly
+# this for mu-core, so the VM gate run never skips F1/F3 again).
+acceptance = [
+    "mu-sdk[embedded]",
 ]
 
 # ----------------------------------------------------------------------------
