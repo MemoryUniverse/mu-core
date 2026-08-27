@@ -35,6 +35,13 @@ from mu_contracts.ports.observability import (
     TurnTraceScope,
 )
 from mu_contracts.ports.persona import PersonaRepository
+from mu_contracts.ports.room import (
+    RoomClientPort,
+    RoomLogRepository,
+    RoomOwnerLeasePort,
+    RoomServicePort,
+    SessionRepository,
+)
 from mu_contracts.ports.security import TenancyGuard
 from mu_contracts.ports.stores import (
     EdgeSpec,
@@ -78,7 +85,12 @@ __all__ = [
     "QdrantPoint",
     "RedisRecord",
     "RelationalRow",
+    "RoomClientPort",
+    "RoomLogRepository",
+    "RoomOwnerLeasePort",
+    "RoomServicePort",
     "RowMapper",
+    "SessionRepository",
     "SpanCtx",
     "StmTierRepository",
     "StoreModel",
