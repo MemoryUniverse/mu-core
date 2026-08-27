@@ -45,9 +45,16 @@ from datetime import UTC, datetime, timedelta
 
 from sortedcontainers import SortedList
 
-from mu_engine.storage.domain.memory import MemoryItem
+from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.domain.recall import RecallChannel, Scored
+from mu_engine.storage.tier_capabilities import (
+    ENUMERATE_INSPECT_BUDGET,
+    decode_rank_cursor,
+    encode_rank_cursor,
+    item_matches,
+    with_pin_group,
+)
 
 __all__ = ["InMemoryStmAdapter"]
 
@@ -208,6 +215,75 @@ class InMemoryStmAdapter:
                     )
                 )
             return out
+
+    async def enumerate_page(
+        self,
+        ns: Namespace,
+        *,
+        states: frozenset[MemoryState],
+        pinned: bool | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[MemoryItem], str | None]:
+        """STM's half of the bounded partition walk (``TierEnumerationPort``), in-process twin of
+        ``RedisStmAdapter.enumerate_page``.
+
+        Same cursor semantics as the Redis leg — a RANK into the recency order, not a count of
+        returned items — so the two backends page identically and a test proving the bound on one
+        is proving the same contract on the other. ``self._partition(ns)`` is keyed by
+        ``ns.to_prefix()``, so a walk never sees another partition's entries.
+        """
+        if limit <= 0:
+            return [], None
+        async with self._lock:
+            part = self._partition(ns)
+            self._prune_expired_locked(part, now=datetime.now(UTC))
+            start = decode_rank_cursor(cursor)
+            out: list[MemoryItem] = []
+            rank = start
+            window = part.recency[start : start + ENUMERATE_INSPECT_BUDGET]
+            for _neg_ts, memory_id in window:
+                rank += 1
+                entry = part.items.get(memory_id)
+                if entry is None:
+                    continue
+                item, _ = entry
+                if item_matches(item, states=states, pinned=pinned):
+                    out.append(item)
+                    if len(out) >= limit:
+                        break
+            exhausted = rank >= len(part.recency)
+            return out, None if exhausted else encode_rank_cursor(rank)
+
+    async def set_pinned(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        pinned: bool,
+        *,
+        at: datetime,
+        by: str,
+        reason: str | None,
+    ) -> int | None:
+        """STM's half of the id-stable cross-store pin upsert (``TierPinPort``).
+
+        Held under the SAME ``self._lock`` as every other mutation, so the read-modify-write is
+        atomic for this partition — the in-process equivalent of the Redis leg's single ``SET``.
+        The TTL/expiry pair is carried over UNCHANGED (pin is retention, never a recall: it must
+        not extend the STM window, memory-health §6.5 rule 2).
+        """
+        async with self._lock:
+            part = self._partition(ns)
+            entry = part.items.get(memory_id)
+            if entry is None:
+                return None
+            item, expires_at = entry
+            if self._is_expired(expires_at, now=datetime.now(UTC)):
+                self._evict_locked(part, memory_id)
+                return None
+            updated = with_pin_group(item, pinned=pinned, at=at, by=by, reason=reason)
+            part.items[memory_id] = (updated, expires_at)
+            return updated.version
 
     async def evict(self, ns: Namespace, memory_id: str) -> None:
         async with self._lock:

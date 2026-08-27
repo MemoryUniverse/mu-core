@@ -37,6 +37,7 @@ __all__ = [
     "PermissionNarrowingError",
     "PinAuthorizationError",
     "PinLimitExceededError",
+    "PinPartiallyAppliedError",
     "PinTargetNotFoundError",
     "PinTargetNotPinnableError",
     "PinnedTransitionBlocked",
@@ -52,6 +53,7 @@ __all__ = [
     "SubModelProviderDisabledError",
     "SurfaceVerbNotImplementedError",
     "TenancyViolationError",
+    "TierCapabilityUnavailableError",
     "TierRepositoryUnavailableError",
     "UnknownBackendError",
     "UnknownComponentError",
@@ -210,6 +212,72 @@ class PinTargetNotPinnableError(MemoryLayerError):
 class PinLimitExceededError(MemoryLayerError):
     """The partition already holds ``PinSettings.max_pins_per_namespace`` pins (spec §5.2 step 2
     — the pin-explosion guard). Refused loud; never a silent no-op."""
+
+
+class PinPartiallyAppliedError(MemoryLayerError):
+    """A cross-store pin landed on SOME of the tiers holding the id and failed on others.
+
+    **This error exists because the guarantee the spec asks for is convergence, not atomicity,
+    and the difference has to be visible rather than papered over.** ``set_pinned`` is specified
+    as an id-stable upsert "applied across every store the item resides in"
+    (``ports/memory.py:52-56``). The stores are Redis/Valkey, Qdrant and FalkorDB — three
+    separate network services with no shared transaction, no two-phase commit and no distributed
+    log in front of them. ``IdempotentWriteScope`` buffers DOMAIN EVENTS and publishes them after
+    the write step; it is an outbox for the bus, not a transaction across the stores. Each store
+    can make its OWN leg atomic (a Redis ``MULTI``, a Qdrant ``set_payload`` on one point, a
+    single Cypher ``SET``) and nothing can make the three atomic together. So a partial apply is
+    not a hazard to be avoided — it is a guaranteed operating condition, and this is its name.
+
+    **Raised, not swallowed, so the event never outruns the write.** ``PinService._commit`` runs
+    the repository call as the write step of an ``IdempotentWriteScope`` and publishes
+    ``MemoryPinned``/``MemoryUnpinned`` only if that step returns. Reporting a partial apply as
+    success would publish a pin event for a pin that half-landed, which is strictly worse than no
+    event: downstream converges on a state no store agrees with.
+
+    **The landed legs are deliberately NOT rolled back.** A compensating write can fail exactly
+    the way the original leg did, turning one inconsistency into two, and ``set_pinned`` is a
+    full-field-group upsert with a caller-supplied ``at``/``by``/``reason`` — re-running it
+    converges. The honest recovery is therefore "retry the whole call", and the landed legs
+    simply re-converge. Leaving them is convergent, not lazy.
+
+    **The two directions are NOT equally safe, and this type says which one you are in.** For a
+    PIN, a leftover pinned leg is the conservative direction: a spuriously-pinned row is merely
+    un-GC-able until reconciled, never lost data. For an UNPIN it is the dangerous direction —
+    a leftover pinned leg strands the row as permanently GC-ineligible, which is precisely what
+    ``PinService`` documents unpin as existing to prevent. ``applied``/``failed`` carry the tier
+    names (content-free: tier enum values and the memory id, never memory text) so an operator
+    can tell the two apart and reconcile, instead of inferring it from a bare failure.
+    """
+
+    def __init__(
+        self, message: str, *, applied: frozenset[str], failed: frozenset[str], pinned: bool
+    ) -> None:
+        super().__init__(message)
+        #: Tier names whose leg accepted the write (content-free — ``Tier`` values only).
+        self.applied = applied
+        #: Tier names whose leg refused or errored.
+        self.failed = failed
+        #: The DIRECTION that half-landed: ``True`` = pin (conservative leftover), ``False`` =
+        #: unpin (a stranded, GC-ineligible leftover — the direction that needs reconciling).
+        self.pinned = pinned
+
+
+class TierCapabilityUnavailableError(MemoryUniverseError):
+    """A bound backend cannot serve a capability the tier-repository port requires.
+
+    Distinct from :class:`TierRepositoryUnavailableError`, and the distinction is the point:
+    that one means "this store is DOWN, retry or degrade"; this one means "this store is UP and
+    will never be able to answer, because the backend you bound has no such primitive". Three of
+    the five vector backends (``pgvector``, ``chroma``, ``faiss``) expose only
+    ``upsert``/``semantic``/``invalidate`` — no point-get and no enumeration primitive of any
+    kind — so on those deployments the bounded partition walk and the cross-store pin genuinely
+    cannot be served.
+
+    Raised rather than answered with an empty page, because an empty page is indistinguishable
+    from "this partition is healthy and holds nothing", which is exactly the silent wrong answer
+    DEV-STANDARDS rule 8 forbids. The house absence rule applies: the capability is reported
+    missing, never stubbed into a lie.
+    """
 
 
 # Naming note: the SPEC names this type verbatim (memory-health-pinning-spec §9, line 377)

@@ -33,15 +33,25 @@ docstring).
 from __future__ import annotations
 
 from collections.abc import Awaitable
+from datetime import datetime
 from typing import cast
 
 from redis.asyncio import Redis
 
 from mu_engine.platform.decorators import retry_io
-from mu_engine.storage.domain.memory import MemoryItem
+from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.domain.recall import RecallChannel, Scored
 from mu_engine.storage.mappers.redis_mapper import RedisMapper
+from mu_engine.storage.ports import RedisRecord
+from mu_engine.storage.tier_capabilities import (
+    ENUMERATE_INSPECT_BUDGET,
+    PAGE_SLACK,
+    decode_rank_cursor,
+    encode_rank_cursor,
+    item_matches,
+    with_pin_group,
+)
 
 __all__ = ["RedisStmAdapter"]
 
@@ -155,8 +165,6 @@ class RedisStmAdapter:
         blob = await self._redis.get(key)
         if blob is None:
             return None
-        from mu_engine.storage.ports import RedisRecord
-
         return self._mapper.from_store(RedisRecord(key=key, ttl_s=None, blob=_as_str(blob)))
 
     async def recent(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]:
@@ -179,6 +187,111 @@ class RedisStmAdapter:
                 )
             )
         return out
+
+    async def enumerate_page(
+        self,
+        ns: Namespace,
+        *,
+        states: frozenset[MemoryState],
+        pinned: bool | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[MemoryItem], str | None]:
+        """STM's half of the bounded partition walk (``TierEnumerationPort``).
+
+        Walks the recency ZSET this adapter already maintains — an ordered, namespace-scoped,
+        rank-addressable index — rather than a ``KEYS``/``SCAN`` glob over the keyspace. That
+        choice is the whole point: a glob is O(keyspace) across every tenant in the Redis
+        instance and would have to filter foreign keys out client-side, which is exactly the
+        filter-only isolation CANONICAL §1 rule 5 refuses. The ZSET key is itself derived from
+        ``ns.to_prefix()``, so a walk physically cannot see another partition's members.
+
+        The cursor is the ZSET RANK to resume from — a position in the inspected window, not a
+        count of returned items. The two differ whenever the filters reject rows, and conflating
+        them would silently skip the rejected rows' successors on the next page.
+        """
+        return await self._retry(self._enumerate_page_impl)(
+            ns, states=states, pinned=pinned, cursor=cursor, limit=limit
+        )
+
+    async def _enumerate_page_impl(
+        self,
+        ns: Namespace,
+        *,
+        states: frozenset[MemoryState],
+        pinned: bool | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[MemoryItem], str | None]:
+        if limit <= 0:
+            return [], None
+        start = decode_rank_cursor(cursor)
+        recency = RedisMapper.recency_key(ns)
+        out: list[MemoryItem] = []
+        inspected = 0
+        rank = start
+        while len(out) < limit and inspected < ENUMERATE_INSPECT_BUDGET:
+            window = min(ENUMERATE_INSPECT_BUDGET - inspected, limit - len(out) + PAGE_SLACK)
+            raw_ids = await self._redis.zrevrange(recency, rank, rank + window - 1)
+            if not raw_ids:
+                return out, None  # ZSET exhausted: the walk is genuinely finished.
+            for raw in raw_ids:
+                rank += 1
+                inspected += 1
+                memory_id = _as_str(raw)
+                item = await self._get_impl(ns, memory_id)
+                if item is None:
+                    # TTL-expired member still lingering in the ZSET — drop it, self-heal, and
+                    # do NOT count it against the page (same discipline as ``_recent_impl``).
+                    await self._redis.zrem(recency, memory_id)
+                    continue
+                if item_matches(item, states=states, pinned=pinned):
+                    out.append(item)
+                    if len(out) >= limit:
+                        break
+        return out, encode_rank_cursor(rank)
+
+    async def set_pinned(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        pinned: bool,
+        *,
+        at: datetime,
+        by: str,
+        reason: str | None,
+    ) -> int | None:
+        """STM's half of the id-stable cross-store pin upsert (``TierPinPort``)."""
+        return await self._retry(self._set_pinned_impl)(
+            ns, memory_id, pinned, at=at, by=by, reason=reason
+        )
+
+    async def _set_pinned_impl(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        pinned: bool,
+        *,
+        at: datetime,
+        by: str,
+        reason: str | None,
+    ) -> int | None:
+        # The key is `mu/{ns.to_prefix()}:stm:mem:{id}` — tenancy rides INSIDE the address, so a
+        # memory_id belonging to another partition simply resolves to a key that does not exist
+        # and the write is reported ABSENT (`None`), never applied to a foreign row. This is the
+        # STM twin of `qdrant_mtm._scoped_point_selector`'s server-side predicate.
+        key = RedisMapper.memory_key(ns, memory_id)
+        blob = await self._redis.get(key)
+        if blob is None:
+            return None
+        current = self._mapper.from_store(RedisRecord(key=key, ttl_s=None, blob=_as_str(blob)))
+        updated = with_pin_group(current, pinned=pinned, at=at, by=by, reason=reason)
+        # KEEPTTL: the STM row's remaining lifetime is its recency semantics. Re-SETting without
+        # it would silently make every pinned row immortal in a tier whose whole contract is a
+        # TTL'd window — and re-SETting with a FRESH TTL would let pin masquerade as a recall
+        # and reinforce the item, which memory-health §6.5 rule 2 forbids outright.
+        await self._redis.set(key, updated.model_dump_json(), keepttl=True)
+        return updated.version
 
     async def evict(self, ns: Namespace, memory_id: str) -> None:
         return await self._retry(self._evict_impl)(ns, memory_id)

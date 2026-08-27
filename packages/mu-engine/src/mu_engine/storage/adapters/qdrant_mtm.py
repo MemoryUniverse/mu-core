@@ -43,6 +43,7 @@ from mu_engine.storage.mappers.qdrant_mapper import (
     point_id,
 )
 from mu_engine.storage.ports import QdrantPoint
+from mu_engine.storage.tier_capabilities import with_pin_group
 
 __all__ = ["QdrantMtmAdapter"]
 
@@ -79,6 +80,14 @@ _KEYWORD_INDEXES = (
     "content_hash",
     "artifact_ref",
 )
+
+# ``pinned`` is a BOOLEAN payload field, so it needs a BOOL payload index rather than a place in
+# ``_KEYWORD_INDEXES`` above. memory-health-pinning-spec §3.1 line 168 requires it by name
+# ("Updates the Qdrant ``pinned`` payload index ... so sweeps can filter it"): without a
+# server-side index, ``enumerate(pinned=True)`` — which ``PinService._assert_within_pin_bound``
+# issues on EVERY pin as a one-round-trip count — degenerates into hydrating the partition and
+# filtering client-side, i.e. the unbounded scan spec §3.1 calls out as forbidden.
+_BOOL_INDEXES = ("pinned",)
 
 
 def _user_prefix(ns: Namespace) -> str:
@@ -221,6 +230,18 @@ class QdrantMtmAdapter:
                     field_name=field,
                     field_schema=models.PayloadSchemaType.KEYWORD,
                 )
+        # The BOOL pin index is ensured on the PRE-EXISTING path too, not only at creation.
+        # ``pinned`` arrived after collections were already in the field, so gating it on creation
+        # would leave every collection that predates the pin feature permanently unable to filter
+        # on it server-side — the index would exist only on machines that happened to start from
+        # empty. Creating an index that already exists is a no-op in Qdrant, and this runs at most
+        # once per collection per process (guarded by ``self._ensured`` below).
+        for bool_field in _BOOL_INDEXES:
+            await self._qdrant.create_payload_index(
+                collection_name=name,
+                field_name=bool_field,
+                field_schema=models.PayloadSchemaType.BOOL,
+            )
         self._ensured.add(name)
         return name
 
@@ -563,6 +584,212 @@ class QdrantMtmAdapter:
             if offset is None or not records:
                 break  # Qdrant signals "no more pages" with a null next-page offset.
         return out
+
+    async def enumerate_page(
+        self,
+        ns: Namespace,
+        *,
+        states: frozenset[MemoryState],
+        pinned: bool | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[MemoryItem], str | None]:
+        """MTM's half of the bounded partition walk (``TierEnumerationPort``).
+
+        The generalisation of :meth:`scan_for_demotion`, which is the same paged ``scroll`` with
+        ``state`` pinned to ``active`` and the continuation THROWN AWAY. What changes is that
+        ``state`` becomes a ``MatchAny`` over the caller's set, ``pinned`` becomes an optional
+        server-side term (indexed by ``_BOOL_INDEXES``), and Qdrant's own next-page offset is
+        RETURNED rather than discarded — which is what turns a one-shot sweep read into a
+        resumable walk.
+
+        **The tenancy predicate is the FULL η (``to_prefix()``), NOT recall's user-prefix.** This
+        is the one place this adapter deliberately does NOT reuse ``_recall_filter``'s
+        ``session_scope=None`` branch. That branch is the cross-session FEDERATION grain ADR 0030
+        introduced for RECALL, and it drops the session segment — a strictly WIDER key than η.
+        Recall is a ranked read where federating the user's own sessions is the intended product
+        behaviour; ``enumerate`` is *"the ONE bounded, PAGINATED partition walk"*
+        (``ports/memory.py`` lines 79-86), and the partition is ``to_prefix()``, six segments,
+        session INCLUDED (CANONICAL §1 rule 5 / CLAUDE.md rule 4). The STM leg
+        (``RedisMapper.memory_key``) and the LTM leg (``m.namespace = $ns``) are both
+        session-EXACT, so a user-prefix match here would make ONE leg of the façade's fan-out read
+        outside the caller's η: ``MemoryHealthService`` would stamp another session's rows with
+        this η, and ``PinService._assert_within_pin_bound`` would count another session's pins
+        against this partition's bound.
+
+        ``scan_for_demotion`` is deliberately left in place: other callers depend on it, and
+        collapsing the two is a separate change from making this one exist.
+        """
+        return await self._retry(self._enumerate_page_impl)(
+            ns, states=states, pinned=pinned, cursor=cursor, limit=limit
+        )
+
+    async def _enumerate_page_impl(
+        self,
+        ns: Namespace,
+        *,
+        states: frozenset[MemoryState],
+        pinned: bool | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[MemoryItem], str | None]:
+        if limit <= 0:
+            return [], None
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return [], None
+        # Full η, never the user prefix — see :meth:`enumerate_page`'s docstring.
+        must: list[models.Condition] = [
+            models.FieldCondition(
+                key=NAMESPACE_PAYLOAD_KEY, match=models.MatchValue(value=ns.to_prefix())
+            ),
+            models.FieldCondition(
+                key="state", match=models.MatchAny(any=sorted(s.value for s in states))
+            ),
+        ]
+        if pinned is not None:
+            must.append(models.FieldCondition(key="pinned", match=models.MatchValue(value=pinned)))
+        scan_filter = models.Filter(must=must)
+        out: list[MemoryItem] = []
+        offset: Any = cursor
+        while len(out) < limit:
+            page = min(_SCROLL_PAGE_SIZE, limit - len(out))
+            records, offset = await self._qdrant.scroll(
+                collection_name=name,
+                scroll_filter=scan_filter,
+                limit=page,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+            )
+            for rec in records:
+                payload: dict[str, Any] = rec.payload or {}
+                out.append(
+                    self._mapper.from_store(
+                        QdrantPoint(
+                            point_id=str(rec.id),
+                            vector=[],
+                            sparse=None,
+                            payload=payload,
+                            collection=name,
+                        )
+                    )
+                )
+            if offset is None or not records:
+                return out, None  # Qdrant signals "no more pages" with a null next-page offset.
+        return out, None if offset is None else str(offset)
+
+    async def set_pinned(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        pinned: bool,
+        *,
+        at: datetime,
+        by: str,
+        reason: str | None,
+    ) -> int | None:
+        """MTM's half of the id-stable cross-store pin upsert (``TierPinPort``)."""
+        return await self._retry(self._set_pinned_impl)(
+            ns, memory_id, pinned, at=at, by=by, reason=reason
+        )
+
+    async def _set_pinned_impl(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        pinned: bool,
+        *,
+        at: datetime,
+        by: str,
+        reason: str | None,
+    ) -> int | None:
+        # The SAME payload-PATCH primitive `invalidate`/`set_entity_uids` already use: a
+        # `set_payload` addressed through `_scoped_point_selector`, so the namespace predicate
+        # rides INSIDE the write and a memory_id from another user/session in this same
+        # org+workspace matches zero points instead of being pinned by mistake. A full point
+        # re-upsert would also lose the vector; a patch cannot.
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return None
+        current = await self._get_impl(ns, memory_id)
+        if current is None:
+            # Not resident in THIS tier's partition — the façade decides what that means.
+            return None
+        updated = with_pin_group(current, pinned=pinned, at=at, by=by, reason=reason)
+        await self._qdrant.set_payload(
+            collection_name=name,
+            payload={
+                "pinned": updated.pinned,
+                "pinned_at": None if updated.pinned_at is None else updated.pinned_at.isoformat(),
+                "pinned_by": updated.pinned_by,
+                "pin_reason": updated.pin_reason,
+                "version": updated.version,
+            },
+            points=_scoped_point_selector(ns, memory_id),
+        )
+        # A scoped write that matched nothing is a SILENT success in Qdrant; re-raised as the
+        # typed absence signal so a pin can never be reported as landed when it did not.
+        await self._raise_if_write_missed(name, ns, memory_id, verb="set_pinned")
+        return updated.version
+
+    async def by_artifact(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]:
+        """Reverse artifact lookup over the MTM tier — the vector-tier twin of
+        ``FalkorLtmAdapter.by_artifact``.
+
+        A server-side filter on the ALREADY-INDEXED ``artifact_ref`` key (``_KEYWORD_INDEXES``)
+        ANDed with the same namespace predicate every other read compiles — never a
+        scan-and-filter. Bounded by ``_SCROLL_PAGE_SIZE`` per round trip; the reference set for a
+        single artifact is small by construction (it is the set of memories extracted from ONE
+        captured activity), so this walks it to exhaustion rather than paging, which is what
+        makes it usable as the reference-count authority for artifact GC-eligibility
+        (memory-layer §2 lines 312-321, CANONICAL §7.10 G6).
+        """
+        return await self._retry(self._by_artifact_impl)(ns, artifact_id)
+
+    async def _by_artifact_impl(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]:
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return []
+        # Full η, never the user prefix: this is the artifact GC reference-count authority, and a
+        # session-wider match would report an artifact referenced only from ANOTHER session as
+        # still live in this one. Same rule as :meth:`enumerate_page`.
+        scan_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key=NAMESPACE_PAYLOAD_KEY, match=models.MatchValue(value=ns.to_prefix())
+                ),
+                models.FieldCondition(
+                    key="artifact_ref", match=models.MatchValue(value=artifact_id)
+                ),
+            ]
+        )
+        out: list[MemoryItem] = []
+        offset: Any = None
+        while True:
+            records, offset = await self._qdrant.scroll(
+                collection_name=name,
+                scroll_filter=scan_filter,
+                limit=_SCROLL_PAGE_SIZE,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+            )
+            for rec in records:
+                payload: dict[str, Any] = rec.payload or {}
+                out.append(
+                    self._mapper.from_store(
+                        QdrantPoint(
+                            point_id=str(rec.id),
+                            vector=[],
+                            sparse=None,
+                            payload=payload,
+                            collection=name,
+                        )
+                    )
+                )
+            if offset is None or not records:
+                return out
 
     async def remove(self, ns: Namespace, memory_id: str) -> None:
         return await self._retry(self._remove_impl)(ns, memory_id)

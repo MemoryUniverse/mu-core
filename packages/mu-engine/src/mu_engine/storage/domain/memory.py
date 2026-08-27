@@ -186,6 +186,35 @@ class MemoryItem(BaseModel):
     # total order (item 4a(b)), never immunity from it. Additive, default False.
     pinned: bool = False
 
+    # ---- the REST of the pin field-group (memory-health-pinning-spec §3.1 line 168) ----
+    # ``set_pinned`` is specified as an upsert of the WHOLE pin group, and unpin must CLEAR
+    # ``pinned_at``/``pinned_by``/``pin_reason`` (``mu_contracts.ports.memory
+    # .MemoryTierRepository.set_pinned``, lines 59-63). Until now this record carried only the
+    # bare ``pinned`` boolean, so the three audit fields had nowhere to live in ANY store — every
+    # adapter serialises THIS class — and ``PinResult.pinned_at`` was satisfied by ``PinService``
+    # echoing its own clock rather than by anything read back. Additive + nullable-defaulted, the
+    # same shape by which ``pinned`` itself landed, so every existing row and constructor stays
+    # valid. AUDIT ONLY: ``pinned_by`` is never an authz principal and never a term in
+    # ``authorized_ids`` (CANONICAL §7.4); ``pin_reason`` is a short named classification, never
+    # memory text (content-free discipline).
+    pinned_at: datetime | None = None
+    pinned_by: str | None = None
+    pin_reason: str | None = None
+
+    # ---- record revision counter (the source of ``set_pinned``'s returned version) ----
+    # ``MemoryTierRepository.set_pinned`` must "return the new version" and ``PinResult.version``
+    # (``mu_contracts/domain/model/pin.py:36-38``, ``Field(ge=0)``) carries it into the audit row.
+    # NEITHER ``MemoryItem`` definition carried a version field, and the spec never said where the
+    # number comes from — so one is introduced HERE, on the record, rather than borrowed from a
+    # store primitive: Qdrant's ``UpdateResult.operation_id`` is per-COLLECTION and meaningless for
+    # an STM-only item, and a control-plane counter would add a fourth store to the pin write.
+    # A record-local counter is the only candidate that is monotonic per item, identical across
+    # every tier the id lives in, and available with zero extra I/O (the pin write already reads
+    # the item to resolve residency). It is NOT a compare-and-set token: nothing rejects a stale
+    # version yet, so it reports revisions, it does not police concurrency. Any FUTURE id-stable
+    # field-group upsert must bump it too, or it stops counting revisions and starts counting pins.
+    version: int = Field(default=0, ge=0)
+
     source: MemorySource = MemorySource.USER
 
     # proposition triple (content-free relational mirror stores hashes/uids, never this text)
