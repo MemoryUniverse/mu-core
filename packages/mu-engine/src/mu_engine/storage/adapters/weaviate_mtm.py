@@ -110,6 +110,52 @@ _VECTOR_NAME = "default"
 # bounds how many objects one round-trip materializes.
 _SCROLL_PAGE_SIZE = 256
 
+# ---------------------------------------------------------------- recall over-fetch (DEV-STANDARDS
+# rule 3: named, documented CONSTRUCTOR DEFAULTS threaded by DI — the SAME seam and the same
+# rationale as ``_DEFAULT_STORE_IO_TIMEOUT_S`` above, because there is still no ``WeaviateSettings``
+# subtree on the central ``Settings`` tree to hang them off; ``factories._build_weaviate`` passes
+# whatever the caller's ``cfg`` supplies and these are the fallbacks. Recorded as the same delta.)
+#
+# WHY ``semantic`` must ask Weaviate for MORE rows than the caller's ``limit``: the GraphQL
+# ``where`` clause is a PRE-filter only, never a correctness guarantee, on the already-live
+# ``MuMtm8``/``MuMtm16`` classes — their ``namespace``/``user_prefix`` properties are stuck at
+# ``Tokenization.WORD`` forever (immutable; see ``_PROPERTIES``), where ``Equal`` is a token-SUBSET
+# match that provably returns rows from a FOREIGN partition. The exact Python re-check
+# (``_namespace_match_value``) then drops those rows. Asking for exactly ``limit`` and dropping
+# rows afterwards therefore handed the caller FEWER than ``limit`` legitimate memories whenever the
+# pre-filter over-matched: no error, no degrade signal, just less memory reaching the agent — the
+# same silent-under-delivery failure CLASS as the cross-session blocker documented above, and worse
+# upstream, where an under-filled recall arm quietly loses the RRF fusion to the other arm.
+#
+# ⚠ HONEST BOUND: over-fetching REDUCES this under-fill; it does NOT eliminate it, and no factor
+# can. If the partitions sharing a tenant hold more over-matching rows than the over-fetch window,
+# the result is still short — silently. Only a FIELD-tokenized class (every class created after the
+# ``_PROPERTIES`` fix) removes the possibility at the source; on a WORD-tokenized class this is
+# mitigation, not a guarantee.
+_DEFAULT_SEMANTIC_OVERFETCH_FACTOR = 3
+# HARD additive bound on the extra rows one recall may materialize. An unbounded (purely
+# multiplicative) over-fetch is its own defect: a large ``limit`` would turn a bounded recall into
+# an enormous scan of the tenant shard, paid on every query, to mitigate a pre-filter leak that is
+# at worst proportional to the number of sibling partitions in the shard. With this cap the query
+# never asks for more than ``limit + _DEFAULT_SEMANTIC_OVERFETCH_MAX_EXTRA`` rows, whatever
+# ``limit`` is.
+_DEFAULT_SEMANTIC_OVERFETCH_MAX_EXTRA = 512
+
+
+def _overfetch_limit(limit: int, *, factor: int, max_extra: int) -> int:
+    """Rows to ask Weaviate for so that ``limit`` rows SURVIVE the exact re-check.
+
+    ``limit + min(limit * (factor - 1), max_extra)`` — multiplicative in the small-``limit`` band
+    where the pre-filter leak actually bites, additively capped above it (see the constants'
+    comment). ``factor <= 1`` degrades to no over-fetch (the pre-fix behavior) rather than to a
+    smaller-than-``limit`` fetch; a non-positive ``limit`` is returned unchanged.
+    """
+    if limit <= 0:
+        return limit
+    extra = min(limit * max(factor, 1) - limit, max(max_extra, 0))
+    return limit + extra
+
+
 # BLOCKER FIX (BQ3; ADR 0030 §1): the Weaviate twin of qdrant_mtm.py's ``_USER_PREFIX_KEY``
 # (``mu_engine/storage/adapters/qdrant_mtm.py:67``) — the truncated, session-less user-prefix
 # property that makes cross-session, per-user federated recall possible on PRIVATE namespaces.
@@ -303,6 +349,8 @@ class WeaviateMtmAdapter:
         http_url: str,
         dim: int,
         store_io_timeout_s: float = _DEFAULT_STORE_IO_TIMEOUT_S,
+        semantic_overfetch_factor: int = _DEFAULT_SEMANTIC_OVERFETCH_FACTOR,
+        semantic_overfetch_max_extra: int = _DEFAULT_SEMANTIC_OVERFETCH_MAX_EXTRA,
     ) -> None:
         self._weaviate = client
         self._http = httpx.AsyncClient(base_url=http_url, timeout=store_io_timeout_s)
@@ -313,6 +361,9 @@ class WeaviateMtmAdapter:
         self._class_ensured = False
         self._ensured_tenants: set[str] = set()
         self._retry = retry_io(timeout_s=store_io_timeout_s)
+        # See ``_overfetch_limit`` / the constants above: DI-threaded, never read from a global.
+        self._semantic_overfetch_factor = semantic_overfetch_factor
+        self._semantic_overfetch_max_extra = semantic_overfetch_max_extra
 
     async def close(self) -> None:
         """Release both underlying connections (DEV-STANDARDS resource management)."""
@@ -644,12 +695,23 @@ class WeaviateMtmAdapter:
             return []
         match_prop, match_value = _resolve_namespace_match(ns, session_scope=session_scope)
         where = self._recall_where(ns, caller_identity_set, session_scope=session_scope)
+        # OVER-FETCH, then re-check, then truncate to ``limit`` (see ``_overfetch_limit`` and the
+        # constants above). Asking for exactly ``limit`` here under-filled recall silently every
+        # time the WORD-tokenized pre-filter over-matched, because the exact re-check below drops
+        # rows AFTER Weaviate has already applied the cut. This REDUCES that under-fill against a
+        # WORD-tokenized class; it does NOT eliminate it — an over-match wider than the over-fetch
+        # window still returns short, and this code cannot detect that it did.
+        fetch_limit = _overfetch_limit(
+            int(limit),
+            factor=self._semantic_overfetch_factor,
+            max_extra=self._semantic_overfetch_max_extra,
+        )
         query = (
             "{ Get { "
             f"{self._class}(tenant: {_gql_str(tenant_name(ns))}, "
             f"nearVector: {{vector: {_gql_vector(query_vector)}, "
             f"targetVectors: [{_gql_str(_VECTOR_NAME)}]}}, "
-            f"limit: {int(limit)}, where: {where}) {{ "
+            f"limit: {fetch_limit}, where: {where}) {{ "
             f"payload_json _additional {{ id distance vectors {{ {_VECTOR_NAME} }} }} "
             "} } }"
         )
@@ -678,6 +740,8 @@ class WeaviateMtmAdapter:
                     rank=len(out),
                 )
             )
+            if len(out) >= limit:
+                break  # the truncation half of the over-fetch: never hand back MORE than `limit`
         return out
 
     # ------------------------------------------------------------------ demotion scan
@@ -700,6 +764,16 @@ class WeaviateMtmAdapter:
         tenant = tenant_name(ns)
         out: list[MemoryItem] = []
         offset = 0
+        # NO over-fetch factor is needed HERE, unlike `_semantic_impl` — this loop already gets the
+        # same effect structurally, and adding one would be redundant. It KEEPS PAGING while
+        # `len(out) < limit`, and `offset` advances by the number of rows Weaviate RETURNED (not by
+        # the number that survived the re-check), so every row the WORD pre-filter over-matched and
+        # the re-check dropped is simply replaced by the next page instead of eating a result slot.
+        # The loop ends only on a genuinely short page (`len(objects) < page` -> end of data) or an
+        # empty one. Under-fill here therefore means the shard really has no more matching rows.
+        # (`_semantic_impl` cannot borrow this trick: its rows are ORDERED BY VECTOR DISTANCE, so
+        # paging deeper with `offset` would keep walking away from the query vector; over-fetching
+        # one wider top-k window is the only shape that preserves ranking.)
         while len(out) < limit:
             page = min(_SCROLL_PAGE_SIZE, limit - len(out))
             query = (
