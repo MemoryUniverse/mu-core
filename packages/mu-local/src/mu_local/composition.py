@@ -50,9 +50,11 @@ import contextlib
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
+import structlog
+
 from mu_contracts.config import Settings, get_settings
 from mu_contracts.domain.errors import MemoryUniverseError
-from mu_contracts.domain.model.memory import Namespace
+from mu_contracts.domain.model.memory import Namespace, Tier
 from mu_contracts.ports.bus import EventBusPort
 from mu_contracts.ports.governance import ConflictRecordRepository
 from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
@@ -66,6 +68,7 @@ from mu_engine.lifecycle.conflict import (
     build_conflict_adjudicator,
     conflict_adjudicator_settings_from_lifecycle,
 )
+from mu_engine.lifecycle.counts import TierCountCache, TierCountSettings
 from mu_engine.lifecycle.demotion import DemotionService
 from mu_engine.lifecycle.mode_gate import ManagerMode, ManagerModeGate
 from mu_engine.lifecycle.promotion import PromotionService
@@ -87,7 +90,15 @@ from mu_engine.services.extract import (
     HeuristicSpoExtractor,
     LlmFactExtractor,
 )
+from mu_engine.services.health.assessor import HeuristicV1Assessor
+from mu_engine.services.health.conflict_edges import PendingConflictEdgeReader
+from mu_engine.services.health.service import MemoryHealthService
+from mu_engine.services.health.settings import HealthSettings
 from mu_engine.services.ingest import IngestService
+from mu_engine.services.memory.repository import TieredMemoryRepository
+from mu_engine.services.memory.router import TierLeg, TierRouter
+from mu_engine.services.pin.service import PinService
+from mu_engine.services.pin.settings import PinSettings
 from mu_engine.services.recall import (
     PrincipalAuthorizedIdsResolver,
     RecallAuthorizationFilter,
@@ -117,6 +128,8 @@ if TYPE_CHECKING:  # pragma: no cover — S1-03 sibling (mu_engine.lifecycle.man
     from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
 
 __all__ = ["LifecycleManagerUnavailableError", "LocalContainer"]
+
+_log = structlog.get_logger("mu_local.composition")
 
 
 class LifecycleManagerUnavailableError(MemoryUniverseError):
@@ -228,6 +241,7 @@ class LocalContainer:
         lifecycle: LifecycleSettings | None = None,
         stage_ledger: StageLedger | None = None,
         conflict_records: ConflictRecordRepository | None = None,
+        tier_counts: TierCountSettings | None = None,
     ) -> None:
         self._settings: Settings = settings or get_settings()
         # CONFIG-AND-DATA-FIX-PLAN.md §1.2 C1: the ONE wired ``EngineSettings`` (C0) read here —
@@ -361,6 +375,46 @@ class LocalContainer:
         #     rule 4) — built once here from ObservabilitySettings and threaded into every service.
         self._clock = SystemClock()
         self._bus = InprocBus()
+        # (7c) AD-24 — the tier-count cache behind ``MemoryLifecycleManager.get_state``'s
+        #      stm/mtm/ltm counts, which were a hardcoded, FALSE ``0,0,0``. Built HERE, ONCE, and
+        #      attached to the SAME ``InprocBus`` above that ingest/distill/promotion/demotion/
+        #      retention already publish onto — not inside ``build_lifecycle_manager``, which is a
+        #      FACTORY that returns a fresh manager per call while ``InprocBus._handlers`` is a
+        #      plain list that is never pruned (subscribing per manager would leak a handler per
+        #      call). Its ``detach`` goes into ``self._closers`` so ``close()`` unsubscribes it.
+        #      Zero API keys, zero daemon: the events it folds are published in-process by the
+        #      services this same container builds (the FULL-LOCAL boundary rule).
+        #
+        #      Settings are INJECTABLE (``tier_counts=`` above) and, failing that, come from
+        #      ``TierCountSettings()`` — a ``BaseSettings`` reading ``MU_TIER_COUNTS_*``, so both
+        #      memory bounds are reachable by an operator (DEV-STANDARDS rule 3; the first cut was
+        #      a bare ``BaseModel`` with no seam and an unreachable ~4 GB ceiling).
+        #
+        #      ``stm_window_s`` must track the STM adapter's real TTL, because STM expiry publishes
+        #      no event and that window is the only thing keeping ``stm_count`` from converging to
+        #      "captures since process start". Two of the KV backends expose it in settings
+        #      (``InMemoryKvSettings``/``MemcachedSettings``: ``default_ttl_s``) and it is read from
+        #      there; ``RedisSettings``/``ValkeySettings`` do NOT — ``RedisStmAdapter.__init__``
+        #      builds a bare ``RedisMapper()`` whose ``default_ttl_s=3600`` no config can reach
+        #      (``storage/adapters/redis_stm.py``/``storage/mappers/redis_mapper.py``). That is a
+        #      real config gap in ``storage/**``, owned by another lane and REPORTED, not papered
+        #      over here: on those backends this falls back to ``TierCountSettings``' own 3600s
+        #      default, which matches the mapper today, and an operator who changes one must set
+        #      ``MU_TIER_COUNTS_STM_WINDOW_S`` to match.
+        _kv_ttl_s = getattr(self._settings.storage.cache, "default_ttl_s", None)
+        self._tier_count_settings: TierCountSettings = (
+            tier_counts
+            if tier_counts is not None
+            else (
+                TierCountSettings(stm_window_s=float(_kv_ttl_s))
+                if _kv_ttl_s is not None
+                else TierCountSettings()
+            )
+        )
+        self.tier_counts = TierCountCache(settings=self._tier_count_settings, clock=self._clock)
+        self.tier_counts.attach(self._bus)
+        self._closers.append(self.tier_counts.detach)
+
         self.tracer: Tracer = build_tracer(enabled=self._obs.otel_enabled, service_name="mu-local")
         self.metrics: MetricSink = build_metrics(enabled=self._obs.metrics_enabled)
         # C3: `settings=` threaded from the WIRED `EngineSettings.observability` so
@@ -428,6 +482,16 @@ class LocalContainer:
         #      C1: from the WIRED `EngineSettings.distill` (`MU_DISTILL__SUPERSEDE_CONFIDENCE`,
         #      `MU_DISTILL__USE_LLM_ADJUDICATOR`, …) instead of a bare `DistillSettings()`.
         self._distill_settings = self._engine_settings.distill
+        # ONE conflict inbox per container, hoisted out of the adjudicator branch below.
+        # ``MemoryHealthService`` READS this inbox (through ``PendingConflictEdgeReader``) to
+        # raise the CONFLICTING / LOW_CONFIDENCE flags, and ``ConflictAdjudicator`` WRITES its
+        # parked verdicts into it. Constructing it inline inside the adjudicator branch would
+        # have given the health view a SECOND, permanently empty inbox in LLM mode and no
+        # shared object at all in heuristic mode — a health lens that structurally could never
+        # see a conflict (DEV-STANDARDS rule 9: one composition root, one instance per plane).
+        self._conflict_records: ConflictRecordRepository = (
+            self._injected_conflict_records or InMemoryConflictRecordRepository()
+        )
         self.conflict_adjudicator: ConflictAdjudicator | None = None
         if self.llm is not None and self._distill_settings.use_llm_adjudicator:
             # C3: `settings=` threaded from the WIRED `EngineSettings.lifecycle`
@@ -441,8 +505,7 @@ class LocalContainer:
                 settings=conflict_adjudicator_settings_from_lifecycle(self.lifecycle_settings),
                 clock=self._clock,
                 bus=self._bus,
-                conflict_records=self._injected_conflict_records
-                or InMemoryConflictRecordRepository(),
+                conflict_records=self._conflict_records,
             )
 
         # (8) application services — each facade verb delegates to exactly one of these; each gets
@@ -515,6 +578,101 @@ class LocalContainer:
             clock=self._clock,
             metrics=self.metrics,
             tracer=self.tracer,
+        )
+
+        # (9) the MemoryRepository FAÇADE + the two services that could not exist without it
+        #     (CANONICAL §6-P2; memory-health-pinning-spec §5.1/§5.2).
+        #
+        #     ``MemoryHealthService`` and ``PinService`` both take ``repo: MemoryRepository`` as a
+        #     REQUIRED keyword with no default, and nothing in this repo implemented that Protocol
+        #     — so neither class could be constructed at all, and mu-client's ``/health`` /
+        #     ``/pin`` / ``/unpin`` IPC routes returned a named 503 while its MCP tools raised
+        #     ``ServiceNotWiredError``. Building the façade alone would not have changed that:
+        #     this container built NEITHER service, so the surfaces had nothing to be handed.
+        #     Both are constructed here, over the SAME stm/mtm/ltm adapters every other service
+        #     shares (never a second set), which is what makes the feature live rather than merely
+        #     present.
+        self._tier_router = TierRouter(
+            (
+                TierLeg(Tier.STM, self.stm, backend=storage.kv.backend),
+                TierLeg(Tier.MTM, self.mtm, backend=storage.vector.backend),
+                TierLeg(Tier.LTM, self.ltm, backend=storage.graph.backend),
+            )
+        )
+        self.memory: TieredMemoryRepository = TieredMemoryRepository(
+            router=self._tier_router,
+            # CANONICAL §6-P2 puts the embed step at the façade boundary; the SAME live embedder
+            # every other arm uses, so `semantic` cannot drift onto a second model.
+            embedder=self.embedder,
+        )
+        #     WHICH of the two services can exist is a BINDING question, answered at BOOT.
+        #
+        #     ``TierRouter.missing_capabilities()`` names every bound backend that has no walk
+        #     primitive and every one that has no id-stable pin upsert. Three of the five vector
+        #     backends (pgvector/chroma/faiss) genuinely have neither. On such a binding a
+        #     constructed ``MemoryHealthService`` would raise ``TierCapabilityUnavailableError``
+        #     on EVERY call, forever — and that class does NOT subclass
+        #     ``TierRepositoryUnavailableError``, so ``MemoryHealthService._walk``'s degrade branch
+        #     never fires and mu-client's ``/health`` route (which wraps ``assess`` in no ``try``)
+        #     would close the connection with no reply. A service that can only ever throw is not
+        #     a wired service; the house ABSENCE rule says leave it absent, and every surface
+        #     already answers a NAMED, content-free "not wired" degrade for exactly that
+        #     (``daemon/ipc.py`` ``health_service_not_wired``). So the gap decides, rather than
+        #     being logged and then ignored.
+        #
+        #     Reported and NOT raised: such a backend still serves ingest and recall perfectly
+        #     well, so refusing the whole container would take a working deployment down over two
+        #     surfaces it never used.
+        #
+        #     REPORTED DESIGN DELTA, not silently absorbed: a partial view over the tiers that CAN
+        #     enumerate would be strictly better than absence here, and the ``partial`` flag plus
+        #     the ``tiers=`` narrowing already exist to express it — but CANONICAL §2 models
+        #     exactly ONE memory-tier degrade reason (``LTM_UNAVAILABLE``), so "MTM cannot
+        #     enumerate at all" has no sanctioned partial answer to fall back to. Inventing one
+        #     here would be a silent deviation from the design set.
+        gaps = self._tier_router.missing_capabilities()
+        cannot_enumerate = tuple(gap for gap in gaps if ":enumerate(" in gap)
+        cannot_pin = tuple(gap for gap in gaps if ":set_pinned(" in gap)
+        if gaps:
+            _log.warning(
+                "memory_repository_capability_gap",
+                missing=list(gaps),
+                impact="health/pin surfaces refuse by name on this binding",
+            )
+        health_settings = HealthSettings()
+        #: ``None`` on a binding whose vector backend cannot walk a partition — the health lens is
+        #: a partition walk and nothing else, so without one there is no view to serve.
+        self.health: MemoryHealthService | None = (
+            None
+            if cannot_enumerate
+            else MemoryHealthService(
+                repo=self.memory,
+                assessor=HeuristicV1Assessor(health_settings),
+                conflicts=PendingConflictEdgeReader(self._conflict_records),
+                settings=health_settings,
+                clock=self._clock,
+                bus=self._bus,
+                tracer=self.tracer,
+                metrics=self.metrics,
+                audit=self.audit,
+            )
+        )
+        #: ``None`` when any bound tier cannot apply the id-stable pin upsert, AND when the
+        #: partition cannot be walked — ``PinService._assert_within_pin_bound`` counts the
+        #: partition's existing pins with one bounded ``enumerate`` page on EVERY pin, so a
+        #: binding that cannot enumerate cannot enforce the pin-explosion bound either.
+        self.pin: PinService | None = (
+            None
+            if (cannot_pin or cannot_enumerate)
+            else PinService(
+                repo=self.memory,
+                bus=self._bus,
+                settings=PinSettings(),
+                clock=self._clock,
+                tracer=self.tracer,
+                metrics=self.metrics,
+                audit=self.audit,
+            )
         )
 
     async def close(self) -> None:
@@ -652,6 +810,7 @@ class LocalContainer:
             runner=runner,
             clock=clock or self._clock,
             warm_cache=warm_cache,
+            counts=self.tier_counts,  # AD-24: SAME cache, attached to the SAME bus (see §7c)
         )
 
     # ---------------------------------------------------------------- backend guards + resolution

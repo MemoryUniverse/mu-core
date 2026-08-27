@@ -81,12 +81,144 @@ bare deltas, correctly returns.
 
 from __future__ import annotations
 
-from typing import Any, Protocol, TypeVar
+from datetime import datetime
+from typing import Any, NamedTuple, Protocol, TypeVar
 
 from mu_contracts.domain.model.conflict import ResolutionOrigin
 from mu_contracts.domain.model.device_sync import PrivateDelta
+from mu_engine.storage.domain.memory import MemoryItem
 
-__all__ = ["total_order_key"]
+__all__ = ["total_order_key", "total_order_key_items"]
+
+#: The ``clock_group`` every ``MemoryItem`` projection carries. Two LIVE items being adjudicated
+#: on one replica are, by construction, both "here": there is no second device in the comparison,
+#: so term 4 is always COMPARABLE for items (contrast two deltas from different devices, which
+#: are genuinely concurrent and tie). Named rather than inlined so the reason survives.
+_LOCAL_REPLICA = "local"
+
+
+class _OrderTerms(NamedTuple):
+    """The seven §7.17 item-4a terms, projected off whatever candidate shape is being compared.
+
+    **This is the ONE ordering in the system, and it is written once.** ``total_order_key``
+    (deltas) and :func:`total_order_key_items` (live items) are two ADAPTERS onto the same term
+    chain in :func:`_compare` — not two orderings. conflict-async §4.2 line 164 requires the auto
+    strategies to reuse the §7.17 order, and the only faithful way to do that was a shared chain
+    with two projections, because ``total_order_key``'s own signature takes two ``PrivateDelta``s
+    for the SAME ``memory_id`` while a conflict is by definition two DIFFERENT memory ids that
+    carry no ``lamport``, no ``origin_device_id`` and no ``resolution_origin`` at all.
+
+    A ``NamedTuple``, not a pydantic model, for the same reason ``AdjudicationBudget`` is a plain
+    class: this is an internal comparison vector built twice per comparison inside a pure hot
+    function, never a domain DTO crossing a boundary — pydantic validation here would be pure
+    cost with nothing to validate (every field is already typed at its projection site).
+    """
+
+    pinned: bool  # term 1 — PRECEDENCE, dominant over everything below
+    manual: bool  # term 2 — sticky manual, below #1 only
+    asserted: bool  # term 3 — valid_at_asserted_only
+    clock_group: str  # term 4's comparability gate (device for deltas, replica for items)
+    clock: Any  # term 4's monotone counter WITHIN that group; see the two projections
+    valid_at: datetime  # term 5 — later wins
+    content_hash: str  # term 6 — no semantic direction; ascending, stability only
+    identity: str  # term 7 — no semantic direction; ascending; makes the chain TOTAL
+
+
+def _compare(a: _OrderTerms, b: _OrderTerms) -> int:
+    """The seven-term short-circuiting chain. The single source of ordering truth."""
+    for term in (
+        _cmp_bool(a.pinned, b.pinned),  # 4a(b) term 1 — dominant over everything below
+        _cmp_bool(a.manual, b.manual),  # 4a(b) term 2 — sticky below #1 only
+        _cmp_bool(a.asserted, b.asserted),  # 4a(d) — ordinary boolean; ties at False/False too
+        _cmp_clock(a, b),  # 4a(c) — same group totally ordered; cross-group a TIE
+        _cmp(a.valid_at, b.valid_at),  # later wins
+        _cmp(a.content_hash, b.content_hash),  # no semantic direction; ascending tiebreak
+        _cmp(a.identity, b.identity),  # ascending; TOTAL (unique per device / per item)
+    ):
+        if term != 0:
+            return term
+    return 0
+
+
+def _cmp_clock(a: _OrderTerms, b: _OrderTerms) -> int:
+    """item 4a(c) — see the module docstring for why same-group-only is the correct, faithful
+    reading of a pure, registry-free vector-clock comparison."""
+    if a.clock_group != b.clock_group:
+        return 0  # concurrent — no cross-group causal info on the candidates themselves
+    return _cmp(a.clock, b.clock)
+
+
+def _delta_terms(delta: PrivateDelta) -> _OrderTerms:
+    return _OrderTerms(
+        pinned=delta.pinned,
+        manual=delta.resolution_origin is ResolutionOrigin.MANUAL,
+        # valid_at_asserted_only: True iff THIS candidate's valid_at was asserted, not inferred
+        # from the DATE_EXTRACTION_FALLBACK wall-clock path (CANONICAL §7.17 PINNED 1).
+        asserted=not delta.valid_at_inferred,
+        clock_group=delta.origin_device_id,
+        clock=delta.lamport,
+        valid_at=delta.valid_at,
+        content_hash=delta.content_hash,
+        identity=delta.origin_device_id,
+    )
+
+
+def _item_terms(item: MemoryItem) -> _OrderTerms:
+    """Project a LIVE ``MemoryItem`` onto the same seven terms (conflict-async §4.2).
+
+    Four terms have no field on a live item, and each is answered rather than invented:
+
+    * **term 2 (``manual``) is ``False``, always.** A manual decision is a property of a
+      *resolution*, not of a memory: it lives on the ``ConflictRecord`` and on the ``PrivateDelta``
+      the resolution emits. Stickiness is therefore enforced where it actually applies — in
+      ``services.conflict.convergence`` over the delta set (§7) — and never here, because a live
+      item that carried a manual flag would let one replica's already-applied decision be
+      re-derived as if it were a fresh candidate property.
+    * **term 3 (``asserted``) reads ``metadata["valid_at_inferred"]``.** That is the shipped
+      convention, not a guess: ``DistillPipeline`` writes the flag there (``distill.py:535``,
+      ``:551``) and reads it back at ``distill.py:1002`` to build the sync delta's own
+      ``valid_at_inferred``. Absent key means asserted, matching that reader's ``False`` default.
+      (``MemoryItem`` having no first-class ``valid_at_inferred`` column is a storage-lane gap,
+      reported; this projection uses the same channel the sync-delta builder already uses, so the
+      two can never disagree.)
+    * **term 4 (``clock``) is ``created_at``, the ASSERTION instant.** On one replica every
+      candidate is same-"device", so term 4 is comparable, and ``created_at`` is that replica's
+      monotone author-order counter — the exact role ``lamport`` plays for a delta. This is also
+      what makes the item order AGREE with the shipped BUG1 rule (``distill.asserted_later``,
+      ``distill.py:705-720``) instead of contradicting it: assertion recency decides, and
+      ``valid_at`` (term 5) is consulted only to break an assertion-time tie. Design line 130
+      reads "newest asserted ``valid_at`` wins", which is the opposite priority; that conflict is
+      REPORTED as a spec gap rather than resolved by silently picking one. Term order here follows
+      §7.17, whose term 4 (the logical clock) genuinely does precede its term 5 (``valid_at``) —
+      so this is the §7.17 order applied faithfully, and it happens to reproduce BUG1's fix.
+    * **term 7 (``identity``) is ``item.id``.** Unique per item (CANONICAL §7.1 tier-stable id),
+      which is what makes the chain TOTAL — the role ``origin_device_id`` plays for deltas.
+    """
+    return _OrderTerms(
+        pinned=item.pinned,
+        manual=False,
+        asserted=not bool(item.metadata.get("valid_at_inferred", False)),
+        clock_group=_LOCAL_REPLICA,
+        clock=item.created_at,
+        valid_at=item.valid_at if item.valid_at is not None else item.created_at,
+        content_hash=item.content_hash,
+        identity=item.id,
+    )
+
+
+def total_order_key_items(a: MemoryItem, b: MemoryItem) -> int:
+    """Compare two LIVE ``MemoryItem`` conflict candidates under the SAME §7.17 item-4a order.
+
+    Returns a positive int if ``a`` dominates ``b``, negative if ``b`` dominates, and ``0`` only
+    if the two are the same item (term 7 is unique per id, so any two distinct items are
+    strictly ordered — the property every AUTOMATIC strategy relies on to never need a
+    coin-flip). Pure: no clock, no I/O, no randomness, no store — the same two items in, the
+    same winner out, on every process and every replica.
+
+    This is the entry point ``AutoResolveStrategy.RECENCY`` IS, and the tie-break every other
+    strategy falls back to (conflict-async §4.2).
+    """
+    return _compare(_item_terms(a), _item_terms(b))
 
 
 def total_order_key(a: PrivateDelta, b: PrivateDelta) -> int:
@@ -106,36 +238,7 @@ def total_order_key(a: PrivateDelta, b: PrivateDelta) -> int:
     never I/O, never a store. Usable as a ``cmp``-style comparator, e.g. via
     ``functools.cmp_to_key(total_order_key)``.
     """
-    for term in (
-        _cmp_bool(a.pinned, b.pinned),  # 4a(b) term 1 — PRECEDENCE, dominant over everything below
-        _cmp_bool(_is_manual(a), _is_manual(b)),  # 4a(b) term 2 — sticky below #1 only
-        _cmp_bool(_asserted(a), _asserted(b)),  # 4a(d) — ordinary boolean; ties at False/False too
-        _cmp_lamport_vc(a, b),  # 4a(c) — same device totally ordered; cross-device a TIE
-        _cmp(a.valid_at, b.valid_at),  # later wins
-        _cmp(a.content_hash, b.content_hash),  # no semantic direction; ascending tiebreak
-        _cmp(a.origin_device_id, b.origin_device_id),  # ascending; TOTAL (unique per device)
-    ):
-        if term != 0:
-            return term
-    return 0
-
-
-def _is_manual(delta: PrivateDelta) -> bool:
-    return delta.resolution_origin is ResolutionOrigin.MANUAL
-
-
-def _asserted(delta: PrivateDelta) -> bool:
-    # valid_at_asserted_only: True iff THIS candidate's valid_at was asserted, not inferred from
-    # the DATE_EXTRACTION_FALLBACK wall-clock path (CANONICAL §7.17 PINNED 1).
-    return not delta.valid_at_inferred
-
-
-def _cmp_lamport_vc(a: PrivateDelta, b: PrivateDelta) -> int:
-    """item 4a(c) — see the module docstring for why same-device-only is the correct, faithful
-    reading of a pure, registry-free vector-clock comparison."""
-    if a.origin_device_id != b.origin_device_id:
-        return 0  # concurrent — no cross-device causal info on the delta itself
-    return _cmp(a.lamport, b.lamport)
+    return _compare(_delta_terms(a), _delta_terms(b))
 
 
 def _cmp_bool(a_val: bool, b_val: bool) -> int:

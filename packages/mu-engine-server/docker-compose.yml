@@ -107,6 +107,16 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.12.5
     container_name: mu-engine-server-qdrant
+    # Docker's default nofile limit is 1024, which qdrant outgrows well before it runs out of
+    # disk: RocksDB holds many open files PER SEGMENT, so a handful of collections is enough.
+    # Observed on the dev VM as `actix_server::accept: Error accepting connection: Too many open
+    # files (os error 24)` plus `RocksDB flush_cf error ... payload_index/000283.sst`, which the
+    # engine server surfaced to callers as a bare HTTP 500 with no hint of the real cause. It made
+    # the F1/F3 acceptance gate flaky in a way that reads as a code defect and is not one.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     volumes:
       - mu-engine-server-qdrant-data:/qdrant/storage
     healthcheck:

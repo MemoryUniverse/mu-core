@@ -9,16 +9,22 @@ Split in two:
 - Python-client assertions (`test_*_python_client`) additionally need `mu_sdk` importable —
   `MemoryClient.promote()`/`.demote()` now make a REAL wire call (the honest 501/no-network stub
   is retired); a nonexistent id maps to the SDK's `NotFoundError`, proving the 404 contract holds
-  end-to-end.
+  end-to-end. `uv sync --group acceptance` (mu-core root) installs it; the guard for it lives in
+  the `local_server_client` fixture, NOT at module scope — see the comment above that fixture for
+  the defect that placement caused.
 """
 
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 import pytest_asyncio
+
+if TYPE_CHECKING:  # the SDK is a test-only, optional dependency — see the fixture guard below
+    from mu_sdk.client import MemoryClient
 
 pytestmark = pytest.mark.integration
 
@@ -143,18 +149,30 @@ def test_promote_invalid_tier_is_400_http(engine_up: None, engine_token: str) ->
 # promote/demote — via the Python client (a REAL wire call now; 404 -> NotFoundError)
 # ============================================================================================
 
-mu_sdk = pytest.importorskip(
-    "mu_sdk", reason="F3's Python-client half needs mu-sdk-python installed"
-)
-
-from mu_sdk.auth import BearerAuth  # noqa: E402
-from mu_sdk.client import MemoryClient  # noqa: E402
-from mu_sdk.config import SdkConfig  # noqa: E402
-from mu_sdk.errors import NotFoundError  # noqa: E402
+# The `mu_sdk` guard below is deliberately NOT at module scope, and that is the whole point.
+# It used to be — a bare `pytest.importorskip("mu_sdk", ...)` right here — which aborts the MODULE
+# import, so a missing SDK skipped all TEN tests in this file, including the eight raw-`httpx`
+# ones above that this module's own docstring promises "run unconditionally... no SDK dependency".
+# The docstring was true; the code was not. Twelve F1+F3 test functions collected as ZERO, and the
+# engine server's entire auth surface went unproven behind a skip line that named the SDK.
+# The guard now lives in the ONE fixture that actually needs the SDK, so exactly the two
+# Python-client tests below can skip and nothing else can be taken down with them.
 
 
 @pytest_asyncio.fixture
 async def local_server_client(engine_token: str) -> MemoryClient:
+    pytest.importorskip(
+        "mu_sdk",
+        reason=(
+            "F3's Python-client half needs the public mu-sdk-python package. Install it with "
+            "`uv sync --group acceptance` from the mu-core root (mu-core/pyproject.toml's "
+            "`acceptance` dependency group path-links the sibling mu-sdk-python repo, test-only)."
+        ),
+    )
+    from mu_sdk.auth import BearerAuth
+    from mu_sdk.client import MemoryClient
+    from mu_sdk.config import SdkConfig
+
     config = SdkConfig(mode="local_server", endpoint=ENGINE_BASE_URL, auth=BearerAuth(engine_token))
     client = MemoryClient(config=config)
     yield client
@@ -165,6 +183,8 @@ async def test_promote_missing_id_maps_to_not_found_python_client(
     engine_up: None, local_server_client: MemoryClient
 ) -> None:
     del engine_up
+    from mu_sdk.errors import NotFoundError  # local: the fixture above already gated the import
+
     with pytest.raises(NotFoundError):
         await local_server_client.promote("mem_does_not_matter", to_tier="mtm")
 
@@ -173,5 +193,7 @@ async def test_demote_missing_id_maps_to_not_found_python_client(
     engine_up: None, local_server_client: MemoryClient
 ) -> None:
     del engine_up
+    from mu_sdk.errors import NotFoundError  # local: the fixture above already gated the import
+
     with pytest.raises(NotFoundError):
         await local_server_client.demote("mem_does_not_matter", to_tier="stm")

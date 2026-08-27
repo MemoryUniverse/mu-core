@@ -50,6 +50,7 @@ from mu_engine.pipelines.distill import DistillSettings
 from mu_engine.pipelines.ledger import LedgerSettings
 from mu_engine.platform.settings import ObservabilitySettings, RetrySettings
 from mu_engine.providers.settings import ModelCatalogSettings, ModelSettings
+from mu_engine.services.conflict.settings import ConflictSettings
 from mu_engine.services.extract import ExtractionSettings
 from mu_engine.services.recall.dto import RecallSettings
 from mu_engine.services.settings import IngestSettings
@@ -77,6 +78,20 @@ class EngineSettings(BaseSettings):
 
     recall: RecallSettings = Field(default_factory=RecallSettings)
     distill: DistillSettings = Field(default_factory=DistillSettings)
+    #: ``conflict-resolution-async-design.md`` §4.1 step 3 — *"Workspace/global default —
+    #: ``settings.conflict.default_policy``"*. Until this mount existed there was NO path from
+    #: the environment to it: ``ConflictPolicyResolver`` fell back to a freshly-constructed
+    #: ``ConflictSettings()`` on every conflict, so step 3 of the precedence chain always
+    #: resolved to a hardcoded ``ConflictResolutionPolicy()`` and the workspace-level knob the
+    #: chain's last step names could not be set at all.
+    #:
+    #: Mounted HERE and not on ``mu_contracts.config.settings.Settings``, for this class's own
+    #: founding reason (module docstring): ``ConflictSettings`` lives in ``mu-engine`` and its
+    #: ``default_policy`` field is typed ``mu_engine.lifecycle.conflict.ConflictResolutionPolicy``,
+    #: so mounting it on the contracts root would force ``mu_contracts`` to import ``mu_engine``
+    #: — exactly what the ``contracts-imports-nothing-in-project`` import-linter contract forbids.
+    #: Env reach: ``MU_CONFLICT__DEFAULT_POLICY__MODE=manual``.
+    conflict: ConflictSettings = Field(default_factory=ConflictSettings)
     extraction: ExtractionSettings = Field(default_factory=ExtractionSettings)
     ingest: IngestSettings = Field(default_factory=IngestSettings)
     lifecycle: LifecycleSettings = Field(default_factory=LifecycleSettings)

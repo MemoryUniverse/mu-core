@@ -110,6 +110,8 @@ from mu_local.errors import LlmNotConfiguredError
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a hard import-time cycle.
     from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
+    from mu_engine.services.health.service import MemoryHealthService
+    from mu_engine.services.pin.service import PinService
 
 __all__ = ["LocalMemory"]
 
@@ -483,6 +485,28 @@ class LocalMemory:
         needs to observe THIS instance's real event stream (e.g. mu-client's daemon
         ``MaintenanceLoop``) subscribes here, never to a second, independently-constructed bus."""
         return self._container.bus
+
+    @property
+    def health(self) -> MemoryHealthService | None:
+        """THIS instance's memory-health lens (``LocalContainer.health``), or ``None`` when the
+        bound vector backend has no partition-walk primitive.
+
+        The accessor exists so a HOST can reach the service the composition root already built.
+        Without it mu-client held a ``LocalMemory`` and could not get at the container's
+        ``health``/``pin`` at all, so its ``/health`` route answered ``health_service_not_wired``
+        even on a binding that could serve — the surfaces were inert one layer above a working
+        engine. ``| None`` rather than raise-if-absent: absence is a REAL binding state
+        (pgvector/chroma/faiss expose no walk primitive), and every surface already has a named,
+        content-free degrade for it."""
+        return self._container.health
+
+    @property
+    def pin(self) -> PinService | None:
+        """THIS instance's pin service (``LocalContainer.pin``), or ``None`` when a bound tier
+        cannot apply the id-stable pin upsert or the partition cannot be walked (the pin-explosion
+        bound is counted with one bounded ``enumerate`` page). Same accessor rationale as
+        :attr:`health`."""
+        return self._container.pin
 
     def build_lifecycle_manager(
         self,

@@ -88,6 +88,13 @@ from mu_engine.providers.catalog import ModelDeployment, ModelKind, ProviderKind
 from mu_engine.providers.embedding import SentenceTransformerEmbedder, build_embedder
 from mu_engine.providers.model_router import ModelRouter, build_model_router
 from mu_engine.providers.settings import ModelCatalogSettings, ModelSettings, default_local_catalog
+from mu_engine.services.conflict.policy_resolver import ConflictPolicyResolver
+from mu_engine.services.conflict.ports import (
+    InMemoryMemoryConflictPolicyStore,
+    InMemoryNamespaceConflictPolicyStore,
+    RecordBackedResolutionQueue,
+)
+from mu_engine.services.conflict.resolution import ConflictResolutionService
 from mu_engine.services.extract import (
     FactExtractorPort,
     HeuristicSpoExtractor,
@@ -339,6 +346,25 @@ class EngineContainer:
         #     is a real network-reachable server, never a bare-unit-test context).
         self._clock = SystemClock()
         self._bus = InprocBus()
+        # AD-24 — `mu_engine.lifecycle.counts.TierCountCache` is DELIBERATELY NOT WIRED HERE, and
+        # this comment exists so nobody wires it without reading why. It IS wired on mu-local
+        # (`mu_local/composition.py`), so `GET /profile` (`routes/lifecycle.py:64-74`) reports
+        # `counts_basis=UNOBSERVED` with zeros on this plane — an honest "we did not look", which
+        # is exactly the value AD-24 asks for when nothing has looked.
+        #
+        # An earlier cut DID attach it here, on the argument that leaving it unwired would "make
+        # that endpoint lie". Measured, the wiring was the worse lie on this plane, for two
+        # reasons that no amount of care inside the cache can fix:
+        #   (a) `self._bus = InprocBus()` above is PER-PROCESS and CANONICAL §4.1 makes the bus
+        #       plane-local, so two uvicorn workers can never converge: two identical `GET /profile`
+        #       calls would return DIFFERENT numbers under the same badge, and a plain restart
+        #       resets one of them to zero;
+        #   (b) `max_tracked_prefixes` is an LRU by WRITE recency across every tenant of a hosted
+        #       plane, so busy tenants evict quiet ones and most users would read UNOBSERVED anyway
+        #       — the feature degrading to the stub at precisely the scale this plane exists for.
+        # Wiring it here needs a SHARED counter (a Valkey/Postgres cardinality this container can
+        # read), not a second copy of an in-process cache. Until then, uniform and honest beats
+        # per-replica and confident.
         self.tracer = build_tracer(enabled=True, service_name="mu-engine-server")
         self.metrics = build_metrics(enabled=True)
         # C3: `settings=` threaded from the WIRED `EngineSettings.observability` so
@@ -375,6 +401,49 @@ class EngineContainer:
         #      InMemoryConflictRecordRepository LocalContainer defaults to.
         # C1: from the WIRED `EngineSettings.distill` instead of a bare `DistillSettings()`.
         self._distill_settings = self._engine_settings.distill
+
+        # (7b) conflict-resolution-async-design.md §4.1 — the most-specific-wins policy chain.
+        #      Without a resolver, `ConflictAdjudicator` falls back to a policy fixed at
+        #      construction time, which structurally cannot express "per-memory beats
+        #      per-namespace": every conflict in the deployment resolved under one hardcoded
+        #      `ConflictResolutionPolicy()`, and the per-namespace knob §4.1 line 155 calls
+        #      "the primary knob the owner asked for" could not be set at all.
+        #
+        #      Step 3 (`settings.conflict.default_policy`) now comes from the WIRED
+        #      `EngineSettings.conflict`, so `MU_CONFLICT__DEFAULT_POLICY__MODE=manual` reaches
+        #      this deployable — the same C1 treatment every other subtree above got.
+        #
+        #      Steps 1 and 2 are the in-process stores: real adapters, not stubs (their own
+        #      docstrings: "the sanctioned LOCAL-plane defaults"), namespace-scoped on
+        #      `ns.to_prefix()`. They are the SAME instances handed to `ConflictResolutionService`
+        #      below, so a policy written through `PUT /conflict-policy` is the policy the next
+        #      detection reads. A durable control-plane row is the multi-tenant server's concern
+        #      (mu-server), not this single-tenant deployable's.
+        self._namespace_conflict_policies = InMemoryNamespaceConflictPolicyStore()
+        self._memory_conflict_policies = InMemoryMemoryConflictPolicyStore()
+        self.conflict_policy_resolver: ConflictPolicyResolver = ConflictPolicyResolver(
+            settings=self._engine_settings.conflict,
+            namespace_policies=self._namespace_conflict_policies,
+            memory_policies=self._memory_conflict_policies,
+        )
+
+        # (7b-2) The §5 write actions + the §5-line-218 resolve queue. The queue is the
+        #        RECORD-BACKED one, never the in-process dict: its durability IS the durable
+        #        `RedisConflictRecordRepository` above, so a decision accepted and then lost to a
+        #        restart is re-derived and applied on the next sweep instead of leaving a record
+        #        that says RESOLVED while both items stay active forever.
+        self.conflict_resolution_queue: RecordBackedResolutionQueue = RecordBackedResolutionQueue(
+            self.conflict_records
+        )
+        self.conflict_resolution: ConflictResolutionService = ConflictResolutionService(
+            records=self.conflict_records,
+            queue=self.conflict_resolution_queue,
+            clock=self._clock,
+            bus=self._bus,
+            namespace_policies=self._namespace_conflict_policies,
+            memory_policies=self._memory_conflict_policies,
+        )
+
         self.conflict_adjudicator: ConflictAdjudicator | None = None
         if self.llm is not None and self._distill_settings.use_llm_adjudicator:
             # C3 (mirrors `mu_local.composition`): `settings=` threaded from the WIRED
@@ -387,6 +456,9 @@ class EngineContainer:
                 clock=self._clock,
                 bus=self._bus,
                 conflict_records=self.conflict_records,
+                # §4.1 — the resolver WINS over the constructor-time `policy`, which is what
+                # makes "per-memory beats per-namespace beats workspace-default" reachable.
+                policy_resolver=self.conflict_policy_resolver,
             )
 
         # (8) application services — each SurfaceFacade verb delegates to exactly one of these.
@@ -422,6 +494,12 @@ class EngineContainer:
             metrics=self.metrics,
             audit=self.audit,
             adjudicator=self.conflict_adjudicator,
+            # ResolveConflictStage's two arms (conflict-async §2 table). Without these the
+            # machinery above is inert: a human decision recorded by `conflict_resolution` would
+            # never be applied to any store, and an AUTOMATIC supersession would never close its
+            # own `ConflictRecord`, leaving `AUTO_RESOLVED`/`origin=auto` unreachable.
+            resolution_queue=self.conflict_resolution_queue,
+            conflict_apply=self.conflict_resolution,
         )
         # C1: from the WIRED `EngineSettings.recall` instead of a bare `RecallSettings()` — the
         # exact class the `02fbed9` `recency_floor_limit` bug lived in.
@@ -499,6 +577,7 @@ class EngineContainer:
             bus=self._bus,
             settings=self.lifecycle_settings,
             clock=self._clock,
+            # counts=…: intentionally omitted on this plane — see the AD-24 note above.
         )
         self.lifecycle_runner: EngineLifecycleSweepRunner = EngineLifecycleSweepRunner(
             bus=self._bus,

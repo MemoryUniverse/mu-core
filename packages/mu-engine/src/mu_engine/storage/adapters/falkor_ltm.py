@@ -76,6 +76,7 @@ from mu_engine.storage.domain.recall import RecallChannel, Scored
 from mu_engine.storage.errors import MtmPointAbsentError
 from mu_engine.storage.mappers.graph_mapper import GraphMapper
 from mu_engine.storage.mappers.tenancy import tenant_partition_digest
+from mu_engine.storage.tier_capabilities import with_pin_group
 
 __all__ = ["EntityUidsSink", "FalkorLtmAdapter"]
 
@@ -194,6 +195,11 @@ _DEFAULT_STORE_IO_TIMEOUT_S = 10.0
 # chain_head_state`) — a real chain is a handful of links; this only guards against a corrupt
 # cyclic ``SUPERSEDED_BY`` edge causing an unbounded loop, never a normal-path limit.
 _MAX_CHAIN_HOPS = 64
+# Hard per-call cap on the bounded partition walk (:meth:`FalkorLtmAdapter.enumerate_page`),
+# applied as a Cypher ``LIMIT`` on top of the caller's own ``limit``. Structural guard, not a
+# tunable: ``facts_by_state`` next door is the un-paged read this one exists to replace, and the
+# whole point of the replacement is that no single graph round trip can materialize a partition.
+_MAX_ENUMERATE_PAGE = 512
 
 
 class FalkorLtmAdapter:
@@ -311,7 +317,16 @@ class FalkorLtmAdapter:
             "m.object_kind = $object_kind, m.polarity = $polarity, m.state = $state, "
             "m.valid_at = $valid_at, m.invalid_at = $invalid_at, "
             "m.content_hash = $content_hash, m.artifact_ref = $artifact_ref, "
-            "m.provenance_id = $provenance_id, m.content = $content, m.memory_json = $memory_json"
+            "m.provenance_id = $provenance_id, m.content = $content, "
+            # The pin group's filterable half. `GraphMapper.to_store` promotes `pinned`/`version`
+            # onto the node props precisely so a sweep can reach them from a Cypher WHERE
+            # (memory-health-pinning-spec §3.1 line 168) — but this SET clause is an explicit
+            # allowlist, so a prop the mapper produces and this list omits is simply never
+            # written. That is not hypothetical: with the mapper updated and this line not,
+            # `m.pinned` read back as NULL on every node and `enumerate(pinned=True)` returned
+            # nothing from the graph tier while looking perfectly healthy.
+            "m.pinned = $pinned, m.version = $version, "
+            "m.memory_json = $memory_json"
             f"{set_authorized}"
         )
         await g.query(cypher, params=dict(props))
@@ -791,6 +806,131 @@ class FalkorLtmAdapter:
             {"ns": ns.to_prefix(), "states": [s.value for s in states]},
         )
         return [MemoryItem.model_validate_json(r[0]) for r in res]
+
+    # ---------------------------------------------------- TierEnumerationPort / TierPinPort --
+    async def enumerate_page(
+        self,
+        ns: Namespace,
+        *,
+        states: frozenset[MemoryState],
+        pinned: bool | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[MemoryItem], str | None]:
+        """LTM's half of the bounded partition walk (``TierEnumerationPort``).
+
+        **This is the bounded answer to :meth:`facts_by_state`, which is not one.** That method's
+        own comment calls it "a full, namespace-scoped ... enumeration": ``MATCH (m:Memory) WHERE
+        m.namespace = $ns AND m.state IN $states RETURN m.memory_json`` with no ordering, no
+        ``SKIP`` and no ``LIMIT``. It is correctly tenant-scoped and still exactly the shape spec
+        §3.1 forbids for a user-facing walk. It is deliberately left untouched —
+        ``RetentionService`` depends on the un-paged form — and this method is what the health
+        view and the pin bound use instead.
+
+        Paged by a KEYSET cursor on ``m.id`` (``ORDER BY m.id`` + ``m.id > $cursor``), not
+        ``SKIP``/``OFFSET``. A keyset walk costs the same on page 1000 as on page 1 and, more
+        importantly, cannot silently skip or repeat rows when a concurrent write shifts the
+        offset underneath a long walk — which for a health view is the difference between "these
+        are your memories" and "these are some of your memories".
+
+        ``coalesce(m.pinned, false)`` rather than a bare ``m.pinned = $pinned``: the property was
+        promoted onto the node only when the pin group landed, so nodes written before that carry
+        no ``pinned`` at all. In Cypher a missing property is ``null``, and ``null = false`` is
+        ``null``, not ``true`` — so an un-coalesced predicate would silently drop every
+        pre-existing fact from an ``enumerate(pinned=False)`` sweep.
+        """
+        return await self._retry(self._enumerate_page_impl)(
+            ns, states=states, pinned=pinned, cursor=cursor, limit=limit
+        )
+
+    async def _enumerate_page_impl(
+        self,
+        ns: Namespace,
+        *,
+        states: frozenset[MemoryState],
+        pinned: bool | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[MemoryItem], str | None]:
+        if limit <= 0:
+            return [], None
+        capped = min(limit, _MAX_ENUMERATE_PAGE)
+        # `m.namespace = $ns` is the property-level tenancy predicate; the physical graph is
+        # ALREADY partitioned per (org, workspace, visibility|user) by `graph_name_for`, so this
+        # is the second of the two layers `storage-pluggable-spec.md §6` item 1 requires — never
+        # a filter standing alone.
+        where = ["m.namespace = $ns", "m.state IN $states"]
+        params: dict[str, Any] = {
+            "ns": ns.to_prefix(),
+            "states": [s.value for s in states],
+            "limit": capped,
+        }
+        if pinned is not None:
+            where.append("coalesce(m.pinned, false) = $pinned")
+            params["pinned"] = pinned
+        if cursor is not None:
+            where.append("m.id > $cursor")
+            params["cursor"] = cursor
+        cypher = (
+            f"MATCH (m:Memory) WHERE {' AND '.join(where)} "
+            "RETURN m.memory_json AS mj, m.id AS id ORDER BY m.id LIMIT $limit"
+        )
+        rows = await g_query(self._graph(ns), cypher, params)
+        items = [MemoryItem.model_validate_json(r[0]) for r in rows]
+        # A SHORT page means the walk is exhausted; a FULL page means there may be more. Erring
+        # toward one extra empty page is correct here — claiming exhaustion on a full page would
+        # silently truncate the caller's view of its own partition.
+        next_cursor = str(rows[-1][1]) if len(rows) == capped and rows else None
+        return items, next_cursor
+
+    async def set_pinned(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        pinned: bool,
+        *,
+        at: datetime,
+        by: str,
+        reason: str | None,
+    ) -> int | None:
+        """LTM's half of the id-stable cross-store pin upsert (``TierPinPort``)."""
+        return await self._retry(self._set_pinned_impl)(
+            ns, memory_id, pinned, at=at, by=by, reason=reason
+        )
+
+    async def _set_pinned_impl(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        pinned: bool,
+        *,
+        at: datetime,
+        by: str,
+        reason: str | None,
+    ) -> int | None:
+        # `{namespace: $ns, id: $id}` is the node-level tenancy predicate, inside the MATCH — a
+        # foreign memory_id matches no node and the SET touches nothing, the graph twin of
+        # `qdrant_mtm._scoped_point_selector`. Read-then-write (not a blind SET) because the
+        # version is derived from the CURRENT record and because `memory_json` is the lossless
+        # carrier every read reconstructs from: writing the promoted `pinned` property without
+        # rewriting `memory_json` would leave the node's filterable view and its authoritative
+        # view disagreeing about whether the item is pinned.
+        current = await self._get_fact_impl(ns, memory_id)
+        if current is None:
+            return None  # not resident in THIS tier's partition.
+        updated = with_pin_group(current, pinned=pinned, at=at, by=by, reason=reason)
+        await self._graph(ns).query(
+            "MATCH (m:Memory {namespace: $ns, id: $id}) "
+            "SET m.pinned = $pinned, m.version = $version, m.memory_json = $mj",
+            params={
+                "ns": ns.to_prefix(),
+                "id": memory_id,
+                "pinned": updated.pinned,
+                "version": updated.version,
+                "mj": updated.model_dump_json(),
+            },
+        )
+        return updated.version
 
     async def chain_head_state(self, ns: Namespace, memory_id: str) -> MemoryState:
         return await self._retry(self._chain_head_state_impl)(ns, memory_id)

@@ -16,13 +16,19 @@ posture (no silent mock fallback).
   ``ConflictRecord.model_dump_json()``. One record, one key (mirrors the ledger's one-key-per-stage
   shape) — the whole record round-trips through pydantic, never a hand-rolled field mapping.
 - ``{prefix}:pending:{ns.to_prefix()}`` — a ``SET`` of ``conflict_id`` members: the inbox index the
-  ``pending()`` query (state=``MANUAL_PENDING``) reads, so that call is an ``SMEMBERS`` + N record
+  ``pending()`` query (state ∈ ``ACTIONABLE_STATES`` = ``{MANUAL_PENDING, REOPENED}``, spec §5
+  line 197 — indexing ``MANUAL_PENDING`` alone actively EVICTED a reopened conflict from the only
+  surface that could show it) reads, so that call is an ``SMEMBERS`` + N record
   ``GET``s instead of an unbounded per-namespace scan. The index is kept in sync on every
   ``add``/``upsert``: the write always ``SREM``s first, then ``SADD``s back only when the record's
   CURRENT state is ``MANUAL_PENDING`` — a record that transitions OUT of pending (resolved/
   dismissed/reopened-then-resolved) drops out of the index on its very next write, never left
   stale. Record write + index update are issued inside one ``MULTI``/``EXEC`` pipeline (redis-py's
-  ``transaction=True`` pipeline) so the two keys never observe a torn intermediate state.
+  ``transaction=True`` pipeline) so the keys never observe a torn intermediate state.
+- ``{prefix}:apply:{ns.to_prefix()}`` — a ``SET`` of ``conflict_id`` members whose decision has been
+  accepted but whose supersession has not landed (``awaits_apply``). This is what makes the resolve
+  hand-off survive a crash: the intent is re-derivable from the durable record instead of living
+  only in an in-process queue.
 
 ``add`` and ``upsert`` share ONE implementation (``_write``) — same behavior as
 ``InMemoryConflictRecordRepository`` (``conflict.py:256-260``, ``upsert`` delegates to ``add``): the
@@ -32,11 +38,15 @@ port draws no idempotency distinction between the two for this repository (contr
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from pydantic import BaseModel, ConfigDict
 from redis.asyncio import Redis
 
-from mu_contracts.domain.model.conflict import ConflictRecord, ConflictState
+from mu_contracts.domain.model.conflict import ConflictRecord
 from mu_contracts.domain.model.memory import Namespace
+from mu_engine.lifecycle.conflict import awaits_apply
+from mu_engine.lifecycle.conflict_policy import ACTIONABLE_STATES
 from mu_engine.platform.decorators import retry_io
 
 __all__ = ["ConflictRedisSettings", "RedisConflictRecordRepository"]
@@ -82,6 +92,9 @@ class RedisConflictRecordRepository:
     def _pending_key(self, ns: Namespace) -> str:
         return f"{self._prefix}:pending:{ns.to_prefix()}"
 
+    def _apply_key(self, ns: Namespace) -> str:
+        return f"{self._prefix}:apply:{ns.to_prefix()}"
+
     # --------------------------------------------------------------------------------- add/upsert
     async def add(self, record: ConflictRecord) -> None:
         return await self._retry(self._write_impl)(record)
@@ -95,14 +108,18 @@ class RedisConflictRecordRepository:
     async def _write_impl(self, record: ConflictRecord) -> None:
         record_key = self._record_key(record.namespace, record.conflict_id)
         pending_key = self._pending_key(record.namespace)
+        apply_key = self._apply_key(record.namespace)
         payload = record.model_dump_json()
         async with self._redis.pipeline(transaction=True) as pipe:
             pipe.set(record_key, payload)
-            # Always SREM first — a record that transitioned OUT of pending must not linger in
-            # the index; SADD back in only if its CURRENT state is still pending.
+            # Always SREM first — a record that transitioned OUT of a set must not linger in its
+            # index; SADD back in only if its CURRENT state still belongs there.
             pipe.srem(pending_key, record.conflict_id)
-            if record.state is ConflictState.MANUAL_PENDING:
+            if record.state in ACTIONABLE_STATES:
                 pipe.sadd(pending_key, record.conflict_id)
+            pipe.srem(apply_key, record.conflict_id)
+            if awaits_apply(record):
+                pipe.sadd(apply_key, record.conflict_id)
             await pipe.execute()
 
     # ----------------------------------------------------------------------------------------- get
@@ -121,7 +138,35 @@ class RedisConflictRecordRepository:
         return await self._retry(self._pending_impl)(ns)
 
     async def _pending_impl(self, ns: Namespace) -> list[ConflictRecord]:
-        raw_ids = await self._redis.smembers(self._pending_key(ns))  # type: ignore[misc]
+        return await self._read_index(
+            ns, self._pending_key(ns), lambda r: r.state in ACTIONABLE_STATES
+        )
+
+    # ------------------------------------------------------------------------- awaiting apply
+    async def awaiting_apply(self, ns: Namespace) -> list[ConflictRecord]:
+        """Decisions ACCEPTED but not yet LANDED — the durable, recoverable resolve queue.
+
+        Not on the ``ConflictRecordRepository`` port (that port lives in another lane's file);
+        it is read structurally through this lane's own ``UnappliedConflictRecordReader``
+        Protocol, which both adapters satisfy.
+        """
+        return await self._retry(self._awaiting_apply_impl)(ns)
+
+    async def _awaiting_apply_impl(self, ns: Namespace) -> list[ConflictRecord]:
+        return await self._read_index(ns, self._apply_key(ns), awaits_apply)
+
+    async def _read_index(
+        self,
+        ns: Namespace,
+        index_key: str,
+        still_qualifies: Callable[[ConflictRecord], bool],
+    ) -> list[ConflictRecord]:
+        """SMEMBERS one index + GET each record, re-checking the predicate on the record itself.
+
+        The index is a HINT, never the truth: a concurrent write can leave a member pointing at a
+        record that has since moved on, so the loaded record is re-tested before it is returned.
+        """
+        raw_ids = await self._redis.smembers(index_key)  # type: ignore[misc]
         ids = {i.decode("utf-8") if isinstance(i, bytes) else i for i in raw_ids}
         out: list[ConflictRecord] = []
         for conflict_id in ids:
@@ -130,6 +175,6 @@ class RedisConflictRecordRepository:
                 continue  # index/record race (e.g. concurrent write) — skip, never fabricate
             blob = raw.decode("utf-8") if isinstance(raw, bytes) else raw
             rec = ConflictRecord.model_validate_json(blob)
-            if rec.state is ConflictState.MANUAL_PENDING:  # defensive re-check, index is a hint
+            if still_qualifies(rec):
                 out.append(rec)
         return out

@@ -41,6 +41,16 @@ class GraphMapper:
             "content_hash": item.content_hash,
             "artifact_ref": item.artifact_ref or "",
             "provenance_id": item.provenance_id,
+            # memory-health-pinning-spec §3.1 line 168 requires the ``:Memory.pinned`` PROPERTY
+            # "so sweeps can filter it". ``pinned`` already round-trips losslessly inside
+            # ``memory_json`` below, but a value inside an opaque JSON blob is unreachable from a
+            # Cypher ``WHERE`` — so without this promoted property, ``enumerate(pinned=...)`` on
+            # the graph tier could only hydrate every node and filter client-side, which is the
+            # unbounded scan §3.1 forbids. ``version`` is promoted for the same reason: it is the
+            # value ``set_pinned`` returns, and a sweep that wants to order or compare revisions
+            # cannot reach into ``memory_json`` to do it.
+            "pinned": item.pinned,
+            "version": item.version,
             "content": item.content,  # fulltext channel seed (spec §4.3 FULLTEXT INDEX)
             "memory_json": item.model_dump_json(),  # lossless round-trip carrier
         }

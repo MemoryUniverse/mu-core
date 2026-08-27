@@ -11,6 +11,7 @@ members = [
 ]
 
 [manifest.dependency-groups]
+acceptance = [{ name = "mu-sdk", extras = ["embedded"], editable = "../mu-sdk-python" }]
 dev = [
     { name = "import-linter", specifier = ">=2.1,<3" },
     { name = "mypy", specifier = ">=1.13,<2" },
@@ -1246,6 +1247,41 @@ requires-dist = [
     { name = "mu-contracts", editable = "packages/mu-contracts" },
     { name = "mu-engine", editable = "packages/mu-engine" },
 ]
+
+[[package]]
+name = "mu-sdk"
+version = "0.1.0"
+source = { editable = "../mu-sdk-python" }
+dependencies = [
+    { name = "httpx" },
+    { name = "mu-contracts" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "tenacity" },
+]
+
+[package.optional-dependencies]
+embedded = [
+    { name = "mu-local" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.115,<1" },
+    { name = "httpx", specifier = ">=0.27,<1" },
+    { name = "import-linter", marker = "extra == 'dev'", specifier = ">=2.1,<3" },
+    { name = "mu-contracts", editable = "packages/mu-contracts" },
+    { name = "mu-local", marker = "extra == 'embedded'", editable = "packages/mu-local" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13,<2" },
+    { name = "pydantic", specifier = ">=2.9,<3" },
+    { name = "pydantic-settings", specifier = ">=2.6,<3" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3,<9" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24,<0.25" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8,<0.9" },
+    { name = "tenacity", specifier = ">=9.0,<10" },
+    { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.32,<1" },
+]
+provides-extras = ["dev", "embedded"]
 
 [[package]]
 name = "multidict"

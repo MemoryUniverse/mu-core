@@ -44,6 +44,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mu_contracts.domain.events import DegradedModeEntered
 from mu_contracts.domain.model.lifecycle import JobHandle, UserPrefix
+from mu_engine.lifecycle.counts import CountsBasis
 from mu_engine.pipelines.distill import DistillActionKind
 
 __all__ = [
@@ -117,9 +118,31 @@ class LifecycleStateView(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     user_prefix: UserPrefix
+    #: **USER-PREFIX-grained, and only as good as ``counts_basis`` says.** These three describe
+    #: the ``user_prefix`` above — every SESSION of that user — not the single ``Namespace`` a
+    #: caller passed to ``get_state``; two sessions of one user return the same three numbers. They
+    #: are ALSO not, on their own, a store cardinality: read ``counts_basis`` first (AD-24).
     stm_count: int = Field(ge=0)
     mtm_count: int = Field(ge=0)
     ltm_count: int = Field(ge=0)
+    #: **What the three counts above are worth** (ARCHITECTURE-DELTAS AD-24). Three bare ``int``s
+    #: cannot express "we did not look": every value they admit is a claim about cardinality, and
+    #: ``0`` is the specific claim *"this user has nothing"*. This field — and ONLY this field —
+    #: lets a caller tell "no memories" from "not observed". ADDITIVE with an ``UNOBSERVED``
+    #: default, deliberately: every existing constructor call and every existing consumer keeps
+    #: working byte-for-byte (this model is ``extra="forbid"``, but its CONSUMERS are not, and both
+    #: wire surfaces — ``GET /profile``'s ``response_model`` and the daemon IPC ``/state`` route —
+    #: ``model_dump(mode="json")`` additively), while the default is the honest answer for a view
+    #: built without a count cache. ``EVENT_DELTA`` is the STRONGEST value it can take and it is
+    #: not a cardinality claim — see ``mu_engine.lifecycle.counts`` for the semantics, the drift
+    #: envelope, and why no ``RECONCILED``/``EXACT`` basis exists.
+    counts_basis: CountsBasis = CountsBasis.UNOBSERVED
+    #: The instant the serving PROCESS began observing tier-transition events on its plane-local
+    #: bus — a process-wide instant, NOT "when this user was first seen". The counts describe only
+    #: what was published after it, so neither an ``UNOBSERVED`` read nor an ``EVENT_DELTA`` zero
+    #: means "nothing exists"; a three-day-old value here says how long the daemon has been up, and
+    #: nothing whatsoever about what the stores held on day zero. ``None`` when no cache is wired.
+    counts_observed_since: datetime | None = None
     last_swept_at: datetime | None = None
     pending_job: JobHandle | None = None  # set if a sweep/promote/demote is in flight for this user
     degraded: DegradedModeEntered | None = None  # CANONICAL §2 — surfaced verbatim if degraded

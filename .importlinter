@@ -55,3 +55,27 @@ forbidden_modules =
     mu_server
     mu_client
     mu_local
+
+# persona (persona-design.md §0 / §2.4 line 122): the persona subsystem is SLEEP-TIME. Nothing
+# that runs while a user is waiting may import it — the CI twin of
+# packages/mu-engine/tests/services/persona/test_persona_boundary_unit.py, which scans both root
+# packages statically. Kept as an explicit source list rather than "all of mu_engine" because the
+# composition roots (platform/composition.py, mu_local/composition.py) are exactly the modules
+# whose job IS to name every subsystem. Chains are reported transitively, so a leak that hides one
+# import deep still fails.
+[importlinter:contract:persona-off-the-hot-path]
+name = persona-off-the-hot-path (sleep-time only, never recall/ingest/warm)
+type = forbidden
+source_modules =
+    mu_engine.services.recall
+    mu_engine.services.ingest
+    mu_engine.services.extract
+    mu_engine.services.conflict
+    mu_engine.surface
+    mu_engine.storage
+    mu_engine.pipelines
+    mu_engine.lifecycle
+    mu_engine.providers
+    mu_local.local_memory
+forbidden_modules =
+    mu_engine.services.persona

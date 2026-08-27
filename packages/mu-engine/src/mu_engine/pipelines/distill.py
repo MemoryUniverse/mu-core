@@ -57,8 +57,10 @@ from mu_contracts.domain.events import (
     DomainEvent,
     FactsExtracted,
     MemoryPromoted,
+    MemoryQuarantined,
     MemorySuperseded,
 )
+from mu_contracts.domain.model.conflict import ConflictRecord, ConflictResolutionKind
 from mu_contracts.domain.model.memory import Tier
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
 from mu_contracts.ports.time import Clock
@@ -100,7 +102,13 @@ if TYPE_CHECKING:
         ConflictAdjudicator,
     )
 
+    # Same cycle, one package further out: ``services.conflict.ports`` imports
+    # ``mu_engine.lifecycle.conflict``, which imports THIS module. Only ever needed as an
+    # annotation (``from __future__ import annotations`` is on), so TYPE_CHECKING is enough.
+    from mu_engine.services.conflict.ports import ResolutionIntent
+
 __all__ = [
+    "ConflictApplyPort",
     "DistillAction",
     "DistillActionKind",
     "DistillPipeline",
@@ -108,6 +116,7 @@ __all__ = [
     "DistillSettings",
     "EventPublisher",
     "InProcessWriterLease",
+    "ResolutionDrainPort",
     "WriterLeasePort",
     "asserted_later",
 ]
@@ -193,6 +202,55 @@ class WriterLeasePort(Protocol):
     """The one supersession writer lease (engine-core §7.5). Acquire-or-defer, plane-qualified."""
 
     def acquire(self, ns: Namespace) -> contextlib.AbstractAsyncContextManager[None]: ...
+
+
+@runtime_checkable
+class ResolutionDrainPort(Protocol):
+    """The APPLY side of ``conflict-resolution-async-design.md`` §5 line 218's resolve queue.
+
+    Declared here rather than imported from ``mu_engine.services.conflict.ports`` for the same
+    reason ``EventPublisher`` is declared rather than imported from ``ports.bus``: that module
+    imports ``mu_engine.lifecycle.conflict``, which imports THIS module, so a runtime import
+    would close a cycle. Structurally satisfied by both shipped queues
+    (``RecordBackedResolutionQueue``, ``InMemoryConflictResolutionQueue``).
+
+    ``drain`` is deliberately NON-DESTRUCTIVE in the record-backed adapter — it re-derives the
+    intents from the durable ``ConflictRecord``s and a record leaves the set only when
+    :meth:`ConflictApplyPort.mark_applied` stamps it. That is what makes a crash between the
+    human's decision and this apply cost a DELAY and never a DECISION, and it is why this port
+    has no ``ack``/``pop``: at-least-once delivery whose stopping condition is a durable fact.
+    """
+
+    async def drain(self, ns: Namespace) -> tuple[ResolutionIntent, ...]: ...
+
+
+@runtime_checkable
+class ConflictApplyPort(Protocol):
+    """The two apply-side callbacks on ``ConflictResolutionService`` this pipeline closes the
+    loop with (§3.1 / §5 line 218; ``services/conflict/resolution.py``).
+
+    Narrow BY CONSTRUCTION: the resolve/reopen/policy verbs are the caller-facing surface and
+    have no business being reachable from a background writer, so they are not on this port.
+    Both methods are idempotent on their side, which is what lets this pipeline retry an apply
+    without double-stamping an audit trail.
+    """
+
+    async def mark_applied(
+        self,
+        ns: Namespace,
+        conflict_id: str,
+        *,
+        superseded_valid_at: datetime | None = None,
+    ) -> ConflictRecord: ...
+
+    async def record_automatic_resolution(
+        self,
+        ns: Namespace,
+        conflict_id: str,
+        *,
+        winner_id: str,
+        superseded_valid_at: datetime | None = None,
+    ) -> ConflictRecord: ...
 
 
 class InProcessWriterLease:
@@ -367,6 +425,8 @@ class DistillPipeline:
         metrics: MetricSink | None = None,
         audit: AuditLog | None = None,
         adjudicator: ConflictAdjudicator | None = None,
+        resolution_queue: ResolutionDrainPort | None = None,
+        conflict_apply: ConflictApplyPort | None = None,
     ) -> None:
         self._ltm = ltm
         self._settings = settings or DistillSettings()
@@ -390,6 +450,25 @@ class DistillPipeline:
         # 100% pre-ADR-0037 backward compatible — `_resolve`'s no-adjudicator degrade floor
         # (`_heuristic_only_verdict`) reproduces the ORIGINAL heuristic-only decision verbatim.
         self._adjudicator: ConflictAdjudicator | None = adjudicator
+        # conflict-resolution-async-design.md §2 table / §5 line 218 — the two halves of
+        # ``ResolveConflictStage`` that were built and left unwired.
+        #
+        # `resolution_queue` is where a HUMAN decision arrives. `ConflictResolutionService`
+        # validates the FSM edge, writes the durable intent onto the `ConflictRecord` and
+        # returns; nothing applies it. Until this pipeline drained the queue, a `POST /resolve`
+        # moved a record to `RESOLVED` and both contending items stayed `state='active'`
+        # forever, with no code path able to re-drive the decision.
+        #
+        # `conflict_apply` is the closing callback in BOTH directions: `mark_applied` after a
+        # manual apply lands (which is what drops the record out of the non-destructive drain),
+        # and `record_automatic_resolution` after an AUTOMATIC supersession lands (which is the
+        # only writer of `ConflictState.AUTO_RESOLVED` / `ResolutionOrigin.AUTO` — states that
+        # no production path could enter while this was unwired).
+        #
+        # Both OPTIONAL: a composition with no `ConflictRecordRepository` has no records to
+        # close and no queue to drain, and the pipeline behaves exactly as before.
+        self._resolution_queue: ResolutionDrainPort | None = resolution_queue
+        self._conflict_apply: ConflictApplyPort | None = conflict_apply
         # Bounded MTM-invalidate retry queue (spec §13.2 fix #2): a write-after-read Qdrant 404 at
         # supersede time is queued here and retried ONCE at the top of the NEXT `distill()` call
         # for the SAME namespace — never a hot retry loop (`_invalidate_mtm_guarded`,
@@ -451,6 +530,21 @@ class DistillPipeline:
             # Bounded retry (spec §13.2 fix #2) for an MTM invalidate degraded on a PRIOR sweep
             # tick for this namespace — attempted ONCE per tick, never a hot retry loop.
             await self._retry_pending_mtm_invalidates(ns)
+
+            # ResolveConflictStage, MANUAL arm (conflict-async §1.1 diagram / §2 table / §5 line
+            # 218): apply every human decision accepted since the last tick, under THIS lease.
+            #
+            # Placed in `_distill` and not inside `_resolve` even though `_resolve` is the
+            # ResolveConflictStage-equivalent for the AUTOMATIC arm, for one decisive reason: a
+            # human decision must land whether or not new memories arrived. `_resolve` runs once
+            # per reconciled window item, so on an empty or conflict-free window it runs zero
+            # times — and the human's decision, already durably `RESOLVED` on the record, would
+            # never be applied on the one kind of tick that is most common. Here it runs once per
+            # `distill()` call, inside the same `self._lease.acquire(ns)` block, which is what
+            # keeps §2 line 54's "one lease, three callers" true instead of opening a second
+            # write path. It runs BEFORE detection so this tick's `_live_residue` re-reads see a
+            # post-decision graph rather than adjudicating against facts a human already retired.
+            await self._apply_manual_resolutions(ns)
 
             # S3-01 (spec §8 S1 / AC-3.2): one fresh per-sweep-tick budget, or None when no
             # adjudicator is wired (the no-adjudicator degrade floor never touches a budget).
@@ -756,7 +850,7 @@ class DistillPipeline:
         # fact self-expires if ANY candidate the adjudicator judged more authoritative exists.
         # `newest` (BUG1 fix) is picked by ASSERTION recency too, for the same reason as above.
         if self_expire:
-            newest, _ = max(self_expire, key=lambda cv: cv[0].created_at)
+            newest, _newest_verdict = max(self_expire, key=lambda cv: cv[0].created_at)
             winner.state = MemoryState.SUPERSEDED
             winner.invalid_at = _valid_at(newest)
             await self._ltm.upsert_fact(winner)
@@ -778,6 +872,16 @@ class DistillPipeline:
                         namespace=ns, loser_id=winner.id, winner_id=newest.id, valid_at=at
                     )
                 )
+            # AFTER the write, never before (§3.1 / `record_automatic_resolution`'s own
+            # docstring): the record claims `AUTO_RESOLVED` + a `superseded_valid_at`, and a
+            # crash between the two must leave a conflict that is still open, not a record
+            # asserting a supersession that never landed. On this branch the INCOMING fact is
+            # the loser of EVERY pair in `self_expire`, so each pair's record is closed with the
+            # surviving candidate as its winner — not just `newest`'s.
+            for expired_against, verdict in self_expire:
+                await self._close_automatic_record(
+                    ns, verdict, winner_id=expired_against.id, superseded_valid_at=at
+                )
             return self._action(
                 DistillActionKind.SELF_EXPIRE, newest, (winner.id,), "incoming_older_than_candidate"
             )
@@ -792,7 +896,7 @@ class DistillPipeline:
         # `winner` was already upserted above (before the per-candidate loop).
         await self._maybe_promote_event(ns, winner)
         loser_ids: list[str] = []
-        for loser, _ in supersede:
+        for loser, verdict in supersede:
             at = _valid_at(winner)
             await self._ltm.invalidate(
                 ns, loser.id, winner.id, at=at, reason="functional_supersede"
@@ -815,9 +919,184 @@ class DistillPipeline:
                         namespace=ns, loser_id=loser.id, winner_id=winner.id, valid_at=at
                     )
                 )
+            # AFTER this loser's cross-store supersession has landed — see the SELF_EXPIRE
+            # branch above for why the order is the contract and not a preference.
+            await self._close_automatic_record(
+                ns, verdict, winner_id=winner.id, superseded_valid_at=at
+            )
         return self._action(
             DistillActionKind.SUPERSEDE, winner, tuple(loser_ids), "functional_or_polarity_conflict"
         )
+
+    async def _close_automatic_record(
+        self,
+        ns: Namespace,
+        verdict: AdjudicationVerdict,
+        *,
+        winner_id: str,
+        superseded_valid_at: datetime,
+    ) -> None:
+        """Close this pair's ``ConflictRecord`` as ``AUTO_RESOLVED`` (conflict-async §3.1).
+
+        ``ConflictAdjudicator`` opens the record in ``DETECTED`` on the automatic lane precisely
+        because *"at this instant nothing has been superseded yet"*; this is the other half of
+        that sentence, and it is called only from AFTER a supersession write. Together they are
+        the ONLY path by which ``ConflictState.AUTO_RESOLVED`` and ``ResolutionOrigin.AUTO`` are
+        reachable at all — spec line 117 makes ``resolution_origin`` the entire distinction
+        between ``AUTO_RESOLVED`` and ``RESOLVED``, and without this call that distinction
+        described a state the system could not enter.
+
+        No-ops when the verdict carried no record — the no-adjudicator degrade floor
+        (``_heuristic_only_verdict``) never opens one — or when no apply port is wired.
+
+        Best-effort, matching ``ConflictAdjudicator._open_record``'s own posture exactly: the
+        supersession is already durably committed on every store by the time this runs, so a
+        failure of the AUDIT surface must not fail the sweep and must not roll anything back.
+        Logged content-free (ids and enum tokens only, never a member body), never silent.
+        ``CancelledError`` propagates untouched (DEV-STANDARDS rule 1).
+        """
+        record = verdict.conflict_record
+        if record is None or self._conflict_apply is None:
+            return
+        try:
+            await self._conflict_apply.record_automatic_resolution(
+                ns,
+                record.conflict_id,
+                winner_id=winner_id,
+                superseded_valid_at=superseded_valid_at,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.error(
+                "conflict_auto_resolution_record_failed",
+                ns=ns.to_prefix(),
+                conflict_id=record.conflict_id,
+                error_type=type(exc).__name__,
+            )
+
+    # ---- ResolveConflictStage, MANUAL arm (conflict-async §5 line 218) -----------------------
+    async def _apply_manual_resolutions(self, ns: Namespace) -> int:
+        """Drain the accepted-but-unapplied human decisions for ``ns`` and apply each one.
+
+        Returns how many were applied — the count is what a caller/test can assert on, and it is
+        deliberately not a report field: a manual decision is not a fact this window extracted.
+
+        The drain is NON-DESTRUCTIVE by contract (:class:`ResolutionDrainPort`). Nothing is
+        acknowledged here; ``mark_applied`` is what removes a record from the next drain, and it
+        is called ONLY after the apply for that intent actually landed. An apply that fails
+        half-way is therefore handed out again on the next tick — at-least-once with an
+        idempotent apply (every per-loser write is skipped when the loser has already left
+        ``ACTIVE``), which is the same discipline the outbox uses everywhere else.
+        """
+        if self._resolution_queue is None or self._conflict_apply is None:
+            return 0
+        applied = 0
+        for intent in await self._resolution_queue.drain(ns):
+            landed_at = await self._apply_resolution_intent(ns, intent)
+            if landed_at is None:
+                continue
+            await self._conflict_apply.mark_applied(
+                ns, intent.conflict_id, superseded_valid_at=landed_at
+            )
+            applied += 1
+        if applied:
+            _log.info("conflict_manual_resolutions_applied", ns=ns.to_prefix(), applied=applied)
+        return applied
+
+    async def _apply_resolution_intent(
+        self, ns: Namespace, intent: ResolutionIntent
+    ) -> datetime | None:
+        """Execute ONE human decision across the stores. ``None`` = not applied, leave it queued.
+
+        ``SUPERSEDE`` and ``QUARANTINE`` are the two kinds this stage can complete; both are the
+        §7.5 cross-store invalidate-don't-delete write with a different terminal state, and both
+        run the loser through the CENTRAL :class:`~mu_engine.lifecycle.policy.LifecyclePolicy`
+        guard with ``trigger=EXPLICIT`` — never a re-implemented pin check. EXPLICIT is correct
+        and load-bearing here: CANONICAL §7.10 makes a pinned item *"never the AUTO-supersede
+        loser"*, which is a statement about sweeps; a human who opened the inbox and chose the
+        winner is exactly the case the rule leaves legal, and refusing it would make a pinned
+        memory impossible to ever resolve.
+
+        ``MERGE`` is REPORTED, not faked: spec line 219 says it *"reuses ``ComposeService``/
+        COMPOSE to write a new ``ComposedContext``/``MemoryItem``, then supersedes both sources
+        **to it**"*. This pipeline holds no ``ComposeService`` and the intent carries only a
+        ``merged_text_ref`` (a reference into the owning store, never the draft text), so there
+        is no honest way to mint the composed item here. It returns ``None``, so the record stays
+        in ``awaiting_apply``: the human's decision is preserved and re-offered every tick rather
+        than being stamped applied against a merge that never happened.
+        """
+        # Function-body-local, same cycle rationale as `self._policy`'s own import in __init__.
+        from mu_engine.lifecycle.policy import TransitionTrigger
+
+        if intent.kind is ConflictResolutionKind.MERGE:
+            _log.warning(
+                "conflict_manual_apply_kind_unsupported",
+                ns=ns.to_prefix(),
+                conflict_id=intent.conflict_id,
+                kind=intent.kind.value,
+            )
+            return None
+        if intent.winner_id is None or not intent.loser_ids:
+            # A coexisting outcome recovered from a record (the service never enqueues one).
+            # Nothing to write, and stamping it applied is what stops it re-draining forever.
+            return self._clock.now()
+
+        winner = await self._ltm.get_fact(ns, intent.winner_id)
+        if winner is None:
+            _log.warning(
+                "conflict_manual_apply_winner_absent",
+                ns=ns.to_prefix(),
+                conflict_id=intent.conflict_id,
+            )
+            return None
+
+        at = _valid_at(winner)
+        quarantine = intent.kind is ConflictResolutionKind.QUARANTINE
+        target = MemoryState.QUARANTINED if quarantine else MemoryState.SUPERSEDED
+        for loser_id in intent.loser_ids:
+            loser = await self._ltm.get_fact(ns, loser_id)
+            if loser is None or loser.state is not MemoryState.ACTIVE:
+                continue  # idempotent: already applied on an earlier tick, or gone
+            if not self._policy.permits(loser, target, trigger=TransitionTrigger.EXPLICIT):
+                _log.info(
+                    "conflict_manual_apply_blocked_by_policy",
+                    ns=ns.to_prefix(),
+                    conflict_id=intent.conflict_id,
+                    loser_id=loser.id,
+                )
+                continue
+            if quarantine:
+                # No `GraphStorePort` quarantine verb exists; the state flip IS the write, and
+                # `invalid_at` keeps it out of the bi-temporal `facts_at` hot read exactly as a
+                # supersession does. Nothing is deleted (§1 invariant 2).
+                loser.state = MemoryState.QUARANTINED
+                loser.invalid_at = at
+                await self._ltm.upsert_fact(loser)
+            else:
+                await self._ltm.invalidate(
+                    ns, loser.id, winner.id, at=at, reason="manual_conflict_resolution"
+                )
+            # The other two arms of the ONE cross-store supersession (§7.2 step 5) — without
+            # them the loser leaves the graph but keeps being fused back in from MTM and the STM
+            # recency window, which is the "absent from EVERY hot read" invariant broken.
+            if self._mtm is not None:
+                await self._invalidate_mtm_guarded(ns, loser=loser, winner=winner, at=at)
+            await self._evict_stm_guarded(ns, loser=loser)
+            if self._bus is not None:
+                await self._bus.publish(
+                    MemoryQuarantined(
+                        namespace=ns,
+                        id=loser.id,
+                        reason="manual_conflict_resolution",
+                        confidence=1.0,
+                    )
+                    if quarantine
+                    else MemorySuperseded(
+                        namespace=ns, loser_id=loser.id, winner_id=winner.id, valid_at=at
+                    )
+                )
+        return at
 
     async def _live_residue(self, ns: Namespace, winner: MemoryItem) -> tuple[MemoryItem, ...]:
         """Live re-read of ``find_conflicts`` immediately before ``_resolve`` uses it (same

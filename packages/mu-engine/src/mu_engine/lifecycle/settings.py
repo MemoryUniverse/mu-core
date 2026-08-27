@@ -24,9 +24,11 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from mu_engine.lifecycle.centrality import CentralitySettings
 from mu_engine.lifecycle.mtm_graph import MtmWorkingGraphSettings
 
 __all__ = [
+    "CentralitySettings",
     "HostedMirrorConsent",
     "LifecycleSettings",
     "ManagerModeSettings",
@@ -38,13 +40,60 @@ __all__ = [
 
 
 class SalienceSettings(BaseModel):
-    """Salience-score weights (spec §16; §6 "rel DROPPED off the sweep" — weights sum to 1)."""
+    """Salience-score weights (spec §16; §6 "rel DROPPED off the sweep" — weights sum to 1).
+
+    **The three ratified weights are UNCHANGED at 0.5 / 0.2 / 0.3.** The A4 structural-salience
+    amendment (``lifecycle/centrality.py``;
+    ``docs/superpowers/design/research-graphify-adoption.md`` §4/§6 item A4) adds ``cen`` as a
+    BLEND SHARE (:attr:`w_centrality`) rather than as a fourth
+    entry in a renormalising weighted mean:
+
+    ```
+    base = w_recency*rec + w_usage*use + w_importance*imp      # these three sum to 1, always
+    S    = base                                    if cen ABSENT
+         = (1 - w_centrality)*base + w_centrality*cen   if cen PRESENT
+    ```
+
+    So the amendment is still a RE-WEIGHTING and never an append: with ``cen`` present the
+    EFFECTIVE four-term vector is ``(0.45, 0.18, 0.27, 0.10)``, which sums to 1 and preserves the
+    ratified 0.5 : 0.2 : 0.3 proportions exactly (5 : 2 : 3 either way). ``rel`` stays dropped —
+    this amendment does not re-open spec §6's resolution of DRAFT §9 Q1.
+
+    **Why a blend and not four declared weights.** The four-weight form has to divide by the sum of
+    the PRESENT weights, and ``(0.45*rec + 0.18*use + 0.27*imp)/0.90`` is not bit-identical to
+    ``0.5*rec + 0.2*use + 0.3*imp``: measured, 46,942 of 112,211 grid points differ in the last
+    ulp and 20 of them cross one of the three ABSOLUTE gates below. Because ``cen`` is absent on
+    every install with no centrality service wired, that would have silently re-decided
+    promote/demote for FULL-LOCAL users. The blend form leaves the absent branch returning ``base``
+    untouched, so those gates stay calibrated for real and not merely approximately.
+
+    **The sum-to-1 invariant is NOT enforced at construction, deliberately, and that is a
+    REPORTED gap rather than an oversight.** A ``model_validator`` rejecting a three-weight vector
+    that misses 1.0 was written and then removed: it makes a single-field env override impossible,
+    because ``MU_LIFECYCLE__SALIENCE__W_RECENCY=0.9`` alone leaves the other two at their defaults
+    and sums to 1.4. That override is exactly what
+    ``tests/config/test_engine_settings_unit.py:115`` exercises (proving three-level env nesting
+    resolves), and enforcing the sum turned it red. An operator can therefore still configure a
+    vector that does not sum to 1 and silently mis-calibrate the three ABSOLUTE gates below — a
+    real pre-existing hazard this amendment did not create and must not silently re-scope into.
+    What IS pinned, by literal assertions in ``tests/lifecycle/test_salience_centrality_unit.py``,
+    is every SHIPPED weight magnitude, so no later edit can rescale the vector unnoticed.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    w_recency: float = 0.5
-    w_usage: float = 0.2
-    w_importance: float = 0.3
+    w_recency: float = Field(default=0.5, ge=0.0)
+    w_usage: float = Field(default=0.2, ge=0.0)
+    w_importance: float = Field(default=0.3, ge=0.0)
+    #: A4 structural-salience BLEND SHARE — the fraction of S(m) the structural term takes when it
+    #: is present (effective weight 0.10, the smallest in the four-term vector). Small on purpose:
+    #: this is the newest and least-validated signal, and 0.10 is small enough that a fact's
+    #: structural position adjusts its rank without ever overriding recency or importance — the
+    #: whole span of the term, cen=0 to cen=1, moves S by at most 0.10, which cannot on its own
+    #: carry an item across the 0.4-wide gap between ``demote_mtm`` and ``promote_stm_mtm``.
+    #: Range-bounded to [0, 1] so ``S = (1-w)*base + w*cen`` stays a convex combination and AC-1's
+    #: unit-interval guarantee is structural.
+    w_centrality: float = Field(default=0.10, ge=0.0, le=1.0)
     recency_half_life_h: float = 24.0
     usage_cap: int = 10
 
@@ -187,3 +236,4 @@ class LifecycleSettings(BaseModel):
     manager_mode: ManagerModeSettings = Field(default_factory=ManagerModeSettings)
     ownership: OwnershipSettings = Field(default_factory=OwnershipSettings)
     mtm_working_graph: MtmWorkingGraphSettings = Field(default_factory=MtmWorkingGraphSettings)
+    centrality: CentralitySettings = Field(default_factory=CentralitySettings)
