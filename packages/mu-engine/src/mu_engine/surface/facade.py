@@ -93,6 +93,7 @@ from mu_contracts.domain.model.memory import Tier as CanonicalTier
 from mu_contracts.domain.model.scope import ClientScope
 from mu_contracts.ports.time import Clock
 from mu_engine.lifecycle.mode_gate import ManagerModeGate
+from mu_engine.lifecycle.policy import LifecyclePolicy, TransitionTrigger
 from mu_engine.pipelines.concrete.ingest import IngestActivity
 from mu_engine.pipelines.distill import (
     DistillActionKind,
@@ -203,6 +204,12 @@ class SurfaceFacade:
         # threads into every service (``mu-local/composition.py``) — never a bare ``datetime.now``
         # call at a verb site (MAJOR-3: bi-temporal stamps must be UTC-correct).
         self._clock: Clock = clock or SystemClock()
+        # The CENTRAL FSM/pin guard (memory-health §6.1). Stateless + pure, so constructed rather
+        # than injected: there is exactly one lifecycle policy, not a swappable strategy. The
+        # verbs below are real write sites (``delete`` soft-deletes across all three tiers,
+        # ``demote`` is the SECOND MTM->STM writer next to ``DemotionService``), so they ask it —
+        # a guard the surface skips is a guard the surface bypasses.
+        self._policy = LifecyclePolicy()
 
     # ------------------------------------------------------------------------------------- write
     async def add(
@@ -465,6 +472,7 @@ class SurfaceFacade:
         to_tier: str = "stm",
         user: str = _DEFAULT_USER,
         session: str | None = None,
+        force_unpinned: bool = False,
     ) -> MemoryVerbResult:
         """TARGETED single-memory demotion — run the REAL MTM->STM forgetting-curve tier-down on ONE
         resident MTM item (``to_tier="stm"``). Reuses the exact write-ahead-then-commit-delete
@@ -486,6 +494,16 @@ class SurfaceFacade:
         item = await self._container.mtm.get(ns, memory_id)
         if item is None:
             raise MemoryNotFoundError(memory_id, reason="not resident in MTM (source tier)")
+        # CENTRAL PIN GUARD (memory-health §6.2). This is the SECOND MTM->STM demotion writer in
+        # the engine (``DemotionService._demote`` is the other); a guard present at only one of
+        # two write sites is precisely the bypass §6 warns about. Asked here with the AUTOMATIC
+        # trigger deliberately: this verb is reachable from an agent-driven MCP/IPC call, not only
+        # from a human, so "the caller asked for it" is not evidence of owner intent. An owner who
+        # really means it unpins first — ``force_unpinned=True`` is that explicit follow-on
+        # (spec §6.1 line 287).
+        self._policy.assert_tier_demotion(
+            item, trigger=TransitionTrigger.AUTOMATIC, force_unpinned=force_unpinned
+        )
         now = self._clock.now()
         stm_copy = item.model_copy(deep=True)
         stm_copy.tier = MemoryTier.STM
@@ -571,6 +589,7 @@ class SurfaceFacade:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
+        force_unpinned: bool = False,
     ) -> MemoryVerbResult:
         """TARGETED delete = INVALIDATE-DON'T-DELETE (soft delete): stop the memory appearing in
         active recall while KEEPING it in bi-temporal history — never a hard ``DETACH DELETE`` of
@@ -585,24 +604,38 @@ class SurfaceFacade:
           layer in STM to preserve (STM's own history is what promotion carries up to MTM/LTM), so
           the honest "stop appearing in active recall" for an STM-only row is eviction.
 
+        A PINNED memory is refused with ``PinnedTransitionBlocked`` unless the caller passes
+        ``force_unpinned=True``. ``ACTIVE -> EXPIRED`` is a RETENTION-class exit and CANONICAL
+        §7.10 makes a pinned item ineligible for one *regardless* of who asked, so spec §6.1 line
+        285-287 routes an owner-driven delete of a pinned memory through an explicit
+        unpin-then-delete: this flag IS that explicit step. Without the guard this verb — the one
+        user-facing delete — silently ignored the pin on all three tiers.
+
         A nonexistent id (absent from every tier) raises :class:`MemoryNotFoundError` (404)."""
         ns = self._ns(user, session)
         now = self._clock.now()
         affected: list[str] = []
         stm_item = await self._container.stm.get(ns, memory_id)
+        mtm_item = await self._container.mtm.get(ns, memory_id)
+        ltm_item = await self._container.ltm.get_fact(ns, memory_id)
+        if stm_item is None and mtm_item is None and ltm_item is None:
+            raise MemoryNotFoundError(memory_id)
+        # CENTRAL PIN GUARD, asked on every located copy BEFORE the first tier is touched — a
+        # per-tier check would leave the item half-deleted when a later tier refused.
+        for located in (stm_item, mtm_item, ltm_item):
+            if located is not None:
+                self._policy.assert_retention_exit(
+                    located, MemoryState.EXPIRED, force_unpinned=force_unpinned
+                )
         if stm_item is not None:
             await self._container.stm.evict(ns, memory_id)
             affected.append(MemoryTier.STM.value)
-        mtm_item = await self._container.mtm.get(ns, memory_id)
         if mtm_item is not None:
             await self._container.mtm.expire(ns, memory_id, at=now)
             affected.append(MemoryTier.MTM.value)
-        ltm_item = await self._container.ltm.get_fact(ns, memory_id)
         if ltm_item is not None:
             await self._container.ltm.expire(ns, memory_id, at=now)
             affected.append(MemoryTier.LTM.value)
-        if not affected:
-            raise MemoryNotFoundError(memory_id)
         return MemoryVerbResult(
             memory_id=memory_id,
             verb="delete",

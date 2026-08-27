@@ -35,6 +35,11 @@ __all__ = [
     "MemoryUniverseError",
     "NamespaceIsolationError",
     "PermissionNarrowingError",
+    "PinAuthorizationError",
+    "PinLimitExceededError",
+    "PinTargetNotFoundError",
+    "PinTargetNotPinnableError",
+    "PinnedTransitionBlocked",
     "PlaneFieldRejectedError",
     "PrivacyTierConflictError",
     "PrivacyTierNotAvailableError",
@@ -165,6 +170,61 @@ class IllegalConflictTransitionError(MemoryUniverseError):
 
 class MemoryLayerError(MemoryUniverseError):
     """Base of the memory-layer subsystem errors (memory-layer §)."""
+
+
+# ── pinning (memory-health-pinning-spec §9, lines 372-378) ───────────────────────────────────
+class PinAuthorizationError(MemoryLayerError):
+    """The caller does not own the partition it tried to pin in, or tried to pin a SHARED-origin
+    item while ``PinSettings.allow_shared_origin_pin`` is off (spec §5.2 step 1).
+
+    Pin is RETENTION, never ACCESS (CANONICAL §7.26): this error means "you may not change this
+    item's retention", never "you may not read it" — raising it neither widens nor narrows any
+    caller's read set.
+    """
+
+
+class PinTargetNotFoundError(MemoryLayerError):
+    """``PinRequest.memory_id`` does not resolve in the target partition (spec §5.2 step 3).
+
+    Carries no id in its message (the non-enumerating-denial discipline of
+    ``NamespaceIsolationError`` / ``mu_engine.platform.exceptions.safe_error_response``): a probe
+    must not be able to distinguish "absent" from "not yours".
+    """
+
+
+class PinTargetNotPinnableError(MemoryLayerError):
+    """The target resolves but has already LEFT the store's live set — ``SUPERSEDED`` /
+    ``EXPIRED`` / ``DELETED`` (spec §5.2 step 3; the ``PinService.PINNABLE_STATES`` set).
+
+    Pin is a RETENTION override, so pinning a settled exit is meaningless AND harmful: a pinned
+    row is unconditionally GC-ineligible (CANONICAL §7.10), so the pin would strand a dead row in
+    the graph forever with no live counterpart for the owner to act on. Refused loud rather than
+    accepted as a no-op.
+
+    NOT in the spec's §9 error list (lines 372-378) — reported as a spec addition, because §5.2
+    step 3 recognises only "not found" and the shipped ``PINNABLE_STATES`` constant had no
+    enforcement behind it at all.
+    """
+
+
+class PinLimitExceededError(MemoryLayerError):
+    """The partition already holds ``PinSettings.max_pins_per_namespace`` pins (spec §5.2 step 2
+    — the pin-explosion guard). Refused loud; never a silent no-op."""
+
+
+# Naming note: the SPEC names this type verbatim (memory-health-pinning-spec §9, line 377)
+# and CANONICAL §7.26 refers to it by that name; renaming it to `...Error` would fork the
+# vocabulary between the design set and the code, which DEV-STANDARDS' spec-driven rule forbids.
+class PinnedTransitionBlocked(IllegalTransitionError):  # noqa: N818
+    """An EXIT edge was attempted on a pinned item without ``force_unpinned`` (spec §6.1).
+
+    Subclasses ``IllegalTransitionError`` deliberately: a pinned item's exit edge is not a
+    special case of policy, it is an ILLEGAL FSM EDGE, and every existing handler that maps
+    ``IllegalTransitionError`` keeps working unchanged. An AUTOMATIC sweep never lets this
+    escalate — it asks :meth:`LifecyclePolicy.permits` first and treats ``False`` as
+    "skip, keep" (spec §9, line 381); the raise is reserved for a caller that wrongly drove an
+    exit transition directly, which is a bug and must fail loud.
+    """
 
 
 # ── governance / transfer (governance-transfer-core §7) ──────────────────────────────────────

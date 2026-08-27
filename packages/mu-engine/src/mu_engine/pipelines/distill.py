@@ -109,6 +109,7 @@ __all__ = [
     "EventPublisher",
     "InProcessWriterLease",
     "WriterLeasePort",
+    "asserted_later",
 ]
 
 _log = structlog.get_logger("mu_engine.pipelines.distill")
@@ -313,11 +314,11 @@ def _heuristic_only_verdict(
         )
     # BUG1 FIX: ASSERTION recency (`created_at`), never `valid_at` — see `_resolve`'s own
     # winner-selection comment above for the full rationale. This no-adjudicator degrade floor
-    # picks the SAME kind label `_resolve` would end up applying via `_asserted_later` regardless
+    # picks the SAME kind label `_resolve` would end up applying via `asserted_later` regardless
     # (that override runs unconditionally on the returned kind too), kept here so the `reason`
     # string and the pre-existing "tie goes to the incoming winner" bare-`>` convention stay
     # accurate for a caller inspecting THIS function's return value directly.
-    if _asserted_later(candidate, winner):
+    if asserted_later(candidate, winner):
         return AdjudicationVerdict(
             kind=AdjudicationKind.SELF_EXPIRE,
             apply=True,
@@ -334,7 +335,7 @@ def _heuristic_only_verdict(
     )
 
 
-def _asserted_later(candidate: MemoryItem, winner: MemoryItem) -> bool:
+def asserted_later(candidate: MemoryItem, winner: MemoryItem) -> bool:
     """BUG1 FIX (data-quality re-assessment §2): True iff ``candidate`` was ASSERTED (its source
     STM message's real ``created_at`` — STM insertion order) strictly after ``winner``. This is
     the ONE predicate that decides supersession direction throughout this module — NEVER a
@@ -394,6 +395,18 @@ class DistillPipeline:
         # for the SAME namespace — never a hot retry loop (`_invalidate_mtm_guarded`,
         # `_retry_pending_mtm_invalidates`).
         self._pending_mtm_retries: list[_PendingMtmInvalidate] = []
+        # The CENTRAL FSM/pin guard (memory-health §6.1). This module is the ONLY writer of
+        # `state=SUPERSEDED` in the engine, so the guard has to be asked HERE — enforcement that
+        # lives only in `ConflictAdjudicator` is bypassed entirely on the DEFAULT full-local
+        # composition, where no LLM router means `adjudicator is None` and `_heuristic_only_verdict`
+        # decides alone. Imported in the constructor body, not at module scope:
+        # `mu_engine.lifecycle` imports `mu_engine.pipelines.distill` (demotion/retention take
+        # `EventPublisher` from it),
+        # so a top-level import here would close that cycle. Same deferral rationale as the
+        # `mu_engine.lifecycle.conflict` import in `_heuristic_only_verdict`.
+        from mu_engine.lifecycle.policy import LifecyclePolicy
+
+        self._policy = LifecyclePolicy()
 
     async def distill(self, ns: Namespace, window: Sequence[MemoryItem]) -> DistillReport:
         """Consolidate a window of promoted MTM facts into LTM (the S3 pass).
@@ -544,7 +557,7 @@ class DistillPipeline:
             session_id=source.session_id,
             # BUG1 FIX (data-quality re-assessment §2 "SUPERSESSION WINNER INVERTED", real-SLM
             # path): `created_at` is the ASSERTION time this node's supersession-direction
-            # decision now authoritatively keys on (see `_resolve`'s `_asserted_later` below) — it
+            # decision now authoritatively keys on (see `_resolve`'s `asserted_later` below) — it
             # must reflect the SOURCE STM message's real capture instant, never the wall-clock
             # instant this extracted-fact object happens to be CONSTRUCTED at (which follows
             # extraction/window-iteration order, not real assertion order — see `_collect_facts`'s
@@ -705,7 +718,35 @@ class DistillPipeline:
                 # extracted bi-temporal `valid_at`) is the ONLY signal that decides direction here.
                 # `valid_at` is still stamped on every node (`_action`/`upsert_fact` below) as the
                 # bi-temporal WORLD-time validity — it is simply never consulted to pick a winner.
-                if _asserted_later(candidate, winner):
+                incoming_loses = asserted_later(candidate, winner)
+                loser = winner if incoming_loses else candidate
+                # ── §6.4 PIN GUARD, AT THE ACTUAL WRITE SITE ──────────────────────────────────
+                # "a pinned item is never the AUTO-supersede loser" (CANONICAL §7.17 item 4a(b)).
+                # It is asked HERE, after the polarity above has been decided, and not (only) in
+                # `ConflictAdjudicator`, for two independent reasons — either alone would make an
+                # adjudicator-side check unsound:
+                #   1. On the DEFAULT full-local composition there is no adjudicator at all
+                #      (`mu-local/composition.py` leaves `conflict_adjudicator=None` without an
+                #      LLM router), so `_heuristic_only_verdict` decides and nothing else would
+                #      ever consult a pin.
+                #   2. Even with one wired, the branch above deliberately DISCARDS the verdict's
+                #      SELF_EXPIRE-vs-SUPERSEDE polarity (BUG1 — the small adjudicator model
+                #      inverts it often enough to have been live-reproduced), so the loser the
+                #      adjudicator reasoned about is not necessarily the loser written below.
+                # Blocked -> PARK, never drop: both facts stay ACTIVE and the pair is tagged
+                # CONFLICTS_WITH in the graph, exactly like the withheld-verdict branch above, so
+                # the conflict surfaces to the owner (health view `CONFLICTING`) instead of
+                # silently overriding the pin.
+                if not self._policy.permits(loser, MemoryState.SUPERSEDED):
+                    await self._ltm.mark_conflict(ns, winner.id, candidate.id, at=self._clock.now())
+                    _log.info(
+                        "supersede_blocked_by_pin",
+                        ns=ns.to_prefix(),
+                        loser_id=loser.id,
+                        peer_id=winner.id if loser is candidate else candidate.id,
+                    )
+                    continue
+                if incoming_loses:
                     self_expire.append((candidate, verdict))
                 else:
                     supersede.append((candidate, verdict))

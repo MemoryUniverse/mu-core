@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 from mu_contracts.domain.model.entity import EntityResolution
-from mu_contracts.domain.model.memory import MemoryItem, Namespace, Tier
+from mu_contracts.domain.model.memory import MemoryItem, Namespace, State, Tier
 from mu_contracts.domain.model.recall import CallerIdentitySet, Scored, SparseQuery, Vector
 
 __all__ = [
@@ -41,6 +41,51 @@ class MemoryTierRepository(Protocol):
     async def delete(self, ns: Namespace, id: str) -> bool: ...
 
     async def by_artifact(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]: ...
+
+    # ---- Lifecycle-override (pin) additions — memory-health §3.1 (spec lines 160-177) --------
+
+    async def set_pinned(
+        self,
+        ns: Namespace,
+        id: str,
+        pinned: bool,
+        *,
+        at: datetime,
+        by: str,
+        reason: str | None = None,
+    ) -> int:
+        """Id-stable upsert of the whole ``pinned`` field-group, returning the new version.
+
+        Keyed by the TIER-STABLE ``MemoryItem.id`` (CANONICAL §7.1) and applied across every store
+        the item resides in — the same cross-store, id-keyed shape as ``invalidate`` (§7.5), and
+        for the same reason: a pin set at any tier must survive promotion/demotion, so it can
+        never be keyed on the tier. ``by`` is the pinning principal (audit only — NEVER an authz
+        principal, CANONICAL §7.4); ``reason`` is a short named classification, never memory text.
+
+        Unpin passes ``pinned=False``, which clears ``pinned_at``/``pinned_by``/``pin_reason``.
+        A missing id raises ``PinTargetNotFoundError`` — never a silent no-op.
+        """
+        ...
+
+    async def enumerate(
+        self,
+        ns: Namespace,
+        *,
+        states: frozenset[State],
+        tiers: frozenset[Tier] | None,
+        pinned: bool | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[MemoryItem], str | None]:
+        """The ONE bounded, PAGINATED partition walk (spec §3.1 lines 171-176).
+
+        Shared by the demotion sweep and ``MemoryHealthService.assess`` so neither invents its own
+        scan. ``pinned=False`` lets a sweep skip pinned items cheaply; ``pinned=None`` = do not
+        filter on pin. Returns ``(page, next_cursor)`` with ``len(page) <= limit`` and
+        ``next_cursor is None`` iff the walk is exhausted. **NEVER unbounded** — an implementation
+        that ignores ``limit`` violates this port.
+        """
+        ...
 
 
 @runtime_checkable
@@ -108,3 +153,30 @@ class MemoryRepository(Protocol):
     ) -> list[Scored[MemoryItem]]: ...
 
     async def by_artifact(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]: ...
+
+    async def set_pinned(
+        self,
+        ns: Namespace,
+        id: str,
+        pinned: bool,
+        *,
+        at: datetime,
+        by: str,
+        reason: str | None = None,
+    ) -> int:
+        """Fan the id-stable pin upsert across every tier the id lives in via ``TierRouter``
+        (spec §3.1 line 179). Returns the new version."""
+        ...
+
+    async def enumerate(
+        self,
+        ns: Namespace,
+        *,
+        states: frozenset[State],
+        tiers: frozenset[Tier] | None,
+        pinned: bool | None,
+        cursor: str | None,
+        limit: int,
+    ) -> tuple[list[MemoryItem], str | None]:
+        """The façade's bounded partition walk, fanning across tiers via ``TierRouter``."""
+        ...
