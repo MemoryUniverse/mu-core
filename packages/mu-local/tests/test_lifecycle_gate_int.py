@@ -288,8 +288,15 @@ async def test_build_lifecycle_manager_get_state_matches_real_store_counts(
             assert state.ltm_count >= 1
         except AssertionError:
             pytest.xfail(
-                "get_state() tier counts are a documented 0 stub pending S3-02 "
-                "WarmRecallCacheService (see mu_engine.lifecycle.manager module docstring)"
+                "get_state() tier counts are a documented 0 stub. NOT 'pending S3-02' — that "
+                "reason was measured WRONG (ARCHITECTURE-DELTAS AD-24): S3-02 has landed and the "
+                "bridge is fully wired on the daemon path, and the counts are still 0,0,0, "
+                "because WarmRecallCacheServicePort declares only invalidate()/last_rendered() "
+                "-- no count method -- and get_state() never consults the warm cache at all. "
+                "The bridge caches rendered BODIES keyed by session; tier counts are "
+                "per-user-prefix CARDINALITIES. Real counts need a count cache in mu-core fed by "
+                "InprocBus, which get_state can read synchronously (its sync contract is "
+                "load-bearing: DEV-STANDARDS rule 1, never block the event loop)."
             )
     finally:
         await _teardown(settings, uid)

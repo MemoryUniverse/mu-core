@@ -116,9 +116,17 @@ conformance permits extra public methods" convention ``SqliteWalRunner`` already
   because spec §5 types ``get_state`` as a SYNCHRONOUS "instant" warm read; the only existing
   ports that could count STM/LTM items (``StmTierRepository.recent``/``GraphStorePort.
   graph_recall``) are ``async`` I/O, and blocking a sync method on real store I/O would violate
-  DEV-STANDARDS rule 1. Real counts need a proactively-maintained ``WarmRecallCacheService``
-  (slice 3, S3-02 — not yet landed) this manager could read synchronously from memory — see
-  :meth:`MemoryLifecycleManager.get_state`'s own docstring for the full reasoning.
+  DEV-STANDARDS rule 1. **The fix is NOT ``WarmRecallCacheService`` — that claim was measured
+  wrong and is recorded as ARCHITECTURE-DELTAS AD-24.** S3-02 HAS landed and the bridge is fully
+  wired on the daemon path, and these counts are still ``0``: ``WarmRecallCacheServicePort``
+  (below) declares only ``invalidate()``/``last_rendered()`` — there is no count method — and
+  ``get_state`` never consults ``_warm_cache`` at all. The bridge caches rendered BODIES keyed by
+  session; tier counts are per-user-prefix CARDINALITIES: different key, different shape,
+  different lifetime. Real counts need a COUNT cache in mu-core fed by ``InprocBus``
+  (``platform/adapters/bus_inproc.py``), on which the real ingest/distill/promotion/demotion/
+  retention services already publish tier transitions IN-PROCESS — so the daemonless path is not
+  the obstacle it was assumed to be. Whatever is built must stay synchronously readable, because
+  ``get_state``'s sync contract is itself load-bearing.
   ``ready_context(session_id)`` is the identical, spec-sanctioned stub (task packet: "may return
   a documented not-yet-wired stub until S3-02 lands"). NOTE: a pre-existing sibling test,
   ``mu-local/tests/test_lifecycle_gate_int.py::test_build_lifecycle_manager_get_state_matches_
@@ -405,7 +413,8 @@ class MemoryLifecycleManager:
         real store I/O would violate DEV-STANDARDS rule 1 (never block the event loop) while
         also contradicting spec §5's own "instant" framing. The only spec-consistent way to give
         ``get_state`` REAL tier counts is a proactively-maintained WARM CACHE
-        (``WarmRecallCacheService``, slice 3/S3-02 — not yet landed) that this manager reads
+        (a COUNT cache — NOT ``WarmRecallCacheService``, which has no count method; AD-24)
+        that this manager reads
         synchronously from memory, refreshed asynchronously in the background on every real
         transition — the identical reasoning this task's own acceptance list already applies to
         ``ready_context``'s stub. See the module docstring's gap list."""
