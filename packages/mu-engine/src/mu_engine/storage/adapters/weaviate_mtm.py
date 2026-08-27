@@ -76,7 +76,7 @@ from typing import Any
 
 import httpx
 import weaviate
-from weaviate.classes.config import Configure, DataType, Property
+from weaviate.classes.config import Configure, DataType, Property, Tokenization
 from weaviate.classes.tenants import Tenant
 from weaviate.collections.classes.internal import _RawGQLReturn
 
@@ -167,26 +167,57 @@ def _resolve_namespace_match(ns: Namespace, *, session_scope: str | None) -> tup
     return "namespace", scoped_ns.to_prefix()
 
 
-# Declared, indexed properties every object of this class carries (mirrors qdrant_mtm.py's
-# ``_KEYWORD_INDEXES`` — the SAME filter grain, just as Weaviate schema properties instead of
-# Qdrant payload-index keys). ``payload_json`` is the lossless full-payload blob
-# ``WeaviateMapper``/``from_store`` actually rebuilds a ``MemoryItem`` from; ``content`` is
-# promoted separately (not read from ``payload_json``) so a future native-BM25 caller has a real
-# inverted-index field to search, per this module's docstring on casualty 1/2. ``user_prefix``
-# is the federated-recall property this fix adds (see :data:`USER_PREFIX_PROPERTY` above).
+def _namespace_match_value(namespace: Namespace, match_prop: str) -> str:
+    """The value ``match_prop`` (a :func:`_resolve_namespace_match` result) resolves to for a
+    CONCRETE ``namespace`` — used to re-verify, in Python, that an object a Weaviate GraphQL
+    ``where`` clause returned genuinely belongs to the intended partition.
+
+    Load-bearing, not decorative: see ``_PROPERTIES``'s docstring for the proven live defect
+    (``Equal`` on this class's ``WORD``-tokenized text properties is a token-SUBSET match, not
+    exact string equality — an English-stopword segment like a trailing "-a" gets silently
+    dropped from BOTH sides of the comparison, so two objects differing only in that segment can
+    both match a query meant to select just one). ``_semantic_impl``/``_scan_for_demotion_impl``
+    call this on every row Weaviate returns and drop any row whose ACTUAL value disagrees — the
+    same defensive principle ``_get_impl``/``_scoped_patch`` already apply to their own by-id
+    reads (see ``_get_impl``'s docstring), extended here to the multi-row recall/scan paths."""
+    if match_prop == USER_PREFIX_PROPERTY:
+        return _user_prefix(namespace)
+    return namespace.to_prefix()
+
+
+# SECOND BLOCKER FOUND WHILE FIXING THE FIRST (verified live, not assumed): Weaviate's default
+# `Tokenization.WORD` on a TEXT property makes `Equal`/`ContainsAny` a token-SUBSET match, NOT
+# exact string equality — and the English stopword list this deployment's inverted index ships
+# with (`/v1/schema` shows `stopwords: {preset: "en"}`) silently drops single-letter segments
+# like the trailing "a" in a session id. Proof: two objects with `namespace` values differing
+# ONLY in `.../session-a` vs `.../session-b` BOTH matched a live `where: {namespace Equal
+# ".../session-a"}` query — "a" was stripped from the analyzed value on both sides, collapsing
+# the comparison to "session" == "session". `Tokenization.FIELD` (whole-value, case-preserving,
+# no stopword filtering) is the correct choice for every property this adapter uses as an
+# EXACT-match filter key (mirrors qdrant_mtm.py's `_KEYWORD_INDEXES` — the SAME filter grain).
+# ``content`` is deliberately left at the WORD default (this module's docstring, casualty 1/2:
+# a future native-BM25 caller needs a real word-tokenized inverted index to search).
+#
+# ⚠ Tokenization is IMMUTABLE on an already-declared property — Weaviate has no ALTER for it.
+# This list only protects a class created AFTER this fix. `MuMtm8`/`MuMtm16` on the tunnelled
+# dev instance already exist with `namespace` at `WORD` (verified live) and cannot be retrofitted
+# without recreating the class (a destructive, out-of-scope migration this task does not
+# perform). `_semantic_impl`/`_scan_for_demotion_impl` therefore ALSO re-verify the namespace/
+# user-prefix match in Python after fetch (see `_namespace_match_value` below) — that check, not
+# this schema declaration, is what actually closes the leak against the currently-live classes.
 _PROPERTIES = [
-    Property(name="memory_id", data_type=DataType.TEXT),
+    Property(name="memory_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
     Property(name="content", data_type=DataType.TEXT),
-    Property(name="namespace", data_type=DataType.TEXT),
-    Property(name="session_id", data_type=DataType.TEXT),
-    Property(name="state", data_type=DataType.TEXT),
-    Property(name="visibility", data_type=DataType.TEXT),
-    Property(name="authorized_ids", data_type=DataType.TEXT_ARRAY),
-    Property(name="current_tier", data_type=DataType.TEXT),
-    Property(name="owner_id", data_type=DataType.TEXT),
-    Property(name="content_hash", data_type=DataType.TEXT),
-    Property(name="artifact_ref", data_type=DataType.TEXT),
-    Property(name=USER_PREFIX_PROPERTY, data_type=DataType.TEXT),
+    Property(name="namespace", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="session_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="state", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="visibility", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="authorized_ids", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.FIELD),
+    Property(name="current_tier", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="owner_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="content_hash", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="artifact_ref", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name=USER_PREFIX_PROPERTY, data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
     Property(
         name="payload_json",
         data_type=DataType.TEXT,
@@ -350,8 +381,15 @@ class WeaviateMtmAdapter:
         coll = self._weaviate.collections.get(self._class)
         cfg = await coll.config.get(simple=True)
         if USER_PREFIX_PROPERTY not in {p.name for p in cfg.properties}:
+            # FIELD tokenization from the start — unlike `namespace` on an already-existing
+            # class (immutable, stuck at WORD), a brand-new property added here has no such
+            # constraint (see `_PROPERTIES`'s docstring on why FIELD is the correct choice).
             await coll.config.add_property(
-                Property(name=USER_PREFIX_PROPERTY, data_type=DataType.TEXT)
+                Property(
+                    name=USER_PREFIX_PROPERTY,
+                    data_type=DataType.TEXT,
+                    tokenization=Tokenization.FIELD,
+                )
             )
 
     # ------------------------------------------------------------------ row <-> object shaping
@@ -604,6 +642,7 @@ class WeaviateMtmAdapter:
     ) -> list[Scored[MemoryItem]]:
         if not await self._partition_ready(ns):
             return []
+        match_prop, match_value = _resolve_namespace_match(ns, session_scope=session_scope)
         where = self._recall_where(ns, caller_identity_set, session_scope=session_scope)
         query = (
             "{ Get { "
@@ -621,17 +660,22 @@ class WeaviateMtmAdapter:
             raise StorageError(f"Weaviate semantic search failed: {result.errors!r}")
         objects = (result.get or {}).get(self._class) or []
         out: list[Scored[MemoryItem]] = []
-        for rank, obj in enumerate(objects):
+        for obj in objects:
             additional = obj.get("_additional") or {}
             vector = (additional.get("vectors") or {}).get(_VECTOR_NAME) or []
             item = self._item_from_payload_json(obj["payload_json"], vector)
+            # Exact Python-side re-check (`_namespace_match_value`'s docstring) — the `where`
+            # clause above is a pre-filter only, never a correctness guarantee on this class's
+            # WORD-tokenized properties.
+            if _namespace_match_value(item.namespace, match_prop) != match_value:
+                continue
             distance = float(additional.get("distance") or 0.0)
             out.append(
                 Scored(
                     item=item,
                     score=1.0 - distance,  # cosine distance -> similarity, matches Qdrant's scale
                     channel=RecallChannel.MTM_DENSE,
-                    rank=rank,
+                    rank=len(out),
                 )
             )
         return out
@@ -673,7 +717,13 @@ class WeaviateMtmAdapter:
             if not objects:
                 break
             for obj in objects:
-                out.append(self._item_from_payload_json(obj["payload_json"], []))
+                item = self._item_from_payload_json(obj["payload_json"], [])
+                # Exact Python-side re-check — see `_namespace_match_value`'s docstring; the
+                # `where` clause above is a pre-filter only on this class's WORD-tokenized
+                # properties.
+                if _namespace_match_value(item.namespace, match_prop) != match_value:
+                    continue
+                out.append(item)
             offset += len(objects)
             if len(objects) < page:
                 break
