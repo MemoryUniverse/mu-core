@@ -27,6 +27,11 @@ Per model, comparing the SDK's field set against the canonical JSON-Schema:
   (pydantic ``extra="forbid"``, zod ``.strict()``), so a field added canonically makes the SDK
   RAISE on a valid server response, and a field the SDK declares but the server never sends is a
   field the SDK invented. Either direction is a real break.
+* **SHARED models take the RESPONSE rule, not a third laxer one.** ``Namespace`` and
+  ``RecallChannels`` are tagged ``shared`` because they also appear on a request body — but they
+  are NESTED INSIDE responses (``RecallResult.namespace``, ``RecallResult.channels_run``), which
+  are parsed closed. Routing them through the request rule let an SDK drop a field the server
+  really sends: see :data:`_CLOSED_ON_THE_WIRE` for the measured RC=0 that proved it.
 * **REQUEST models — the SDK may be a SUBSET, never a SUPERSET, and must carry every REQUIRED
   field.** A client that omits an optional field still produces a message the server accepts; a
   client that sends a field the canonical model does not declare gets a hard ``422``
@@ -58,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import dataclasses
 import json
 import re
 import sys
@@ -199,6 +205,52 @@ class ModelSpec:
         return frozenset(n for n, f in self.fields.items() if f.required)
 
 
+# The roles whose field set the SDK parses with a CLOSED schema, and which therefore admit NO
+# missing field. `response` is obvious. `shared` is the one that was wrong: `Namespace` and
+# `RecallChannels` are tagged "shared" because they appear on a request body too — but they are
+# also NESTED INSIDE response bodies (`RecallResult.namespace: Namespace`,
+# `RecallResult.channels_run: RecallChannels`, contracts/recall.py:109,111), which both SDKs parse
+# with `extra="forbid"` / `.strict()`. `compare` used to route every non-`response` role through
+# the REQUEST rule, so a shared model was allowed to be a subset. MEASURED on the pushed refs:
+# deleting `ltm: z.boolean().default(true)` from `mu-sdk-js`'s `recallChannelsSchema` — a key the
+# server really sends inside every RecallResult — left `check-sdks` at "OK: no SDK drift", RC=0,
+# while the SDK it just blessed would throw ZodError on the first real recall. "shared" is not a
+# third, laxer rule; it is BOTH rules at once, so it takes the strictest.
+_CLOSED_ON_THE_WIRE = frozenset({"response", "shared"})
+
+
+def missing_field_problem(sdk: str, spec: ModelSpec, got: ModelSpec) -> str | None:
+    """The ASYMMETRIC half of the drift rule, written in exactly ONE place.
+
+    Responses (and shared models, carried inside one) must match the contract EXACTLY; requests may
+    be a subset but must carry every REQUIRED field. `compare` is the only caller and both entry
+    points — the `check-sdks` CLI and `test_sdk_wire_parity.py` — go through `compare`, so the two
+    gates cannot come to different verdicts about the same model. Returns None when there is no
+    problem.
+    """
+    if spec.role in _CLOSED_ON_THE_WIRE:
+        missing = sorted(set(spec.fields) - set(got.fields))
+        if not missing:
+            return None
+        carried = (
+            "RESPONSE"
+            if spec.role == "response"
+            else "SHARED — it is nested inside a response body, so this rule is the RESPONSE rule"
+        )
+        return (
+            f"{sdk}: {spec.name} ({carried}) is missing field(s) the contract emits: {missing}. "
+            "The SDK parses responses with a closed schema, so it will RAISE on a valid server "
+            "response."
+        )
+    missing_required = sorted(spec.required - set(got.fields))
+    if missing_required:
+        return (
+            f"{sdk}: {spec.name} (REQUEST) is missing REQUIRED field(s): {missing_required}. "
+            "The SDK cannot construct a message the server will accept."
+        )
+    return None
+
+
 def _kinds_from_schema(
     node: Mapping[str, Any], defs: Mapping[str, Any], depth: int = 0
 ) -> frozenset[str]:
@@ -228,6 +280,27 @@ def _kinds_from_schema(
     return frozenset(kinds)
 
 
+def canonical_lookups(name: str, role: str) -> tuple[str, ...]:
+    """The ``x-schema-key`` entries that describe this model AS IT APPEARS ON THE WIRE.
+
+    A ``shared`` model is emitted TWICE — once in validation mode (``<name>.request``) and once in
+    serialization mode (``<name>.response``) — because pydantic can legitimately give the two
+    different property sets (a computed field is serialization-only; ``Field(exclude=True)`` is
+    validation-only). ``canonical_specs`` used to read ``.request`` and nothing else.
+
+    MEASURED at dev/mlm-build@eaf6c00: both shared models collapse to ONE ``$defs`` key today —
+    ``Namespace`` -> key ``Namespace`` in both modes, ``RecallChannels`` -> key ``RecallChannels``
+    in both — so the old line was a no-op *and* a fail-open waiting for the first divergence. The
+    day a computed field lands on ``RecallChannels``, the response-only key would be invisible to
+    this gate, and an SDK that correctly declared it would be reported as INVENTING a field. Both
+    keys are read and merged instead, so the canonical view is the union the SDK actually has to
+    parse.
+    """
+    if role != "shared":
+        return (name,)
+    return (f"{name}.request", f"{name}.response")
+
+
 def canonical_specs() -> dict[str, ModelSpec]:
     """The canonical field view, read from the GENERATED JSON-Schema (not from the classes).
 
@@ -240,17 +313,40 @@ def canonical_specs() -> dict[str, ModelSpec]:
     key_of: Mapping[str, str] = doc["x-schema-key"]
     specs: dict[str, ModelSpec] = {}
     for name, (_model, role) in WIRE_MODELS.items():
-        lookup = name if role != "shared" else f"{name}.request"
-        node = defs[key_of[lookup]]
         spec = ModelSpec(name=name, role=role)
-        required = set(node.get("required", []))
-        for fname, fnode in node.get("properties", {}).items():
-            spec.fields[fname] = FieldSpec(
-                name=fname,
-                kinds=_kinds_from_schema(fnode, defs),
-                required=fname in required,
-                source=json.dumps(fnode, sort_keys=True),
-            )
+        for lookup in canonical_lookups(name, role):
+            if lookup not in key_of:
+                # Fail CLOSED and by name. A shared model the generator stopped emitting in one of
+                # the two modes is a contract change, not a missing dict key, and the gate must say
+                # so rather than dying with a bare KeyError three frames down.
+                raise KeyError(
+                    f"the generated schema has no root for {lookup!r} (model {name}, role {role}). "
+                    "The wire generator and this checker disagree about which schema modes exist; "
+                    "fix the generator or canonical_lookups, never skip the model."
+                )
+            node = defs[key_of[lookup]]
+            required = set(node.get("required", []))
+            for fname, fnode in node.get("properties", {}).items():
+                candidate = FieldSpec(
+                    name=fname,
+                    kinds=_kinds_from_schema(fnode, defs),
+                    required=fname in required,
+                    source=json.dumps(fnode, sort_keys=True),
+                )
+                seen = spec.fields.get(fname)
+                if seen is None:
+                    spec.fields[fname] = candidate
+                    continue
+                # Present in BOTH modes. Kinds are unioned (a wire value matching either mode is a
+                # valid wire value); `required` keeps the REQUEST answer, which is the only mode
+                # where "the client must send it" means anything.
+                spec.fields[fname] = dataclasses.replace(
+                    seen,
+                    kinds=seen.kinds | candidate.kinds,
+                    source=seen.source
+                    if seen.source == candidate.source
+                    else f"{seen.source} | {candidate.source}",
+                )
         specs[name] = spec
     return specs
 
@@ -524,26 +620,14 @@ def compare(
             continue
 
         extra = sorted(set(got.fields) - set(spec.fields))
-        missing = sorted(set(spec.fields) - set(got.fields))
         if extra:
             problems.append(
                 f"{sdk}: {name} declares field(s) the contract does not: {extra}. "
                 "Every canonical wire model is extra=forbid/.strict() — an invented field is a 422."
             )
-        if spec.role == "response":
-            if missing:
-                problems.append(
-                    f"{sdk}: {name} (RESPONSE) is missing field(s) the contract emits: {missing}. "
-                    "The SDK parses responses with a closed schema, so it will RAISE on a valid "
-                    "server response."
-                )
-        else:
-            missing_required = sorted(spec.required - set(got.fields))
-            if missing_required:
-                problems.append(
-                    f"{sdk}: {name} (REQUEST) is missing REQUIRED field(s): {missing_required}. "
-                    "The SDK cannot construct a message the server will accept."
-                )
+        absence = missing_field_problem(sdk, spec, got)
+        if absence:
+            problems.append(absence)
         # Every canonical field is audited, not only the shared ones: a REQUEST field the SDK is
         # allowed to omit still has to be READABLE on the contract side, or the artifact the SDKs
         # are generated from is itself unverified.

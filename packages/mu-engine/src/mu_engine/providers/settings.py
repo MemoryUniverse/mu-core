@@ -16,6 +16,8 @@ no model id, host, or threshold is hardcoded in any code path.
 
 from __future__ import annotations
 
+from enum import StrEnum
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from mu_engine.providers.catalog import (
@@ -25,13 +27,66 @@ from mu_engine.providers.catalog import (
     Task,
     WarmLocalConfig,
 )
+from mu_engine.providers.shipped_settings import ShippedCatalogSettings
 
 __all__ = [
+    "CatalogSource",
+    "LocalFallbackPosture",
     "ModelCatalogSettings",
     "ModelSettings",
     "RouterSettings",
+    "TaskDefaults",
     "default_local_catalog",
 ]
+
+
+class CatalogSource(StrEnum):
+    """WHICH table `ModelCatalogSettings` resolves to at composition (MVP-SPEC §8-Q8).
+
+    Q8 asked whether the ~915-line multi-provider table is opt-in or the default and recorded
+    that *"today it is neither — it is a table with no caller, which is how design starts to
+    depreciate."* This enum is the answer, written down: **SHIPPED is the default**, so a plane
+    built from bare settings resolves every task out of the box (gate G6), and EMPTY is the
+    named, one-env-var way back to the pre-2026-08-28 posture.
+    """
+
+    SHIPPED = "shipped"  # DEFAULT — `shipped_catalog()` narrowed by the credential probe
+    EMPTY = "empty"  # providers/deployments exactly as configured (the pre-wiring posture)
+
+
+class TaskDefaults(StrEnum):
+    """WHERE the per-task fields of `ModelSettings` point when the operator did not set them.
+
+    `ModelSettings` stays the ONE user-configurable seam (CANONICAL §7.2): a field the operator
+    set — in code or via `MU_MODEL__ANSWER_MODEL` — is NEVER overwritten, whichever value this
+    carries (`ModelSettings.model_fields_set` is the discriminator).
+    """
+
+    RECOMMENDED = "recommended"  # DEFAULT — `recommended_model_settings()`'s logical ModelGroups
+    LEGACY = "legacy"  # `ModelSettings`' own `gpt-*` field defaults, untouched
+
+
+class LocalFallbackPosture(StrEnum):
+    """Whether the local rows may serve the REMOTE-PREFERRED groups
+    (`ShippedCatalogSettings.local_serves_remote_preferred_groups`).
+
+    That flag is the shipped catalog's OWN answer to a box with no cloud keys: with it off, a
+    keyless plane's `mu-reason-hard` / `gpt-5-chat` groups are empty and `ProviderModelRegistry`
+    refuses to start (model-layer-spec §5, and the behaviour
+    `test_shipped_catalog_unit.py::test_without_the_flag_a_keyless_box_fails_loud_on_the_hard_tier`
+    pins). A plane that must boot with ZERO credentials therefore has to make a choice, and
+    leaving the choice implicit is how it got made by accident.
+
+    AUTO makes it explicit and evidence-driven: adopt the no-remote-credentials posture **iff the
+    credential probe found no remote credential at all**, and say so in a named, content-free
+    event. For the adjudicating groups that is the deliberate ADR 0037 deviation the flag's own
+    docstring describes — logged, never silent, and `NEVER` keeps the fail-loud original.
+    """
+
+    AUTO = "auto"  # DEFAULT — adopt it only when zero remote credentials resolved
+    NEVER = "never"  # keep the shipped default: a keyless box fails loud on the hard tier
+    ALWAYS = "always"  # local rows are primary even where remote credentials exist
+
 
 # The default local embedder backend key + model — the ONE active embedding backend this
 # phase ships (works offline). Declared as a Settings default (central-config home), not a
@@ -120,6 +175,28 @@ class ModelCatalogSettings(BaseModel):
     # composition root passes its WIRED `ModelCatalogSettings` in (see that function's docstring).
     default_embed_backend: str = _DEFAULT_EMBED_BACKEND
     default_minilm_path: str = _DEFAULT_MINILM_PATH
+
+    # --- ENG-115a: the wiring knobs. Everything below is reachable as `MU_MODEL_CATALOG__*`
+    #     because `EngineSettings.model_catalog` mounts THIS class (config/engine_settings.py:99).
+    #: WHICH table to resolve (see :class:`CatalogSource`). SHIPPED is the default — MVP-SPEC
+    #: §8-Q8 answer (a). `providers`/`deployments` above stay the operator's own explicit rows and
+    #: are OVERLAID on the shipped table, never replaced by it.
+    source: CatalogSource = CatalogSource.SHIPPED
+    #: The environment-dependent knobs of the shipped table (endpoints, Azure deployment names,
+    #: secret-seam NAMES). `MU_MODEL_CATALOG__SHIPPED__LOCAL_HTTP_API_BASE=...` etc.
+    shipped: ShippedCatalogSettings = Field(default_factory=ShippedCatalogSettings)
+    #: Where UNSET per-task fields point (see :class:`TaskDefaults`).
+    task_defaults: TaskDefaults = TaskDefaults.RECOMMENDED
+    #: The keyless-box posture (see :class:`LocalFallbackPosture`).
+    local_fallback: LocalFallbackPosture = LocalFallbackPosture.AUTO
+    #: Root of the secret seam a `credential_ref` NAME is looked up under — one file per ref
+    #: (`/run/secrets/<ref>`, model-layer-spec §4). `None` ⇒ the environment alone is the seam.
+    #: A VALUE never appears in this tree; only the directory that holds them.
+    secrets_dir: str | None = None
+    #: Also consult the environment for a `credential_ref` (upper-cased) when no secret file
+    #: exists. This is how `ANTHROPIC_API_KEY` in the operator's shell activates the anthropic
+    #: provider with no config at all — the ordinary way every one of these vendors is configured.
+    credentials_from_env: bool = True
 
 
 def default_local_catalog(catalog: ModelCatalogSettings | None = None) -> ModelCatalogSettings:

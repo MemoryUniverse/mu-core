@@ -29,15 +29,23 @@ a single configured LLM/SLM profile mu-local's composition root turns into a REA
 shape the reference integration test builds, ``mu-engine/tests/pipelines/
 test_distill_llm_slm_int.py:115-136,163-196``) — one deployment layered onto
 ``default_local_catalog()``, every task field pointed at the same model-group. ``StorageSettings
-.llm=None`` (the default) keeps ``LocalContainer``/``LocalMemory`` in heuristic mode, BYTE-FOR-BYTE
-the prior behaviour (backward compatible) — no field here is read unless a caller opts in.
+.llm=None`` (the default) keeps ``LocalMemory``'s LLM-dependent verbs in heuristic mode,
+BYTE-FOR-BYTE the prior behaviour (backward compatible) — no field here is read unless a caller
+opts in. Since 2026-08-28 (ENG-115a) ``llm=None`` no longer means the plane has NO model layer:
+``LocalContainer.model_router`` is always built, from the SHIPPED multi-provider catalog narrowed
+by a credential probe. This profile is the way to PIN every task to one specific deployment.
+
+ENG-118 (the credential rule) is enforced by two defaults below: ``provider="hosted_vllm"`` — the
+keyless local litellm prefix — and ``api_key=None`` in place of the former literal
+``"sk-mu-local-placeholder"``. Both were measured against a header-recording listener, not
+reasoned about; see the field comments.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 __all__ = [
     "BackendChoice",
@@ -91,10 +99,30 @@ class ModelProfileSettings(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    provider: str = "openai"  # litellm's provider prefix; OpenAI-compatible local servers use this
+    # litellm's provider prefix. `hosted_vllm` — NOT `openai` — is the default, and the difference
+    # was MEASURED against a listener that records headers, not reasoned about (ENG-118):
+    #   openai + api_key="sk-mu-local-placeholder" -> Authorization: Bearer sk-mu-local-…
+    #   openai + no api_key, OPENAI_API_KEY in env -> Authorization: Bearer <REAL cloud key>
+    #   hosted_vllm                                -> Authorization: Bearer fake-api-key
+    # i.e. the old default shipped a literal key from source to localhost, and merely deleting that
+    # literal made it WORSE — litellm's openai branch falls back to `get_secret("OPENAI_API_KEY")`,
+    # so an operator with a cloud key in their shell sent it to 127.0.0.1 on every extraction.
+    # `hosted_vllm` reads only HOSTED_VLLM_API_KEY and substitutes "fake-api-key"
+    # (litellm/llms/hosted_vllm/chat/transformation.py:125), so the local seam is credential-free
+    # on the wire as well as in the table — the same prefix `shipped_catalog.py` uses, and its
+    # chat/embedding/rerank handlers all exist.
+    provider: str = "hosted_vllm"
     base_url: str  # e.g. "http://127.0.0.1:11435/v1" (Ollama's OpenAI-compat shim) — required
     model: str  # provider-native model id, e.g. "qwen2.5:0.5b" — required
-    api_key: str = "sk-mu-local-placeholder"  # NOT a secret; local OpenAI-compat shims rarely check
+    #: An endpoint that DOES check a key. `None` (the default) is the honest local posture — no
+    #: placeholder, because a fake credential in source is a literal key on the wire, not an
+    #: absence. When set, the value is handed to the composition root's `SecretSeamResolver` under
+    #: `credential_ref` and reaches litellm through `ProviderRecord.credential_ref` — the ONE
+    #: sanctioned seam (`catalog.py:77`) — never through `ModelDeployment.extra_params`, which
+    #: `model-layer-spec §4` reserves for `api_version` and nothing else.
+    api_key: SecretStr | None = None
+    #: The NAME this profile's key is registered under in the secret seam. Never a value.
+    credential_ref: str = "mu_local_llm_api_key"
     max_tokens: int = 512
     temperature: float = 0.0
     provider_key: str = "mu_local_llm"  # registry key stamped on the ProviderRecord/ModelDeployment

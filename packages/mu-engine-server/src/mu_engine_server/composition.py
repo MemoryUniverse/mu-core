@@ -54,13 +54,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
 from mu_contracts.domain.errors import BackendUnavailableError
 from mu_contracts.domain.model.memory import Namespace as _Namespace
+from mu_contracts.domain.model.memory import Tier as _Tier  # PERSONA (§5.2) tier legs
 from mu_contracts.domain.model.memory import Visibility as _NsVisibility
 from mu_contracts.domain.model.recall import CallerIdentitySet
 from mu_contracts.ports.bus import EventBusPort
@@ -87,7 +88,19 @@ from mu_engine.platform.tenancy import DefaultTenancyGuard
 from mu_engine.providers.catalog import ModelDeployment, ModelKind, ProviderKind, ProviderRecord
 from mu_engine.providers.embedding import SentenceTransformerEmbedder, build_embedder
 from mu_engine.providers.model_router import ModelRouter, build_model_router
-from mu_engine.providers.settings import ModelCatalogSettings, ModelSettings, default_local_catalog
+from mu_engine.providers.plane import (
+    PlaneModelLayer,
+    build_plane_router,
+    build_plane_secret_resolver,
+    resolve_plane_model_layer,
+)
+from mu_engine.providers.secrets import SecretSeamResolver
+from mu_engine.providers.settings import (
+    CatalogSource,
+    ModelCatalogSettings,
+    ModelSettings,
+    default_local_catalog,
+)
 from mu_engine.services.conflict.policy_resolver import ConflictPolicyResolver
 from mu_engine.services.conflict.ports import (
     InMemoryMemoryConflictPolicyStore,
@@ -101,6 +114,9 @@ from mu_engine.services.extract import (
     LlmFactExtractor,
 )
 from mu_engine.services.ingest import IngestService
+from mu_engine.services.memory.repository import TieredMemoryRepository
+from mu_engine.services.memory.router import TierLeg, TierRouter
+from mu_engine.services.persona import PersonaWiring, build_persona
 from mu_engine.services.recall import (
     PrincipalAuthorizedIdsResolver,
     RecallAuthorizationFilter,
@@ -176,23 +192,33 @@ class _NullSharedRecall:
         )
 
 
-def _build_llm_catalog(profile: SlmProfile) -> tuple[ModelSettings, ModelCatalogSettings]:
-    """PORT of ``mu_local.composition._build_llm_catalog`` (module-level function, no ``mu_local``
-    state — reads only its ``profile`` argument), layering ONE ``ProviderKind.LOCAL_HTTP``
-    deployment onto ``default_local_catalog()`` — the same shape the reference SLM integration
-    test builds (``mu-engine/tests/pipelines/test_distill_llm_slm_int.py:163-196``).
+#: The secret-seam NAME the configured SLM profile's key is registered under (ENG-118: a NAME in
+#: the catalog, the VALUE only inside the resolver). Never a value, never in `extra_params`.
+_PROFILE_CREDENTIAL_REF = "mu_engine_server_llm_api_key"
 
-    CONFIG-AND-DATA-FIX-PLAN.md §1.2 C1 (mirrors the identical fix in ``mu_local.composition``):
-    ``ModelSettings`` is derived from the WIRED ``get_engine_settings().model`` via ``model_copy``
-    instead of constructed bare, so ``MU_MODEL__MAX_OUTPUT_TOKENS``/``MU_MODEL__TEMPERATURE`` are
-    reachable — ``profile.max_tokens``/``profile.temperature`` stay the SLM's own per-call
-    extraction params (threaded into ``ExtractionSettings`` separately, unchanged).
+
+def _profile_rows(profile: SlmProfile) -> tuple[ProviderRecord, ModelDeployment]:
+    """The ONE ``ProviderKind.LOCAL_HTTP`` row the configured SLM profile contributes.
+
+    ENG-118 (mirrors the identical fix in ``mu_local.composition``): the key no longer travels in
+    ``ModelDeployment.extra_params`` — ``model-layer-spec §4`` reserves that field for
+    ``api_version`` and nothing else. The provider carries a ``credential_ref`` NAME and the
+    root's :class:`SecretSeamResolver` holds the value, so ``registry.compile_model_list``
+    resolves it through the one sanctioned seam (``registry.py:123-124``).
+
+    REPORTED, NOT FIXED HERE (outside this lane's file ownership): ``SlmProfile.provider`` still
+    defaults to ``"openai"`` (``settings.py:103``) and ``api_key`` to a literal placeholder
+    (``:105``). With the ``openai`` prefix litellm falls back to ``get_secret("OPENAI_API_KEY")``
+    when no key is supplied, i.e. a deployment with a cloud key in its environment would send it
+    to ``127.0.0.1`` — measured, see ``mu_local/config.py``'s ``provider`` comment. The keyless
+    fix is ``provider="hosted_vllm"`` + ``api_key=None``, which ``mu_local.config`` now defaults.
     """
     provider = ProviderRecord(
         key=profile.provider_key,
         kind=ProviderKind.LOCAL_HTTP,
         litellm_provider=profile.provider,
         api_base=profile.base_url,
+        credential_ref=_PROFILE_CREDENTIAL_REF if profile.api_key else None,
         is_local=True,
     )
     deployment = ModelDeployment(
@@ -200,16 +226,13 @@ def _build_llm_catalog(profile: SlmProfile) -> tuple[ModelSettings, ModelCatalog
         provider_key=profile.provider_key,
         model_id=f"{profile.provider}/{profile.model}",
         kind=ModelKind.LLM,
-        extra_params={"api_key": profile.api_key},
     )
-    # CONFIG-AND-DATA-FIX-PLAN.md §1.2 C2 (mirrors the identical fix in `mu_local.composition`):
-    # the BASE catalog is now the WIRED `get_engine_settings().model_catalog` (C0), so
-    # `MU_MODEL_CATALOG__ROUTER__…`/`MU_MODEL_CATALOG__DEFAULT_EMBED_BACKEND`/
-    # `MU_MODEL_CATALOG__DEFAULT_MINILM_PATH` all reach the catalog `build_model_router` consumes.
-    catalog_base = default_local_catalog(get_engine_settings().model_catalog)
-    catalog = catalog_base.model_copy(update={"providers": [provider], "deployments": [deployment]})
-    model_defaults = get_engine_settings().model
-    models = model_defaults.model_copy(
+    return provider, deployment
+
+
+def _profile_models(profile: SlmProfile, models: ModelSettings) -> ModelSettings:
+    """Pin every LLM task at the profile's ONE model-group (unchanged behaviour, C1 preserved)."""
+    return models.model_copy(
         update={
             "provider": profile.provider_key,
             "answer_model": profile.model_group,
@@ -221,7 +244,37 @@ def _build_llm_catalog(profile: SlmProfile) -> tuple[ModelSettings, ModelCatalog
             "rerank_model": profile.model_group,
         }
     )
-    return models, catalog
+
+
+def _profile_resolver(profile: SlmProfile, catalog: ModelCatalogSettings) -> SecretSeamResolver:
+    """The plane's secret seam plus, when the profile carries a key VALUE, that value under its
+    NAME. The value never enters the catalog data, `extra_params`, or a log line."""
+    overrides = {_PROFILE_CREDENTIAL_REF: profile.api_key} if profile.api_key else None
+    return build_plane_secret_resolver(catalog, overrides=overrides)
+
+
+def _resolve_profile_layer(
+    profile: SlmProfile, models: ModelSettings, catalog: ModelCatalogSettings
+) -> PlaneModelLayer:
+    """A configured profile means *"pin every task to this deployment"*, so its source is EMPTY
+    with the profile row overlaid — the shipped multi-provider table would add groups no task can
+    reach. The plane DEFAULT (``llm.enabled=False``) takes the SHIPPED path instead."""
+    provider, deployment = _profile_rows(profile)
+    return resolve_plane_model_layer(
+        models=_profile_models(profile, models),
+        catalog=catalog.model_copy(update={"source": CatalogSource.EMPTY}),
+        resolver=_profile_resolver(profile, catalog),
+        overlay_providers=[provider],
+        overlay_deployments=[deployment],
+    )
+
+
+def _build_llm_catalog(profile: SlmProfile) -> tuple[ModelSettings, ModelCatalogSettings]:
+    """PORT of ``mu_local.composition._build_llm_catalog`` (module-level, reads only its argument
+    plus the WIRED ``get_engine_settings()``), kept so the two roots stay diff-able."""
+    engine_settings = get_engine_settings()
+    layer = _resolve_profile_layer(profile, engine_settings.model, engine_settings.model_catalog)
+    return layer.models, layer.catalog
 
 
 class EngineContainer:
@@ -319,7 +372,15 @@ class EngineContainer:
         # (6) LLM: settings.llm.enabled (default True, unlike LocalContainer's llm=None default —
         #     see SlmProfile's own docstring for why) ⇒ a REAL ModelRouter over the dev SLM +
         #     LlmFactExtractor for DISTILL's SPO extraction; disabled ⇒ heuristic mode, unchanged.
-        self.llm: ModelRouter | None = None
+        #     ENG-115a / gate G6: `model_router` is ALWAYS built now. With `llm.enabled=False` it
+        #     resolves the SHIPPED multi-provider catalog (anthropic/openai/azure/deepseek/
+        #     moonshot + the keyless local endpoints) narrowed by a credential probe, instead of
+        #     the plane having no model layer at all; `self.llm` — and therefore the LLM extractor
+        #     and the conflict adjudicator — stays governed by `llm.enabled`, unchanged.
+        self.model_router: ModelRouter = self._build_plane_router(
+            settings.llm if settings.llm.enabled else None
+        )
+        self.llm: ModelRouter | None = self.model_router if settings.llm.enabled else None
         # C2 (mirrors `mu_local.composition`): `settings=` threaded from the WIRED
         # `EngineSettings.extraction` — previously bare, so `MU_EXTRACTION__MIN_TOKENS`/vocab
         # overrides never reached the DEFAULT (heuristic) extraction path.
@@ -327,12 +388,11 @@ class EngineContainer:
             settings=self._engine_settings.extraction
         )
         if settings.llm.enabled:
-            self.llm = self._build_llm_router(settings.llm)
             # C1: base on the WIRED `EngineSettings.extraction` (mirrors the identical fix in
             # `mu_local.composition`) — `max_tokens`/`temperature` still come from the SLM
             # profile (the per-call params for THIS deployed model), unchanged.
             self._extractor = LlmFactExtractor(
-                self.llm,
+                self.model_router,
                 model_group=settings.llm.model_group,
                 settings=self._engine_settings.extraction.model_copy(
                     update={
@@ -586,6 +646,49 @@ class EngineContainer:
         )
         self._lifecycle_runner_task: asyncio.Task[None] | None = None
 
+        # ---------------------------------------------------------------- (10) PERSONA (§5.2)
+        #: PORT of ``LocalContainer``'s own persona block, one plane over — same
+        #: ``build_persona`` call, same ABSENCE rule (``None`` when persona is disabled or no
+        #: model is wired, because spec line 103's slot tagger IS ``models.classify_model``), and
+        #: the same two bus subscriptions, so the two planes cannot drift into two personas.
+        #:
+        #: **The partition reader is built HERE and is persona's own**, unlike mu-local's, which
+        #: reuses the container's shared ``MemoryRepository`` façade. This container has no such
+        #: façade: nothing on this plane built a ``TierRouter``/``TieredMemoryRepository`` (a real
+        #: asymmetry between the two roots — ``health``/``pin`` are consequently absent here too).
+        #: ``TierRouter`` is a stateless dispatcher over the stm/mtm/ltm adapters THIS container
+        #: already built, so this opens no second connection and no second adapter set
+        #: (DEV-STANDARDS rule 9 is about instances of state, and this holds none). It is named
+        #: privately so that when this plane grows the shared façade, persona switches to it
+        #: without a name collision — REPORTED as the right follow-up, not silently absorbed.
+        self._persona_memory: TieredMemoryRepository = TieredMemoryRepository(
+            router=TierRouter(
+                (
+                    TierLeg(_Tier.STM, self.stm, backend=_KV_BACKEND),
+                    TierLeg(_Tier.MTM, self.mtm, backend=_VECTOR_BACKEND),
+                    TierLeg(_Tier.LTM, self.ltm, backend=_GRAPH_BACKEND),
+                )
+            ),
+            embedder=self.embedder,
+        )
+        self.persona: PersonaWiring | None = build_persona(
+            memory=self._persona_memory,
+            router=self.llm,
+            bus=self._bus,
+            clock=self._clock,
+            tracer=self.tracer,
+            metrics=self.metrics,
+            audit=self.audit,
+        )
+        if self.persona is not None:
+            # §5.2's topic-affinity prior, as a DECORATOR over the finished ranked read. The
+            # ``cast`` carries the identical, reported caveat mu-local's does: ``mu_engine.
+            # surface.facade.LocalContainerLike`` declares ``recall: RecallService`` as an
+            # invariant attribute, and that file is neither this lane's to edit nor allowed to
+            # name persona at all. The wrapper implements that class's entire public surface and
+            # ``test_persona_shaping_unit`` asserts it.
+            self.recall = cast("RecallService", self.persona.shaped(self.recall))
+
     async def start_lifecycle_sweep(self) -> None:
         """Starts `self.lifecycle_runner.run()` as a background `asyncio.Task` (T2 wiring) — a
         no-op (never a silent double-start) if a task is already running. Called by
@@ -661,15 +764,29 @@ class EngineContainer:
             )
         return embedder
 
-    def _build_llm_router(self, profile: SlmProfile) -> ModelRouter:
-        """C1: threads `chunk_token_ratio` from the WIRED `EngineSettings.extraction` (mirrors
-        the identical fix in `mu_local.composition`) — no longer a `@staticmethod` so it can read
-        `self._engine_settings`."""
-        models, catalog = _build_llm_catalog(profile)
+    def _build_plane_router(self, profile: SlmProfile | None) -> ModelRouter:
+        """The plane's REAL ``ModelRouter`` through the ONE model-layer entry point (mirrors
+        ``mu_local.composition.LocalContainer._build_plane_router``).
+
+        ``profile is None`` (``llm.enabled=False``) ⇒ the SHIPPED catalog + the credential probe;
+        a profile ⇒ that ONE deployment, every task pinned to it. C1: `chunk_token_ratio` still
+        threaded from the WIRED `EngineSettings.extraction`.
+        """
+        ratio = self._engine_settings.extraction.chunk_token_ratio
+        catalog = self._engine_settings.model_catalog
+        if profile is None:
+            return build_plane_router(
+                models=self._engine_settings.model,
+                catalog=catalog,
+                chunk_token_ratio=ratio,
+                resolver=build_plane_secret_resolver(catalog),
+            )
+        layer = _resolve_profile_layer(profile, self._engine_settings.model, catalog)
         return build_model_router(
-            models=models,
-            catalog=catalog,
-            chunk_token_ratio=self._engine_settings.extraction.chunk_token_ratio,
+            models=layer.models,
+            catalog=layer.catalog,
+            secret_resolver=_profile_resolver(profile, catalog),
+            chunk_token_ratio=ratio,
         )
 
     def _register_closer(self, adapter: object, *client_paths: str) -> None:

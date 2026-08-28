@@ -19,7 +19,13 @@
 #
 #   And because a checkout can silently stop happening, the gate is ALSO run two ways that cannot
 #   skip: the standalone `scripts/wire_contract.py check-sdks`, which treats an absent sibling as a
-#   FAILURE, and an explicit zero-skips assertion over the parity module's own JUnit report.
+#   FAILURE, and an explicit zero-skips assertion over the parity module's own JUnit report. The
+#   pytest half additionally runs under `MU_REQUIRE_SIBLING_REPOS=1` (job env), which turns the
+#   module's own "sibling not checked out" skips into failures that NAME the path they looked in.
+#
+#   It ALSO runs as its own job (`sdk-drift`, first below), because a gate reported only as part of
+#   a 45-minute job is reported as that job's colour, not its own — see that job's comment for the
+#   measured run where every drift step was green inside a red `gates`.
 #
 # What is deliberately NOT here, and why (see CONTRIBUTING.md § "What CI does not run"):
 #   * the `integration` marker — it needs real Valkey / Qdrant / FalkorDB / Postgres
@@ -58,12 +64,71 @@ env:
   MU_SDK_REF: dev/sdk-build
 
 jobs:
+  # THE SDK-DRIFT GATE, AS ITS OWN CHECK.
+  #
+  # It also runs inside `gates` below (twice: standalone + pytest), and that is not redundant —
+  # it is the difference between "the gate passed" and "CI passed". MEASURED, run 33192194234 on
+  # dev/mlm-build@eaf6c00: both drift steps were GREEN and the `gates` job was RED, because
+  # `pytest (everything that does not need a real store)` failed 12 tests that call out to
+  # huggingface.co from a runner with no model cache. The one gate this repo has over the two SDKs
+  # was therefore reported to a reviewer as part of a red job, and could not be made a required
+  # check without also requiring an unrelated network-dependent suite.
+  #
+  # It is cheap enough to stand alone precisely because it installs nothing: the checker is a
+  # stdlib `ast`/regex parser whose only third-party import is pydantic, reached by a sys.path
+  # bootstrap. Same `--no-project --with` invocation both SDK repos run, which is GREEN on a real
+  # runner today (mu-sdk-js run 33192203700, 41s for that whole workflow).
+  sdk-drift:
+    name: sdk-drift (both SDKs vs mu-contracts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout mu-core
+        uses: actions/checkout@v7
+        with:
+          path: mu-core
+
+      - name: Checkout mu-sdk-python (sibling — read as source text)
+        uses: actions/checkout@v7
+        with:
+          repository: MemoryUniverse/mu-sdk-python
+          ref: ${{ env.MU_SDK_REF }}
+          path: mu-sdk-python
+
+      - name: Checkout mu-sdk-js (sibling — read as source text)
+        uses: actions/checkout@v7
+        with:
+          repository: MemoryUniverse/mu-sdk-js
+          ref: ${{ env.MU_SDK_REF }}
+          path: mu-sdk-js
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+
+      # An absent or dead-ref sibling is a FAILURE naming the path, never a skip. MEASURED with
+      # mu-sdk-js moved aside: exit 1, "mu-sdk-js not found at .../mu-sdk-js/src/models — the
+      # sibling repo must be checked out for this gate to mean anything."
+      - name: SDK drift vs mu-contracts (an absent sibling is a FAILURE, not a skip)
+        working-directory: mu-core
+        run: uv run --no-project --with 'pydantic>=2.9,<3' python scripts/wire_contract.py check-sdks --verbose
+
   gates:
     name: gates
     runs-on: ubuntu-latest
     # A cold run installs the full engine dependency tree (torch via sentence-transformers) and
     # runs mypy over 238 files: measured ~4 min for mypy alone on a warm cache.
     timeout-minutes: 45
+    # JOB-LEVEL, because the two sibling checkouts below are unconditional for this job: every
+    # pytest step here is therefore a run that was DECLARED able to compare the SDKs, and a test
+    # that reports a sibling missing is reporting a broken checkout, not an honest limitation of
+    # the machine. The flag turns those skips into failures NAMING the path they looked in — which
+    # is what the JUnit zero-skip assertion further down could only tell you the count of. Both are
+    # kept: this one says which sibling and where, that one catches a skip for any OTHER reason.
+    # `vm_test.sh` exports the same variable once it has put both siblings on the far side.
+    env:
+      MU_REQUIRE_SIBLING_REPOS: "1"
     steps:
       # Must land at $GITHUB_WORKSPACE/mu-core: `scripts/wire_contract.py` addresses the siblings as
       # `<repo>/../mu-sdk-python` and `<repo>/../mu-sdk-js`.
@@ -144,11 +209,14 @@ jobs:
         working-directory: mu-core
         run: uv run --no-sync python scripts/wire_contract.py check-sdks --verbose
 
-      # And the pytest half, with the skip made loud. The parity module's own JUnit report is
-      # asserted to contain ZERO skipped tests: the exact state this workflow silently produced on
-      # every run before the sibling checkouts existed. `tests` is not pinned to a number — the
-      # module is still growing — but zero collected is also a failure, because a module that
-      # collects nothing is another way to be green while proving nothing.
+      # And the pytest half, with the skip made loud TWICE over. `MU_REQUIRE_SIBLING_REPOS=1`
+      # (job env, above) turns the module's own "sibling not checked out" skips into failures that
+      # name the path; and the parity module's JUnit report is asserted to contain ZERO skipped
+      # tests, which catches a skip introduced for any OTHER reason. The second is not redundant:
+      # the first only knows about the skip reasons the module has today.
+      # `tests` is not pinned to a number — the module is still growing — but zero collected is
+      # also a failure, because a module that collects nothing is another way to be green while
+      # proving nothing.
       - name: SDK drift (pytest — and it must RUN, not skip)
         if: ${{ !cancelled() }}
         working-directory: mu-core

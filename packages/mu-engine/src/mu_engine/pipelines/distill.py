@@ -51,6 +51,7 @@ from pydantic import BaseModel, ConfigDict
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from mu_contracts.domain.events import (
+    ConflictDetected,
     ConsolidationCompleted,
     DegradedModeEntered,
     DegradeReason,
@@ -770,6 +771,10 @@ class DistillPipeline:
         # applies per sweep-tick-per-winner residue, exactly the "N+1 candidates" shape it names).
         self_expire: list[tuple[MemoryItem, AdjudicationVerdict]] = []
         supersede: list[tuple[MemoryItem, AdjudicationVerdict]] = []
+        # Every candidate this sweep judged a genuine contradiction WITHOUT an adjudicator — i.e.
+        # the ids `ConflictDetected` has to name on the default full-local composition. See
+        # `_announce_heuristic_detection` for why the list is collected here and published once.
+        heuristic_detected: list[str] = []
         for candidate in residue:
             heuristic_flag = self._contradicts(winner, candidate)
             if self._adjudicator is not None and budget is not None:
@@ -782,6 +787,12 @@ class DistillPipeline:
                 )
             else:
                 verdict = _heuristic_only_verdict(winner, candidate, heuristic_flag)
+                if verdict.kind is not AdjudicationKind.COEXIST:
+                    # A contradiction, decided by the degrade floor. `_heuristic_only_verdict`
+                    # opens no `ConflictRecord`, so `ConflictAdjudicator._open_record` — the only
+                    # producer of `ConflictDetected` — is never reached on this lane. Recorded
+                    # here, announced once after the loop, BEFORE any write.
+                    heuristic_detected.append(candidate.id)
             if not verdict.apply:
                 if verdict.kind is not AdjudicationKind.COEXIST:
                     # A genuine contradiction that could NOT be auto-applied — a PENDING
@@ -845,6 +856,12 @@ class DistillPipeline:
                 else:
                     supersede.append((candidate, verdict))
             # COEXIST -> no action; both stay active.
+
+        # §2's stage table places the detection announcement BEFORE the AUTOMATIC/MANUAL branch —
+        # so it is published here, after every verdict is in and before the first supersession
+        # write below, on EVERY outcome (applied, pin-blocked or withheld) rather than inside any
+        # one of their branches.
+        await self._announce_heuristic_detection(ns, winner, heuristic_detected)
 
         # Graphiti bi-temporal interval logic (edge_operations.py:406-441/622-639): the incoming
         # fact self-expires if ANY candidate the adjudicator judged more authoritative exists.
@@ -926,6 +943,49 @@ class DistillPipeline:
             )
         return self._action(
             DistillActionKind.SUPERSEDE, winner, tuple(loser_ids), "functional_or_polarity_conflict"
+        )
+
+    async def _announce_heuristic_detection(
+        self, ns: Namespace, winner: MemoryItem, candidate_ids: list[str]
+    ) -> None:
+        """Emit ``ConflictDetected`` for the lane that has no ``ConflictAdjudicator``.
+
+        ``conflict-resolution-async-design.md`` §2's stage table binds one sentence to detection —
+        *"Emits ``ConflictDetected`` and opens/updates a ``ConflictRecord``"* — and both halves
+        landed in ``ConflictAdjudicator`` (``lifecycle/conflict.py::_open_record``/
+        ``_emit_detected``). That closed only the lane an LLM router turns on. On the DEFAULT
+        full-local composition ``mu-local/composition.py`` leaves ``conflict_adjudicator=None``,
+        ``_heuristic_only_verdict`` decides alone, and it opens no record — so no producer was
+        reached and the one catalogued event meaning *"a contradiction exists"* stayed silent on
+        the shape that actually ships. The pin guard makes that worst: a blocked supersession
+        leaves both facts ACTIVE, publishes no ``MemorySuperseded``, and was therefore the one
+        contradiction with no bus trace at all — precisely the one an owner has to act on.
+
+        **Exactly one producer per lane.** This fires ONLY where the adjudicator did not run
+        (``heuristic_detected`` is appended in that ``else`` branch and nowhere else), so an
+        adjudicated conflict is announced once by ``conflict.py`` and never twice.
+
+        **Grain: one event per sweep-winner, not per candidate.** ``candidate_ids`` is a list
+        because the residue is many-to-one (``events.py`` ``ConflictDetected``); N events for one
+        winner's residue would describe one instant N times. There is no per-tick spam to gate
+        against as ``conflict.py`` must: its ``announce`` predicate exists because the
+        ``MaintenanceLoop`` re-derives the same ``conflict_id`` every tick, whereas this call is
+        reached once per incoming fact per ``distill()`` — the same cardinality as the
+        ``FactsExtracted``/``MemorySuperseded`` already on this bus.
+
+        Content-free (CANONICAL §3.1): ids, a namespace and a fixed provenance token, nothing
+        hydrated. ``method`` is ``conflict.py``'s own no-LLM token, so the two lanes report the
+        same provenance vocabulary and a consumer can tell a judged conflict from a heuristic one.
+        """
+        if not candidate_ids or self._bus is None:
+            return
+        await self._bus.publish(
+            ConflictDetected(
+                namespace=ns,
+                incoming_id=winner.id,
+                candidate_ids=candidate_ids,
+                method="polarity_cardinality_heuristic",
+            )
         )
 
     async def _close_automatic_record(

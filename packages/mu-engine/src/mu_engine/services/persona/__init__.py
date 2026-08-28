@@ -23,17 +23,37 @@ from mu_engine.services.persona.aggregator import (
     persona_aggregator_registry,
     slots_changed,
 )
+from mu_engine.services.persona.driver import (
+    PersonaBusBridge,
+    PersonaSweeper,
+    internal_persona_scope,
+)
 from mu_engine.services.persona.evidence import (
     OBJECTIVE_SLOTS,
     SUBJECTIVE_SLOTS,
     PersonaEvidence,
     PersonaEvidenceReader,
 )
+from mu_engine.services.persona.factory import PersonaWiring, build_persona
+from mu_engine.services.persona.reader import (
+    ClassifierSlotTagger,
+    PartitionPersonaEvidenceReader,
+    PersonaPartitionReader,
+    PersonaSlotTagger,
+    SlotTag,
+)
 from mu_engine.services.persona.service import PersonaService
 from mu_engine.services.persona.settings import (
     MEMORYBANK_ROLLUP_V1,
     WEIGHTED_SLOT_V1,
     PersonaSettings,
+)
+from mu_engine.services.persona.shaping import (
+    AFFINITY_SLOTS,
+    PersonaAffinityShaper,
+    PersonaShapedRankedRead,
+    RankedHit,
+    RankedRead,
 )
 from mu_engine.services.persona.store import (
     InMemoryPersonaRepository,
@@ -49,22 +69,37 @@ from mu_engine.services.persona.synthesizer import (
 )
 
 __all__ = [
+    "AFFINITY_SLOTS",
     "MEMORYBANK_ROLLUP_V1",
     "OBJECTIVE_SLOTS",
     "SUBJECTIVE_SLOTS",
     "WEIGHTED_SLOT_V1",
+    "ClassifierSlotTagger",
     "InMemoryPersonaRepository",
     "MemoryBankRollupV1Synthesizer",
+    "PartitionPersonaEvidenceReader",
+    "PersonaAffinityShaper",
+    "PersonaBusBridge",
     "PersonaEvidence",
     "PersonaEvidenceReader",
+    "PersonaPartitionReader",
     "PersonaService",
     "PersonaSettings",
+    "PersonaShapedRankedRead",
+    "PersonaSlotTagger",
+    "PersonaSweeper",
     "PersonaSynthesisPort",
     "PersonaVersionConflictError",
+    "PersonaWiring",
     "PortraitSynthesizer",
+    "RankedHit",
+    "RankedRead",
+    "SlotTag",
     "TraitAggregator",
     "WeightedSlotV1Aggregator",
     "assert_private",
+    "build_persona",
+    "internal_persona_scope",
     "persona_aggregator_registry",
     "persona_key",
     "persona_synthesizer_registry",

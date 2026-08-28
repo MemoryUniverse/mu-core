@@ -44,6 +44,7 @@ from pathlib import Path
 import pytest
 
 import mu_engine
+import mu_engine_server
 import mu_local
 from mu_contracts.domain.model.memory import Namespace
 from mu_contracts.ports.persona import PersonaRepository
@@ -56,11 +57,18 @@ PERSONA_MODULE = "mu_engine.services.persona"
 
 _ENGINE_ROOT = Path(mu_engine.__file__).parent
 _LOCAL_ROOT = Path(mu_local.__file__).parent
+#: The SHARED plane's own root. Added when persona was composed there: `mu_engine_server` was
+#: outside every gate — this scan named two roots, and `.importlinter`'s
+#: `persona-off-the-hot-path` contract lists no `mu_engine_server` source module — so nothing
+#: stopped that plane's request path from importing persona. Composing persona into its
+#: composition root without also scanning it would have been the leak this file exists to catch,
+#: introduced by the change that closed it.
+_SERVER_ROOT = Path(mu_engine_server.__file__).parent
 _PERSONA_ROOT = Path(persona_pkg.__file__).parent
 
 #: EVERY package whose modules may run while a user is waiting. Both root packages in full — the
 #: denylist that used to live here is what let 46 modules through.
-SCANNED_ROOTS: tuple[Path, ...] = (_ENGINE_ROOT, _LOCAL_ROOT)
+SCANNED_ROOTS: tuple[Path, ...] = (_ENGINE_ROOT, _LOCAL_ROOT, _SERVER_ROOT)
 
 #: The ONLY modules permitted to import persona: the package itself, and the composition roots
 #: whose job is to name every subsystem. A composition root importing persona is how persona gets
@@ -71,6 +79,7 @@ IMPORT_ALLOWED: frozenset[Path] = frozenset(
         _ENGINE_ROOT / "platform" / "composition.py",
         _ENGINE_ROOT / "platform" / "registries.py",
         _LOCAL_ROOT / "composition.py",
+        _SERVER_ROOT / "composition.py",
     }
 )
 
@@ -96,7 +105,12 @@ def _banned_files() -> list[Path]:
 def _module_dotted_path(path: Path) -> str:
     """``.../mu_engine/services/ingest.py`` -> ``mu_engine.services.ingest`` — needed to resolve a
     RELATIVE import, which is the spelling the first version of this detector could not see."""
-    root = _ENGINE_ROOT if _ENGINE_ROOT in path.parents or path == _ENGINE_ROOT else _LOCAL_ROOT
+    root = next(
+        (r for r in SCANNED_ROOTS if r == path or r in path.parents),
+        None,
+    )
+    if root is None:  # pragma: no cover — a path from outside every scanned root is a bug here
+        raise AssertionError(f"{path} is not inside any scanned root")
     rel = path.relative_to(root.parent).with_suffix("")
     parts = list(rel.parts)
     if parts[-1] == "__init__":
@@ -228,8 +242,9 @@ def test_the_scanner_actually_found_source_files():
     package silently dropped out of the walk (mu_engine alone is ~137 modules)."""
     banned = _banned_files()
     assert len(banned) > 120
-    # Both planes are really in the walk, not just the engine.
+    # All THREE planes are really in the walk, not just the engine.
     assert any(_LOCAL_ROOT in path.parents for path in banned)
+    assert any(_SERVER_ROOT in path.parents for path in banned)
     # ...and the modules the first version of this file missed are in it now.
     for missed in (
         _ENGINE_ROOT / "services" / "__init__.py",
@@ -253,6 +268,7 @@ def test_the_allowlist_holds_composition_roots_and_nothing_else():
             _ENGINE_ROOT / "platform" / "composition.py",
             _ENGINE_ROOT / "platform" / "registries.py",
             _LOCAL_ROOT / "composition.py",
+            _SERVER_ROOT / "composition.py",
         }
     )
     for path in IMPORT_ALLOWED:

@@ -79,3 +79,15 @@ source_modules =
     mu_local.local_memory
 forbidden_modules =
     mu_engine.services.persona
+# The ONE exempted edge, and it is the composition root's own. `mu_local.local_memory` holds a
+# `LocalContainer`, so it imports `mu_local.composition` — and `mu_local.composition` is the
+# module whose JOB is to name every subsystem (this contract's own comment above, and the
+# identical entry in `test_persona_boundary_unit.IMPORT_ALLOWED`). Before persona was composed
+# this edge was inert and the two gates agreed by accident; composing persona made the accident
+# visible. Exempting exactly this edge keeps the rule intact and keeps the two gates saying the
+# same thing: `local_memory` naming persona ITSELF still fails here, every OTHER chain into
+# persona still fails here, and the hot-path modules (recall/ingest/extract/conflict/surface/
+# storage/pipelines/lifecycle/providers) are untouched. MEASURED both ways — see the mutation
+# recorded with this change.
+ignore_imports =
+    mu_local.local_memory -> mu_local.composition

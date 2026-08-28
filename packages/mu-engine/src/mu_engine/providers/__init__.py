@@ -10,6 +10,14 @@ into `litellm.Router`, never reimplement them; research §1.3):
   L6 chunking.py         — long-text map-reduce over litellm token primitives
   L7 model_router.py     — DI ModelRouter façade implementing the canonical ports
 
+The plane wiring (ENG-115a) sits above those seven:
+  shipped_settings.py    — `ShippedCatalogSettings`, mounted on `ModelCatalogSettings.shipped`
+  shipped_catalog.py     — the DECLARED multi-provider table (data, not machinery)
+  secrets.py             — `SecretSeamResolver`: `credential_ref` NAME -> value (overrides/file/env)
+  plane.py               — `build_plane_router`: settings -> probe -> ACTIVE catalog -> ModelRouter
+This is what each composition root calls; before it existed the table above had no caller and the
+plane shipped one embedder and zero LLM deployments.
+
 Embedding (CANONICAL §6-P5) is a DEDICATED seam (embedding.py) — an offline sentence-transformers
 MiniLM is the ONE active embedding backend, selected by `models.embed_backend`.
 
@@ -44,11 +52,22 @@ from mu_engine.providers.catalog import (
 )
 from mu_engine.providers.embedding import SentenceTransformerEmbedder, build_embedder
 from mu_engine.providers.model_router import ModelRouter, build_model_router
-from mu_engine.providers.registry import ProviderModelRegistry, RegistryError
+from mu_engine.providers.plane import (
+    PlaneModelLayer,
+    build_plane_router,
+    build_plane_secret_resolver,
+    resolve_plane_model_layer,
+    resolve_task_models,
+)
+from mu_engine.providers.registry import ProviderModelRegistry, RegistryError, SecretResolver
+from mu_engine.providers.secrets import SecretSeamResolver
 from mu_engine.providers.settings import (
+    CatalogSource,
+    LocalFallbackPosture,
     ModelCatalogSettings,
     ModelSettings,
     RouterSettings,
+    TaskDefaults,
     default_local_catalog,
 )
 from mu_engine.providers.shipped_catalog import (
@@ -70,6 +89,7 @@ from mu_engine.providers.shipped_catalog import (
 from mu_engine.providers.task_map import TaskClassMapper
 
 __all__ = [
+    "CatalogSource",
     "Chunk",
     "Completion",
     "CredentialProbe",
@@ -79,6 +99,7 @@ __all__ = [
     "EmbeddingPort",
     "LLMProviderPort",
     "LegacyModelGroup",
+    "LocalFallbackPosture",
     "Message",
     "MessageRole",
     "ModelCatalogSettings",
@@ -89,6 +110,7 @@ __all__ = [
     "ModelLayerError",
     "ModelRouter",
     "ModelSettings",
+    "PlaneModelLayer",
     "ProviderKey",
     "ProviderKind",
     "ProviderModelRegistry",
@@ -97,21 +119,28 @@ __all__ = [
     "RerankHit",
     "RerankProviderPort",
     "RouterSettings",
+    "SecretResolver",
+    "SecretSeamResolver",
     "SentenceTransformerEmbedder",
     "ShippedCatalogSettings",
     "StreamingCompletionPort",
     "Task",
     "TaskClassMapper",
+    "TaskDefaults",
     "Usage",
     "Vector",
     "WarmLocalConfig",
     "active_catalog",
     "build_embedder",
     "build_model_router",
+    "build_plane_router",
+    "build_plane_secret_resolver",
     "default_local_catalog",
     "group_tasks",
     "recommended_model_settings",
     "resolvable_credential_refs",
+    "resolve_plane_model_layer",
+    "resolve_task_models",
     "shipped_catalog",
     "shipped_deployments",
     "shipped_providers",
