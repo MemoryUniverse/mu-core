@@ -68,3 +68,18 @@ def test_classify_honours_explicit_hint() -> None:
 
 def test_cancellation_is_terminal_never_retried() -> None:
     assert classify_error(asyncio.CancelledError()) is RetryClass.TERMINAL
+
+
+def test_the_non_enumerating_denial_still_wins_after_the_governance_re_parent() -> None:
+    """AD-89 re-parented ``AuthorizationError`` under ``GovernanceError``, which made every
+    tenancy/authz refusal a ``GovernanceError`` too — and therefore made the ORDER of
+    ``_ERROR_TABLE`` load-bearing. The table is walked in sequence and ``AuthorizationError`` is
+    its FIRST row, so a denial still collapses to the fixed non-enumerating ``404 NOT_FOUND`` and
+    a probe cannot distinguish "denied" from "absent" (spec §5).
+
+    **What breaks it:** adding a ``GovernanceError`` row ABOVE ``AuthorizationError`` — which is
+    exactly the mapping a repo wiring governance refusals to ``403``/``409`` is tempted to add.
+    """
+    envelope = to_envelope(NamespaceIsolationError("not found"))
+    assert (envelope.status, envelope.code) == (404, ErrorCode.NOT_FOUND)
+    assert envelope.message == safe_error_response().message

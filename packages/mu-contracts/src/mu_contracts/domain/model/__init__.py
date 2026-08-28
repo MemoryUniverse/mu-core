@@ -54,8 +54,10 @@ from mu_contracts.domain.model.governance import (
     RoleMembership,
     ShareableRef,
     ShareableType,
+    SubscriptionFilter,
     TransferClass,
     TransferState,
+    grant_id_for,
 )
 from mu_contracts.domain.model.health import (
     MemoryHealthEntry,
@@ -265,6 +267,7 @@ __all__ = [
     "SparseQuery",
     "StaleRoomOwnerError",
     "State",
+    "SubscriptionFilter",
     "SyncOp",
     "Tier",
     "TransferClass",
@@ -277,6 +280,7 @@ __all__ = [
     "Visibility",
     "WorkspaceMembership",
     "canonical_dedupe_key",
+    "grant_id_for",
     "mint_agent_principal_id",
     "resolve_floor_policy",
     "resolve_subagent_identity",
