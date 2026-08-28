@@ -507,12 +507,43 @@ class Session(BaseModel):
     def leave(self, principal_id: str, *, at: datetime) -> Participant:
         """ParticipantNotInRoom (spec:80). The row is KEPT, ``left_at`` stamped — provenance for
         every message the principal authored survives the departure, and the same stamp is what
-        CANONICAL §7.4/M15 hangs the offboarding re-stamp job on."""
+        CANONICAL §7.4/M15 hangs the offboarding re-stamp job on.
+
+        **The departure CASCADES to every row this principal OWNS** (its bound/shared agents), and
+        that is a correctness property, not a convenience. Measured (ARCHITECTURE-DELTAS AD-133):
+        a member who left through the production route kept full read of the room's shared
+        memories through the agent she had enrolled and still controls — ``leave`` stamped only
+        her own row, ``is_active_member`` is ``left_at is None``, so the agent row stayed active
+        and every membership gate admitted it. Offboarding was not severed, it was HALVED, and
+        §7.4's M15 bullet (*"a member who leaves loses read access to what was shared"*) is
+        categorical about which of the two answers is right.
+
+        This is the SAME cascade ``unbind``/``revoke_agent_share`` already perform for a single
+        agent (``mu_server.agents.bridge._revoke_cascade``); doing it here means the property does
+        not depend on the departing member remembering to unbind first — a security property that
+        requires two calls in the right order is a property that holds by convention, which is the
+        shape this repository keeps having to fix (``7079ba8``).
+
+        The owner's own row is stamped FIRST so that a cascade over an already-updated aggregate
+        cannot re-visit it, and the returned participant is the owner's row (the caller's
+        subject) — the cascaded rows are an effect, not the answer.
+        """
         participant = self.find_active(principal_id)
         if participant is None:
             raise ParticipantNotInRoomError(f"{principal_id} is not an active member")
         participant.left_at = at
         participant.presence = PresenceState.OFFLINE
+        for owned in self.participants:
+            # `is_active_member` (not `left_at is None` re-spelled) so the two readings of
+            # "departed" cannot drift; `is not participant` because the owner's own row is a row
+            # it owns and is already stamped.
+            if (
+                owned is not participant
+                and owned.is_active_member
+                and owned.owner_principal_id == principal_id
+            ):
+                owned.left_at = at
+                owned.presence = PresenceState.OFFLINE
         return participant
 
     def close(self) -> None:

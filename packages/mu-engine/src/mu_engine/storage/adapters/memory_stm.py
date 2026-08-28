@@ -45,6 +45,8 @@ from datetime import UTC, datetime, timedelta
 
 from sortedcontainers import SortedList
 
+from mu_contracts.domain.model.recall import CallerIdentitySet
+from mu_engine.storage.authz import authorized_item, authorized_window
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.domain.recall import RecallChannel, Scored
@@ -186,19 +188,43 @@ class InMemoryStmAdapter:
         part.chash[item.content_hash] = existing_id
         return existing_id
 
-    async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
+    async def get(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> MemoryItem | None:
+        """Keyed read, Model-A authorized on a SHARED η — the SAME predicate the Redis adapter
+        applies (``storage/authz.py``, AD-129). The in-memory adapter holds the property too: a
+        fake that authorizes more than the real store hides exactly this class of defect."""
         async with self._lock:
             part = self._partition(ns)
             entry = part.items.get(memory_id)
             if entry is None:
-                return None
-            item, expires_at = entry
-            if self._is_expired(expires_at, now=datetime.now(UTC)):
-                self._evict_locked(part, memory_id)
-                return None
-            return item
+                found: MemoryItem | None = None
+            else:
+                item, expires_at = entry
+                if self._is_expired(expires_at, now=datetime.now(UTC)):
+                    self._evict_locked(part, memory_id)
+                    found = None
+                else:
+                    found = item
+        return authorized_item(
+            found, ns=ns, caller_identity_set=caller_identity_set, operation="stm.get"
+        )
 
-    async def recent(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]:
+    async def recent(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        """Recency floor, Model-A filtered on a SHARED η — the SAME predicate the Redis adapter
+        applies (``storage/authz.py``, AD-128). The in-memory adapter holds the property too: it
+        is what unit tests and the local dev stack run against, so a fake that authorizes more
+        than the real store would hide exactly this class of defect."""
         async with self._lock:
             part = self._partition(ns)
             self._prune_expired_locked(part, now=datetime.now(UTC))
@@ -214,7 +240,9 @@ class InMemoryStmAdapter:
                         is_floor=True,
                     )
                 )
-            return out
+            return authorized_window(
+                out, ns=ns, caller_identity_set=caller_identity_set, operation="stm.recent"
+            )
 
     async def enumerate_page(
         self,

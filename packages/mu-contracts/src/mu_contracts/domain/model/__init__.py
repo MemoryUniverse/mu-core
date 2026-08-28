@@ -20,6 +20,12 @@ from mu_contracts.domain.model.artifact import (
     Retention,
     RetentionPolicy,
 )
+from mu_contracts.domain.model.authorized_ids import (
+    AUTHORIZED_IDS_KEY,
+    model_a_permits,
+    stamp_of,
+    validate_stamp_subjects,
+)
 from mu_contracts.domain.model.conflict import (
     ConflictEdgeRow,
     ConflictEdges,
@@ -155,6 +161,7 @@ from mu_contracts.domain.model.session import (
 from mu_contracts.domain.model.usage import Usage
 
 __all__ = [
+    "AUTHORIZED_IDS_KEY",
     "AclEntry",
     "Addressing",
     "AddressingNotStorableError",
@@ -282,8 +289,11 @@ __all__ = [
     "canonical_dedupe_key",
     "grant_id_for",
     "mint_agent_principal_id",
+    "model_a_permits",
     "resolve_floor_policy",
     "resolve_subagent_identity",
+    "stamp_of",
     "subagent_partition_session",
     "subagent_write_namespace",
+    "validate_stamp_subjects",
 ]

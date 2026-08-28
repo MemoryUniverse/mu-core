@@ -15,6 +15,7 @@ from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 from pydantic import BaseModel
 
+from mu_contracts.domain.model.recall import CallerIdentitySet
 from mu_engine.storage.domain.artifact import ContextArtifact
 from mu_engine.storage.domain.conflict import ConflictEdges
 from mu_engine.storage.domain.entity import EntityResolution
@@ -122,9 +123,65 @@ class StmTierRepository(Protocol):
         id-stability applied to the dedup path)."""
         ...
 
-    async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None: ...
+    async def get(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> MemoryItem | None:
+        """One keyed row, or ``None``.
 
-    async def recent(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]: ...
+        ``caller_identity_set`` is the Model-A CALLER PRINCIPAL set (CANONICAL §7.4) and carries
+        the SAME per-visibility contract as :meth:`recent`: ignored on a PRIVATE η (§1 rule 5
+        authorizes the own partition by key), REQUIRED on a SHARED one, where a row whose exploded
+        ``authorized_ids`` stamp does not intersect it — an unstamped row included — is returned as
+        ``None``. ``None`` on a SHARED η raises
+        :class:`~mu_contracts.domain.errors.CallerIdentitySetRequiredError`.
+
+        A denial is a MISS, deliberately: the caller supplies the id, so "you may not read this"
+        and "no such row" must be indistinguishable or this verb is an existence oracle over the
+        partition. The parameter exists because its ABSENCE was the UNBOUNDED half of AD-128 — the
+        recency floor is capped by ``recency_floor_limit`` and ``stm_ttl_s``, a by-id read by
+        neither (ARCHITECTURE-DELTAS **AD-129**).
+        """
+        ...
+
+    async def recent(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        """The recency-floor window over ``ns``, newest-first, at most ``limit`` rows.
+
+        ``caller_identity_set`` is the Model-A CALLER PRINCIPAL set (CANONICAL §7.4), and it is
+        REQUIRED on a SHARED η — the port grew it because it could not express it, which is the
+        whole of AD-128: the MTM and LTM arms of ``ThreeChannelRecallRanker`` both received the
+        caller set and the STM floor arm could not, so a non-member of a room read the room's
+        items by naming its session. (The same shape as the C2 fix: *"the port must be able to
+        express the caller set"*.)
+
+        Contract, per visibility:
+
+        * **PRIVATE η** — ``None`` is correct and expected: the whole own-partition is authorized
+          by the ``to_prefix()`` key (§1 rule 5 / §7.4 *"PRIVATE items are isolated by
+          ``Namespace.to_prefix()`` partitioning, not via authorized_ids"*). Any set passed here
+          is ignored.
+        * **SHARED η** — every returned row MUST satisfy
+          :func:`~mu_contracts.domain.model.authorized_ids.model_a_permits`: its exploded
+          ``authorized_ids`` stamp intersects this set. A row with no stamp is DENIED (fail
+          closed — an unstamped row is one no governance decision was recorded for). ``None``
+          raises :class:`~mu_contracts.domain.errors.CallerIdentitySetRequiredError`; it is never
+          an empty result and never an unfiltered one.
+
+        The filter is applied over the ALREADY-BOUNDED ``limit`` window, so a caller may receive
+        FEWER than ``limit`` rows on a SHARED η — a floor is a floor, not a quota, and no
+        implementation may widen the window to refill it (that would be the over-fetch §7.4
+        rejects with Model B).
+        """
+        ...
 
     async def evict(self, ns: Namespace, memory_id: str) -> None: ...
 

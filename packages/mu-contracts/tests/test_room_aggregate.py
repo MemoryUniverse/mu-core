@@ -335,3 +335,79 @@ def test_the_cursors_and_the_version_cannot_be_negative_past_the_empty_sentinel(
         Session(**base, last_seq=-2)
     with pytest.raises(ValidationError):
         Session(**base, version=-1)
+
+
+def _agent(principal_id: str, *, owner: str) -> Participant:
+    return Participant(
+        principal_id=principal_id,
+        kind=ParticipantKind.BOUND_AGENT,
+        joined_at=NOW,
+        owner_principal_id=owner,
+        binding_id=f"bind-{principal_id}",
+    )
+
+
+def test_leave_cascades_to_the_agents_the_departing_principal_owns() -> None:
+    """**AD-133, measured through the production routes before this line existed.**
+
+    Alice joins, enrols the agent she owns and drives, then leaves through
+    ``POST /v1/rooms/{id}/leave``. ``leave`` stamped only HER row; ``is_active_member`` is
+    ``left_at is None``; so the agent row stayed ACTIVE and every membership gate — the room
+    verbs' ``_assert_member`` and the shared-memory roster gate alike — kept admitting an identity
+    Alice still controls. She lost one of the two identities she holds: offboarding was HALVED,
+    not severed, while CANONICAL §7.4's M15 bullet is categorical that *"a member who leaves loses
+    read access to what was shared"*.
+
+    **What breaks it:** deleting the ``for owned in self.participants`` loop from ``Session.leave``.
+    """
+    room = _room()
+    room.join(_human("alice"), max_participants=10)
+    room.join(_agent("agt_alice", owner="alice"), max_participants=10)
+    room.join(_human("bob"), max_participants=10)
+    room.join(_agent("agt_bob", owner="bob"), max_participants=10)
+
+    room.leave("alice", at=NOW)
+
+    assert [p.principal_id for p in room.active_participants()] == ["bob", "agt_bob"]
+    departed = {p.principal_id: p for p in room.participants if not p.is_active_member}
+    assert set(departed) == {"alice", "agt_alice"}
+    assert departed["agt_alice"].left_at == NOW
+    assert departed["agt_alice"].presence is PresenceState.OFFLINE
+
+
+def test_leave_does_not_touch_agents_owned_by_anyone_else() -> None:
+    """The cascade is by OWNERSHIP, not by kind — a shared agent another principal owns keeps its
+    seat when an unrelated member departs. Without this the test above would pass against a
+    ``leave`` that simply evicted every agent row."""
+    room = _room()
+    room.join(_human("alice"), max_participants=10)
+    room.join(_agent("agt_bob", owner="bob"), max_participants=10)
+    room.join(_human("bob"), max_participants=10)
+
+    room.leave("alice", at=NOW)
+
+    assert [p.principal_id for p in room.active_participants()] == ["agt_bob", "bob"]
+
+
+def test_leave_returns_the_departing_row_not_a_cascaded_one() -> None:
+    """The cascade is an EFFECT; the answer is still the caller's own row —
+    ``RoomService.leave`` publishes ``ParticipantLeft`` from it."""
+    room = _room()
+    room.join(_human("alice"), max_participants=10)
+    room.join(_agent("agt_alice", owner="alice"), max_participants=10)
+
+    assert room.leave("alice", at=NOW).principal_id == "alice"
+
+
+def test_a_departed_principal_cannot_leave_twice_even_though_it_owns_rows() -> None:
+    """Idempotence direction: the second call refuses on the OWNER's row, before any cascade —
+    a re-leave must not silently re-stamp ``left_at`` on rows and move the offboarding timestamp
+    forward."""
+    room = _room()
+    room.join(_human("alice"), max_participants=10)
+    room.join(_agent("agt_alice", owner="alice"), max_participants=10)
+    room.leave("alice", at=NOW)
+
+    with pytest.raises(ParticipantNotInRoomError):
+        room.leave("alice", at=NOW + timedelta(minutes=5))
+    assert {p.left_at for p in room.participants} == {NOW}

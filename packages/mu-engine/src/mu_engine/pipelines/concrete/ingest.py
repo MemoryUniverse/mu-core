@@ -22,10 +22,11 @@ from datetime import datetime
 from hashlib import sha256
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mu_contracts.domain.events import DomainEvent, IngestCompleted, MemoryCaptured, MemoryPromoted
-from mu_contracts.domain.model.memory import Namespace, Tier
+from mu_contracts.domain.model.authorized_ids import AUTHORIZED_IDS_KEY, validate_stamp_subjects
+from mu_contracts.domain.model.memory import Namespace, Tier, Visibility
 from mu_contracts.ports.time import Clock
 from mu_engine.pipelines.base import BaseStage, PipelineContext, StageOutcome, StageStatus
 from mu_engine.pipelines.errors import StageExecutionError
@@ -81,6 +82,38 @@ class IngestActivity(BaseModel):
 
     owner_id: str | None = None  # defaults to the η principal when omitted
 
+    #: Model-A stamp for a SHARED write — the EXPLODED principal ids permitted to read this item
+    #: (CANONICAL §7.4: *"It is STAMPED at write/sync time from the session participant set +
+    #: materialized ACL rows"*; this is that write-time stamp, and the recall filter's only input).
+    #:
+    #: The caller resolves the session's participant roster and passes it; the engine never
+    #: invents one, because the engine cannot see a roster — membership is a governance fact that
+    #: lives on the plane that owns the session. `None` on a SHARED η therefore writes an
+    #: UNSTAMPED row, which every Model-A reader DENIES to everyone (`storage/authz.py`,
+    #: `qdrant_mtm`, `falkor_ltm`): fail-closed, never a room-readable row nobody authorized.
+    #: MUST be `None` on a PRIVATE η — §7.4: *"PRIVATE items are isolated by
+    #: `Namespace.to_prefix()` partitioning, not via `authorized_ids`"*, and a private item
+    #: *"never enters a grant/ACL/`authorized_ids` until published"* (§1 rule 6).
+    authorized_ids: frozenset[str] | None = None
+
+    @model_validator(mode="after")
+    def _stamp_is_shared_only_and_principal_only(self) -> IngestActivity:
+        """Validate the stamp AT THE BOUNDARY (DEV-STANDARDS rule 2), not at the store.
+
+        Two refusals, both from §7.4: a role/session/device id may never be stamped (it is an
+        offboarding hole / ACL bypass — `validate_stamp_subjects`), and a PRIVATE item may never
+        carry a stamp at all (its authorization is the partition key, and a stamp there would be
+        a second, contradicting answer to "who may read this")."""
+        if self.authorized_ids is None:
+            return self
+        if self.namespace.visibility is not Visibility.SHARED:
+            raise ValueError(
+                "authorized_ids is a SHARED-plane stamp (CANONICAL §7.4): a PRIVATE item is "
+                "isolated by Namespace.to_prefix() and never enters an ACL until published"
+            )
+        validate_stamp_subjects(self.authorized_ids)
+        return self
+
     def atomic_fact_text(self) -> str:
         """The text the MTM vector embeds — the ``{subject} {predicate} {object}`` triple when
         structured, else the whole salient utterance (engine-core-spec §5 atomic-fact embedding)."""
@@ -132,6 +165,14 @@ def _build_memory_item(
     kwargs: dict[str, Any] = {}
     if provenance_id is not None:
         kwargs["provenance_id"] = provenance_id
+    if activity.authorized_ids is not None:
+        # The Model-A stamp is written ONCE, here, onto the item minted ONCE (§7.1 id-stability),
+        # so it rides the SAME object into every tier: STM's JSON row, the Qdrant payload keyword
+        # index (`qdrant_mapper.py:85-88` reads exactly this key), and the FalkorDB list property
+        # (`graph_mapper.py`). Stamping per-tier instead would let one tier answer a security
+        # question differently from another — the state `CompositeStampWriter` exists to prevent
+        # on the re-stamp path.
+        kwargs["metadata"] = {AUTHORIZED_IDS_KEY: sorted(activity.authorized_ids)}
     return MemoryItem(
         content=activity.text,
         kind=MemoryKind.REFERENCE if artifact_ref else MemoryKind.PROPOSITION,

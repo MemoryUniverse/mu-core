@@ -38,7 +38,9 @@ from typing import cast
 
 from redis.asyncio import Redis
 
+from mu_contracts.domain.model.recall import CallerIdentitySet
 from mu_engine.platform.decorators import retry_io
+from mu_engine.storage.authz import authorized_item, authorized_window
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.domain.recall import RecallChannel, Scored
@@ -157,8 +159,24 @@ class RedisStmAdapter:
         await pipe.execute()
         return existing_id
 
-    async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
-        return await self._retry(self._get_impl)(ns, memory_id)
+    async def get(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> MemoryItem | None:
+        """Keyed read, Model-A authorized on a SHARED η (``storage/authz.py``, AD-129).
+
+        The Redis ``GET`` is unchanged; what changed is that the hydrated row is re-authorized
+        against the caller's principal set before it leaves the adapter, and a denial is rendered
+        as the same ``None`` a miss is."""
+        return authorized_item(
+            await self._retry(self._get_impl)(ns, memory_id),
+            ns=ns,
+            caller_identity_set=caller_identity_set,
+            operation="stm.get",
+        )
 
     async def _get_impl(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         key = RedisMapper.memory_key(ns, memory_id)
@@ -167,16 +185,46 @@ class RedisStmAdapter:
             return None
         return self._mapper.from_store(RedisRecord(key=key, ttl_s=None, blob=_as_str(blob)))
 
-    async def recent(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]:
-        return await self._retry(self._recent_impl)(ns, limit=limit)
+    async def recent(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        """Recency floor, Model-A filtered on a SHARED η (``storage/authz.py``, AD-128).
 
-    async def _recent_impl(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]:
+        The ZSET read is UNCHANGED — the same ``limit`` window off the same tenancy-prefixed key.
+        What changed is that a SHARED window is no longer returned to whoever asked for it: the
+        rows are re-authorized against the caller's principal set before they leave the adapter.
+        The filter runs AFTER hydration because the stamp rides in the row's JSON, which is the
+        only place Redis carries it — it is a filter over an already-bounded window, never an
+        over-fetch."""
+        return await self._retry(self._recent_impl)(
+            ns, limit=limit, caller_identity_set=caller_identity_set
+        )
+
+    async def _recent_impl(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[Scored[MemoryItem]]:
         recency = RedisMapper.recency_key(ns)
         ids = await self._redis.zrevrange(recency, 0, max(0, limit - 1))
         out: list[Scored[MemoryItem]] = []
         for rank, raw in enumerate(ids):
             memory_id = _as_str(raw)
-            item = await self.get(ns, memory_id)
+            # ``_get_impl``, NOT the public ``get``: the window is authorized ONCE, by
+            # ``authorized_window`` below. Hydrating through the public verb would apply Model-A
+            # twice and — because this loop's ``None`` branch means "TTL-expired, self-heal" — a
+            # DENIAL would be indistinguishable from an expiry and would ``ZREM`` the row out of
+            # the recency index. An authorization decision that DELETES the data it denies is a
+            # far worse defect than the one being fixed; it also raised on the SHARED plane,
+            # because this internal read has no caller to pass. One authorization point per public
+            # verb, and the primitive underneath it stays a primitive.
+            item = await self._get_impl(ns, memory_id)
             if item is None:
                 # a TTL-expired member still lingering in the ZSET — drop it, self-heal.
                 await self._redis.zrem(recency, memory_id)
@@ -186,7 +234,9 @@ class RedisStmAdapter:
                     item=item, score=1.0, channel=RecallChannel.STM_FLOOR, rank=rank, is_floor=True
                 )
             )
-        return out
+        return authorized_window(
+            out, ns=ns, caller_identity_set=caller_identity_set, operation="stm.recent"
+        )
 
     async def enumerate_page(
         self,

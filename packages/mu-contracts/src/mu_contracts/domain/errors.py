@@ -18,6 +18,7 @@ __all__ = [
     "BoundaryViolationError",
     "BudgetExceededError",
     "BusUnavailableError",
+    "CallerIdentitySetRequiredError",
     "ConflictUnresolvedError",
     "DomainError",
     "DuplicateComponentError",
@@ -53,6 +54,7 @@ __all__ = [
     "RevocationConflictError",
     "SchemaDriftError",
     "SettingsValidationError",
+    "StampSubjectError",
     "StoreUnavailableError",
     "SubModelProviderDisabledError",
     "SurfaceVerbNotImplementedError",
@@ -141,6 +143,30 @@ class NamespaceIsolationError(AuthorizationError):
 
 # Governance/tenancy docs use this spelling for the same class.
 TenancyViolationError = NamespaceIsolationError
+
+
+class CallerIdentitySetRequiredError(AuthorizationError):
+    """A SHARED-η read reached a tier repository with NO caller identity set (CANONICAL §7.4).
+
+    On the SHARED plane the ``to_prefix()`` partition (§1 rule 5) separates ORGS, not MEMBERS of
+    one org — the session slot is caller-supplied — so Model-A is the whole gate and a read with
+    no caller set cannot be authorized by anything. Raised rather than answered with an empty
+    list because ``None`` here is a WIRING bug (a call site that forgot to thread the set), and a
+    wiring bug that returns ``[]`` looks exactly like an empty room until the day someone
+    "fixes" the emptiness by removing the filter. A denial of a resolved caller is a filtered-out
+    row, never this error.
+
+    Regression anchor: ARCHITECTURE-DELTAS AD-128 — the STM recency-floor arm of SHARED recall
+    ran with no caller set at all and served a non-member the room's items.
+    """
+
+
+class StampSubjectError(GovernanceError):
+    """An id offered for a point's ``authorized_ids`` is not a stampable PRINCIPAL id (§7.4).
+
+    Raised by ``validate_stamp_subjects`` at every stamp site: a role id, a session id or a device
+    id in a stamp is an offboarding hole / ACL bypass, so it is refused rather than dropped.
+    """
 
 
 class SubModelProviderDisabledError(AuthorizationError):
