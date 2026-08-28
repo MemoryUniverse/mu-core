@@ -88,6 +88,7 @@ from mu_engine.lifecycle.promotion import (
     PromotionOutcomeKind,
     PromotionReport,
     PromotionService,
+    SharedPlaneSweepUnsupportedError,
 )
 from mu_engine.lifecycle.retention import (
     LtmRetentionStorePort,
@@ -151,6 +152,7 @@ __all__ = [
     "SalienceInputs",
     "SalienceSettings",
     "SalienceStrategy",
+    "SharedPlaneSweepUnsupportedError",
     "TransitionKind",
     "WarmRecallCacheServicePort",
     "build_conflict_adjudicator",

@@ -405,10 +405,53 @@ class FactProvenance(Base):
 
 # ============================================================ §2.6 provenance_ledger
 class ProvenanceLedgerRow(Base):
+    """THE append-only provenance ledger — one table, two planes (AD-106).
+
+    ⚠ **This shape is a UNION, and the AD-106 half that produced it is deliberately visible.**
+    Until revision ``a71f3c9de205`` there were TWO provenance tables for one concept: this one
+    (the memory-lineage ledger, `storage-schema-rowmapper-spec.md` §2.6) and
+    ``transfer_provenance`` (``mu-server/src/mu_server/transfer/store_pg.py``), stood up because
+    the shipped ``ProvenanceAction`` had four members and the transfer FSM needed eight, so half
+    the governance plane's rows could not be written here at all (AD-62). AD-62 landed the eight,
+    which removed the reason the fork existed. ``governance-transfer-core-spec.md`` §4 and this
+    spec's §2.6 both describe ONE append-only ledger per object stream, so the fork is a
+    divergence, not a design.
+
+    The columns below the lineage block are what a transfer event needs and a memory-lineage
+    append does not, which is why every one of them is NULLABLE. Two mappings are worth stating
+    because a reader looking for the transfer plane's own column names will not find them:
+    ``transfer_provenance.actor_principal_id`` IS :attr:`actor_id` and
+    ``transfer_provenance.occurred_at`` IS :attr:`at` — the same fact under this table's name.
+    Duplicating them would have produced two "who acted" columns that can disagree.
+
+    **What identifies the subject of a row.** A memory-lineage append sets :attr:`memory_id`; a
+    transfer event sets ``(object_type, object_id)``, whose object may be a ``ContextIndex``, a
+    ``ContextPacket`` or a grant — none of which is a memory. That is why :attr:`memory_id`
+    became nullable here. The invariant "exactly one of them identifies the subject" is enforced
+    at the pydantic boundary, not by a DDL ``CHECK``, for the same reason :attr:`action` carries
+    no ``CHECK`` (see below): a constraint here turns every vocabulary addition into a migration
+    on a table whose values are already validated before they arrive.
+
+    **``position`` is Postgres-only, and that is a stated scope limit rather than a degrade.** It
+    is the org-scoped total order the ledger scan (``read_all(org_id, from_position)``) walks, and
+    it is DB-assigned from a sequence — the shape ``transfer_provenance`` already had, kept so the
+    governance adapter's INSERT does not have to change when it re-points here. MySQL cannot give
+    a non-key column an ``AUTO_INCREMENT``, so on any dialect but Postgres the column exists and
+    stays NULL. The lineage half of this table is fully portable exactly as before; the governance
+    plane is Postgres-only by deployment (``mu_server.control_plane.migrate`` builds its Alembic
+    config from ``PostgresSettings``), so nothing that can run today is left without an order.
+    Unlike the D7 index degrade this is not "the same answer, slower" — a NULL ``position`` has no
+    scan order — which is why it is written as a scope limit and not filed as a degrade.
+    """
+
     __tablename__ = "provenance_ledger"
 
-    stream_id: Mapped[str] = mapped_column(String(128), nullable=False)  # provenance_id
-    version: Mapped[int] = mapped_column(Integer, nullable=False)  # monotonic within stream
+    # ---- lineage core (spec §2.6, unchanged in meaning) ------------------------------------
+    #: 512 rather than 128: the transfer plane's stream ids are ``object_ref_key``-derived
+    #: composites, and its own table sized this column at 512 for that reason.
+    stream_id: Mapped[str] = mapped_column(String(512), nullable=False)  # provenance_id
+    #: BigInteger, not Integer: an append-only stream has no reason to stop at 2**31.
+    version: Mapped[int] = mapped_column(BigInteger, nullable=False)  # monotonic within stream
     # A `ProvenanceAction` VALUE (mu_contracts.domain.model.governance): origin|composed|shared|
     # pulled|reshared|accepted|revoked|superseded, plus the deprecated `derived` (AD-62). This is
     # a plain VARCHAR with no CHECK constraint and no database ENUM type — deliberately, and it is
@@ -417,16 +460,48 @@ class ProvenanceLedgerRow(Base):
     # schema delta. Keep it that way; a CHECK here would make every vocabulary addition a
     # migration on a table whose values are already validated before they arrive.
     action: Mapped[str] = mapped_column(String(128), nullable=False)
-    memory_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: NULL on a governance event, whose subject is ``(object_type, object_id)`` — see the class
+    #: docstring. Never NULL on a memory-lineage append.
+    memory_id: Mapped[str | None] = mapped_column(String(128))
     org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
     actor_id: Mapped[str] = mapped_column(String(128), nullable=False)
     at: Mapped[datetime] = _dt()
     meta: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
 
+    # ---- append identity + ledger order ------------------------------------------------------
+    #: The caller-supplied idempotency key. UNIQUE at the DATABASE, because an append-only ledger
+    #: whose duplicate-suppression lives only in application code is one retry away from a
+    #: double-counted history.
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: Org-scoped total order for the ledger scan. Postgres-only — see the class docstring.
+    position: Mapped[int | None] = mapped_column(BigInteger)
+
+    # ---- governance/transfer event fields (NULL on a memory-lineage append) ------------------
+    object_type: Mapped[str | None] = mapped_column(String(32))  # ShareableType value
+    object_id: Mapped[str | None] = mapped_column(String(128))
+    object_content_hash: Mapped[str | None] = mapped_column(String(128))
+    #: 384 to match this schema's own ``namespace_prefix`` width, which is strictly wider than the
+    #: 256 ``transfer_provenance`` used — so no existing governance row can fail to fit.
+    origin_namespace_id: Mapped[str | None] = mapped_column(String(384))
+    grantor_principal_id: Mapped[str | None] = mapped_column(String(128))
+    grantee_kind: Mapped[str | None] = mapped_column(String(32))  # PrincipalRefKind value
+    grantee_id: Mapped[str | None] = mapped_column(String(128))
+    grant_id: Mapped[str | None] = mapped_column(String(128))
+    packet_id: Mapped[str | None] = mapped_column(String(128))
+    source_refs: Mapped[list[Any] | None] = mapped_column(JSONB)
+    content_hash: Mapped[str | None] = mapped_column(String(128))
+    cascade_root_grant_id: Mapped[str | None] = mapped_column(String(128))
+
     __table_args__ = (
-        PrimaryKeyConstraint("stream_id", "version"),
+        # ``org_id`` joined the PK in ``a71f3c9de205``. Without it two orgs whose streams share an
+        # id collide on one history — the tenancy defect ``transfer_provenance`` had already
+        # avoided by keying ``(org_id, stream_id, version)``, and which this table would have
+        # inherited the moment a second plane wrote to it.
+        PrimaryKeyConstraint("org_id", "stream_id", "version"),
+        UniqueConstraint("event_id", name="ux_prov_ledger_event"),
         Index("ix_prov_ledger_memory", "org_id", "workspace_id", "memory_id"),
+        Index("ix_prov_ledger_position", "org_id", "position"),
     )
 
 

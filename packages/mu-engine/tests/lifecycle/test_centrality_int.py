@@ -431,7 +431,9 @@ async def test_a_refresh_does_not_resurrect_a_superseded_fact(
         await ltm.upsert_fact(f)
     victim, winner = facts[0], facts[1]
     await ltm.invalidate(ns, victim.id, winner.id, at=datetime.now(UTC), reason="test")
-    graph = ltm._graph(ns)  # raw props: the only honest assertion
+    # `_graph` became a COROUTINE in AD-110 (the FalkorDB client connects lazily, off the event
+    # loop, on first use). Only the `await` is new here — the assertion below is untouched.
+    graph = await ltm._graph(ns)  # raw props: the only honest assertion
     props = "m.state, m.invalid_at, m.pinned, m.version, m.access_count"
     before = (await graph.query(f"MATCH (m:Memory) RETURN m.id, {props} ORDER BY m.id")).result_set
     index, cfg = _index()
@@ -459,7 +461,7 @@ async def test_a_refresh_is_idempotent_and_costs_no_writes_however_often_it_runs
         await ltm.upsert_fact(make_fact(ns, "Postgres", f"Service{i}"))
     index, cfg = _index()
     service = _service(ltm, index, cfg)
-    graph = ltm._graph(ns)
+    graph = await ltm._graph(ns)  # AD-110: `_graph` is a coroutine now; assertion unchanged
 
     first = await service.refresh(ns)
     snapshot = (await graph.query("MATCH (m:Memory) RETURN m ORDER BY m.id")).result_set

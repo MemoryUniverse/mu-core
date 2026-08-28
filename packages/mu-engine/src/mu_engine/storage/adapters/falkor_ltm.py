@@ -57,7 +57,9 @@ OWNER DECISIONS (2026-07-27, AUTHORITATIVE):
 
 from __future__ import annotations
 
+import asyncio
 import re
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
@@ -217,8 +219,9 @@ class FalkorLtmAdapter:
 
     def __init__(  # type: ignore[no-any-unimported]  # falkordb ships no stubs
         self,
-        db: FalkorDB,
+        db: FalkorDB | None = None,
         *,
+        db_factory: Callable[[], FalkorDB] | None = None,
         mapper: GraphMapper | None = None,
         clock: Clock | None = None,
         shortlist_size: int = _DEFAULT_SHORTLIST_SIZE,
@@ -226,7 +229,43 @@ class FalkorLtmAdapter:
         store_io_timeout_s: float = _DEFAULT_STORE_IO_TIMEOUT_S,
         mtm_entity_sink: EntityUidsSink | None = None,
     ) -> None:
+        """AD-110: ``db`` and ``db_factory`` are the EAGER and the LAZY way to supply the
+        connection, and exactly one of them must be given.
+
+        ``FalkorDB.__init__`` runs a SYNCHRONOUS cluster-detection probe
+        (``Is_Cluster`` -> a fresh blocking ``redis.Redis(...).info(section="server")``, even on
+        the ``falkordb.asyncio`` class — ``falkordb/asyncio/cluster.py``). A composition root
+        builds its stores from inside the ASGI ``lifespan`` coroutine, so an EAGER ``db=`` there
+        runs that probe ON the event loop thread and stalls every other task for as long as it
+        takes — bounded by ``socket_timeout`` since the previous fix, but a stall is a stall
+        (DEV-STANDARDS async sharpener: *"no blocking/sync I/O in the event loop"*).
+
+        ``db_factory`` is therefore what :func:`mu_engine.storage.factories._build_falkordb`
+        passes: construction does ZERO I/O, and the probe happens on first USE, inside
+        :meth:`_ensure_db`'s ``asyncio.to_thread`` — off the loop, once, under a lock, and still
+        bounded by the same ``store_io_timeout_s`` budget (``retry_io``'s per-attempt
+        ``asyncio.wait_for``). ``db=`` is retained because an integration test that already holds
+        a live client has nothing to defer and no event loop to protect.
+
+        A failed lazy connect leaves ``self._db`` unset, so the NEXT call retries it: a FalkorDB
+        that is down at startup and up a minute later heals, which an eager probe cannot do
+        (it takes the whole process down before ``/health`` exists to report it).
+        """
+        if (db is None) == (db_factory is None):
+            raise ValueError(
+                "FalkorLtmAdapter needs exactly one of `db` (an already-connected client) or "
+                "`db_factory` (a zero-argument callable connected lazily, off the event loop) — "
+                f"got db={'set' if db is not None else 'None'}, "
+                f"db_factory={'set' if db_factory is not None else 'None'}"
+            )
         self._db = db
+        # ONE non-optional seam, so :meth:`_ensure_db` has no unreachable ``None`` branch to
+        # narrow away: an eagerly-supplied client becomes a factory that returns it (never
+        # called, since ``self._db`` is already set and the fast path returns first).
+        self._db_factory: Callable[[], FalkorDB] = db_factory or (lambda: db)  # type: ignore[no-any-unimported]
+        # Guards the one-time lazy connect. Created here (not lazily) so two concurrent first
+        # calls cannot each mint their own lock and both run the probe.
+        self._db_lock = asyncio.Lock()
         self._mapper = mapper or GraphMapper()
         self._clock: Clock = clock or SystemClock()
         self._shortlist_size = shortlist_size
@@ -300,14 +339,69 @@ class FalkorLtmAdapter:
             return f"mu_g__{digest}__shared"
         return f"mu_g__{digest}__u_{ns.user}"
 
-    def _graph(self, ns: Namespace) -> Any:
-        return self._db.select_graph(self.graph_name_for(ns))
+    async def _ensure_db(self) -> Any:
+        """The FalkorDB client, connecting OFF the event loop on first use (AD-110).
+
+        ``asyncio.to_thread`` is what moves the vendor constructor's blocking cluster probe off
+        the loop; the ``asyncio.Lock`` + the second ``is not None`` check inside it make the
+        connect happen exactly once even when N coroutines race the first call. On failure
+        ``self._db`` stays ``None`` and the exception propagates to ``retry_io`` (a connection
+        error is RETRYABLE), so the next call tries again rather than caching a dead client.
+        """
+        db = self._db
+        if db is not None:
+            return db
+        async with self._db_lock:
+            if self._db is None:
+                self._db = await asyncio.to_thread(self._db_factory)
+            return self._db
+
+    async def _graph(self, ns: Namespace) -> Any:
+        db = await self._ensure_db()
+        return db.select_graph(self.graph_name_for(ns))
+
+    async def ping(self) -> None:
+        """Cheapest liveness verb for this tier — connect (lazily, off the loop) and PING.
+
+        Public because AD-110 made the previous way of asking unusable. A composition root's
+        health probe used to reach the raw client by private attribute path
+        (``mu-server/src/mu_server/composition_shared.py:386`` probes ``self.ltm`` at
+        ``"_db.connection"``), which resolved only because the client was built eagerly inside
+        the factory. It is not built until first use any more, so that path resolves to ``None``
+        and the probe reports the tier ``error`` on a perfectly healthy store — see this method's
+        entry in the AD-110 report for the exact companion edit that is owed.
+
+        Deliberately a ``PING`` on the underlying connection and NOT ``select_graph(name).query``:
+        a read-only Cypher against a literal probe name MATERIALIZES that graph key on the
+        multi-tenant store, outside every ``mu_g__…`` namespace — measured, and already recorded
+        in the composition root that stopped doing it.
+
+        NOT wrapped in ``self._retry``: a health probe reports what is true NOW, and a retry loop
+        would report the state of the store several backoffs ago. The caller owns the bound.
+        """
+        db = await self._ensure_db()
+        await db.connection.ping()
+
+    async def aclose(self) -> None:
+        """Release the underlying connection, if one was ever opened (AD-110).
+
+        A lazily-connected adapter that was never used has nothing to close, and says so by doing
+        nothing — the same posture a composition root's LIFO teardown already takes for an
+        unresolvable client. The reason this exists as a METHOD is the mirror of :meth:`ping`'s:
+        a teardown registry that resolved the raw client ONCE, at construction, now resolves
+        ``None`` and silently registers no closer at all, so the socket outlives the process's
+        shutdown sequence.
+        """
+        db = self._db
+        if db is None:
+            return
+        await db.connection.aclose()
 
     async def upsert_fact(self, item: MemoryItem) -> None:
         return await self._retry(self._upsert_fact_impl)(item)
 
     async def _upsert_fact_impl(self, item: MemoryItem) -> None:
-        g = self._graph(item.namespace)
+        g = await self._graph(item.namespace)
         row = self._mapper.to_store(item)
         props = row.props
         set_authorized = ", m.authorized_ids = $authorized_ids" if "authorized_ids" in props else ""
@@ -479,7 +573,7 @@ class FalkorLtmAdapter:
         # by state/validity (a superseded/expired fact is still returned so the verb acts on it
         # idempotently), unlike ``graph_recall``/``facts_at`` (bi-temporal still-valid read models).
         res = await g_query(
-            self._graph(ns),
+            await self._graph(ns),
             "MATCH (m:Memory {namespace: $ns, id: $id}) RETURN m.memory_json AS mj",
             {"ns": ns.to_prefix(), "id": memory_id},
         )
@@ -497,7 +591,7 @@ class FalkorLtmAdapter:
         # hard ``DETACH DELETE`` ``gc_delete`` performs. NO ``SUPERSEDED_BY`` edge (a plain delete
         # has no winner, unlike ``_invalidate_impl``). Closes the fact's own entity-entity edge too
         # (bi-temporal parity), reusing ``_invalidate_entity_edge``.
-        g = self._graph(ns)
+        g = await self._graph(ns)
         at_iso = at.isoformat()
         await g.query(
             "MATCH (m:Memory {namespace: $ns, id: $id}) "
@@ -565,7 +659,7 @@ class FalkorLtmAdapter:
             f"MATCH (m:Memory) WHERE {' AND '.join(where)} "
             "RETURN m.memory_json AS mj ORDER BY m.valid_at DESC LIMIT $limit"
         )
-        res = await g_query(self._graph(ns), cypher, params)
+        res = await g_query(await self._graph(ns), cypher, params)
         out: list[Scored[MemoryItem]] = []
         for rank, record in enumerate(res):
             item = MemoryItem.model_validate_json(record[0])
@@ -597,7 +691,7 @@ class FalkorLtmAdapter:
             where.append("m.subject = $subject")
             params["subject"] = subject
         cypher = f"MATCH (m:Memory) WHERE {' AND '.join(where)} RETURN m.memory_json AS mj"
-        res = await g_query(self._graph(ns), cypher, params)
+        res = await g_query(await self._graph(ns), cypher, params)
         return [MemoryItem.model_validate_json(r[0]) for r in res]
 
     async def find_conflicts(self, ns: Namespace, subject: str, predicate: str) -> list[MemoryItem]:
@@ -637,7 +731,7 @@ class FalkorLtmAdapter:
             "active": MemoryState.ACTIVE.value,
             "now": self._clock.now().isoformat(),  # injected Clock, UTC (MAJOR-3)
         }
-        res = await g_query(self._graph(ns), cypher, params)
+        res = await g_query(await self._graph(ns), cypher, params)
         return [MemoryItem.model_validate_json(r[0]) for r in res]
 
     async def invalidate(
@@ -652,7 +746,7 @@ class FalkorLtmAdapter:
     ) -> None:
         # invalidate-don't-delete (spec §4.2 lifecycle): stamp loser state='superseded' +
         # invalid_at, MERGE (old)-[:SUPERSEDED_BY]->(new) + (old)-[:CONFLICTS_WITH]->(new).
-        g = self._graph(ns)
+        g = await self._graph(ns)
         at_iso = at.isoformat()
         await g.query(
             "MATCH (loser:Memory {namespace: $ns, id: $loser}) "
@@ -708,7 +802,7 @@ class FalkorLtmAdapter:
     ) -> None:
         # bare CONFLICTS_WITH edge between two facts that BOTH remain active (D3, spec §8) —
         # no state/invalid_at write to either side, unlike `_invalidate_impl`'s bundled edge.
-        g = self._graph(ns)
+        g = await self._graph(ns)
         await g.query(
             "MATCH (a:Memory {namespace: $ns, id: $a}) "
             "WITH a MATCH (b:Memory {namespace: $ns, id: $b}) "
@@ -737,7 +831,7 @@ class FalkorLtmAdapter:
         # BUG2 FIX: USER-level scope (see `_user_scope_prefix`) — must match `_merge_entity`'s OWN
         # write scope, or every resolve MERGE-mints a duplicate entity node per session.
         res = await g_query(
-            self._graph(ns),
+            await self._graph(ns),
             cypher,
             {"ns": _user_scope_prefix(ns), "canon": canonical, "k": self._shortlist_size},
         )
@@ -772,7 +866,9 @@ class FalkorLtmAdapter:
             "MATCH (a:Artifact {namespace: $ns, id: $art})<-[:REFERENCES]-(m:Memory) "
             "RETURN m.memory_json AS mj"
         )
-        res = await g_query(self._graph(ns), cypher, {"ns": ns.to_prefix(), "art": artifact_id})
+        res = await g_query(
+            await self._graph(ns), cypher, {"ns": ns.to_prefix(), "art": artifact_id}
+        )
         return [MemoryItem.model_validate_json(r[0]) for r in res]
 
     # ------------------------------------------------------------- LtmRetentionStorePort (S2-01)
@@ -801,7 +897,7 @@ class FalkorLtmAdapter:
             "RETURN m.memory_json AS mj"
         )
         res = await g_query(
-            self._graph(ns),
+            await self._graph(ns),
             cypher,
             {"ns": ns.to_prefix(), "states": [s.value for s in states]},
         )
@@ -875,7 +971,7 @@ class FalkorLtmAdapter:
             f"MATCH (m:Memory) WHERE {' AND '.join(where)} "
             "RETURN m.memory_json AS mj, m.id AS id ORDER BY m.id LIMIT $limit"
         )
-        rows = await g_query(self._graph(ns), cypher, params)
+        rows = await g_query(await self._graph(ns), cypher, params)
         items = [MemoryItem.model_validate_json(r[0]) for r in rows]
         # A SHORT page means the walk is exhausted; a FULL page means there may be more. Erring
         # toward one extra empty page is correct here — claiming exhaustion on a full page would
@@ -919,7 +1015,7 @@ class FalkorLtmAdapter:
         if current is None:
             return None  # not resident in THIS tier's partition.
         updated = with_pin_group(current, pinned=pinned, at=at, by=by, reason=reason)
-        await self._graph(ns).query(
+        await (await self._graph(ns)).query(
             "MATCH (m:Memory {namespace: $ns, id: $id}) "
             "SET m.pinned = $pinned, m.version = $version, m.memory_json = $mj",
             params={
@@ -940,7 +1036,7 @@ class FalkorLtmAdapter:
         # node (the one with no outgoing ``SUPERSEDED_BY`` edge — "the chain head") and return
         # THAT node's state (spec §9 mermaid: GC only when "chain head dead"). A node with no
         # outgoing edge is its own head (the common EXPIRED case — a self-expire gains no edge).
-        graph = self._graph(ns)
+        graph = await self._graph(ns)
         prefix = ns.to_prefix()
         current_id = memory_id
         for _ in range(_MAX_CHAIN_HOPS):
@@ -967,7 +1063,7 @@ class FalkorLtmAdapter:
         # The one true HARD delete the retention sweep ever calls — never on an ACTIVE fact
         # (RetentionService gates this on SUPERSEDED/EXPIRED + window + chain-head-dead). Real
         # ``DETACH DELETE`` (drops the node AND its edges) against the live graph, no mock.
-        await self._graph(ns).query(
+        await (await self._graph(ns)).query(
             "MATCH (m:Memory {namespace: $ns, id: $id}) DETACH DELETE m",
             params={"ns": ns.to_prefix(), "id": memory_id},
         )
@@ -1032,7 +1128,7 @@ class FalkorLtmAdapter:
         tokens = {t.casefold() for t in re.findall(r"[A-Za-z0-9]+", query) if len(t) > 1}
         if not tokens:
             return []
-        g = self._graph(ns)
+        g = await self._graph(ns)
         # BUG2 FIX (scoping): the entity/edge frontier walk scopes on the USER-level prefix (see
         # `_user_scope_prefix`'s docstring), not the session-included `ns.to_prefix()` — so a
         # relational query issued from ANY session for this user walks entity edges materialized

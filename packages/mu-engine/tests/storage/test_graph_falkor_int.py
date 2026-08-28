@@ -16,9 +16,11 @@ import pytest
 import pytest_asyncio
 from falkordb.asyncio import FalkorDB
 
+from mu_contracts.config import get_settings
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.factories import STORE_REGISTRY
 from mu_engine.storage.mappers.tenancy import tenant_partition_digest
 
 pytestmark = pytest.mark.integration
@@ -259,3 +261,53 @@ async def test_graph_recall_explicit_session_scope_still_narrows_to_one_session(
     assert {h.item.object for h in widened} == {
         "Paris"
     }, "session_scope must be able to target ANY of the user's sessions, not only the caller's"
+
+
+# =================================================================================================
+# AD-110 — the two verbs the lazy connect made necessary, against the REAL store
+# =================================================================================================
+async def test_ping_connects_lazily_and_reports_the_real_store(
+    falkor_db: FalkorDB,
+) -> None:
+    """``ping()`` is the tier's liveness verb, and it must work on an adapter that has NEVER been
+    used — that is the whole point of it existing (AD-110).
+
+    Built through the REGISTRY, not by handing in ``falkor_db``: the registry path is the one that
+    defers the connect, so an adapter constructed with an already-live client would prove nothing.
+
+    It also must not MATERIALIZE a graph. ``select_graph(name).query("RETURN 1")`` — the obvious
+    liveness verb — creates a persistent graph key on the multi-tenant store even for a read-only
+    Cypher, outside every ``mu_g__…`` namespace (CLAUDE.md rule 4). The graph list is compared
+    before and after for exactly that.
+    """
+    settings = get_settings()
+    adapter: FalkorLtmAdapter = STORE_REGISTRY.build(
+        "graph",
+        "falkordb",
+        host=settings.storage.graph.host,
+        port=settings.storage.graph.port,
+    )
+    assert adapter._db is None, "the registry connected eagerly; AD-110 has regressed"
+
+    def _names(raw: list[object]) -> set[str]:
+        return {g.decode() if isinstance(g, bytes) else str(g) for g in raw}
+
+    before = _names(await falkor_db.list_graphs())
+    await adapter.ping()
+    after = _names(await falkor_db.list_graphs())
+
+    assert adapter._db is not None, "ping() did not connect — it cannot have reached the store"
+    assert after == before, (
+        f"ping() materialized graph(s) {sorted(after - before)} on the shared store — a liveness "
+        "probe must not write, least of all outside every tenant namespace."
+    )
+
+    # aclose() on a used adapter really closes; on an unused one it is a no-op, not an error.
+    await adapter.aclose()
+    fresh: FalkorLtmAdapter = STORE_REGISTRY.build(
+        "graph",
+        "falkordb",
+        host=settings.storage.graph.host,
+        port=settings.storage.graph.port,
+    )
+    await fresh.aclose()  # never connected — must not raise

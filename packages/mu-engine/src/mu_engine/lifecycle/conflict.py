@@ -66,6 +66,7 @@ import structlog
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from mu_contracts.domain.events import (
+    ConflictDetected,
     ConflictResolutionPending,
     DegradedModeEntered,
     DegradeReason,
@@ -911,13 +912,58 @@ class ConflictAdjudicator:
                 # holds regardless (no fabricated winner either way); log loud, never crash the
                 # sweep over the audit surface (DEV-STANDARDS rule 8 — logged, not silent).
                 _log.error("conflict_record_park_failed", conflict_id=record.conflict_id)
-        if announce and to_state is ConflictState.MANUAL_PENDING:
-            # Only the PARKED lane has something waiting for a human. A ``DETECTED`` record on
-            # the automatic lane is an audit row, not a request for attention — publishing
-            # "waiting for you" for a conflict the machine is about to resolve itself would put
-            # a permanent phantom in the inbox surface §8 line 278 routes this event to.
-            await self._emit_pending(record, effective)
+        if announce:
+            # §2's table binds BOTH halves of one sentence to this stage — *"Emits
+            # ``ConflictDetected`` and opens/updates a ``ConflictRecord``"* — BEFORE the
+            # AUTOMATIC/MANUAL branch. Only the second half shipped: the record was opened here
+            # and ``ConflictDetected`` was constructed nowhere in any repository, so the one
+            # event in the whole catalog that says "a contradiction exists" was declared
+            # vocabulary with no producer. Every consumer written against it (an audit tap, a
+            # metering tap, a UI timeline) saw silence and could not tell that from "no
+            # conflicts ever happened".
+            #
+            # It fires for BOTH lanes, because detection is what happened on both: the automatic
+            # lane's record is opened in ``DETECTED`` a moment before the apply site closes it
+            # as ``AUTO_RESOLVED``, and an auto-resolved contradiction is exactly as real an
+            # audit fact as a parked one. That is also why this is NOT folded into
+            # ``_emit_pending``: ``ConflictResolutionPending`` means "a human must answer this"
+            # and stays MANUAL-only, while ``ConflictDetected`` means "this happened".
+            #
+            # Gated on ``announce`` for the same reason the bookend is (see 3. above): the
+            # daemon ``MaintenanceLoop`` re-derives the same ``conflict_id`` every tick, and an
+            # ungated emit would put one event per tick forever on the bus for one ignored
+            # conflict. New record, changed state, or a genuinely new delta — never an unchanged
+            # re-detection.
+            await self._emit_detected(record)
+            if to_state is ConflictState.MANUAL_PENDING:
+                # Only the PARKED lane has something waiting for a human. A ``DETECTED`` record
+                # on the automatic lane is an audit row, not a request for attention —
+                # publishing "waiting for you" for a conflict the machine is about to resolve
+                # itself would put a permanent phantom in the inbox surface §8 line 278 routes
+                # this event to.
+                await self._emit_pending(record, effective)
         return record
+
+    async def _emit_detected(self, record: ConflictRecord) -> None:
+        """§2 table — the "a contradiction exists" audit fact, for BOTH lanes.
+
+        Every field is projected off the record already written, so the event and the audit row
+        can never disagree: ``method`` is the record's own provenance token
+        (``llm_adjudicator`` / ``polarity_cardinality_heuristic``), and the member mapping is
+        ``_emit_pending``'s exactly — ``_open_record`` is always called ``(winner, candidate)``
+        with ``winner`` the item being distilled, so member 0 is the incoming id and the rest are
+        the candidates it contends with. Content-free by construction: ids, an enum-shaped token
+        and a namespace, nothing hydrated.
+        """
+        await publish_content_free(
+            self._bus,
+            ConflictDetected(
+                namespace=record.namespace,
+                incoming_id=record.member_ids[0],
+                candidate_ids=list(record.member_ids[1:]),
+                method=record.method,
+            ),
+        )
 
     async def _emit_pending(self, record: ConflictRecord, policy: ConflictResolutionPolicy) -> None:
         """§8 line 278 — the user-visible "this is waiting for you" bookend.

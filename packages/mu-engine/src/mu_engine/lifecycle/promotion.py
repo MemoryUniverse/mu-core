@@ -69,6 +69,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
+from mu_contracts.domain.errors import MemoryUniverseError
 from mu_contracts.domain.events import MemoryPromoted
 from mu_contracts.domain.model.memory import Tier
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
@@ -85,7 +86,7 @@ from mu_engine.platform.observability import (
 )
 from mu_engine.services.settings import IngestSettings
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState, MemoryTier
-from mu_engine.storage.domain.namespace import Namespace
+from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.ports import MtmTierRepository, StmTierRepository
 
 __all__ = [
@@ -93,6 +94,7 @@ __all__ = [
     "PromotionOutcomeKind",
     "PromotionReport",
     "PromotionService",
+    "SharedPlaneSweepUnsupportedError",
     "assert_immediate_gate_seam_unchanged",
 ]
 
@@ -107,6 +109,46 @@ _LATENCY_METRIC = "mu_operation_latency_seconds"
 _ERROR_METRIC = "mu_operation_errors_total"
 # Promotion-specific counter (CANONICAL §5.1 MemoryPromoted, tagged by transition).
 _PROMOTION_METRIC = "mu_lifecycle_promotions_total"
+
+
+class SharedPlaneSweepUnsupportedError(MemoryUniverseError):
+    """A lifecycle sweep was asked to run over a SHARED η, and this engine cannot yet do it.
+
+    **AD-142.** Raised by :meth:`PromotionService.promote_session`. It refuses instead of
+    proceeding, and it refuses HERE — at the top of the verb — rather than letting the failure
+    surface from three layers down as
+    :class:`~mu_contracts.domain.errors.CallerIdentitySetRequiredError`, which is what happened
+    before and which points the reader at the WRONG fix.
+
+    Why the wrong fix. ``promote_session`` reads its window with
+    ``StmTierRepository.recent(ns, limit=…)`` and passes no ``caller_identity_set``, because a
+    maintenance sweep serves NO caller — there is no principal set that would be honest to pass.
+    Since AD-128 that argument is REQUIRED on a SHARED η, so the adapter raises
+    ``CallerIdentitySetRequiredError``, whose message reasonably reads as *"supply the caller
+    set"*. Supplying a ``SYSTEM``/all-principals sentinel to satisfy it is precisely the
+    fail-open shape AD-128 was opened to remove, and it would re-open it on a verb nothing
+    audits. So the error is not a missing argument, and this class exists to say so by name.
+
+    Why the sweep is not simply re-pointed at the enumeration verb either — the SECOND, larger
+    obligation, found while resolving this row and not previously recorded (see AD-143). The
+    read half is genuinely easy: ``recent()`` is a RECALL verb that serves a caller, while
+    ``TierEnumerationPort.enumerate_page`` (``storage/tier_capabilities.py:71``, implemented by
+    ``RedisStmAdapter``/``InMemoryStmAdapter``) is the partition-walk MAINTENANCE verb, carries
+    no Model-A filter by design, and is what a sweep should read through. But the WRITE half is
+    not built: ``promote_session``'s second leg hands every survivor to
+    ``DistillPipeline.distill``, and ``pipelines/distill.py:646-673`` constructs the distilled
+    LTM fact as a BRAND-NEW ``MemoryItem`` whose ``metadata`` is exactly
+    ``{"derived_from", "extractor_span"}`` (plus an optional ``valid_at_inferred``). The source
+    row's ``authorized_ids`` stamp is DROPPED. On a SHARED η an unstamped row is DENIED by
+    ``model_a_permits`` — fail closed, so nothing leaks — which means a shared-plane sweep that
+    "worked" would quietly distil every promoted item into an LTM fact that NO member can ever
+    read again. Fixing only the read would convert a loud refusal into silent data loss.
+
+    So the refusal stands until BOTH halves land: an enumeration-based maintenance read, and
+    stamp carry-through in DISTILL. On a PRIVATE η nothing changes — ``§1`` rule 5 authorizes
+    the own partition by key, ``recent()`` needs no caller set there, and this error is never
+    raised.
+    """
 
 
 class PromotionOutcomeKind(StrEnum):
@@ -316,6 +358,15 @@ class PromotionService:
         second, parallel promoter (DEV-STANDARDS rule 6, DRY). ``force=False`` (every pre-existing
         caller: the periodic backstop / ``Stop`` / idle timer via ``sweep_namespace_now``) is
         byte-for-byte the prior gated behaviour.
+
+        **PRIVATE η only (AD-142).** A SHARED η raises
+        :class:`SharedPlaneSweepUnsupportedError` before any store is touched — read that class's
+        docstring for why the refusal is the honest answer and what two things are owed before it
+        can be lifted. Nothing on either shipped composition reaches this branch today
+        (``mu-engine-server`` mounts no shared-plane routes; ``mu-local``'s ``_ns`` builds a
+        PRIVATE η), so the refusal changes no working path — it replaces a misleading
+        ``CallerIdentitySetRequiredError`` raised three layers down with a named one that states
+        the real obligation.
         """
         if ns.session != session_id:
             raise ValueError(
@@ -326,6 +377,21 @@ class PromotionService:
             raise RuntimeError(
                 "promote_session requires an injected StmTierRepository (none was configured on "
                 "this PromotionService instance) — never a silent no-op (DEV-STANDARDS rule 8)."
+            )
+        # AD-142 — refuse a SHARED η HERE, by name, instead of letting the STM port's
+        # ``CallerIdentitySetRequiredError`` surface from the read below. See
+        # :class:`SharedPlaneSweepUnsupportedError` for why the honest answer is a refusal and
+        # not a ``SYSTEM`` caller sentinel, and for the SECOND obligation (DISTILL drops the
+        # ``authorized_ids`` stamp) that makes a read-only fix worse than the refusal.
+        if ns.visibility is Visibility.SHARED:
+            raise SharedPlaneSweepUnsupportedError(
+                "promote_session refuses a SHARED namespace: a lifecycle sweep serves no caller, "
+                "so it has no honest caller_identity_set for the Model-A gate on "
+                "StmTierRepository.recent (AD-128), and DISTILL does not yet carry the "
+                "authorized_ids stamp onto the facts it derives — running anyway would write LTM "
+                "facts no member could read. Owed, in order: a maintenance read through "
+                "TierEnumerationPort.enumerate_page, then stamp carry-through in "
+                f"DistillPipeline. (namespace={ns.to_prefix()})"
             )
         window = [
             scored.item

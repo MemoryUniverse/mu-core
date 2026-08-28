@@ -156,24 +156,37 @@ def _build_falkordb(**cfg: Any) -> FalkorLtmAdapter:
     (graph, "neo4j"|"kuzu"|"ladybug"|"neptune") backend registers alongside this one.
     """
     graph_settings = get_settings().storage.graph
-    # Resolved BEFORE constructing ``FalkorDB``: its ``__init__`` builds a synchronous probe
-    # connection (``Is_Cluster`` -> ``redis.Redis(...).info(section="server")``, even on the
-    # ``falkordb.asyncio`` class — see ``falkordb/asyncio/cluster.py``) and blocks the event
-    # loop thread on it during ASGI startup (``mu_server.app.lifespan`` -> ``SharedContainer``
-    # -> this factory). Left unbounded, a FalkorDB that accepts TCP but never answers wedges
-    # startup forever, before ``/health`` exists to report it. Threading the SAME
-    # ``store_io_timeout_s`` budget the adapter already uses for every later call into
-    # ``socket_timeout``/``socket_connect_timeout`` bounds that constructor-time probe by the
-    # store's own configured budget rather than a new hardcoded constant (DEV-STANDARDS rule 3).
+    # AD-110 — THIS FACTORY DOES NO I/O, and that is the whole point of the closure below.
+    #
+    # ``FalkorDB.__init__`` builds a synchronous probe connection (``Is_Cluster`` ->
+    # ``redis.Redis(...).info(section="server")``, even on the ``falkordb.asyncio`` class — see
+    # ``falkordb/asyncio/cluster.py``). Every composition root builds its stores from inside an
+    # ASGI ``lifespan`` coroutine (``mu_server.app.lifespan`` -> ``SharedContainer`` -> this
+    # factory), so constructing ``FalkorDB`` HERE ran that blocking probe on the event loop
+    # thread. Bounding it by ``socket_timeout`` (the previous fix, kept below) turned an
+    # unbounded wedge into a bounded stall; it did not stop it being a stall, and
+    # DEV-STANDARDS' async sharpener says *"no blocking/sync I/O in the event loop"* — not
+    # *"briefly"*.
+    #
+    # So the connect is DEFERRED, not moved: ``STORE_REGISTRY.build("graph", "falkordb", ...)``
+    # now returns after pure attribute assignment, and ``FalkorLtmAdapter._ensure_db`` runs this
+    # closure once, on first use, inside ``asyncio.to_thread``. The timeouts still matter there
+    # — they are what bounds the probe's thread — and they still come from the store's own
+    # configured budget rather than a new literal (DEV-STANDARDS rule 3).
     store_io_timeout_s = cfg.get("store_io_timeout_s", graph_settings.store_io_timeout_s)
-    db = FalkorDB(
-        host=cfg["host"],
-        port=cfg["port"],
-        socket_timeout=store_io_timeout_s,
-        socket_connect_timeout=store_io_timeout_s,
-    )
+    host = cfg["host"]
+    port = cfg["port"]
+
+    def _connect() -> FalkorDB:  # type: ignore[no-any-unimported]  # falkordb ships no stubs
+        return FalkorDB(
+            host=host,
+            port=port,
+            socket_timeout=store_io_timeout_s,
+            socket_connect_timeout=store_io_timeout_s,
+        )
+
     return FalkorLtmAdapter(
-        db,
+        db_factory=_connect,
         shortlist_size=cfg.get("shortlist_size", graph_settings.entity_shortlist_size),
         similarity_threshold=cfg.get(
             "similarity_threshold", graph_settings.entity_similarity_threshold

@@ -27,9 +27,11 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from qdrant_client import AsyncQdrantClient
 
+from mu_contracts.domain.errors import CallerIdentitySetRequiredError
 from mu_engine.lifecycle.promotion import (
     PromotionOutcomeKind,
     PromotionService,
+    SharedPlaneSweepUnsupportedError,
     assert_immediate_gate_seam_unchanged,
 )
 from mu_engine.lifecycle.salience import SalienceStrategy
@@ -304,3 +306,111 @@ async def test_promote_session_requires_injected_stm(
     )
     with pytest.raises(RuntimeError):
         await svc.promote_session(ns, "sess-A")
+
+
+# =================================================================================================
+# AD-142 — a lifecycle sweep serves NO caller, so a SHARED η is refused BY NAME, not by accident
+# =================================================================================================
+async def test_promote_session_refuses_a_shared_namespace_and_writes_nothing(
+    ltm: FalkorLtmAdapter,
+    mtm: QdrantMtmAdapter,
+    qdrant_client: AsyncQdrantClient,
+    uid: str,
+    make_item: Callable[..., MemoryItem],
+    make_stm: Callable[..., ValkeyStmAdapter],
+) -> None:
+    """A SHARED η raises ``SharedPlaneSweepUnsupportedError``, and NOTHING is written.
+
+    The status code is not the point — the CONSEQUENCE is. Before the AD-142 fix this path
+    raised ``CallerIdentitySetRequiredError`` from inside the STM adapter, three layers down,
+    whose message reads as *"supply the caller set"*; the one way to satisfy that from a sweep
+    is a ``SYSTEM``/all-principals sentinel, which is exactly the fail-open shape AD-128 was
+    opened to remove. So this asserts BOTH that the refusal is the named one AND that it is not
+    the misleading one — an error type is load-bearing here, not decoration.
+
+    The write-side assertions are what make it a consequence test: the MTM collection for this η
+    is never created and the LTM graph holds nothing, so the refusal happened BEFORE any store
+    was touched rather than after a partial sweep.
+    """
+    ns = Namespace.shared(org=f"org{uid}", workspace=f"ws{uid}", session="sess-A")
+    clock = FrozenClock(_T0)
+    stm = make_stm()
+    svc = PromotionService(
+        mtm=mtm,
+        distill=DistillPipeline(ltm=ltm, mtm=mtm, clock=clock),
+        salience=SalienceStrategy(SalienceSettings()),
+        stm=stm,
+        clock=clock,
+    )
+    # A real, salient, resident SHARED STM row — so a sweep that RAN would have promoted it and
+    # the "nothing was written" assertions below would be vacuous.
+    item = make_item(
+        ns,
+        "Ada works at Acme",
+        subject="Ada",
+        predicate="works_at",
+        obj="Acme",
+        importance=1.0,
+        created_at=_T0,
+    )
+    await stm.put(item)
+
+    with pytest.raises(SharedPlaneSweepUnsupportedError) as raised:
+        await svc.promote_session(ns, "sess-A")
+
+    assert not isinstance(raised.value, CallerIdentitySetRequiredError), (
+        "the sweep is still failing with the STM port's missing-caller-set error — that message "
+        "points the next reader at a SYSTEM sentinel, which is the fail-open shape AD-128 "
+        "removed."
+    )
+    # Content-free: the message names the namespace and the two owed changes, never the row.
+    assert item.content not in str(raised.value)
+
+    # CONSEQUENCE — no tier was advanced.
+    collections = {c.name for c in (await qdrant_client.get_collections()).collections}
+    assert collection_name(ns, mtm._dim) not in collections, (
+        "the MTM collection for this SHARED η exists — the sweep reached the write leg before "
+        "refusing, so the refusal is not the fail-closed guard it claims to be."
+    )
+    assert await ltm.graph_recall(ns, subject="Ada", limit=10) == []
+
+
+async def test_promote_session_still_promotes_on_a_private_namespace(
+    ltm: FalkorLtmAdapter,
+    mtm: QdrantMtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+    make_stm: Callable[..., ValkeyStmAdapter],
+) -> None:
+    """The control for the refusal above: AD-142's guard is scoped to SHARED and nothing else.
+
+    A visibility check that refused everything would make the test above pass while breaking
+    every real caller — the local daemon's ``Stop``/``PreCompact``/idle sweeps all land here on a
+    PRIVATE η. This asserts the guard did not simply disable ``promote_session``.
+    """
+    ns = make_ns(session="sess-A")
+    clock = FrozenClock(_T0)
+    stm = make_stm()
+    svc = PromotionService(
+        mtm=mtm,
+        distill=DistillPipeline(ltm=ltm, mtm=mtm, clock=clock),
+        salience=SalienceStrategy(SalienceSettings()),
+        stm=stm,
+        clock=clock,
+    )
+    await stm.put(
+        make_item(
+            ns,
+            "Ada works at Acme",
+            subject="Ada",
+            predicate="works_at",
+            obj="Acme",
+            importance=1.0,
+            created_at=_T0,
+        )
+    )
+
+    report = await svc.promote_session(ns, "sess-A")
+
+    assert report.promoted_stm_mtm == 1
+    assert len(await ltm.graph_recall(ns, subject="Ada", limit=10)) == 1

@@ -1,0 +1,1610 @@
+{
+  "components": {
+    "schemas": {
+      "AddRequest": {
+        "additionalProperties": false,
+        "description": "``POST /memories`` body — design §2.5's canonical ``add`` superset signature, request-body\nprojection (the SDK-facing method also carries a ``local_memory_id`` construction detail and\ntransports ``idempotency_key`` as a header, not a body field — see this module's docstring; both\nare declared here anyway per this task's field-set brief and the \"one place naming every field\"\nrationale above).\n\n``content``'s union type (``str | dict[str, Any] | list[dict[str, Any]]``) is carried VERBATIM\nfrom the already-shipped ``mu_engine_server.schemas.AddRequest`` (mirrors\n``SurfaceFacade.add``'s accepted content shape: a single message, a structured message dict, or\na list of turns) rather than narrowed to ``str`` — design §2.5's illustrative\n``add(content: str, ...)`` signature is the SDK's own public-parameter simplification, not a\nconstraint on what the wire body may carry; narrowing it here would silently drop a capability\nthe real server already exercises.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent"
+          },
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            ],
+            "title": "Content"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Idempotency Key"
+          },
+          "importance_score": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Importance Score"
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Metadata"
+          },
+          "object": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Object"
+          },
+          "predicate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Predicate"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subject"
+          },
+          "tier": {
+            "anyOf": [
+              {
+                "enum": [
+                  "stm",
+                  "mtm",
+                  "ltm"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tier"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User"
+          },
+          "visibility": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Visibility"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "title": "AddRequest",
+        "type": "object"
+      },
+      "ConsolidateRequest": {
+        "additionalProperties": false,
+        "description": "``POST /v1/memories/consolidate`` body — the MLM manual verb (mode-gated server-side by\n``ManagerModeGate.assert_manual_allowed``, ADR 0031; see\n``mu_engine.surface.facade.SurfaceFacade.consolidate``/``mu_local.local_memory.LocalMemory.\nconsolidate``, both read before writing this file — neither needs any field beyond the three\nbelow: no ``manager_mode`` routing hint is consulted by either real implementation, unlike the\nOLD shared-plane conformance shape at ``api-mcp-surface-spec.md`` §A.9).\n\nField-for-field IDENTICAL to the already-shipped ``mu_engine_server.schemas.\nConsolidateRequest`` (verified before writing this file) — adopted verbatim, not re-invented.\n\n**Response-side reconciliation (A4 winner, confirmed for this task's report):** the real\nserver's ``POST /v1/memories/consolidate`` route (``mu_engine_server/routes/memories.py``)\nalready declares ``response_model=ConsolidateView`` — the SAME\n:class:`~mu_contracts.contracts.views.ConsolidateView` B0 re-homed to this package\n(``noop``-carrying, no ``generated_at``). ``mu-sdk-python``'s ``MemoryClient.consolidate()``\nstill parses its response as its OWN, pre-canonical ``mu_sdk.models.consolidate.\nConsolidateResult`` (``generated_at`` required, ``noop`` absent, ``extra=\"forbid\"``) — a real\nvalidation-time mismatch against what the real server actually returns, confirmed by reading\nboth classes directly. Reconciling ``MemoryClient.consolidate()``'s return-side parsing onto\n``ConsolidateView`` is ``mu-sdk-python``'s fix, not this module's (R0 owns only\n``mu-contracts/.../contracts/``) — flagged here as the concrete, named follow-on for whichever\ntask lands it.",
+        "properties": {
+          "limit": {
+            "default": 50,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User"
+          }
+        },
+        "title": "ConsolidateRequest",
+        "type": "object"
+      },
+      "ConsolidateView": {
+        "additionalProperties": false,
+        "description": "The receipt of one MTM->LTM consolidation sweep (maps from ``DistillReport``). The\ncanonical ``consolidate`` return DTO (Decision B — uncontested, no wire counterpart existed).\n\nMUST-ADD over the pre-Decision-B embedded shape: ``noop`` (Decision B — ``DistillReport``\nalready exposes a ``noop`` count that the old ``mu_local.views.ConsolidateView`` silently\ndropped; consolidation transparency should include it).",
+        "properties": {
+          "added": {
+            "title": "Added",
+            "type": "integer"
+          },
+          "facts_extracted": {
+            "title": "Facts Extracted",
+            "type": "integer"
+          },
+          "noop": {
+            "title": "Noop",
+            "type": "integer"
+          },
+          "superseded": {
+            "title": "Superseded",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "facts_extracted",
+          "added",
+          "superseded",
+          "noop"
+        ],
+        "title": "ConsolidateView",
+        "type": "object"
+      },
+      "ContextView": {
+        "additionalProperties": false,
+        "description": "A deterministically-assembled context window (NO LLM synthesis — spec §7 INJECT render).\nThe canonical ``build_context`` return DTO — already pinned by design §2.5 REVIEW-2 FIX 1\n(``MemoryClient.build_context(...) -> ContextView``).\n\n``items`` is re-typed from the retired ``mu_local.views.MemoryRecordView`` to the canonical\n:class:`~mu_contracts.contracts.recall.RecallItemView` (Decision B cross-cutting section: ONE\nhit-item DTO for both ``RecallResult.items`` and this class's ``items``, not two near-\nduplicates). ``degraded`` is left as the plain ``str | None`` NAMED-degrade label the embedded\nshape already used (unchanged — Decision B calls out only the item-DTO unification here, not a\n``degraded`` type change; a caller mapping from a ``RecallResult`` uses ``.degraded.value if\n... else None``, exactly as ``mu_local.local_memory._to_list_view`` already does today).",
+        "properties": {
+          "degraded": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Degraded"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RecallItemView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "items"
+        ],
+        "title": "ContextView",
+        "type": "object"
+      },
+      "ContextWindowRequest": {
+        "additionalProperties": false,
+        "description": "``POST /v1/context/window`` body — the private-plane ``build_context``/``ContextView`` twin\n(design §2.5 REVIEW-2 FIX 1), NOT the shared-plane ``context.*`` governed-discovery sub-API\n(design §2.1 REVIEW-3 C1 — that surface is absent from ``mu-engine-server`` entirely, and this\nclass is never used for it).\n\nField-for-field IDENTICAL to the already-shipped ``mu_engine_server.schemas.\nContextWindowRequest`` (verified before writing this file) — ``query`` is the canonical field\nname here; see this module's docstring \"Field-name decisions\" for why ``query`` (not ``text``)\nwins for THIS verb, the one genuine field-name bug this task's context pack flags.",
+        "properties": {
+          "limit": {
+            "default": 10,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "max_chars": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Chars"
+          },
+          "query": {
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "ContextWindowRequest",
+        "type": "object"
+      },
+      "DegradeReason": {
+        "description": "The one closed union of degrade reasons across every subsystem (CANONICAL §2). A degrade\nis a NAMED reason + emitted event + metric, never a bare fallback. SYNC-CLASS members are the\nONLY user-visible reasons (via ``SyncStatusView``); everything else is operator-only.",
+        "enum": [
+          "ltm_unavailable",
+          "date_extraction_fallback",
+          "ltm_graph_latency_cap",
+          "daemon_unreachable_spooled",
+          "server_unreachable",
+          "recall_core_down",
+          "stale_injection",
+          "ltm_extraction_deferred",
+          "unsupported_host_format",
+          "capture_schema_drift",
+          "temporal_unavailable",
+          "note_link_skipped",
+          "fact_dropped",
+          "backpressure_shed",
+          "durable_substrate_down",
+          "revoke_cascade_disabled",
+          "revoke_ack_pending",
+          "room_log_unavailable",
+          "room_subscriber_lagged",
+          "room_transport_degraded",
+          "bound_agent_unavailable",
+          "presence_store_down",
+          "surface_component_down",
+          "shared_recall_unavailable",
+          "artifact_hydration_budget",
+          "e2e_client_side_recall",
+          "e2e_no_server_embed",
+          "e2e_no_server_consolidation",
+          "hosted_e2e_storage_only",
+          "sync_backfill_window_exceeded",
+          "device_wipe_ack_pending",
+          "key_rotation_pending",
+          "sync_stalled",
+          "sync_delta_dead_lettered",
+          "primary_sync_lag",
+          "gateway_upstream_unavailable",
+          "gateway_region_unavailable",
+          "host_wiring_absent",
+          "kv_nondurable",
+          "recency_zset_unavailable",
+          "llm_unavailable_heuristic",
+          "vector_single_node",
+          "relational_index_reduced",
+          "model_group_unavailable",
+          "model_local_unavailable_fell_back",
+          "conflict_adjudication_degraded",
+          "conflict_pending_suppressed",
+          "conflict_manual_backlog",
+          "mtm_invalidate_point_absent",
+          "trust_ledger_unavailable",
+          "offline_failover_not_consented"
+        ],
+        "title": "DegradeReason",
+        "type": "string"
+      },
+      "GetRequest": {
+        "additionalProperties": false,
+        "description": "``GET /memories/{memory_id}``'s parameter set — design §2.5's ``get`` verb, \"kept, exists\nonly on ``LocalMemory`` today... TO BUILD on the wire/``MemoryClient`` side so both transports\nexpose it.\"\n\nModeled as one class even though, on THIS verb's real HTTP shape, ``memory_id`` travels as a\nPATH parameter and ``user``/``session`` as QUERY parameters (never all three as one JSON body —\nthe already-shipped ``mu_engine_server.routes.memories.get_memory`` takes them exactly this\nway: ``memory_id: str`` path param, ``user``/``session`` as plain query-param function args, no\nrequest-body model at all). This class exists so both sides have ONE canonical name for \"the\nfull parameter set this verb needs\" to validate/type against (e.g. a client building its\n``params={...}`` dict, or a server-side dependency that wants to bind and plane-gate the query\nparams together) — construct it, then project its fields onto whichever transport-specific\nlocations (path/query) the calling code needs, same discipline ``ContextWindowRequest`` et al.\nuse for an actual JSON body. No shared-plane fields apply to a by-id point-read (design §2.5\nlists no shared-plane fields for ``get``), so none are declared here.",
+        "properties": {
+          "memory_id": {
+            "minLength": 1,
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User"
+          }
+        },
+        "required": [
+          "memory_id"
+        ],
+        "title": "GetRequest",
+        "type": "object"
+      },
+      "MemoryCreateRequest": {
+        "additionalProperties": false,
+        "description": "``POST /memories``'s **FROZEN** wire body (``api-mcp-surface-spec.md`` Appendix A.1,\n``api.py:103``; surface-table row ``:187``).\n\nDistinct from :class:`AddRequest`, and the distinction is the point — the two were being\nconflated, and a plane bound the wrong one:\n\n* :class:`AddRequest` is the canonical ``add`` **method** superset (design §2.5). It carries the\n  PRIVATE-plane identity fields (``user``/``session``/``agent``) and ``idempotency_key``, which\n  are plane-gated or travel as a HEADER — not body fields on this route.\n* This class is what actually goes on the WIRE for the shared write, and it is frozen: no\n  ``user``/``session``/``agent`` (tenancy is derived server-side from the resolved auth\n  identity, never accepted as a client-supplied body field — ``api-mcp-surface-spec.md`` §2.2,\n  so the surface is never an oracle a probe can steer), and it carries ``content_type`` +\n  ``local_memory_id``, which the method superset does not.\n\nIt lives HERE rather than in a client package because both sides of the wire have to agree on\nit: the public SDK already declared this exact shape locally, and the shared plane declared a\nnarrower server-local one, so neither could talk to the other. A wire body with two spellings\nis not a contract.",
+        "properties": {
+          "content": {
+            "minLength": 1,
+            "title": "Content",
+            "type": "string"
+          },
+          "content_type": {
+            "default": "text",
+            "enum": [
+              "text",
+              "code",
+              "url",
+              "image",
+              "transcript"
+            ],
+            "title": "Content Type",
+            "type": "string"
+          },
+          "importance_score": {
+            "default": 0.5,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Importance Score",
+            "type": "number"
+          },
+          "local_memory_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Local Memory Id"
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Metadata",
+            "type": "object"
+          },
+          "object": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Object"
+          },
+          "predicate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Predicate"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subject"
+          },
+          "tier": {
+            "default": "stm",
+            "enum": [
+              "stm",
+              "mtm",
+              "ltm"
+            ],
+            "title": "Tier",
+            "type": "string"
+          },
+          "visibility": {
+            "$ref": "#/components/schemas/Visibility"
+          }
+        },
+        "required": [
+          "content",
+          "visibility"
+        ],
+        "title": "MemoryCreateRequest",
+        "type": "object"
+      },
+      "MemoryResponse": {
+        "additionalProperties": false,
+        "description": "The full materialized memory row (``api.py:38``, Appendix A.1) — the canonical DTO for\n``get(memory_id) -> MemoryResponse | None`` and ``share(memory_id, *, visibility) ->\nMemoryResponse`` (design §2.5, ``SDK-BUILD-DECISIONS.md`` Decision B). NOT the ``add`` return\nshape — ``add`` returns the receipt :class:`~mu_contracts.contracts.views.MemoryWriteResult`\n(Decision B rationale: this DTO lacks ``promoted``/``tiers_written``, the two most informative\nwrite flags, and forcing embedded ``add`` to build this would be an unwanted read-after-write).",
+        "properties": {
+          "access_count": {
+            "minimum": 0,
+            "title": "Access Count",
+            "type": "integer"
+          },
+          "asserted_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Asserted State"
+          },
+          "child_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Child Ids",
+            "type": "array"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "content_hash": {
+            "default": "",
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "content_type": {
+            "enum": [
+              "text",
+              "code",
+              "url",
+              "image",
+              "transcript"
+            ],
+            "title": "Content Type",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "entity_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Entity Id"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expires At"
+          },
+          "gds_pagerank": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Gds Pagerank"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "importance_score": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Importance Score",
+            "type": "number"
+          },
+          "invalid_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Invalid At"
+          },
+          "last_seen": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Last Seen"
+          },
+          "mention_count": {
+            "default": 1,
+            "minimum": 0,
+            "title": "Mention Count",
+            "type": "integer"
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Metadata",
+            "type": "object"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          },
+          "object": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Object"
+          },
+          "object_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Object Kind"
+          },
+          "object_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Object Type"
+          },
+          "object_value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Object Value"
+          },
+          "parent_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Parent Ids",
+            "type": "array"
+          },
+          "polarity": {
+            "anyOf": [
+              {
+                "enum": [
+                  "positive",
+                  "negative"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Polarity"
+          },
+          "predicate": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Predicate"
+          },
+          "predicate_cardinality": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Predicate Cardinality"
+          },
+          "relevance_score": {
+            "default": 0.0,
+            "title": "Relevance Score",
+            "type": "number"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          },
+          "source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source Id"
+          },
+          "speaker_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Speaker Id"
+          },
+          "speaker_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Speaker Kind"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "subject": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Subject"
+          },
+          "tier": {
+            "enum": [
+              "stm",
+              "mtm",
+              "ltm"
+            ],
+            "title": "Tier",
+            "type": "string"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          },
+          "valid_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Valid At"
+          }
+        },
+        "required": [
+          "id",
+          "content",
+          "content_type",
+          "tier",
+          "state",
+          "importance_score",
+          "access_count",
+          "created_at",
+          "updated_at",
+          "namespace"
+        ],
+        "title": "MemoryResponse",
+        "type": "object"
+      },
+      "MemoryVerbResult": {
+        "additionalProperties": false,
+        "description": "The receipt of one TARGETED, single-memory lifecycle verb — ``promote``/``demote``/\n``update``/``delete`` (the four verbs the surface facade drives over the REAL lifecycle +\nbi-temporal invalidation machinery: ``PromotionService``/``DemotionService``'s own copy-on-\nwrite shapes, ``MtmTierRepository``/``GraphStorePort.invalidate`` supersede, and the\n``expire`` soft-delete). Distinct from :class:`MemoryWriteResult` (the ``add`` INGEST receipt)\nbecause these verbs act on an ALREADY-resident memory: there is no fresh ``content_hash`` to\nreport, and the informative flags are the tier transition (``from_tier``/``to_tier``), which\ntiers were touched (``tiers_affected``), and — for ``update`` — the id of the old version that\nwas superseded by the new one (``superseded_id``).\n\n``memory_id`` is the memory the verb's RESULT refers to: the same id for promote/demote/delete,\nbut for ``update`` it is the NEW version's id (the task's \"return the new memory\"), with the\nsuperseded old id carried in ``superseded_id``. ``invalidated`` is set by ``delete`` (the item\nwas soft-deleted — state flipped to ``expired`` + ``invalid_at`` stamped, still in bi-temporal\nhistory, dropped from active recall — never a hard ``DETACH DELETE`` of active data).",
+        "properties": {
+          "events_emitted": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Events Emitted",
+            "type": "array"
+          },
+          "from_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "From Tier"
+          },
+          "invalidated": {
+            "default": false,
+            "title": "Invalidated",
+            "type": "boolean"
+          },
+          "memory_id": {
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "superseded_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Superseded Id"
+          },
+          "tiers_affected": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Tiers Affected",
+            "type": "array"
+          },
+          "to_tier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "To Tier"
+          },
+          "verb": {
+            "title": "Verb",
+            "type": "string"
+          }
+        },
+        "required": [
+          "memory_id",
+          "verb"
+        ],
+        "title": "MemoryVerbResult",
+        "type": "object"
+      },
+      "MemoryWriteResult": {
+        "additionalProperties": false,
+        "description": "The fast-return receipt of one ``add`` (maps from ``IngestResult`` — ids/flags only). The\ncanonical ``add`` return DTO (Decision B — a receipt, not ``MemoryResponse``'s full row: this\nshape carries ``promoted``/``tiers_written``, the two most informative write flags, that\n``MemoryResponse`` lacks).\n\nMUST-ADD over the pre-Decision-B embedded shape (``mu_local.views.MemoryWriteResult``, which\nhad only ``memory_id``/``content_hash``/``promoted``/``tiers_written``): ``namespace`` (so a\nwire caller learns the resolved η the same way ``MemoryResponse.namespace`` already does — wire\nparity) and ``events_emitted`` (optional, defaults empty — a receipt-side hook for callers that\nwant to know what domain events an ``add`` published, without changing embedded's zero-extra-\nI/O fast-return discipline since the engine's ``IngestResult`` can populate it directly).",
+        "properties": {
+          "content_hash": {
+            "title": "Content Hash",
+            "type": "string"
+          },
+          "events_emitted": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Events Emitted",
+            "type": "array"
+          },
+          "memory_id": {
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "namespace": {
+            "title": "Namespace",
+            "type": "string"
+          },
+          "promoted": {
+            "title": "Promoted",
+            "type": "boolean"
+          },
+          "tiers_written": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tiers Written",
+            "type": "array"
+          }
+        },
+        "required": [
+          "memory_id",
+          "content_hash",
+          "promoted",
+          "tiers_written",
+          "namespace"
+        ],
+        "title": "MemoryWriteResult",
+        "type": "object"
+      },
+      "Namespace": {
+        "additionalProperties": false,
+        "description": "η — the tenancy partition key. Structured, immutable, ordered. Exactly FIVE fields.\n\n``agent`` is deliberately NOT a field (CANONICAL §1 rule 2): the acting-agent identity\nlives on ``ClientScope``/``AgentBinding``, because the SHARED partition is agent-agnostic.\n``region``/residency is NOT a field either (rule 7) — it is resolved from ``org`` before a\nkey is built, so ``to_prefix()`` stays region-agnostic and byte-stable across regions.",
+        "properties": {
+          "org": {
+            "title": "Org",
+            "type": "string"
+          },
+          "session": {
+            "title": "Session",
+            "type": "string"
+          },
+          "user": {
+            "title": "User",
+            "type": "string"
+          },
+          "visibility": {
+            "$ref": "#/components/schemas/Visibility"
+          },
+          "workspace": {
+            "title": "Workspace",
+            "type": "string"
+          }
+        },
+        "required": [
+          "org",
+          "workspace",
+          "user",
+          "session",
+          "visibility"
+        ],
+        "title": "Namespace",
+        "type": "object"
+      },
+      "RecallChannels": {
+        "additionalProperties": false,
+        "description": "Which channels a recall runs (recall-service-design.md:78-82). A degraded recall drops\none; :attr:`RecallResult.channels_run` reports what actually ran.",
+        "properties": {
+          "ltm": {
+            "default": true,
+            "title": "Ltm",
+            "type": "boolean"
+          },
+          "mtm": {
+            "default": true,
+            "title": "Mtm",
+            "type": "boolean"
+          },
+          "stm": {
+            "default": true,
+            "title": "Stm",
+            "type": "boolean"
+          }
+        },
+        "title": "RecallChannels",
+        "type": "object"
+      },
+      "RecallItemView": {
+        "additionalProperties": false,
+        "description": "One ranked hit — the single canonical hit-item shape shared by ``RecallResult.items`` and\n``ContextView.items`` (Decision B cross-cutting section). Deliberately WITHOUT the engine-\ninternal ``content_hash``/per-item ``namespace`` fields ``mu_engine.services.recall.dto.\nRecallItemView`` carries for federate-dedup (module docstring) — those are an implementation\ndetail of the recall service's private/shared-arm merge, not part of the surface a caller\nreads.",
+        "properties": {
+          "artifact_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Artifact Ref"
+          },
+          "channel": {
+            "title": "Channel",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "fused_score": {
+            "title": "Fused Score",
+            "type": "number"
+          },
+          "is_floor": {
+            "default": false,
+            "title": "Is Floor",
+            "type": "boolean"
+          },
+          "memory_id": {
+            "title": "Memory Id",
+            "type": "string"
+          },
+          "rerank_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Rerank Score"
+          },
+          "tier": {
+            "$ref": "#/components/schemas/Tier"
+          }
+        },
+        "required": [
+          "memory_id",
+          "content",
+          "tier",
+          "channel",
+          "fused_score"
+        ],
+        "title": "RecallItemView",
+        "type": "object"
+      },
+      "RecallMode": {
+        "description": "recall-service-design.md:84-87.",
+        "enum": [
+          "ranked",
+          "answer",
+          "inject"
+        ],
+        "title": "RecallMode",
+        "type": "string"
+      },
+      "RecallRequest": {
+        "additionalProperties": false,
+        "description": "``POST /v1/memories/recall`` body — design §2.5's canonical ``recall`` superset signature.\n\nField-for-field IDENTICAL to the already-shipped ``mu_engine_server.schemas.RecallRequest``\nplus the two additional PRIVATE-plane fields that server's private-only version omits\n(``agent``) and the always-common pass-through fields the SDK side already sends\n(``channels``/``mode``/``persona``/``max_tokens``/``correlation_id`` — design §2.5: \"become\nalways-available pass-through options rather than wire-only\"). ``text`` is the canonical\nquery-text field name — see this module's docstring \"Field-name decisions\" for why ``text``\n(not ``query``) wins for THIS verb specifically.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Agent"
+          },
+          "channels": {
+            "$ref": "#/components/schemas/RecallChannels"
+          },
+          "correlation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Correlation Id"
+          },
+          "limit": {
+            "default": 10,
+            "minimum": 1,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "max_tokens": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Tokens"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/RecallMode",
+            "default": "ranked"
+          },
+          "persona": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Persona"
+          },
+          "session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session"
+          },
+          "text": {
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          },
+          "tier": {
+            "anyOf": [
+              {
+                "enum": [
+                  "stm",
+                  "mtm",
+                  "ltm"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tier"
+          },
+          "user": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "User"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "title": "RecallRequest",
+        "type": "object"
+      },
+      "RecallResult": {
+        "additionalProperties": false,
+        "description": "The ranked read result — the canonical return DTO for ``recall(...)`` (Decision B: wins\nover the embedded ``MemoryListView`` as a strict superset; nothing embedded recall returns is\nlost, see the decision doc's field-by-field diff).",
+        "properties": {
+          "channels_run": {
+            "$ref": "#/components/schemas/RecallChannels"
+          },
+          "degraded": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DegradeReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "generated_at": {
+            "format": "date-time",
+            "title": "Generated At",
+            "type": "string"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/RecallItemView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "namespace": {
+            "$ref": "#/components/schemas/Namespace"
+          }
+        },
+        "required": [
+          "namespace",
+          "items",
+          "channels_run",
+          "generated_at"
+        ],
+        "title": "RecallResult",
+        "type": "object"
+      },
+      "Tier": {
+        "description": "The three memory tiers (memory-layer §1). ``MemoryItem.id`` is carried unchanged\nacross STM→MTM→LTM (CANONICAL §7.1 — id stability across tiers).",
+        "enum": [
+          "stm",
+          "mtm",
+          "ltm"
+        ],
+        "title": "Tier",
+        "type": "string"
+      },
+      "Visibility": {
+        "description": "The plane/partition axis of η. SHARED zeroes the ``user`` slot (CANONICAL §1 rule 4).",
+        "enum": [
+          "private",
+          "shared"
+        ],
+        "title": "Visibility",
+        "type": "string"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "GENERATED from the mu-contracts pydantic models by mu-core/scripts/wire_contract.py — do not edit by hand. Covers the operations whose request AND response models are both canonical mu-contracts models; the remaining mu-engine-server routes are listed under x-uncontracted-routes with the reason each is not yet contractable.",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "title": "Memory Universe wire contract",
+    "version": "0.1.0"
+  },
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "openapi": "3.1.0",
+  "paths": {
+    "/memories": {
+      "post": {
+        "operationId": "add_memory",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryWriteResult"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Invalid argument (e.g. an unknown tier)."
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "422": {
+            "description": "Request body failed schema validation."
+          }
+        },
+        "summary": "INGEST one memory (STM durable, deterministic STM->MTM promote)."
+      }
+    },
+    "/memories/{memory_id}": {
+      "get": {
+        "operationId": "get_memory",
+        "parameters": [
+          {
+            "description": "The memory id.",
+            "in": "path",
+            "name": "memory_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Private-plane η user segment; the server resolves its own default when absent.",
+            "in": "query",
+            "name": "user",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Private-plane η session segment.",
+            "in": "query",
+            "name": "session",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryResponse"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "404": {
+            "description": "Not found."
+          }
+        },
+        "summary": "Point-get one memory by id from the caller's partition. 404 on a miss.",
+        "x-request-model": "GetRequest",
+        "x-request-projection": "path+query"
+      }
+    },
+    "/v1/context/window": {
+      "post": {
+        "operationId": "build_context_window",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContextWindowRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContextView"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Invalid argument (e.g. an unknown tier)."
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "422": {
+            "description": "Request body failed schema validation."
+          }
+        },
+        "summary": "Deterministic context-window assembly (no LLM synthesis)."
+      }
+    },
+    "/v1/memories/consolidate": {
+      "post": {
+        "operationId": "consolidate_memories",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsolidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsolidateView"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "409": {
+            "description": "Refused: the namespace is MANAGED and the caller does not own its lifecycle (ADR 0031)."
+          },
+          "422": {
+            "description": "Request body failed schema validation."
+          }
+        },
+        "summary": "MTM->LTM DISTILL sweep. 409 under a MANAGED namespace (ADR 0031)."
+      }
+    },
+    "/v1/memories/recall": {
+      "post": {
+        "operationId": "recall_memories",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecallRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecallResult"
+                }
+              }
+            },
+            "description": "Success."
+          },
+          "400": {
+            "description": "Invalid argument (e.g. an unknown tier)."
+          },
+          "401": {
+            "description": "Missing or invalid bearer token."
+          },
+          "422": {
+            "description": "Request body failed schema validation."
+          }
+        },
+        "summary": "Federate-live RANKED recall (STM floor + MTM dense + LTM graph), fused once."
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "x-uncontracted-routes": [
+    {
+      "method": "POST",
+      "path": "/v1/memories/{memory_id}/promote",
+      "reason": "response is canonical (MemoryVerbResult) but the request body MemoryVerbRequest is declared in mu_engine_server.schemas, not in mu-contracts. Contractable as soon as MemoryVerbRequest is re-homed here and re-exported from schemas.py the way the five canonical request models already are."
+    },
+    {
+      "method": "POST",
+      "path": "/v1/memories/{memory_id}/demote",
+      "reason": "same as .../promote — MemoryVerbRequest is not a mu-contracts model."
+    },
+    {
+      "method": "PUT",
+      "path": "/memories/{memory_id}",
+      "reason": "response is canonical (MemoryVerbResult); the request body UpdateRequest is declared in mu_engine_server.schemas, not in mu-contracts."
+    },
+    {
+      "method": "DELETE",
+      "path": "/memories/{memory_id}",
+      "reason": "response is canonical (MemoryVerbResult); its user/session query params are declared as bare function args on the route, with no canonical request model naming the field set. GetRequest happens to carry the identical fields but naming it here would put 'GetRequest' on a DELETE in the emitted OpenAPI — an invented mapping, not a contract. Needs a canonical DeleteRequest (or an explicit alias decision)."
+    },
+    {
+      "method": "GET",
+      "path": "/profile",
+      "reason": "response model LifecycleStateView lives in mu_engine.lifecycle.dto — an ENGINE internal DTO served directly on the wire. Contractable once it is re-homed to mu-contracts (see the reported delta in this task's report)."
+    },
+    {
+      "method": "POST",
+      "path": "/lifecycle/enforce",
+      "reason": "request body LifecycleEnforceRequest is a mu_engine_server.schemas model; the response JobHandle IS canonical (mu_contracts.domain.model.lifecycle)."
+    },
+    {
+      "method": "GET",
+      "path": "/lifecycle/events",
+      "reason": "response model ExplainRecord lives in mu_engine.lifecycle.explain — an ENGINE internal DTO served directly on the wire, same class of leak as GET /profile."
+    }
+  ]
+}

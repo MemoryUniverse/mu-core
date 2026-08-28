@@ -37,12 +37,33 @@ def _script() -> ScriptDirectory:
     return ScriptDirectory.from_config(cfg)
 
 
-def test_the_revision_is_the_single_chain_head_and_chains_from_the_previous_one() -> None:
+def test_the_chain_has_one_head_and_this_revision_is_still_on_it() -> None:
     """A second head is the failure mode that makes ``alembic upgrade head`` ambiguous and leaves
-    a deployment silently missing one branch's tables."""
+    a deployment silently missing one branch's tables.
+
+    ⚠ **This assertion used to read ``list(script.get_heads()) == [_REVISION]``, and that was the
+    AD-113 defect wearing a different file name.** Pinning the head to THIS revision does not
+    test single-headedness; it tests that nobody has written another migration since — so the
+    very next revision (``a71f3c9de205``, AD-106) turned it red while the chain was perfectly
+    healthy. AD-113 already ruled on the identical shape in
+    ``test_room_tables_migration_int.py:80`` and replaced it with exactly this pair, for exactly
+    this reason: *"a pin every future migration must come back and edit is testing the
+    calendar."* The ruling is applied here rather than re-litigated.
+
+    What is asserted instead is what the docstring above actually claims, and it is STRICTLY
+    stronger than the pin: there is exactly ONE head whatever it happens to be, this revision
+    chains from ``_PRIOR``, and this revision is still REACHABLE from that head — a rebase that
+    orphaned it would be a real defect and the old pin could not have seen it either.
+    """
     script = _script()
-    assert list(script.get_heads()) == [_REVISION]
+    heads = list(script.get_heads())
+    assert len(heads) == 1, f"the migration chain has forked: {heads}"
     assert script.get_revision(_REVISION).down_revision == _PRIOR
+    reachable = {rev.revision for rev in script.walk_revisions("base", heads[0])}
+    assert _REVISION in reachable, (
+        f"{_REVISION} is no longer on the chain reachable from head {heads[0]} — it has been "
+        "orphaned by a rebase, so `alembic upgrade head` would never apply it."
+    )
 
 
 def test_the_acl_row_carries_permission_not_null() -> None:
