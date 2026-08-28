@@ -64,7 +64,7 @@ import math
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
-from mu_contracts.domain.errors import StoreUnavailableError
+from mu_contracts.domain.errors import CallerIdentitySetRequiredError, StoreUnavailableError
 from mu_contracts.domain.events import DegradeReason
 from mu_contracts.domain.model.recall import CallerIdentitySet, Vector
 from mu_contracts.ports.time import Clock
@@ -77,7 +77,7 @@ from mu_engine.services.recall.dto import (
 )
 from mu_engine.services.recall.fusion import FusionStrategy, dedup_by_content_hash
 from mu_engine.storage.domain.memory import MemoryItem
-from mu_engine.storage.domain.namespace import Namespace
+from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored
 from mu_engine.storage.ports import LtmTierRepository, MtmTierRepository, StmTierRepository
 
@@ -167,6 +167,24 @@ class ThreeChannelRecallRanker:
         # `query` (raw text) is used ONLY by the D1 STM relevance scorer below ("lexical" mode) —
         # the LTM graph arm remains the deterministic recency seed this phase (no LLM entity
         # resolution — see docstring); it never reads `query`.
+        # FAIL-CLOSED GATE (AD-128; CANONICAL §7.4). On a SHARED η the `to_prefix()` partition
+        # separates ORGS, not the MEMBERS of one org — the session slot is caller-supplied — so
+        # Model-A is the WHOLE gate and `None` cannot be a legal caller set here. Every tier
+        # adapter reads `caller_identity_set is None` as "omit the Model-A clause entirely"
+        # (`qdrant_mtm.py:402`, `falkor_ltm.py:561`, `weaviate_mtm.py`, `pgvector_mtm.py`,
+        # `chroma_mtm.py`), so a caller that forgot to thread the set would get an UNFILTERED
+        # shared read from all three arms. Refuse it HERE, once, at the one place that knows both
+        # the η and the caller set — rather than relying on every present and future call site
+        # remembering (the convention-at-the-call-sites shape that produced C2, C3 and 7ccc405).
+        # An EMPTY set is legal and authorizes NOTHING: `RecallService` coerces a missing shared
+        # caller set to `frozenset()` deliberately ("the safe direction, never an over-broad
+        # match"), and every arm's predicate denies on it.
+        if ns.visibility is Visibility.SHARED and caller_identity_set is None:
+            raise CallerIdentitySetRequiredError(
+                "recall: a SHARED-η rank requires the Model-A caller identity set "
+                "(CANONICAL §7.4) — pass frozenset() to authorize nothing, never None"
+            )
+
         pool = self._settings.channel_pool_size
         floor_limit = self._settings.recency_floor_limit
 
@@ -179,7 +197,12 @@ class ThreeChannelRecallRanker:
         try:
             async with asyncio.TaskGroup() as tg:
                 floor_t = tg.create_task(
-                    self._stm.recent(ns, limit=floor_limit) if channels.stm else _empty_scored()
+                    # AD-128: the STM floor arm receives the caller identity set exactly like the
+                    # MTM and LTM arms below. Until the port could express it, this ONE arm ran
+                    # unauthorized on the SHARED plane and served a non-member the room's items.
+                    self._stm.recent(ns, limit=floor_limit, caller_identity_set=caller_identity_set)
+                    if channels.stm
+                    else _empty_scored()
                 )
                 mtm_t = tg.create_task(
                     self._mtm.semantic(

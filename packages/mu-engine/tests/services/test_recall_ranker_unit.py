@@ -56,7 +56,15 @@ class _FakeStm:
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         return next((i for i in self._items if i.id == memory_id), None)
 
-    async def recent(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]:
+    async def recent(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        # AD-128: the port grew the Model-A caller set; this fake stands in for a PRIVATE-η
+        # partition, where §7.4 authorizes by to_prefix() and the set is not consulted.
         newest_first = list(reversed(self._items))[:limit]
         return [
             Scored(item=i, score=1.0, channel=RecallChannel.STM_FLOOR, rank=rank, is_floor=True)

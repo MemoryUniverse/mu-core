@@ -27,7 +27,9 @@ import json
 
 import aiomcache
 
+from mu_contracts.domain.model.recall import CallerIdentitySet
 from mu_engine.platform.decorators import retry_io
+from mu_engine.storage.authz import authorized_item, authorized_window
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.domain.recall import RecallChannel, Scored
@@ -115,8 +117,21 @@ class MemcachedStmAdapter:
         # idempotency contract (``ports.py``) degrades to a no-op here: always the given id.
         return item.id
 
-    async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
-        return await self._retry(self._get_impl)(ns, memory_id)
+    async def get(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> MemoryItem | None:
+        """Keyed read, Model-A authorized on a SHARED η — the SAME predicate the Redis adapter
+        applies (``storage/authz.py``, AD-129); a security property may not differ by backend."""
+        return authorized_item(
+            await self._retry(self._get_impl)(ns, memory_id),
+            ns=ns,
+            caller_identity_set=caller_identity_set,
+            operation="stm.get",
+        )
 
     async def _get_impl(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         key = RedisMapper.memory_key(ns, memory_id).encode("utf-8")
@@ -126,15 +141,35 @@ class MemcachedStmAdapter:
         row = RedisRecord(key=key.decode("utf-8"), ttl_s=None, blob=blob.decode("utf-8"))
         return self._mapper.from_store(row)
 
-    async def recent(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]:
-        return await self._retry(self._recent_impl)(ns, limit=limit)
+    async def recent(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        """Recency floor, Model-A filtered on a SHARED η — the SAME predicate the Redis adapter
+        applies (``storage/authz.py``, AD-128); a security property may not differ by backend."""
+        return await self._retry(self._recent_impl)(
+            ns, limit=limit, caller_identity_set=caller_identity_set
+        )
 
-    async def _recent_impl(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]:
+    async def _recent_impl(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[Scored[MemoryItem]]:
         key = RedisMapper.recency_key(ns).encode("utf-8")
         entries, _ = await self._read_recency(key)
         out: list[Scored[MemoryItem]] = []
         for rank, (memory_id, _ts) in enumerate(entries[: max(0, limit)]):
-            item = await self.get(ns, memory_id)
+            # ``_get_impl``, NOT the public ``get`` — the window is authorized ONCE, below.
+            # Hydrating through the public verb would apply Model-A twice and, since this loop
+            # reads ``None`` as "TTL-expired, self-heal", a DENIAL would EVICT the row from the
+            # recency list. Same reasoning, same fix, as the Redis adapter.
+            item = await self._get_impl(ns, memory_id)
             if item is None:
                 # TTL-expired member still lingering in the recency list — self-heal, same as
                 # the Redis adapter's ZSET pruning.
@@ -145,7 +180,9 @@ class MemcachedStmAdapter:
                     item=item, score=1.0, channel=RecallChannel.STM_FLOOR, rank=rank, is_floor=True
                 )
             )
-        return out
+        return authorized_window(
+            out, ns=ns, caller_identity_set=caller_identity_set, operation="stm.recent"
+        )
 
     async def evict(self, ns: Namespace, memory_id: str) -> None:
         return await self._retry(self._evict_impl)(ns, memory_id)

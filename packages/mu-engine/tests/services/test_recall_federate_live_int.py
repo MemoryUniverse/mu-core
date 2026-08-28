@@ -262,6 +262,16 @@ async def test_federate_live_recall_fuses_and_isolates(
         await mtm.upsert(s_team)
         await mtm.upsert(s_secret)
         await mtm.upsert(s_dup)
+        # AD-128: a shared point is ORDINARILY STM-resident as well — `IngestService`'s stages are
+        # write_stm -> deterministic_promote, so every shared write lands in the recency floor
+        # before it is ever a vector. Until this file wrote the shared items to STM too, the
+        # `s_secret` assertion below could only ever exercise the MTM arm's Model-A filter, and
+        # the STM floor arm — which had NO authorization at all and returned the room to anyone
+        # who named its session — was invisible to it. Adding these two lines turned that
+        # assertion RED against the real stores before the fix, and it is the line the leak
+        # escaped through.
+        await stm.put(s_team)
+        await stm.put(s_secret)
 
         # --- other-tenant data (different user) — must never surface ---
         o_item = await make_item(other, "The favorite color over there is crimson")

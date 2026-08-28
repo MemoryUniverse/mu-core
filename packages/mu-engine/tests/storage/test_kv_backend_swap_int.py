@@ -30,7 +30,13 @@ class _StmLike(Protocol):
     typed without importing every concrete adapter class."""
 
     async def put(self, item: MemoryItem) -> None: ...
-    async def recent(self, ns: Namespace, *, limit: int) -> list[Scored[MemoryItem]]: ...
+    async def recent(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+    ) -> list[Scored[MemoryItem]]: ...
     async def evict(self, ns: Namespace, memory_id: str) -> None: ...
 
 

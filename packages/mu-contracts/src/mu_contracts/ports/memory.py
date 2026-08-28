@@ -90,7 +90,37 @@ class MemoryTierRepository(Protocol):
 
 @runtime_checkable
 class StmTierRepository(MemoryTierRepository, Protocol):
-    async def recent(self, ns: Namespace, *, limit: int) -> list[MemoryItem]:  # recency floor
+    async def get(
+        self,
+        ns: Namespace,
+        id: str,
+        *,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> MemoryItem | None:
+        """Point-get, Model-A authorized on a SHARED η (CANONICAL §7.4).
+
+        Widens ``MemoryTierRepository.get`` with the OPTIONAL caller set — optional so every
+        PRIVATE-plane caller is unchanged, required in effect on a SHARED η where ``None`` raises
+        ``CallerIdentitySetRequiredError`` and a row the caller is not stamped on is returned as a
+        MISS. This tier overrides it because this tier is the one a SHARED plane point-gets
+        through, and the parameter's absence was a measured leak (ARCHITECTURE-DELTAS AD-129)."""
+        ...
+
+    async def recent(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[MemoryItem]:
+        """The recency floor. ``caller_identity_set`` is Model-A (CANONICAL §7.4) and is REQUIRED
+        on a SHARED η: every returned row's exploded ``authorized_ids`` stamp must intersect it,
+        an unstamped row is DENIED, and ``None`` raises ``CallerIdentitySetRequiredError``. On a
+        PRIVATE η it is ``None`` — the own partition is authorized by ``to_prefix()`` (§1 rule 5).
+
+        The parameter exists because its ABSENCE was a live SHARED-plane leak: the MTM/LTM arms of
+        recall were Model-A filtered and this one could not express the caller set at all
+        (ARCHITECTURE-DELTAS AD-128)."""
         ...
 
     async def set_ttl(self, ns: Namespace, id: str, ttl_s: int) -> None: ...
