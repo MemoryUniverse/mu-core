@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from mu_contracts.domain.model.conflict import ResolutionOrigin
 from mu_contracts.domain.model.device import ClientMode, DevicePlatform, DeviceState, PrivacyTier
@@ -57,6 +57,7 @@ __all__ = [
     "CaptureSourceHalted",
     "CaptureSourceStarted",
     "ComposeRequested",
+    "ComposedContextStale",
     "ConflictDetected",
     "ConflictDismissed",
     "ConflictPolicyChanged",
@@ -579,6 +580,27 @@ class ContextIndexed(DomainEvent):
     namespace: Namespace
 
 
+class ComposedContextStale(DomainEvent):
+    """A source of an immutable ``ComposedContext`` left the live set (CANONICAL §7.10 [G8];
+    ``governance-transfer-core-spec.md:476``, listed among §13's emitted events at :875).
+
+    **Observational by contract.** On ``MemorySuperseded``/``MemoryDemoted``/
+    ``MemoryGarbageCollected`` of a source, governance records ``sources_superseded_count`` and
+    emits this. The composed snapshot **stays immutable** and **no downstream grant is auto-
+    severed** — that is a policy toggle (§13-Q3), not this event's job. Only the freshness marker
+    changes, which is why the count rides the event and no state does.
+
+    Declared here because §13 lists it among the governance events emitted and ``events.py`` did
+    not have it (AD-69), so the one signal that a bundle has gone stale had nowhere to be
+    published.
+    """
+
+    composed_id: str
+    #: How many of this bundle's sources have left the live set. A COUNT, never the source bodies
+    #: — the refs are recoverable from the ``COMPOSED_FROM`` provenance fan-out (spec:476).
+    sources_superseded_count: int = Field(ge=1)
+
+
 class ContextShared(DomainEvent):
     grant_id: str
     to_session: str
@@ -662,8 +684,33 @@ class RevokeCascadeStarted(DomainEvent):
 
 
 class RevokeCascadeCompleted(DomainEvent):
+    """The cascade's terminal receipt-material (AD-42).
+
+    ⚠ **"Completed" must never hide a still-live LOCAL copy or an unpurged cache.** Until this
+    change the event carried ``revoked_count`` alone, so the two counts that decide whether the
+    revoke actually SETTLED had no home on it: ``governance-transfer-core-spec.md:762`` emits
+    ``RevokeCascadeCompleted(root, revoked_count, ack_pending_count, cache_entries_purged)``,
+    ``design-governance-transfer.puml:659`` draws exactly that triple, and
+    ``trust-ledger-spec.md:366`` requires ``counts={"revoked","ack_pending","cache_purged"}`` to be
+    DERIVABLE from this event so the projector can append ``REVOKE_SETTLED`` and build the
+    receipt. With the fields absent, the producer routed them onto the trust-ledger row instead
+    and said so in a code comment — the receipt's honesty (``state=PARTIAL`` when
+    ``ack_pending > 0``, trust-ledger:388-389) depended on a side channel.
+
+    Both counts default to ``0`` so every existing producer keeps constructing unchanged, and
+    ``0`` is the honest reading of what those producers measure: no ack outstanding, nothing
+    purged. A count is content-free (CANONICAL §3).
+    """
+
     root_grant_id: str
     revoked_count: int
+    #: LOCAL copies whose daemon never returned ``revoke_ack`` within ``revoke_ack_budget_s``
+    #: (spec:867). ``> 0`` is what forces the receipt to ``PARTIAL`` — the event may not claim
+    #: "revoked everywhere" when it was not.
+    ack_pending_count: int = Field(default=0, ge=0)
+    #: Warm-cache entries ACTUALLY purged — "reflects only actual purges" (spec:868), so a purge
+    #: that exhausted its attempts lowers this number rather than being rounded up into success.
+    cache_entries_purged: int = Field(default=0, ge=0)
 
 
 class RevokeCascadeStepFailed(DomainEvent):

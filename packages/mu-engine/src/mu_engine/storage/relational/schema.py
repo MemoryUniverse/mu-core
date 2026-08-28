@@ -277,6 +277,11 @@ class AclEntry(Base):
     object_ref: Mapped[str] = mapped_column(String(512), nullable=False)
     subject_principal_id: Mapped[str] = mapped_column(String(128), nullable=False)
     grantee_kind: Mapped[str] = mapped_column(String(128), nullable=False)  # user|session|role
+    # read|write|delete|share — WHAT this row grants (AD-67, governance-transfer-core-spec:201).
+    # Without it the standing ACL grid cannot answer "does this subject hold READ on this object"
+    # by row lookup, and the read path would have to fold the grant chain — destroying the one
+    # property that justifies this table existing beside `grants` (spec:204).
+    permission: Mapped[str] = mapped_column(String(128), nullable=False)
     grant_id: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = _dt()
     revoked_at: Mapped[datetime | None] = _dt_opt()  # NULL = live
@@ -404,9 +409,14 @@ class ProvenanceLedgerRow(Base):
 
     stream_id: Mapped[str] = mapped_column(String(128), nullable=False)  # provenance_id
     version: Mapped[int] = mapped_column(Integer, nullable=False)  # monotonic within stream
-    action: Mapped[str] = mapped_column(
-        String(128), nullable=False
-    )  # ORIGIN|DERIVED|SUPERSEDED|COMPOSED
+    # A `ProvenanceAction` VALUE (mu_contracts.domain.model.governance): origin|composed|shared|
+    # pulled|reshared|accepted|revoked|superseded, plus the deprecated `derived` (AD-62). This is
+    # a plain VARCHAR with no CHECK constraint and no database ENUM type — deliberately, and it is
+    # why extending the enum from four members to eight needed **no migration at all**: the value
+    # set is enforced by pydantic at the boundary, not by the DDL, so widening it produces zero
+    # schema delta. Keep it that way; a CHECK here would make every vocabulary addition a
+    # migration on a table whose values are already validated before they arrive.
+    action: Mapped[str] = mapped_column(String(128), nullable=False)
     memory_id: Mapped[str] = mapped_column(String(128), nullable=False)
     org_id: Mapped[str] = mapped_column(String(128), nullable=False)  # tenancy root (ADR 0026)
     workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)

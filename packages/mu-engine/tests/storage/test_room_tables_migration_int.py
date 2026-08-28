@@ -77,8 +77,23 @@ _ALEMBIC_INI = (
     / "relational"
     / "alembic.ini"
 )
-_HEAD = "b3d47c9a1e02"  # THE REVISION UNDER TEST
+_HEAD = "b3d47c9a1e02"  # THE REVISION UNDER TEST — not necessarily the chain head, see below
 _PRIOR = "9c41d0b7ae52"  # the revision it Revises
+
+#: ⚠ **``_HEAD`` is the revision under test, NOT "whatever alembic's head is today".**
+#:
+#: This file used to assert ``script.get_current_head() == _HEAD`` and, after
+#: ``scratch.upgrade("head")``, ``version() == _HEAD``. Both were true only until the NEXT
+#: migration landed — and one did (``c4a1e07b9d33``, ``acl_entries.permission``), which turned two
+#: assertions about *this* revision into a red test about the calendar. A pin that every future
+#: migration must come back and edit is not testing the revision; it is testing that no one has
+#: written another one. ``test_principal_registry_migration_int.py:45-61`` already records the same
+#: lesson in the opposite direction, and uses alembic's ``"head"`` literal for the same reason.
+#:
+#: What is asserted instead is what this revision actually claims: it chains from ``_PRIOR``, it is
+#: still ON the chain reachable from the current head (a rebase that orphaned it would be a real
+#: defect), and a fresh ``upgrade head`` — what an operator's first deploy runs — lands on the
+#: script directory's own head with this revision's tables and columns present.
 
 _TABLES = ("room_log", "room_session", "room_participant")
 
@@ -271,11 +286,14 @@ async def test_the_revision_chains_from_the_real_head_and_the_whole_chain_applie
     any statement in this revision that a freshly-migrated database rejects.
     """
     script = ScriptDirectory.from_config(scratch.cfg)
-    assert script.get_current_head() == _HEAD, "this revision is no longer the chain head"
+    chain_head = script.get_current_head()
+    assert chain_head is not None
     assert script.get_revision(_HEAD).down_revision == _PRIOR
+    lineage = {revision.revision for revision in script.walk_revisions("base", chain_head)}
+    assert _HEAD in lineage, "this revision has been orphaned from the chain reachable from head"
 
     await scratch.upgrade("head")
-    assert await scratch.version() == _HEAD
+    assert await scratch.version() == chain_head
     assert await scratch.tables() == set(_TABLES)
 
     log = await scratch.columns("room_log")

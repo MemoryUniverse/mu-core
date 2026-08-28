@@ -6,10 +6,12 @@ from pydantic import ValidationError
 from mu_contracts.domain.events import (
     RESERVED_REASONS,
     SYNC_CLASS_ALWAYS,
+    ComposedContextStale,
     DegradedModeEntered,
     DegradeReason,
     DomainEvent,
     MemoryCaptured,
+    RevokeCascadeCompleted,
     RoomMessagePosted,
 )
 from mu_contracts.domain.model import Namespace, Tier, Visibility
@@ -74,3 +76,49 @@ def test_sync_class_and_reserved_sets_are_disjoint() -> None:
     assert SYNC_CLASS_ALWAYS.isdisjoint(RESERVED_REASONS)
     assert DegradeReason.SYNC_STALLED in SYNC_CLASS_ALWAYS
     assert DegradeReason.E2E_NO_SERVER_EMBED in RESERVED_REASONS
+
+
+# ==================================================================================================
+# AD-42 — the cascade receipt's counts have a home on the event
+# ==================================================================================================
+def test_revoke_cascade_completed_carries_the_two_counts_the_receipt_reads() -> None:
+    """``governance-transfer-core-spec.md:762`` and ``design-governance-transfer.puml:659`` both
+    emit ``(root, revoked_count, ack_pending_count, cache_entries_purged)``, and
+    ``trust-ledger-spec.md:366`` requires ``{"revoked","ack_pending","cache_purged"}`` to be
+    DERIVABLE from this event. With the fields absent the producer routed them onto the ledger row
+    instead, so the receipt's ``PARTIAL``/``SETTLED`` honesty depended on a side channel."""
+    ev = RevokeCascadeCompleted(
+        root_grant_id="g1", revoked_count=7, ack_pending_count=1, cache_entries_purged=12
+    )
+    assert (ev.ack_pending_count, ev.cache_entries_purged) == (1, 12)
+
+
+def test_revoke_cascade_completed_counts_default_to_zero_for_existing_producers() -> None:
+    """Zero is the honest reading of what a producer that measures neither reports — and the
+    default is what lets every shipped call site keep constructing unchanged."""
+    ev = RevokeCascadeCompleted(root_grant_id="g1", revoked_count=1)
+    assert (ev.ack_pending_count, ev.cache_entries_purged) == (0, 0)
+
+
+def test_revoke_cascade_completed_refuses_a_negative_count() -> None:
+    """A negative purge count is not a measurement; it is a bug that would flow straight into a
+    signed receipt."""
+    with pytest.raises(ValidationError):
+        RevokeCascadeCompleted(root_grant_id="g1", revoked_count=1, cache_entries_purged=-1)
+
+
+# ==================================================================================================
+# AD-69 — ComposedContextStale (CANONICAL §7.10 G8; spec:476, listed at :875)
+# ==================================================================================================
+def test_composed_context_stale_carries_a_count_and_no_sources() -> None:
+    """Observational by contract: the snapshot stays immutable and no grant is auto-severed, so
+    the event carries the freshness COUNT and no state. A count is content-free (CANONICAL §3)."""
+    ev = ComposedContextStale(composed_id="cmp1", sources_superseded_count=2)
+    assert ev.composed_id == "cmp1"
+    assert ev.sources_superseded_count == 2
+
+
+def test_composed_context_stale_refuses_a_zero_count() -> None:
+    """ "Stale because zero sources went stale" is not a signal, it is noise on the bus."""
+    with pytest.raises(ValidationError):
+        ComposedContextStale(composed_id="cmp1", sources_superseded_count=0)

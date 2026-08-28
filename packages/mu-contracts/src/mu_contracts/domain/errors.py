@@ -15,6 +15,7 @@ from __future__ import annotations
 __all__ = [
     "AuthorizationError",
     "BackendUnavailableError",
+    "BoundaryViolationError",
     "BudgetExceededError",
     "BusUnavailableError",
     "ConflictUnresolvedError",
@@ -28,12 +29,14 @@ __all__ = [
     "IllegalConflictTransitionError",
     "IllegalTransitionError",
     "InvalidBackendError",
+    "InvalidTransferStateError",
     "LlmNotConfiguredError",
     "MandatoryBackendMissingError",
     "MemoryLayerError",
     "MemoryNotFoundError",
     "MemoryUniverseError",
     "NamespaceIsolationError",
+    "PacketExpiredError",
     "PermissionNarrowingError",
     "PinAuthorizationError",
     "PinLimitExceededError",
@@ -44,6 +47,7 @@ __all__ = [
     "PlaneFieldRejectedError",
     "PrivacyTierConflictError",
     "PrivacyTierNotAvailableError",
+    "ProvenanceIntegrityError",
     "ProviderError",
     "ReshareDepthExceededError",
     "RevocationConflictError",
@@ -57,6 +61,8 @@ __all__ = [
     "TierRepositoryUnavailableError",
     "UnknownBackendError",
     "UnknownComponentError",
+    "UnknownPrincipalError",
+    "UnknownRoleError",
     "VectorNotFilterableError",
     "WorkflowUnavailableError",
 ]
@@ -88,9 +94,43 @@ class BackendUnavailableError(MemoryUniverseError):
     """The selected backend's optional extra is not installed (mu-local-and-sdk §)."""
 
 
+# ── governance / transfer — the ONE hierarchy every refusal on this plane hangs from ───────
+#
+# ⚠ **``GovernanceError`` is declared HERE, above the security section, and that placement is the
+# fix, not an accident of ordering (AD-89).** Two authorities disagreed about
+# ``AuthorizationError``'s parent: ``platform-layer0-spec.md:320`` writes
+# ``class AuthorizationError(MemoryUniverseError)`` and
+# ``governance-transfer-core-spec.md:840-870`` writes ``class AuthorizationError(GovernanceError)``
+# inside ONE hierarchy. The shipped code followed the first, so ``AuthorizationError`` and
+# ``RevocationConflictError`` — between them the governance plane's most common refusal and its
+# concurrency refusal — were NOT ``GovernanceError`` subclasses, and a consumer mapping
+# ``GovernanceError`` to an HTTP status caught neither. Every one of those refusals reached a
+# client as a bare 500.
+#
+# The specs are reconciled the ONLY way that loses nothing: ``GovernanceError`` becomes an
+# INTERMEDIATE root, so ``AuthorizationError`` is still a ``MemoryUniverseError`` (layer-0's
+# sentence stays true — it is a strictly weaker claim) and is ALSO a ``GovernanceError``
+# (governance's sentence becomes true). Nothing that caught the old base stops catching it.
+#
+# ⚠ **The blast radius is real and is stated so it is not discovered later:**
+# ``NamespaceIsolationError`` (a.k.a. ``TenancyViolationError``),
+# ``SubModelProviderDisabledError``, ``PrivacyTierNotAvailableError``,
+# ``PrivacyTierConflictError`` and ``HybridMirrorRequiredError`` all descend from
+# ``AuthorizationError`` and therefore become ``GovernanceError`` subclasses too. That is
+# semantically right — each IS a governance refusal — but it makes ORDER load-bearing in any
+# error→status table: ``mu_engine.platform.exceptions._ERROR_TABLE`` is walked in sequence and
+# ``AuthorizationError`` is its FIRST row, so tenancy denials keep collapsing to the
+# non-enumerating ``404 NOT_FOUND`` and a later ``GovernanceError`` row could never shadow them.
+# **Any table that adds a ``GovernanceError`` row MUST keep it BELOW ``AuthorizationError``**, or
+# a probe regains the ability to tell "denied" from "absent".
+class GovernanceError(MemoryUniverseError):
+    """Base of the governance/transfer errors (governance-transfer-core-spec §13)."""
+
+
 # ── security ───────────────────────────────────────────────────────────────────────────────
-class AuthorizationError(MemoryUniverseError):
-    """Base for every authorization denial (platform-layer0-spec §6)."""
+class AuthorizationError(GovernanceError):
+    """Base for every authorization denial (platform-layer0-spec §6; re-parented under
+    :class:`GovernanceError` per governance-transfer-core-spec §13 — see the note above)."""
 
 
 class NamespaceIsolationError(AuthorizationError):
@@ -121,8 +161,14 @@ class HybridMirrorRequiredError(AuthorizationError):
     (sync-devices-gateway §A.5)."""
 
 
-class RevocationConflictError(MemoryUniverseError):
-    """A concurrent revoke lost a compare-and-set (sync-devices-gateway §A.5)."""
+class RevocationConflictError(GovernanceError):
+    """A concurrent revoke lost a compare-and-set (sync-devices-gateway §A.5).
+
+    Re-parented under :class:`GovernanceError` (AD-89): ``governance-transfer-core-spec.md:850``
+    lists it in the governance hierarchy and maps it to ``409``. It sat directly under
+    ``MemoryUniverseError``, so the one refusal a revoke cascade races on was invisible to a
+    governance handler — a bare 500 on the exact path whose whole promise is a receipt.
+    """
 
 
 # ── infra ──────────────────────────────────────────────────────────────────────────────────
@@ -295,11 +341,8 @@ class PinnedTransitionBlocked(IllegalTransitionError):  # noqa: N818
     """
 
 
-# ── governance / transfer (governance-transfer-core §7) ──────────────────────────────────────
-class GovernanceError(MemoryUniverseError):
-    """Base of the governance/transfer errors."""
-
-
+# ── governance / transfer (governance-transfer-core §13) ─────────────────────────────────────
+# ``GovernanceError`` itself is declared ABOVE the security section — see the note there.
 class GrantNotFoundError(GovernanceError):
     """A grant id does not resolve."""
 
@@ -318,6 +361,59 @@ class PermissionNarrowingError(GovernanceError):
 
 class ReshareDepthExceededError(GovernanceError):
     """A re-share exceeded ``policy.max_reshare_depth``."""
+
+
+# The six §13 refusals that were declared in the spec and existed in NO repo (AD-69). Until they
+# landed here the transfer plane declared them locally, which put six members of a "single"
+# hierarchy behind the commercial boundary where no open-plane caller could name them.
+class BoundaryViolationError(GovernanceError):
+    """A PRIVATE object crossed, or was about to cross, into the shared plane — or a shared write
+    was routed at a private store (``BoundaryGuard.assert_shareable`` /
+    ``assert_shared_plane_target``, spec:840-848).
+
+    **FAIL LOUD, never a filter.** This is the one boundary the whole two-plane split exists to
+    hold: a silent drop here would look identical to "nothing to share" while the object had
+    already been classified for transit.
+    """
+
+
+class ProvenanceIntegrityError(GovernanceError):
+    """A provenance-ledger version or hash conflict — an append whose ``expected_version`` did not
+    match the stream head, or a chain that does not fold (spec:849).
+
+    The ledger is append-only and per-stream monotonic; a version conflict means two writers
+    believed they held the same head, and accepting either would produce an audit chain that
+    silently lost a fact.
+    """
+
+
+class InvalidTransferStateError(GovernanceError):
+    """An illegal ``ContextPacket`` FSM edge (spec:851; ``409``). The legal edges are the ONLY
+    edges — a guard rejects everything else rather than tolerating a state the receipt path
+    cannot explain."""
+
+
+class PacketExpiredError(GovernanceError):
+    """A packet was advanced after ``expires_at`` (spec:852; ``409``).
+
+    Distinct from :class:`InvalidTransferStateError` on purpose: the requested EDGE was legal and
+    the CLOCK refused it, and a caller that cannot tell those apart cannot tell "you may not do
+    this" from "you are too late".
+    """
+
+
+class UnknownPrincipalError(GovernanceError):
+    """A grant, ACL row or role membership named a principal that does not resolve (spec:853)."""
+
+
+class UnknownRoleError(GovernanceError):
+    """A role grant or membership named a role that does not resolve (spec:854).
+
+    Separate from :class:`UnknownPrincipalError` because the accept-time explosion (§3) treats the
+    two differently: an unknown PRINCIPAL yields no ACL row, while an unknown ROLE would silently
+    yield ZERO rows for a grant that looked issued — an access that appears granted and grants
+    nothing.
+    """
 
 
 # ── storage-pluggable build-time refusals (fail-loud, storage-pluggable §7) ──────────────────
