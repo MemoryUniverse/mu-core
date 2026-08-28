@@ -62,7 +62,13 @@ from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
-from tests.pipelines.test_distill_llm_slm_int import _SLM_CFG, _SLM_UP, _build_slm_catalog
+
+# RELATIVE, on purpose. This line used to read
+# ``from tests.pipelines.test_distill_llm_slm_int import ...`` and it broke the ENTIRE suite
+# whenever the repo root was on ``sys.path`` (e.g. ``python -m pytest``): pytest then names
+# every module ``packages.mu-engine.tests...``, ``tests`` is not a top-level module, and
+# collection is Interrupted with ZERO tests run. See ``_slm_support`` for the measurement.
+from ._slm_support import _SLM_CFG, _SLM_UP, _build_slm_catalog
 
 pytestmark = [
     pytest.mark.integration,

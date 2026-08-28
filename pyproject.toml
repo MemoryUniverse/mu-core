@@ -55,7 +55,13 @@ dev = [
 # gate's dependency for everyone who actually runs the gate (infra/mu-vm/vm_test.sh does exactly
 # this for mu-core, so the VM gate run never skips F1/F3 again).
 acceptance = [
-    "mu-sdk[embedded]",
+    # Bounded like every other in-project edge (OSS-GATE-0828). This one matters MORE than the
+    # others, not less: `mu-sdk` is the ONE in-project distribution name that is already TAKEN on
+    # PyPI (mu-sdk 0.0.3, "ss-panel mu api sdk for python", uploaded 2016-12-15, single release,
+    # ships no importable module). The `[tool.uv.sources]` entry above keeps this edge bound to
+    # the sibling checkout, and a sibling-less `uv sync --group acceptance` FAILS loudly rather
+    # than silently resolving the 2016 stranger — verified 2026-08-28, OSS-GATE-0828.md §4.
+    "mu-sdk[embedded]>=0.1.0,<0.2.0",
 ]
 
 # ----------------------------------------------------------------------------

@@ -1,0 +1,280 @@
+# mu-core CI — the gates DEV-STANDARDS calls CI-blocking, and nothing that is not real.
+#
+# Every command below was run against a clean clone of this repo (plus the two sibling SDK
+# checkouts the drift gate needs) before this file was written. The evidence for each is quoted in
+# .github/CONTRIBUTING.md § "What CI actually runs".
+#
+# WHY THE `gates` JOB CHECKS OUT THREE REPOSITORIES.
+#   `packages/mu-contracts/tests/test_sdk_wire_parity.py` is the SDK-drift gate: it is the only
+#   thing anywhere that verifies `mu-sdk-python` and `mu-sdk-js` still declare the wire vocabulary
+#   `mu-contracts` defines. Both SDKs are SIBLING repositories, and the gate SKIPS when they are not
+#   on disk. Until this workflow checked them out it took three green SKIPS on every single run —
+#   a gate that reads as coverage and gates nothing, which is worse than no gate at all.
+#   MEASURED, bare checkout: `3 skipped in 0.48s`, exit 0, with real drift planted in the SDK.
+#   The two SDK repos are READ AS SOURCE TEXT only (the checker is an `ast`/regex parser); nothing
+#   here installs or imports them, so this does NOT weaken mu-core's "depends on nothing" promise —
+#   `uv sync --locked` below is unchanged and still resolves without either sibling.
+#   Both siblings are PUBLIC (verified: `gh repo view MemoryUniverse/mu-sdk-python --json
+#   visibility` -> PUBLIC), so the default GITHUB_TOKEN can read them.
+#
+#   And because a checkout can silently stop happening, the gate is ALSO run two ways that cannot
+#   skip: the standalone `scripts/wire_contract.py check-sdks`, which treats an absent sibling as a
+#   FAILURE, and an explicit zero-skips assertion over the parity module's own JUnit report.
+#
+# What is deliberately NOT here, and why (see CONTRIBUTING.md § "What CI does not run"):
+#   * the `integration` marker — it needs real Valkey / Qdrant / FalkorDB / Postgres
+#     (DEV-STANDARDS: "INTEGRATION TESTS USE THE REAL SYSTEM — ZERO MOCKS"). Those run on the
+#     dev VM via infra/mu-vm/vm_test.sh, not on a GitHub runner. They are deselected here, never
+#     mocked and never weakened.
+#   * the dependency vuln + license scan DEV-STANDARDS asks for — it does not pass today and a
+#     gate that is red on day one teaches people to ignore CI. Tracked, not faked.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "dev/**"
+  workflow_dispatch:
+
+# One in-flight run per ref. A superseded push stops burning a runner.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only by default: nothing in this workflow writes to the repo or publishes anything.
+permissions:
+  contents: read
+
+env:
+  # Pin the toolchain driver itself, not just the dependency tree: a uv upgrade that changes
+  # resolution must be a visible one-line diff, not a silent Tuesday.
+  UV_VERSION: "0.8.13"
+  # The SDKs' integration trunk, which is not their GitHub default branch (`main` is behind it).
+  # This is the branch the drift gate is meaningful against: pointing it at `main` would compare
+  # mu-core's tip contract against an SDK nobody is developing. One line to change on the day that
+  # trunk merges down.
+  MU_SDK_REF: dev/sdk-build
+
+jobs:
+  gates:
+    name: gates
+    runs-on: ubuntu-latest
+    # A cold run installs the full engine dependency tree (torch via sentence-transformers) and
+    # runs mypy over 238 files: measured ~4 min for mypy alone on a warm cache.
+    timeout-minutes: 45
+    steps:
+      # Must land at $GITHUB_WORKSPACE/mu-core: `scripts/wire_contract.py` addresses the siblings as
+      # `<repo>/../mu-sdk-python` and `<repo>/../mu-sdk-js`.
+      - name: Checkout mu-core
+        uses: actions/checkout@v7
+        with:
+          path: mu-core
+
+      - name: Checkout mu-sdk-python (sibling — the SDK-drift gate reads it)
+        uses: actions/checkout@v7
+        with:
+          repository: MemoryUniverse/mu-sdk-python
+          ref: ${{ env.MU_SDK_REF }}
+          path: mu-sdk-python
+
+      - name: Checkout mu-sdk-js (sibling — the SDK-drift gate reads it)
+        uses: actions/checkout@v7
+        with:
+          repository: MemoryUniverse/mu-sdk-js
+          ref: ${{ env.MU_SDK_REF }}
+          path: mu-sdk-js
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          working-directory: mu-core
+          cache-dependency-glob: uv.lock
+
+      # --locked, not a bare sync: a pyproject edit that never re-locked is itself a defect, and
+      # this is the only place it gets caught. The `acceptance` group is NOT installed — it is a
+      # path dep on the sibling mu-sdk-python repo, and mu-core must keep resolving without it.
+      # (The sibling is now on disk, which is exactly why the group must STAY non-default: this
+      # step is the proof that a standalone clone of the OPEN repo still installs.)
+      - name: Install (locked)
+        working-directory: mu-core
+        run: uv sync --locked
+
+      # --no-sync on every tool call below: `uv run` will otherwise re-sync the environment and
+      # can silently fall back to a *different*, unpinned tool version. Verified: without it,
+      # `uv run ruff` resolved 0.15.10 in a sibling repo whose dev extra was not installed and
+      # reported format diffs the pinned ruff 0.8.6 does not report.
+      - name: ruff (lint)
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: uv run --no-sync ruff check .
+
+      - name: ruff-format (format)
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: uv run --no-sync ruff format --check .
+
+      - name: import-linter (package boundaries)
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: uv run --no-sync lint-imports
+
+      # Explicit source roots: mypy is configured strict here, and pointing it at `.` would drag
+      # in tests and the migration env under the same strict settings.
+      - name: mypy --strict
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: >-
+          uv run --no-sync mypy
+          packages/mu-contracts/src
+          packages/mu-engine/src
+          packages/mu-local/src
+          packages/mu-engine-server/src
+
+      # THE SDK-DRIFT GATE, run the way that CANNOT skip. `check-sdks` reports an absent sibling as
+      # a FAILURE naming the path it looked in, so if either checkout above is ever removed,
+      # renamed or pointed at a dead ref, this step goes red instead of the suite going quietly
+      # green. MEASURED against a bare checkout: exit 1, "mu-sdk-python not found at ... — the
+      # sibling repo must be checked out for this gate to mean anything."
+      - name: SDK drift (standalone checker — an absent sibling is a FAILURE, not a skip)
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: uv run --no-sync python scripts/wire_contract.py check-sdks --verbose
+
+      # And the pytest half, with the skip made loud. The parity module's own JUnit report is
+      # asserted to contain ZERO skipped tests: the exact state this workflow silently produced on
+      # every run before the sibling checkouts existed. `tests` is not pinned to a number — the
+      # module is still growing — but zero collected is also a failure, because a module that
+      # collects nothing is another way to be green while proving nothing.
+      - name: SDK drift (pytest — and it must RUN, not skip)
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: |
+          uv run --no-sync pytest packages/mu-contracts/tests/test_sdk_wire_parity.py \
+            -q -p no:cacheprovider --junit-xml=sdk-parity.xml
+          python3 - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("sdk-parity.xml").getroot()
+          suites = root.findall("testsuite") or [root]
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          sys.stdout.write(f"SDK-drift gate: {tests} test(s) collected, {skipped} skipped\n")
+          if tests == 0:
+              sys.exit("THE SDK-DRIFT GATE COLLECTED NOTHING — it is not gating anything.")
+          if skipped:
+              sys.exit(
+                  f"THE SDK-DRIFT GATE SKIPPED {skipped} of {tests} test(s). A skip here means a "
+                  "sibling SDK checkout is missing, so the drift comparison did not happen and "
+                  "this run's green says nothing about the SDKs. Fix the checkout — never the "
+                  "assertion."
+              )
+          PY
+
+      # COLLECTION INTEGRITY, run under the OTHER sys.path shape — the one a plain `pytest` never
+      # exercises, and the one that took the whole suite down without a single test failing.
+      #
+      # The root `pyproject.toml` sets `--import-mode=importlib` AND
+      # `consider_namespace_packages = true`. Together those make the module NAME pytest gives a
+      # test file a function of `sys.path`, not of the repo. MEASURED on a clean checkout at
+      # be70c3d, on `packages/mu-engine/tests/pipelines/test_conflict_adjudicator_int.py`, via
+      # `_pytest.pathlib.resolve_pkg_root_and_module_name(..., consider_namespace_packages=True)`:
+      #   repo root NOT on sys.path (`pytest`)     -> `tests.pipelines.test_conflict_adjudicator_int`
+      #   repo root ON sys.path (`python -m pytest`) -> `packages.mu-engine.tests.pipelines.<same>`
+      # Under the second name `tests` is not a top-level module, so that file's absolute
+      # `from tests.pipelines.test_distill_llm_slm_int import ...` raised
+      # `ModuleNotFoundError: No module named 'tests'`, pytest reported
+      # `Interrupted: 1 error during collection`, and the run ended `1 skipped, 266 deselected,
+      # 1 error` — ZERO tests executed, on a repo that is PUBLIC. The step below is exactly the
+      # command that produced that; it is here so the shape can never regress unobserved again.
+      # Collection-only (no store, no network): ~80 s, and it imports every test module in the repo,
+      # `integration` ones included, which `-m "not integration"` does too but only after the fact.
+      - name: pytest collection (python -m — the sys.path shape a plain `pytest` never covers)
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: uv run --no-sync python -m pytest --collect-only -q -p no:cacheprovider
+
+      # The whole container-free tier, not just `-m unit`: 71 tests carry neither marker, and
+      # `-m unit` would have silently skipped them. Measured on a clean clone: 1546 passed,
+      # 1 skipped, 274 deselected.
+      #
+      # AND THE RESULT IS ASSERTED, not read. pytest's own summary for a dead run is
+      # `1 skipped, 266 deselected, 1 error` — a line that scans like a healthy deselect count, and
+      # two review lanes did read it that way. The exit code was always 2, but nothing in this
+      # workflow ever said out loud how many tests actually RAN. Now something does: same
+      # JUnit-report idiom as the SDK-drift gate above.
+      - name: pytest (everything that does not need a real store)
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: |
+          uv run --no-sync pytest -m "not integration" \
+            -p no:cacheprovider --junit-xml=pytest-container-free.xml
+          python3 - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # A floor, not the exact count — the suite grows, and pinning it would turn every added
+          # test into a CI edit. 1546 ran when this was written; 1400 leaves normal churn alone
+          # while still catching a whole package or testpath that quietly stopped collecting.
+          FLOOR = 1400
+
+          root = ET.parse("pytest-container-free.xml").getroot()
+          suites = root.findall("testsuite") or [root]
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          ran = tests - skipped
+          sys.stdout.write(
+              f"container-free tier: {ran} test(s) RAN "
+              f"({tests} collected, {skipped} skipped, {failures} failed, {errors} errored)\n"
+          )
+          if errors:
+              sys.exit(
+                  f"{errors} COLLECTION/SETUP ERROR(S). A module that cannot be imported is not a "
+                  "test that passed — pytest aborts the session and every remaining test goes "
+                  "unrun. Fix the import; never delete the module to get green."
+              )
+          if ran < FLOOR:
+              sys.exit(
+                  f"ONLY {ran} test(s) RAN, floor is {FLOOR}. The suite did not shrink by itself: "
+                  "something stopped being collected (an aborted session, a dropped testpath, a "
+                  "marker that now deselects more than it should). Find what vanished — do not "
+                  "lower the floor to match it."
+              )
+          PY
+
+  build:
+    name: build (sdist + wheel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # No sibling checkout here on purpose: `uv build` does not resolve dependencies, and this job
+      # is also the standing proof that the OPEN repo builds entirely on its own.
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      # The four OPEN distributions this repo ships. This is the packaging half of the
+      # open-source gate: if a wheel cannot be built here, it cannot be published anywhere.
+      - name: uv build --all-packages
+        run: uv build --all-packages
+
+      - name: Show what was built
+        run: ls -l dist/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14

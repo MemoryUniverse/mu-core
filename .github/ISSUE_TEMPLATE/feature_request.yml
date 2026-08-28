@@ -1,0 +1,54 @@
+name: Feature request or design question
+description: Something mu-core should do, or a decision that looks wrong from outside.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repo is built against a design set that is not public yet, so a change that looks
+        obviously right from outside may contradict a recorded decision. Describing the **problem**
+        rather than the patch gives a maintainer room to tell you which.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that mu-core makes hard or impossible? Concrete beats general.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today instead
+      description: The workaround, if there is one, and what it costs you.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you think should happen
+      description: Optional. If you have an API or a shape in mind, sketch it.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Where does this belong
+      description: >
+        mu-core is the fully-open, on-device half: the complete engine, at good quality, with no
+        server involved. Anything that only exists because other people, devices or tenants are
+        involved lives in the hosted plane and is not in this repo.
+      options:
+        - Single-user, on-device — belongs in mu-core
+        - Involves other people, devices or tenants — probably not mu-core
+        - Not sure
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Are you offering to build it
+      options:
+        - label: I would be willing to open a PR for this if a maintainer agrees with the shape.

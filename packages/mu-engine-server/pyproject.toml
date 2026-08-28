@@ -15,9 +15,22 @@ description = "Memory Universe — mu-engine-server: thin single-tenant HTTP ser
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 readme = "README.md"
+# No "License ::" trove classifier on purpose: PEP 639 replaced it with the `license` expression
+# above, and declaring both is the deprecated form.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
 dependencies = [
-    "mu-contracts",
-    "mu-engine",
+    # BOUNDED, not bare (OSS-GATE-0828): `[tool.uv.sources]` in the workspace root is a dev-only
+    # override that never reaches wheel metadata, so a bare name published this distribution with
+    # "any mu-contracts/mu-engine ever released will do" as its compatibility statement. The four
+    # mu-core distributions version in lockstep — the 0.1.x line.
+    "mu-contracts>=0.1.0,<0.2.0",
+    "mu-engine>=0.1.0,<0.2.0",
     # HTTP layer (design §2.3/§7.1: thin FastAPI/uvicorn wrapper; C2 route layer, C3 auth dependency).
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.32,<1",
@@ -27,6 +40,14 @@ dependencies = [
     # EngineServerApp) imports it directly, not just transitively.
     "redis>=5.2,<6",
 ]
+
+# Open-source metadata (OSS-GATE-0828): a distribution page with no link back to the source, the
+# tracker or the license text is not an open-source release. mu-core ships FOUR distributions from
+# ONE repo, so Repository points at the repo and the package is identified by its subdirectory.
+[project.urls]
+Homepage = "https://github.com/MemoryUniverse"
+Repository = "https://github.com/MemoryUniverse/mu-core"
+Issues = "https://github.com/MemoryUniverse/mu-core/issues"
 
 [build-system]
 requires = ["hatchling"]

@@ -165,8 +165,19 @@ dedicated `mu-dev-*` stack) — for example `tests/storage/test_graph_falkor_int
 
 ## Quickstart
 
+> **Clone `dev/mlm-build`, not the default branch.** GitHub's default branch here is `main`, and
+> `main` is stale in a way no install tool will warn you about — `uv sync` exits `0` on it. Two
+> concrete things are missing there: `mu_contracts.contracts` is still the empty scaffold
+> (`__init__.py` and nothing else), so `import mu_contracts.contracts.recall` raises
+> `ModuleNotFoundError`; and `packages/mu-engine-server/` does not exist at all, so the `make up`
+> block further down is a `cd: no such file or directory`. Anything built on a `main` clone —
+> `mu-client`, `mu-sdk-python` — therefore installs cleanly and then crashes on its first command.
+> `dev/mlm-build` is the trunk this README describes and every command here is verified against it.
+> Landing trunk on `main` is the real fix and is pending an owner decision; until it lands, `-b` is
+> not optional.
+
 ```bash
-git clone https://github.com/MemoryUniverse/mu-core
+git clone -b dev/mlm-build https://github.com/MemoryUniverse/mu-core
 cd mu-core
 uv sync --group dev
 
@@ -185,7 +196,7 @@ async def main() -> None:
         await memory.add("The staging DB migration runs Tuesdays at 02:00 UTC.")
         result = await memory.recall("when does the migration run?")
         for item in result.items:
-            print(item.score, item.tier, item.content)
+            print(item.fused_score, item.tier, item.content)
 
 asyncio.run(main())
 ```
@@ -201,6 +212,26 @@ not optional** — `StoreRegistry.assert_mandatory_roles` refuses to build a con
 `graph` or `relational` unbound, so `uv sync` alone is not enough and the `docker compose` line
 above is the prerequisite, not a nicety. What you do *not* need is a cloud account, an API key, or
 any Memory Universe server.
+
+**Using `mu-core` from another project.** Nothing here is published to a registry yet — the four
+distributions (`mu-contracts`, `mu-engine`, `mu-local`, `mu-engine-server`) exist only in this
+repo. A `uv sync` inside a fresh `mu-core` clone needs no sibling and no registry, but consuming
+the engine *from your own project* currently takes explicit git URLs:
+
+```bash
+uv pip install \
+  "mu-contracts @ git+https://github.com/MemoryUniverse/mu-core@dev/mlm-build#subdirectory=packages/mu-contracts" \
+  "mu-engine    @ git+https://github.com/MemoryUniverse/mu-core@dev/mlm-build#subdirectory=packages/mu-engine" \
+  "mu-local     @ git+https://github.com/MemoryUniverse/mu-core@dev/mlm-build#subdirectory=packages/mu-local"
+```
+
+The `@dev/mlm-build` in each URL is load-bearing for the same reason the `-b` above is: drop it and
+uv resolves the stale default branch, installs 100-odd packages without complaint, and leaves you
+with a `mu_contracts` that has no `contracts.recall` to import.
+
+Naming all three is required: each one's metadata refers to the others by name, and with nothing
+published under those names a resolver has nowhere else to look. (`mu-core` itself is a *virtual*
+uv workspace root, not a distribution — there is no `pip install mu-core`.)
 
 Prefer HTTP? `mu-engine-server` is the same engine behind a small FastAPI surface:
 

@@ -8,10 +8,27 @@ description = "Memory Universe — shared wire vocabulary: domain models, event 
 requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 readme = "README.md"
+# No "License ::" trove classifier on purpose: PEP 639 replaced it with the `license` expression
+# above, and declaring both is the deprecated form.
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Typing :: Typed",
+]
 dependencies = [
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3",
 ]
+
+# Open-source metadata (OSS-GATE-0828): a distribution page with no link back to the source, the
+# tracker or the license text is not an open-source release. mu-core ships FOUR distributions from
+# ONE repo, so Repository points at the repo and the package is identified by its subdirectory.
+[project.urls]
+Homepage = "https://github.com/MemoryUniverse"
+Repository = "https://github.com/MemoryUniverse/mu-core"
+Issues = "https://github.com/MemoryUniverse/mu-core/issues"
 
 [build-system]
 requires = ["hatchling"]

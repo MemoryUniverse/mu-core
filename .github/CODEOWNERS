@@ -1,0 +1,19 @@
+# Code owners for mu-core.
+#
+# GitHub requests a review from the owner of every path a pull request touches. An entry naming an
+# account without write access to this repository is silently IGNORED by GitHub — no warning, no
+# review request — so this file lists only accounts verified to exist and to have landed commits
+# here. Add teams (@MemoryUniverse/<team>) as they are created; do not add a name speculatively,
+# because an ignored line looks exactly like a working one.
+
+# Everything, by default.
+*                                   @TRextabat
+
+# The wire vocabulary: every change here is a contract change for four repositories at once.
+/packages/mu-contracts/              @TRextabat
+
+# The package boundaries and the CI gates that enforce them.
+/.importlinter                       @TRextabat
+/.github/                            @TRextabat
+/pyproject.toml                      @TRextabat
+/uv.lock                             @TRextabat

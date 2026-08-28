@@ -1,0 +1,13 @@
+# Templates only — a blank issue with no context costs a maintainer a round-trip to learn what
+# the two forms already ask for.
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/MemoryUniverse/mu-core/security/advisories/new
+    about: Report privately. Never in a public issue.
+  - name: How to contribute, and what the gates are
+    url: https://github.com/MemoryUniverse/mu-core/blob/HEAD/.github/CONTRIBUTING.md
+    about: Setup, the exact commands CI runs, and what CI deliberately does not run.
+  - name: Memory Universe
+    url: https://github.com/MemoryUniverse
+    about: The other repositories — the client, and the two SDKs.

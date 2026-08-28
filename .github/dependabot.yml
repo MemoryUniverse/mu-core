@@ -1,0 +1,21 @@
+# Dependabot — GitHub Actions only, deliberately.
+#
+# The Python dependency tree here is resolved by uv and pinned in uv.lock, and it is reached
+# through cross-repo path dependencies that Dependabot cannot see; a per-package PR against this
+# repo would be noise that another repo's lockfile immediately contradicts. Dependency updates are
+# done with `uv lock --upgrade` and reviewed as one change.
+#
+# Action versions are the opposite case: they are pinned by tag in one small file, an out-of-date
+# action is a real supply-chain exposure, and the update is a one-line diff CI can verify.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - dependencies
+      - ci
+    open-pull-requests-limit: 3
