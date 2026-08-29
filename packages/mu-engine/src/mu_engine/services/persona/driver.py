@@ -41,6 +41,15 @@ NAMED ``DegradedModeEntered`` plus a log line — the same shape ``PersonaServic
 ``lifecycle/conflict.py:434-461`` already use. This is containment, never a silent swallow: the
 degrade is observable, counted, and carries the exception TYPE (never its message, which could
 carry memory content).
+
+**Containment must not FLATTEN the name, which is the correction this module carries.** A single
+catch-all mapped every cause to one reason, so the one failure persona actually hits in production
+— the slot classifier answering with a vocabulary it invented, measured to happen for 3 of the 24
+orderings of a four-memory partition on the deployed 0.5B model — would have been reported to an
+operator as ``llm_unavailable_heuristic``: go and look at a model that is configured, up, and
+replying. Errors that know their own degrade (:class:`~mu_engine.services.persona.reader.
+PersonaDegradeError`) now carry ``reason`` and ``mode`` with them, and this class emits what the
+error says rather than what the ``except`` clause assumed.
 """
 
 from __future__ import annotations
@@ -59,6 +68,7 @@ from mu_contracts.domain.events import (
 from mu_contracts.domain.model.memory import Namespace, Visibility
 from mu_contracts.domain.model.scope import ClientScope
 from mu_engine.pipelines.distill import EventPublisher
+from mu_engine.services.persona.reader import PersonaDegradeError
 from mu_engine.services.persona.service import PersonaService
 from mu_engine.services.persona.settings import PersonaSettings
 from mu_engine.services.persona.store import persona_key
@@ -68,8 +78,9 @@ __all__ = ["PersonaBusBridge", "PersonaSweeper", "internal_persona_scope"]
 _log = structlog.get_logger("mu_engine.services.persona.driver")
 
 _DEGRADE_COMPONENT = "persona"
+#: The mode/reason for a sweep failure whose cause has no name of its own — a store timeout, a
+#: version conflict, anything the subsystem did not anticipate.
 _DEGRADE_MODE = "persona_sweep_failed"
-#: Same closest-existing member, same recorded gap, as ``PersonaService._DEGRADE_REASON``.
 _DEGRADE_REASON = DegradeReason.LLM_UNAVAILABLE_HEURISTIC
 
 
@@ -167,6 +178,11 @@ class PersonaSweeper:
                 await self._service.refresh(scope, ns)
         except asyncio.CancelledError:
             raise
+        except PersonaDegradeError as exc:
+            # A failure that already KNOWS its name. Containment must not flatten it: an operator
+            # alerting on `llm_unavailable_heuristic` would go hunting for an unconfigured model
+            # while the configured one sat there answering with a vocabulary of its own invention.
+            await self._degrade(ns, detail=type(exc).__name__, mode=exc.mode, reason=exc.reason)
         except Exception as exc:
             await self._degrade(ns, detail=type(exc).__name__)
 
@@ -180,19 +196,24 @@ class PersonaSweeper:
         self._ticks[key] = index + 1
         return index
 
-    async def _degrade(self, ns: Namespace, *, detail: str) -> None:
+    async def _degrade(
+        self,
+        ns: Namespace,
+        *,
+        detail: str,
+        mode: str = _DEGRADE_MODE,
+        reason: DegradeReason = _DEGRADE_REASON,
+    ) -> None:
         # Content-free: a namespace prefix, an enum and an exception TYPE — never its message,
         # which can carry memory content.
-        _log.warning(
-            "persona_sweep_degraded", ns=persona_key(ns), reason=_DEGRADE_REASON, detail=detail
-        )
+        _log.warning("persona_sweep_degraded", ns=persona_key(ns), reason=reason, detail=detail)
         if self._bus is None:
             return
         await self._bus.publish(
             DegradedModeEntered(
                 component=_DEGRADE_COMPONENT,
-                mode=_DEGRADE_MODE,
-                reason=_DEGRADE_REASON,
+                mode=mode,
+                reason=reason,
                 detail=detail,
             )
         )

@@ -384,6 +384,7 @@
         "conflict_pending_suppressed",
         "conflict_manual_backlog",
         "mtm_invalidate_point_absent",
+        "persona_tagger_unusable",
         "trust_ledger_unavailable",
         "offline_failover_not_consented"
       ],

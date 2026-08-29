@@ -24,6 +24,7 @@ import pytest
 from mu_contracts.domain.events import (
     ConsolidationCompleted,
     DegradedModeEntered,
+    DegradeReason,
     MemoryPromoted,
     SleeptimeTick,
 )
@@ -33,6 +34,7 @@ from mu_engine.services.persona.driver import (
     PersonaSweeper,
     internal_persona_scope,
 )
+from mu_engine.services.persona.reader import PersonaTaggerUnusableError
 from mu_engine.services.persona.service import PersonaService
 from mu_engine.services.persona.settings import PersonaSettings
 
@@ -258,3 +260,50 @@ def test_datetime_is_not_needed_here() -> None:
     source = inspect.getsource(PersonaSweeper)
     assert "datetime" not in source
     assert datetime is datetime
+
+
+async def test_a_failure_that_knows_its_name_is_emitted_under_that_name(ns: Namespace):
+    """Containment must not FLATTEN the reason — this is the assertion that the operator's alert
+    points at the right thing.
+
+    A single catch-all mapped every cause to ``llm_unavailable_heuristic``, which says *no model
+    is configured and a deterministic path took over*. The failure persona actually hits is the
+    opposite: the classify model is configured, up, and replying — with slot names it invented
+    (MEASURED: 3 of the 24 orderings of a four-memory partition on `qwen2.5:0.5b`). An operator
+    paged with the wrong reason goes looking at a healthy model layer while the persona subsystem
+    quietly writes nothing.
+
+    Delete the ``except PersonaDegradeError`` clause and this goes RED on both fields, while the
+    containment test above stays green — which is exactly the gap that shipped.
+    """
+
+    class Unusable(SpyService):
+        async def rebuild(self, scope: object, ns: Namespace) -> None:
+            raise PersonaTaggerUnusableError(rows=4, batches=1)
+
+    bus = RecordingBus()
+    sweeper = PersonaSweeper(service=Unusable(), bus=bus)  # type: ignore[arg-type]
+
+    await sweeper.on_sleeptime(SleeptimeTick(namespace=ns))
+
+    degrades = [e for e in bus.events if isinstance(e, DegradedModeEntered)]
+    assert [(d.component, d.mode, d.reason, d.detail) for d in degrades] == [
+        (
+            "persona",
+            "persona_no_usable_tags",
+            DegradeReason.PERSONA_TAGGER_UNUSABLE,
+            "PersonaTaggerUnusableError",
+        )
+    ]
+
+
+async def test_a_named_persona_failure_still_never_reaches_the_publisher(ns: Namespace):
+    """The named path is still CONTAINMENT: ``consolidate()`` must not fail because a 0.5B model
+    answered badly."""
+
+    class Unusable(SpyService):
+        async def rebuild(self, scope: object, ns: Namespace) -> None:
+            raise PersonaTaggerUnusableError(rows=4, batches=1)
+
+    sweeper = PersonaSweeper(service=Unusable(), bus=RecordingBus())  # type: ignore[arg-type]
+    await sweeper.on_sleeptime(ConsolidationCompleted(namespace=ns, facts_n=1, superseded_n=0))

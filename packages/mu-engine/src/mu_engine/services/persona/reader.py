@@ -61,6 +61,8 @@ from typing import Protocol, runtime_checkable
 import structlog
 from pydantic import BaseModel, ConfigDict, Field
 
+from mu_contracts.domain.errors import MemoryUniverseError
+from mu_contracts.domain.events import DegradeReason
 from mu_contracts.domain.model.memory import MemoryItem, Namespace, State, Tier
 from mu_contracts.domain.model.persona import PersonaSlot
 from mu_engine.providers._contracts import Message, MessageRole
@@ -73,8 +75,10 @@ from mu_engine.services.persona.synthesizer import PersonaSynthesisPort
 __all__ = [
     "ClassifierSlotTagger",
     "PartitionPersonaEvidenceReader",
+    "PersonaDegradeError",
     "PersonaPartitionReader",
     "PersonaSlotTagger",
+    "PersonaTaggerUnusableError",
     "SlotTag",
 ]
 
@@ -91,6 +95,63 @@ _EVIDENCE_TIERS: frozenset[Tier] = frozenset({Tier.MTM, Tier.LTM})
 #: engine has already decided no longer holds (invalidate-don't-delete, memory-layer §7.3), and
 #: §3.3's supersession rule would be defeated if the loser kept voting for its slot.
 _EVIDENCE_STATES: frozenset[State] = frozenset({State.ACTIVE})
+
+
+class PersonaDegradeError(MemoryUniverseError):
+    """A persona failure that already KNOWS which named degrade it is.
+
+    Persona is an optional voice/relevance subsystem that runs on the sleep-time stack, so its
+    failures are CONTAINED by :class:`~mu_engine.services.persona.driver.PersonaSweeper` rather
+    than allowed to fail a user's ``consolidate()``. Containment is where the
+    ``DegradedModeEntered`` is emitted — and containment that flattened every cause to one reason
+    would be the silent failure wearing a name: an operator alerting on
+    ``llm_unavailable_heuristic`` would go looking for an unconfigured model that is configured
+    and answering.
+
+    So the reason travels ON the exception, from the layer that knows it to the layer that emits
+    it. The sweeper reads :attr:`reason` and :attr:`mode` off this type instead of guessing, and
+    a subclass cannot ship without naming both.
+
+    **Placement delta (recorded), same one ``PersonaVersionConflictError`` records.** CANONICAL
+    §7.27 puts named errors in ``mu_contracts.domain.errors``; that file is shared and outside
+    this lane's ownership, so this hierarchy is declared beside its raiser — the shape
+    ``mu_engine.providers._contracts`` uses for ``ModelLayerError``.
+    """
+
+    #: The closed-union member an operator sees. Subclasses MUST override.
+    reason: DegradeReason = DegradeReason.LLM_UNAVAILABLE_HEURISTIC
+    #: ``DegradedModeEntered.mode`` — the NAMED degraded path, free text by design (CANONICAL §2).
+    mode: str = "persona_degraded"
+
+
+class PersonaTaggerUnusableError(PersonaDegradeError):
+    """The classifier ANSWERED, and not one verdict in the answer was usable.
+
+    This is the defect this class exists to make impossible to ship silently, and it was a real
+    one: on a real container the sweep logged ``persona_tag_rows_dropped batch=4 dropped=4``,
+    dropped all four verdicts, aggregated an empty evidence set, took the ``min_support`` early
+    return, and wrote NO persona — with no event, no metric, no typed error and a ``DEBUG`` line
+    for the whole story. The caller could not tell that outcome apart from "this partition is
+    young", and ``mu-client``'s inject assembler went on reserving 15 % of the context window for
+    a ``<persona>`` section that could never be non-empty.
+
+    **It is deliberately NOT raised when the model returns no rows at all.** "Most memories
+    evidence no slot" is the answer spec line 103 says most rows have, and an empty ``tags`` list
+    is the model saying exactly that — a correct, cacheable verdict. What is NOT correct is a
+    reply that offers N verdicts of which zero are in the vocabulary: that is the model failing
+    to answer the question it was asked, and it must not read as "this user has no traits".
+
+    ``rows``/``batches`` are COUNTS (content-free, CLAUDE.md rule 3) — never a slot value, never
+    a memory body, so this exception may be logged and put in ``DegradedModeEntered.detail``.
+    """
+
+    reason = DegradeReason.PERSONA_TAGGER_UNUSABLE
+    mode = "persona_no_usable_tags"
+
+    def __init__(self, *, rows: int, batches: int) -> None:
+        super().__init__(f"persona slot-tagger returned {rows} rows and 0 usable tags")
+        self.rows = rows
+        self.batches = batches
 
 
 class SlotTag(BaseModel):
@@ -238,12 +299,26 @@ class ClassifierSlotTagger:
     ``test_persona_reader_unit``, and the gloss table is asserted to cover ``PersonaSlot``
     exactly, so neither can drift away from the code again.
 
-    **A malformed or partly-malformed reply drops the offending ROWS, and only those.** That is
-    not a silent partial: a classifier is a per-row judgement, an unparseable row is a row with no
-    verdict, and a row with no verdict is exactly "this memory evidences no slot" — the answer the
-    spec says most rows have. What is NOT tolerated is a malformed ENVELOPE (not JSON, not an
-    object, no ``tags`` list): that is the model failing to answer at all, and it RAISES so the
-    caller's named degrade fires instead of persona quietly learning nothing.
+    **A partly-malformed reply drops the offending ROWS, and only those.** That is not a silent
+    partial: a classifier is a per-row judgement, an unparseable row is a row with no verdict, and
+    a row with no verdict is exactly "this memory evidences no slot" — the answer the spec says
+    most rows have.
+
+    **A reply in which NOT ONE row is usable is a different thing, and it is now named.** Two
+    failures are NOT tolerated, and neither of them may return quietly:
+
+    * a malformed ENVELOPE (not JSON, not an object, no ``tags`` list) — the model failing to
+      answer at all — RAISES ``ValueError``;
+    * a well-formed envelope offering N verdicts of which ZERO survive :func:`_parse_row` —
+      the model answering, in a vocabulary that is not the one it was given — is retried on a
+      rotated batch and then RAISES :class:`PersonaTaggerUnusableError`, which carries the
+      ``DegradeReason`` an operator sees.
+
+    That second case is the one this class shipped without, and it was not hypothetical: on a
+    real container the sweep logged ``persona_tag_rows_dropped batch=4 dropped=4`` and the
+    subsystem went on to write no persona at all, at ``DEBUG``, with no event and no metric.
+    An empty ``tags`` list remains a legitimate answer and is NOT this case — see
+    :class:`PersonaTaggerUnusableError`.
     """
 
     def __init__(self, *, router: PersonaSynthesisPort, settings: PersonaSettings) -> None:
@@ -251,12 +326,87 @@ class ClassifierSlotTagger:
         self._settings = settings
 
     async def tag(self, items: Sequence[MemoryItem]) -> Mapping[str, tuple[SlotTag, ...]]:
+        """Tag every item, or RAISE :class:`PersonaTaggerUnusableError` if the model gave nothing.
+
+        The raise is decided across the WHOLE call, not per batch, and on two counters:
+
+        * ``rows`` — how many verdicts the model offered. Zero means it answered "no slots",
+          which is a correct answer and is returned as such.
+        * ``usable`` — how many of those verdicts survived :func:`_parse_row`. Zero usable out of
+          a non-zero ``rows`` is the model failing to answer the question at all.
+
+        A batch that fails this way contributes NOTHING to the returned mapping, even when a
+        sibling batch succeeded. That omission is the difference between an unanswered question
+        and an answer of "no slot": the reader caches what it is handed, so returning empty
+        verdicts here would freeze a model failure into the process's tag cache and every later
+        sweep in that process would inherit it without ever asking the model again.
+        """
         out: dict[str, tuple[SlotTag, ...]] = {}
+        rows = usable = batches = 0
         for batch in _batched(items, self._settings.tagger_batch_size):
-            out.update(await self._tag_batch(batch))
+            tagged, batch_rows, batch_usable = await self._tag_batch(batch)
+            rows += batch_rows
+            usable += batch_usable
+            batches += 1
+            # A batch that gave up returns an EMPTY mapping (see :meth:`_tag_batch`), so this
+            # update contributes nothing for it — the omission has exactly ONE home, and it is
+            # the one the failure happens in.
+            out.update(tagged)
+        if rows and not usable:
+            _log.warning(
+                "persona_tagger_unusable",
+                rows=rows,
+                batches=batches,
+                items=len(items),
+                retries=self._settings.tagger_unusable_retries,
+            )
+            raise PersonaTaggerUnusableError(rows=rows, batches=batches)
         return out
 
-    async def _tag_batch(self, batch: Sequence[MemoryItem]) -> dict[str, tuple[SlotTag, ...]]:
+    async def _tag_batch(
+        self, batch: Sequence[MemoryItem]
+    ) -> tuple[dict[str, tuple[SlotTag, ...]], int, int]:
+        """One batch -> ``(verdicts, rows_offered, rows_usable)``, with a ROTATED retry.
+
+        **Why a rotation and not a plain retry, MEASURED against the deployed model.** The tagger
+        runs at ``tagger_temperature`` 0.0, and at 0.0 `qwen2.5:0.5b` on `mu-dev-slm` returned the
+        byte-identical reply on 6 consecutive serial calls and on 12 concurrent ones — so a plain
+        retry is a model call bought to receive the same failure. What DOES vary is the order the
+        statements arrive in: over all 24 orderings of one four-memory partition, 3 produced zero
+        usable verdicts (the model abandons the slot list and answers with `"mountain"`,
+        `"coffee"`, `"kubernetes_operator"` — names lifted from the statements), and a rotation
+        of each of those 3 recovered all four verdicts, on all 9 rotations tried. The batch order
+        is the store's walk order and carries no meaning, so rotating it changes only the prompt.
+
+        A single-item batch is never retried: its rotation is itself, so the retry is provably
+        the same call.
+        """
+        attempts = 1 if len(batch) < 2 else 1 + self._settings.tagger_unusable_retries
+        rows = 0
+        for attempt in range(attempts):
+            # Rotation, not shuffle: deterministic, so the same partition asks the same questions
+            # in the same order on every run (DEV-STANDARDS: no `random` without a seed).
+            offset = attempt % len(batch) if batch else 0
+            rotated = [*batch[offset:], *batch[:offset]]
+            tagged, rows, usable = await self._tag_once(rotated)
+            if usable or not rows:
+                return tagged, rows, usable
+            _log.warning(
+                "persona_tag_batch_unusable",
+                attempt=attempt,
+                attempts=attempts,
+                rows=rows,
+                batch=len(batch),
+            )
+        # Gave up. The mapping is EMPTY, not the last attempt's all-untagged verdicts, and that is
+        # the whole point: the reader caches whatever it is handed, for the life of the process, so
+        # handing back "no slot" for memories the model failed on would freeze the failure into the
+        # cache and every later sweep would inherit it without asking the model again.
+        return {}, rows, 0
+
+    async def _tag_once(
+        self, batch: Sequence[MemoryItem]
+    ) -> tuple[dict[str, tuple[SlotTag, ...]], int, int]:
         completion = await self._router.generate(
             Task.CLASSIFY,
             [
@@ -287,7 +437,11 @@ class ClassifierSlotTagger:
         # real, cacheable verdict ("no slot"), and without it the reader would re-ask the model
         # about the same untagged memory on every single rebuild — the exact cost spec line 103
         # forbids, reintroduced through the back door.
-        return {item.id: tuple(tagged.get(item.id, ())) for item in batch}
+        return (
+            {item.id: tuple(tagged.get(item.id, ())) for item in batch},
+            len(rows),
+            len(rows) - dropped,
+        )
 
 
 _SLOT_VOCABULARY = "\n".join(

@@ -112,6 +112,20 @@ class PersonaSettings(BaseModel):
     #: batch bound one call would carry the whole ``max_evidence_items`` walk and blow the
     #: model's context window (``ClassifierSlotTagger``).
     tagger_batch_size: int = Field(default=16, ge=1)
+    #: ADDITION. Bounded retries of ONE batch whose reply carried rows but not a single usable
+    #: verdict. Each retry ROTATES the batch, and both halves of that are measurements, not
+    #: taste (see :class:`~mu_engine.services.persona.reader.ClassifierSlotTagger`):
+    #:
+    #: * a plain retry is provably worthless — against `qwen2.5:0.5b` at `tagger_temperature`
+    #:   0.0 the same prompt returned the byte-identical reply 6/6 and 12/12 times, so re-asking
+    #:   the same question spends a model call to receive the same failure;
+    #: * the failure is a property of the ORDER, not of the memories — 3 of the 24 orderings of
+    #:   one four-memory partition yielded zero usable verdicts, and a rotation of each of those
+    #:   three recovered all four verdicts on every one of the 9 rotations tried.
+    #:
+    #: Default 2, so a rotation is tried from two different starting statements before the sweep
+    #: gives up and degrades by name. Zero disables the retry and keeps the degrade.
+    tagger_unusable_retries: int = Field(default=2, ge=0)
     #: ADDITION. The per-process slot-tag cache bound. Spec line 103 wants the tag "cached on the
     #: item"; ``MemoryItem`` has nowhere to hold it (``evidence.py`` module docstring), so the
     #: cache lives in ``PartitionPersonaEvidenceReader`` and — like every other in-memory

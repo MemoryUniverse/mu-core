@@ -22,11 +22,12 @@ from mu_contracts.domain.events import (
     PersonaUpdated,
 )
 from mu_contracts.domain.model.memory import Namespace, Tier
-from mu_contracts.domain.model.persona import PersonaSlot
+from mu_contracts.domain.model.persona import PersonaProfile, PersonaSlot
 from mu_contracts.domain.model.scope import ClientScope
 from mu_engine.platform.clock import FrozenClock
 from mu_engine.services.persona.aggregator import WeightedSlotV1Aggregator
 from mu_engine.services.persona.evidence import PersonaEvidence
+from mu_engine.services.persona.reader import PersonaTaggerUnusableError
 from mu_engine.services.persona.service import PersonaService
 from mu_engine.services.persona.settings import PersonaSettings
 from mu_engine.services.persona.store import InMemoryPersonaRepository
@@ -839,3 +840,118 @@ async def test_a_failure_increments_the_error_metric_content_free(
 def test_due_at_tick_is_lettas_turns_counter_rule():
     settings = PersonaSettings(rebuild_every_ticks=8)
     assert [t for t in range(1, 25) if settings.due_at_tick(t)] == [8, 16, 24]
+
+
+# ------------------------------------------------- the classifier answered, and said nothing
+class UnusableTaggerReader:
+    """A ``PersonaEvidenceReader`` whose classifier answered and produced nothing usable.
+
+    Not a fake failure: this is what :class:`~mu_engine.services.persona.reader.
+    ClassifierSlotTagger` now raises when the model returns rows and not one of them names a slot
+    in the vocabulary — measured on the deployed 0.5B model for 3 of the 24 orderings of a
+    four-memory partition.
+    """
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    async def evidence_for(self, ns: Namespace, *, limit: int) -> list[PersonaEvidence]:
+        self.reads += 1
+        raise PersonaTaggerUnusableError(rows=4, batches=1)
+
+    async def evidence_for_ids(self, ns: Namespace, ids: frozenset[str]) -> list[PersonaEvidence]:
+        self.reads += 1
+        raise PersonaTaggerUnusableError(rows=4, batches=1)
+
+
+async def test_a_rebuild_whose_classifier_said_nothing_usable_raises_instead_of_returning_none(
+    scope: ClientScope, ns: Namespace
+):
+    """The defect, at the layer that made it invisible.
+
+    ``rebuild`` returns ``None`` for a perfectly healthy reason — a partition below
+    ``min_support``, "come back next tick". A classifier that has stopped producing usable
+    verdicts returned the SAME ``None``, so the caller was handed the young-partition story about
+    a broken subsystem, and the whole event was a ``DEBUG`` line. DEV-STANDARDS rule 8 allows a
+    failure path exactly two endings, a named ``DegradeReason`` or a typed raise; this is both,
+    because the raise CARRIES the reason.
+
+    Change ``_run``'s ``raise`` to ``return None, 0, 0`` and this goes RED — which is the point:
+    the silent version is now a test failure rather than a product behaviour.
+    """
+    service = _service(evidence=UnusableTaggerReader())
+
+    with pytest.raises(PersonaTaggerUnusableError) as caught:
+        await service.rebuild(scope, ns)
+
+    assert caught.value.reason is DegradeReason.PERSONA_TAGGER_UNUSABLE
+    assert caught.value.mode == "persona_no_usable_tags"
+
+
+async def test_the_degraded_sweep_is_audited_under_its_own_outcome_not_skipped(
+    scope: ClientScope, ns: Namespace
+):
+    """An operator reading the audit must be able to tell a young partition from a broken
+    classifier. ``skipped`` is the young-partition outcome and is normal on a healthy install;
+    reusing it here is what let a stopped subsystem hide inside routine traffic.
+
+    The row is written BEFORE the re-raise on purpose: the record of a degraded sweep must exist
+    whether or not anybody catches the exception.
+    """
+    audit, metrics = RecordingAudit(), RecordingMetrics()
+    service = _service(evidence=UnusableTaggerReader(), audit=audit, metrics=metrics)
+
+    with pytest.raises(PersonaTaggerUnusableError):
+        await service.rebuild(scope, ns)
+
+    assert [(r["operation"], r["outcome"]) for r in audit.rows] == [
+        ("persona.rebuild", "degraded_no_usable_tags")
+    ]
+    # …and the operator's metric fired too, from `_timed`'s own error accounting.
+    assert ("mu_operation_errors_total", {"operation": "persona.rebuild"}) in metrics.incs
+
+
+async def test_the_degraded_audit_row_stays_content_free(scope: ClientScope, ns: Namespace):
+    """Persona is inferred from private data, so the degrade row is held to the same rule as
+    every other row (CLAUDE.md rule 3): counts, a namespace prefix, an operation name."""
+    audit = RecordingAudit()
+    service = _service(evidence=UnusableTaggerReader(), audit=audit)
+
+    with pytest.raises(PersonaTaggerUnusableError):
+        await service.rebuild(scope, ns)
+
+    assert audit.rows[0]["counts"] == {
+        "evidence": 0,
+        "slots": 0,
+        "slots_changed": 0,
+        "version": 0,
+        "dropped": 0,
+    }
+
+
+async def test_a_degraded_refresh_drops_its_queue_instead_of_re_asking_a_broken_classifier(
+    scope: ClientScope, ns: Namespace, make_evidence: Callable[..., PersonaEvidence]
+):
+    """The queue exists so a promoted memory is folded in on the next sweep. Holding ids for a
+    sweep that just failed only re-does the same work against the same broken classifier — and
+    the next full ``rebuild`` reads the whole evidence set anyway, so nothing is lost.
+    """
+    repo = InMemoryPersonaRepository()
+    await repo.upsert(
+        PersonaProfile(
+            namespace=ns,
+            slots={},
+            overall_brief="x",
+            brief_etag="e" * 8,
+            version=1,
+            rebuilt_at=T0,
+            source_memory_count=3,
+        )
+    )
+    service = _service(evidence=UnusableTaggerReader(), repo=repo)
+    service.note_promoted(_promoted(ns, "m1"))
+
+    with pytest.raises(PersonaTaggerUnusableError):
+        await service.refresh(scope, ns)
+
+    assert service._pending == {}

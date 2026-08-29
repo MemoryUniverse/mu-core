@@ -92,6 +92,7 @@ from mu_engine.platform.observability import (
 from mu_engine.platform.tenancy import DefaultTenancyGuard
 from mu_engine.services.persona.aggregator import TraitAggregator, slots_changed
 from mu_engine.services.persona.evidence import PersonaEvidence, PersonaEvidenceReader
+from mu_engine.services.persona.reader import PersonaTaggerUnusableError
 from mu_engine.services.persona.settings import PersonaSettings
 from mu_engine.services.persona.store import assert_private, persona_key
 from mu_engine.services.persona.synthesizer import PortraitSynthesizer
@@ -116,16 +117,27 @@ _INCREMENTAL_TIERS: frozenset[Tier] = frozenset({Tier.MTM, Tier.LTM})
 #: collide with a live profile and reads unambiguously as "load_brief will now return nothing".
 _ERASED_VERSION = 0
 
+#: The audit ``outcome`` for a sweep that read a partition, asked the classifier, and got back
+#: nothing it could use. It is deliberately NOT ``"skipped"`` — ``skipped`` is the young-partition
+#: answer (``min_support`` not reached), a normal outcome on a healthy install, and collapsing the
+#: two is exactly how the defect stayed invisible: an operator reading the audit could not tell a
+#: user with three memories apart from a classifier that had stopped working.
+_OUTCOME_NO_USABLE_TAGS = "degraded_no_usable_tags"
+
 _DEGRADE_COMPONENT = "persona"
 #: The ONE named degraded path: Stage 1 landed, Stage 2 did not (spec §2.2 succeeds without any
 #: model at all), so the profile carries structured slots and the PREVIOUS brief.
 _DEGRADE_MODE = "persona_slots_only"
 
-#: RECORDED GAP: CANONICAL §2's ``DegradeReason`` union has no persona member, and this lane does
-#: not own ``domain/events.py``. ``LLM_UNAVAILABLE_HEURISTIC`` is the closest existing named
-#: reason and is already used for exactly this shape by the conflict adjudicator
-#: (``lifecycle/conflict.py:434``: no model configured -> deterministic result). A
-#: ``PERSONA_SYNTHESIS_DEGRADED`` member should be added — flagged, not invented here.
+#: Stage 2's reason, and it stays ``LLM_UNAVAILABLE_HEURISTIC`` ON PURPOSE now that the union has
+#: a persona member. ``PERSONA_TAGGER_UNUSABLE`` names a model that ANSWERED with nothing usable;
+#: this site is the opposite failure — no synthesizer is wired, or the synthesis call itself
+#: failed — and the structured slots stand while the previous brief is carried forward. That is
+#: exactly the shape the conflict adjudicator already uses this reason for
+#: (``lifecycle/conflict.py:434``: no model configured -> deterministic result). Reusing the
+#: tagger's reason here would tell an operator the classifier is broken when it is not.
+#: STILL OPEN: a ``PERSONA_SYNTHESIS_DEGRADED`` member would be more precise than either
+#: (reported, not invented here).
 _DEGRADE_REASON = DegradeReason.LLM_UNAVAILABLE_HEURISTIC
 
 
@@ -184,7 +196,7 @@ class PersonaService:
         outcome on a young partition, not an error.
         """
         self._scope_guard.assert_scope(scope, ns, _OP_REBUILD)
-        profile, evidence_count, changed = await self._timed(
+        profile, evidence_count, changed = await self._run(
             _OP_REBUILD, ns, lambda: self._rebuild(ns)
         )
         # A full rebuild reads the WHOLE evidence set, so anything :meth:`note_promoted` had
@@ -326,7 +338,7 @@ class PersonaService:
         full :meth:`rebuild`, which reads the whole evidence set anyway.
         """
         self._scope_guard.assert_scope(scope, ns, _OP_REFRESH)
-        profile, evidence_count, changed = await self._timed(
+        profile, evidence_count, changed = await self._run(
             _OP_REFRESH, ns, lambda: self._refresh(ns)
         )
         if changed or evidence_count:
@@ -405,6 +417,52 @@ class PersonaService:
         return erased, 0, 0
 
     # ---------------------------------------------------------------------------- side seams
+    async def _run[T: tuple[Any, int, int]](
+        self, operation: str, ns: Namespace, work: Callable[[], Coroutine[Any, Any, T]]
+    ) -> T:
+        """:meth:`_timed`, plus the ONE failure this service must not let pass as a normal
+        outcome: the classifier answered and nothing it said was usable.
+
+        **Why this raises instead of returning ``None``.** ``rebuild`` returns ``PersonaProfile |
+        None``, and ``None`` already means a legitimate thing — "this partition has fewer than
+        ``min_support`` tagged memories, come back next tick". Letting a broken classifier return
+        the same ``None`` is what made the defect invisible: the caller was told the young-partition
+        story about a subsystem that had stopped working, ``mu-client`` went on reserving 15 % of
+        the context window for the ``<persona>`` section that would never fill, and the only trace
+        was a ``DEBUG`` line. DEV-STANDARDS rule 8 gives exactly two honest endings for a failure
+        path — a named ``DegradeReason`` or a typed raise — and this is BOTH: the raise reaches the
+        caller, and it CARRIES the reason (:class:`PersonaDegradeError`) so the containment
+        boundary that emits ``DegradedModeEntered`` does not have to guess.
+
+        The audit row is written FIRST and then the error re-raised, so the operator-visible
+        record of a degraded sweep exists whether or not anyone catches the exception. The pending
+        queue is drained for the same reason it is drained on success: a full rebuild reads the
+        whole evidence set anyway, so holding ids for a sweep that already failed only re-does the
+        work with the same broken classifier.
+        """
+        try:
+            return await self._timed(operation, ns, work)
+        except PersonaTaggerUnusableError as exc:
+            self._drain_pending(ns)
+            # Content-free: two COUNTS off the exception, never a slot value or a memory body.
+            _log.warning(
+                "persona_tagger_unusable",
+                ns=persona_key(ns),
+                operation=operation,
+                reason=exc.reason,
+                rows=exc.rows,
+                batches=exc.batches,
+            )
+            self._record(
+                operation,
+                ns,
+                None,
+                evidence_count=0,
+                changed=0,
+                outcome=_OUTCOME_NO_USABLE_TAGS,
+            )
+            raise
+
     def _drain_pending(self, ns: Namespace) -> frozenset[str]:
         return frozenset(self._pending.pop(persona_key(ns), set()))
 
@@ -512,6 +570,7 @@ class PersonaService:
         evidence_count: int,
         changed: int,
         erased: bool | None = None,
+        outcome: str | None = None,
     ) -> None:
         """COUNTS ONLY, and content-free BY CONSTRUCTION rather than by promise.
 
@@ -532,7 +591,7 @@ class PersonaService:
                 "dropped": self._dropped.pop(persona_key(ns), 0),
             }
         )
-        outcome = (
+        resolved_outcome = outcome or (
             ("erased" if erased else "absent")
             if erased is not None
             else ("ok" if profile is not None else "skipped")
@@ -540,7 +599,7 @@ class PersonaService:
         self._audit.record(
             TraceScope(correlation_id=persona_key(ns)),
             operation=sanitize_label_value(operation),
-            outcome=sanitize_label_value(outcome),
+            outcome=sanitize_label_value(resolved_outcome),
             visibility=sanitize_label_value(ns.visibility.value),
             counts=fields.counts,
         )

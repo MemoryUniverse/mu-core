@@ -52,7 +52,7 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
-from mu_contracts.domain.events import SleeptimeTick
+from mu_contracts.domain.events import DegradedModeEntered, SleeptimeTick
 from mu_contracts.domain.model.memory import Namespace, Visibility
 from mu_contracts.domain.model.persona import PersonaProfile, PersonaSlot, SlotValue
 from mu_engine.providers._contracts import ModelGroupUnavailableError
@@ -63,6 +63,7 @@ from mu_engine.services.persona import (
     PersonaShapedRankedRead,
     persona_key,
 )
+from mu_engine.services.persona.reader import PersonaTaggerUnusableError
 from mu_engine.services.persona.shaping import _WORD
 from mu_engine.services.recall.dto import RecallItemView as _EngineRecallItem
 from mu_engine.services.recall.dto import RecallQuery
@@ -311,11 +312,17 @@ async def test_a_real_sleeptime_tick_builds_a_real_persona_from_real_memories(
     await _write_memories(persona_mem)
     assert await repo.get(ns) is None
 
+    degrades = _watch_degrades(container)
     await container.bus.publish(SleeptimeTick(namespace=ns))
 
     assert (
         container.persona.sweeper._ticks.get(persona_key(ns)) == 1
     ), "SleeptimeTick never reached the persona sweeper — the DESIGNED trigger is not subscribed"
+    # A clean sweep emits NO persona degrade. This assertion is the one that turns the old
+    # "flaky" failure into a diagnosis: when the classifier returns nothing usable the sweep now
+    # names it, and this line fails with the REASON in the message instead of with a bare
+    # `profile is None` that could equally mean min_support, a store, or a dead subscription.
+    assert not degrades, f"the sweep degraded: {[(d.mode, d.reason, d.detail) for d in degrades]}"
     profile = await repo.get(ns)
     assert profile is not None, (
         "the sweep ran but wrote no persona — either the classifier returned no usable tag on "
@@ -334,6 +341,98 @@ async def test_a_real_sleeptime_tick_builds_a_real_persona_from_real_memories(
     assert body.strip(), "overall_brief is empty — the <persona> section would still render blank"
     assert len(body) <= PersonaSettings().brief_char_limit
     assert etag
+
+
+@pytest.mark.skipif(not _SLM_UP, reason=_SLM_REASON)
+async def test_the_real_classifier_builds_a_persona_from_every_rotation_of_the_real_batch(
+    persona_mem: LocalMemory,
+) -> None:
+    """The REAL defect behind the word "flaky", asserted against the real model.
+
+    The sweep that "failed in the full suite and passed alone" was never about the suite. It was
+    measured, on the VM, against the real `qwen2.5:0.5b`:
+
+    * **the classifier is deterministic** — the same prompt at ``tagger_temperature`` 0.0 returned
+      the byte-identical reply on 6 consecutive serial calls and on 12 concurrent ones, so
+      concurrency and suite load change nothing;
+    * **it is ORDER-sensitive** — over all 24 orderings of these same four memories, 3 produced
+      ZERO usable verdicts: the model abandons the slot list and answers ``"mountain"``,
+      ``"coffee"``, ``"kubernetes_operator"``, names lifted from the statements;
+    * **the order is the store's, and it is a different one every run** — the evidence walk was
+      stable 12/12 within a namespace and came back ``(1,2,0,3)``, ``(3,0,2,1)`` and ``(2,1,3,0)``
+      in three consecutive fresh namespaces. Every run of this file rolls a fresh ``uid``, so
+      every run drew a fresh order, and roughly one run in eight drew a losing one.
+
+    So the test that asserts a persona gets built was a lottery, and the pipeline's answer to
+    losing it was to drop all four verdicts and write nothing, at ``DEBUG``.
+
+    This test removes the lottery instead of re-rolling it. It runs the REAL tagger over the REAL
+    memories in every ROTATION of the walk order — four rotations, so whichever statement the
+    store happens to put first, one of them is the world-fact-first order that was measured to
+    break the model — and asserts every one of them still yields a verdict. Setting
+    ``tagger_unusable_retries=0`` makes it RED.
+    """
+    ns = _ns(persona_mem)
+    container = persona_mem._container
+    assert container.persona is not None
+    await _write_memories(persona_mem)
+
+    reader = container.persona.service._evidence
+    items = await reader._walk(ns, limit=PersonaSettings().max_evidence_items)
+    assert len(items) == len(_MEMORIES), "the walk did not return the four memories to classify"
+
+    for offset in range(len(items)):
+        rotated = [*items[offset:], *items[:offset]]
+        tags = await reader._tagger.tag(rotated)
+        assert any(tags[item.id] for item in rotated), (
+            f"rotation {offset} produced no usable slot tag for ANY of the four memories — a "
+            "sweep on this order writes an empty persona and the 15 % inject budget is spent on "
+            "nothing"
+        )
+
+
+async def test_the_named_persona_degrade_reaches_a_real_subscriber_on_the_container_bus(
+    persona_mem: LocalMemory,
+) -> None:
+    """The DEGRADE contract's LAST leg, on the real container and the real bus.
+
+    The rotation above makes the failure rare; it cannot make it impossible, because no prompt
+    makes a 0.5B model correct. So the terminal state has to be honest — and "honest" ends at an
+    operator's subscriber, which is the one leg no unit test can reach.
+
+    **What this proves, exactly.** The container's OWN ``InprocBus`` — the one ``build_persona``
+    subscribed the sweeper to — delivers the persona degrade to a real subscriber with the exact
+    payload an operator consumes: component ``persona``, mode ``persona_no_usable_tags``, reason
+    ``persona_tagger_unusable``. A rename of either constant, or a bus that stopped carrying
+    ``DegradedModeEntered``, is RED here.
+
+    **What it does NOT prove, said plainly rather than implied.** It does not drive the raise
+    through ``PersonaService``, because nothing can make the real model return an unusable reply
+    on demand and a stand-in tagger is a mock — barred in an integration test (DEV-STANDARDS).
+    That leg (tagger raises -> service raises + audits -> sweeper emits THIS payload) is pinned
+    in ``test_persona_reader_unit`` / ``test_persona_service_unit`` / ``test_persona_driver_unit``,
+    where a double is sanctioned. The two halves meet on the constants asserted below.
+    """
+    ns = _ns(persona_mem)
+    container = persona_mem._container
+    assert container.persona is not None
+    degrades = _watch_degrades(container)
+
+    await container.persona.sweeper._degrade(
+        ns,
+        detail=PersonaTaggerUnusableError.__name__,
+        mode=PersonaTaggerUnusableError.mode,
+        reason=PersonaTaggerUnusableError.reason,
+    )
+
+    assert [(d.component, d.mode, d.reason.value, d.detail) for d in degrades] == [
+        (
+            "persona",
+            "persona_no_usable_tags",
+            "persona_tagger_unusable",
+            "PersonaTaggerUnusableError",
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------- (e) CONSEQUENCE
@@ -494,6 +593,23 @@ async def test_a_persona_of_only_voice_slots_changes_no_order(persona_mem: Local
 
 
 # ------------------------------------------------------------------------------------ helpers
+def _watch_degrades(container: object) -> list[DegradedModeEntered]:
+    """Subscribe a real handler to the container's REAL bus and keep what it publishes.
+
+    Not a mock and not a patch: ``InprocBus.subscribe`` is the same public seam ``build_persona``
+    itself uses, and this adds one more subscriber to the live bus. It is the only way to observe
+    the degrade the way an operator's consumer would.
+    """
+    seen: list[DegradedModeEntered] = []
+
+    async def record(event: DegradedModeEntered) -> None:
+        if event.component == "persona":
+            seen.append(event)
+
+    container.bus.subscribe(DegradedModeEntered, record)  # type: ignore[attr-defined]
+    return seen
+
+
 async def _eventually(read: Callable[[], Awaitable[_EngineRecallResult]]) -> _EngineRecallResult:
     """Poll until the ranker returns hits — qdrant/falkordb apply writes asynchronously. Same
     shape as `test_local_roundtrip_int._eventually`, typed for the ENGINE result the container's

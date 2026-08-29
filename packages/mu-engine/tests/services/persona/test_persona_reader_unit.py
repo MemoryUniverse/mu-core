@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 import pytest
 
 from mu_contracts.domain.errors import NamespaceIsolationError
+from mu_contracts.domain.events import DegradeReason
 from mu_contracts.domain.model.memory import MemoryItem, Namespace, State, Tier
 from mu_contracts.domain.model.persona import PersonaSlot
 from mu_engine.providers.catalog import Task
@@ -24,6 +25,7 @@ from mu_engine.services.persona.reader import (
     _SLOT_GLOSS,
     ClassifierSlotTagger,
     PartitionPersonaEvidenceReader,
+    PersonaTaggerUnusableError,
     SlotTag,
     _parse_envelope,
     _parse_row,
@@ -333,6 +335,12 @@ async def test_a_good_reply_becomes_tags_keyed_by_the_right_memory(
     assert got["m1"] == (SlotTag(slot=PersonaSlot.EXPERTISE, value="rust", confidence=0.7),)
 
 
+#: One GOOD row about ``m1``, so every batch below has a surviving verdict. Without it the batch
+#: has rows and zero usable ones, which is now a NAMED failure and not a per-row drop — see
+#: ``test_a_reply_with_rows_but_no_usable_verdict_raises_by_name``.
+_GOOD_ROW = '{"index": 1, "slot": "expertise", "value": "rust", "confidence": 0.7}'
+
+
 @pytest.mark.parametrize(
     "row",
     [
@@ -348,10 +356,150 @@ async def test_an_unusable_row_is_dropped_and_only_that_row(
     row: str, make_item: Callable[..., MemoryItem]
 ):
     """An out-of-batch index is the dangerous one: it would attribute one memory's trait to
-    another memory — a provenance corruption no later layer could detect."""
-    tagger, _router = _tagger(f'{{"tags": [{row}]}}')
-    got = await tagger.tag([make_item(memory_id="m0")])
-    assert got == {"m0": ()}
+    another memory — a provenance corruption no later layer could detect.
+
+    **This test was re-based on a TWO-item batch, and the change is a contract change, argued.**
+    It used to send one item and one bad row and assert ``{"m0": ()}``. Two things were wrong
+    with that. It could not observe its own claim — "and ONLY that row" needs a second row to
+    survive — and, more importantly, a reply whose every row is unusable is no longer the same
+    event as a reply with one bad row among good ones. The first is the model answering in a
+    vocabulary of its own invention (MEASURED on the deployed 0.5B model: 3 of the 24 orderings of
+    a four-memory partition), and it now RAISES by name rather than returning "this user has no
+    traits". So the good row is what makes this a per-row-drop test instead of an accidental
+    second copy of the all-unusable test below.
+    """
+    tagger, _router = _tagger(f'{{"tags": [{row}, {_GOOD_ROW}]}}')
+    got = await tagger.tag([make_item(memory_id="m0"), make_item(memory_id="m1")])
+    assert got["m0"] == ()
+    assert got["m1"] == (SlotTag(slot=PersonaSlot.EXPERTISE, value="rust", confidence=0.7),)
+
+
+# ------------------------------------------------------- the model answered, and said nothing
+#: A reply in which every row names a slot that is not in the vocabulary. This is not invented:
+#: it is the shape `qwen2.5:0.5b` returned on `mu-dev-slm`, at temperature 0, for the batch orders
+#: that put the world-fact first — the model stops copying names off the list and starts lifting
+#: them from the statements.
+_ALL_UNUSABLE = (
+    '{"tags": [{"index": 0, "slot": "mountain", "value": "Mount Everest", "confidence": 1.0}, '
+    '{"index": 1, "slot": "coffee", "value": "dark roast", "confidence": 0.8}]}'
+)
+_ALL_USABLE = (
+    '{"tags": [{"index": 0, "slot": "expertise", "value": "rust", "confidence": 0.7}, '
+    '{"index": 1, "slot": "hobby", "value": "climbing", "confidence": 0.6}]}'
+)
+
+
+async def test_a_reply_with_rows_but_no_usable_verdict_raises_by_name(
+    make_item: Callable[..., MemoryItem],
+):
+    """THE DEFECT, as an executable assertion.
+
+    On a real container this produced the log line ``persona_tag_rows_dropped batch=4 dropped=4``
+    and then nothing at all: an empty tag mapping, an empty evidence set, ``rebuild`` taking the
+    ``min_support`` early return, ``DEBUG``-level silence, no event, no metric, and a caller told
+    the same "come back when this partition is older" story a healthy young install is told. The
+    ``<persona>`` section of every prompt kept its 15 % budget for a string that could not fill.
+
+    A model that offers N verdicts and gets zero of them into the vocabulary has FAILED to answer.
+    It must be nameable, and the name must reach an operator.
+    """
+    router = StubRouter([_ALL_UNUSABLE] * 3)
+    tagger = ClassifierSlotTagger(router=router, settings=PersonaSettings())
+
+    with pytest.raises(PersonaTaggerUnusableError) as caught:
+        await tagger.tag([make_item(memory_id="m0"), make_item(memory_id="m1")])
+
+    assert caught.value.reason is DegradeReason.PERSONA_TAGGER_UNUSABLE
+    assert caught.value.mode == "persona_no_usable_tags"
+    # `rows` is the verdict count of the reply the tagger GAVE UP on, not a sum over attempts:
+    # 2 verdicts offered, 0 usable, in 1 batch. Summing the three attempts would report 6 and
+    # tell an operator the model said three times as much as it did.
+    assert (caught.value.rows, caught.value.batches) == (2, 1)
+    # …and it did spend the configured retries before naming it (1 attempt + 2 rotations).
+    assert len(router.calls) == 1 + PersonaSettings().tagger_unusable_retries
+
+
+async def test_an_empty_tags_list_is_an_answer_and_never_raises(
+    make_item: Callable[..., MemoryItem],
+):
+    """The other side of the same line, and the reason the rule is not "no tags ⇒ degrade".
+
+    Spec line 103 says most memories evidence no slot; ``{"tags": []}`` is the model saying so,
+    correctly, and it is a cacheable verdict. Degrading on it would fire the alarm on every
+    healthy partition of world-facts — the kind of false degrade that trains an operator to
+    ignore the real one.
+    """
+    tagger, router = _tagger('{"tags": []}')
+
+    assert await tagger.tag([make_item(memory_id="m0"), make_item(memory_id="m1")]) == {
+        "m0": (),
+        "m1": (),
+    }
+    assert len(router.calls) == 1  # answered, so not retried
+
+
+async def test_the_retry_rotates_the_batch_because_a_plain_retry_is_provably_useless(
+    make_item: Callable[..., MemoryItem],
+):
+    """The measurement this retry is built on, pinned so a later edit cannot quietly drop it.
+
+    At ``tagger_temperature`` 0.0 the deployed model returned the byte-identical reply on 6
+    consecutive serial calls and 12 concurrent ones — so re-sending the SAME prompt buys the same
+    failure. What varies is the ORDER: 3 of 24 orderings of one four-memory partition yielded zero
+    usable verdicts, and rotating each of those three recovered all four verdicts on all 9
+    rotations tried. So the retry must change the prompt, and the only thing it is allowed to
+    change is the order.
+
+    Deleting the rotation (``rotated = list(batch)``) leaves this RED on the second user message.
+    """
+    router = StubRouter([_ALL_UNUSABLE, _ALL_USABLE])
+    tagger = ClassifierSlotTagger(router=router, settings=PersonaSettings())
+    items = [make_item(memory_id="m0", content="alpha"), make_item(memory_id="m1", content="beta")]
+
+    got = await tagger.tag(items)
+
+    assert len(router.calls) == 2
+    first = router.calls[0][1][1].content
+    second = router.calls[1][1][1].content
+    assert first == "0: alpha\n1: beta"
+    assert second == "0: beta\n1: alpha", "the retry re-sent the same prompt"
+    # …and the recovered verdicts are keyed to the ROTATED batch, not to the original one: index 0
+    # of the second call is `m1`. Getting this wrong would attribute one memory's trait to another.
+    assert got["m1"] == (SlotTag(slot=PersonaSlot.EXPERTISE, value="rust", confidence=0.7),)
+    assert got["m0"] == (SlotTag(slot=PersonaSlot.HOBBY, value="climbing", confidence=0.6),)
+
+
+async def test_a_single_item_batch_is_never_retried(make_item: Callable[..., MemoryItem]):
+    """A one-item batch rotates to itself, so a retry is provably the same call against a
+    deterministic model. Spending it would be a model bill with a known-zero return."""
+    router = StubRouter(['{"tags": [{"index": 0, "slot": "x", "value": "y", "confidence": 1.0}]}'])
+    tagger = ClassifierSlotTagger(router=router, settings=PersonaSettings())
+
+    with pytest.raises(PersonaTaggerUnusableError):
+        await tagger.tag([make_item(memory_id="m0")])
+    assert len(router.calls) == 1
+
+
+async def test_a_failed_batch_contributes_nothing_even_when_a_sibling_batch_succeeded(
+    make_item: Callable[..., MemoryItem],
+):
+    """The cache-poisoning half of the defect, and the reason a failed batch is OMITTED rather
+    than returned as empty verdicts.
+
+    ``PartitionPersonaEvidenceReader`` caches every verdict it is handed, for the life of the
+    process, precisely so a memory is classified once and not once per rebuild. Hand it "no slot"
+    for a batch the model actually failed on and that failure is frozen: every later sweep in that
+    process reads the cache, never asks the model again, and reports a permanently empty persona
+    for memories a working classifier would have tagged on the next tick.
+    """
+    router = StubRouter([_ALL_USABLE, _ALL_UNUSABLE, _ALL_UNUSABLE, _ALL_UNUSABLE])
+    tagger = ClassifierSlotTagger(router=router, settings=PersonaSettings(tagger_batch_size=2))
+    items = [make_item(memory_id=f"m{i}") for i in range(4)]
+
+    got = await tagger.tag(items)
+
+    assert set(got) == {"m0", "m1"}, "the failed batch's ids must not be cacheable as 'no slot'"
+    assert "m2" not in got and "m3" not in got
 
 
 @pytest.mark.parametrize("reply", ["not json", "[]", '{"nope": 1}'])

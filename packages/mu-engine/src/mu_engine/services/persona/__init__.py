@@ -38,8 +38,10 @@ from mu_engine.services.persona.factory import PersonaWiring, build_persona
 from mu_engine.services.persona.reader import (
     ClassifierSlotTagger,
     PartitionPersonaEvidenceReader,
+    PersonaDegradeError,
     PersonaPartitionReader,
     PersonaSlotTagger,
+    PersonaTaggerUnusableError,
     SlotTag,
 )
 from mu_engine.services.persona.service import PersonaService
@@ -80,6 +82,7 @@ __all__ = [
     "PartitionPersonaEvidenceReader",
     "PersonaAffinityShaper",
     "PersonaBusBridge",
+    "PersonaDegradeError",
     "PersonaEvidence",
     "PersonaEvidenceReader",
     "PersonaPartitionReader",
@@ -89,6 +92,7 @@ __all__ = [
     "PersonaSlotTagger",
     "PersonaSweeper",
     "PersonaSynthesisPort",
+    "PersonaTaggerUnusableError",
     "PersonaVersionConflictError",
     "PersonaWiring",
     "PortraitSynthesizer",

@@ -237,6 +237,17 @@ class DegradeReason(StrEnum):
     # write-after-read Qdrant point visibility lag on cross-store supersede-invalidate;
     # bounded retry next sweep, the loser stays SUPERSEDED in the graph (source of truth)
     MTM_INVALIDATE_POINT_ABSENT = "mtm_invalidate_point_absent"  # ADR 0037
+    # --- persona (persona-design.md §2.2 line 103; operator) ---
+    # The slot classifier ANSWERED and not one of its verdicts was in the slot vocabulary, so the
+    # sleep-time sweep has no evidence and writes no persona. Deliberately NOT one of the three
+    # reasons it would otherwise have to borrow, each of which would send an operator somewhere
+    # else: MODEL_GROUP_UNAVAILABLE says the model was down (it was not — it replied),
+    # LLM_UNAVAILABLE_HEURISTIC says no model is configured and a deterministic path took over
+    # (none did), and FACT_DROPPED is distill's per-fact accounting. MEASURED against the one
+    # deployed model (Ollama `qwen2.5:0.5b`): 3 of the 24 orderings of one four-memory partition
+    # make it abandon the vocabulary and invent a slot name per row — so this is a reason a
+    # real deployment reaches, not a defensive constant.
+    PERSONA_TAGGER_UNUSABLE = "persona_tagger_unusable"
     # --- trust-ledger (§7.25; operator) ---
     TRUST_LEDGER_UNAVAILABLE = "trust_ledger_unavailable"
     # --- lifecycle / hosted-mirror consent (§4, §16; X4 consent gate, operator) ---
