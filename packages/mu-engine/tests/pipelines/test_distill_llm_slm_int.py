@@ -182,10 +182,18 @@ def slm_catalog() -> tuple[ModelSettings, ModelCatalogSettings]:
     return _build_slm_catalog(_SLM_CFG)
 
 
-@pytest.fixture
-def router(slm_catalog: tuple[ModelSettings, ModelCatalogSettings]) -> ModelRouter:
+# YIELDS and closes: a ModelRouter is a RESOURCE. Its `LiteLLMRouterAdapter` makes litellm start a
+# process-global logging worker (`while True: await queue.get()`) on THIS test's event loop, which
+# pytest-asyncio then closes; handed back unclosed, that consumer is collected against a dead loop
+# and `asyncio.Queue.get`'s bare `except:` raises ``RuntimeError: Event loop is closed``.
+@pytest_asyncio.fixture
+async def router(
+    slm_catalog: tuple[ModelSettings, ModelCatalogSettings],
+) -> AsyncIterator[ModelRouter]:
     models, catalog = slm_catalog
-    return build_model_router(models=models, catalog=catalog)
+    built = build_model_router(models=models, catalog=catalog)
+    yield built
+    await built.aclose()
 
 
 @pytest.fixture

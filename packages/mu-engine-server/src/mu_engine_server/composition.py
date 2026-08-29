@@ -381,6 +381,22 @@ class EngineContainer:
             settings.llm if settings.llm.enabled else None
         )
         self.llm: ModelRouter | None = self.model_router if settings.llm.enabled else None
+        # (6a) …and its TEARDOWN, which did not exist. `close()` below promises to "release every
+        #      store connection this container opened"; the MODEL layer was outside that promise
+        #      entirely, so litellm's process-global logging worker — a `while True: await
+        #      queue.get()` consumer that our first async model call starts — was left pending on
+        #      a loop nobody would close it on. MEASURED on the VM's full mu-core suite: nine
+        #      `RuntimeError: Event loop is closed` unraisables out of `asyncio.Queue.get`, plus
+        #      dropped `Logging.async_success_handler` coroutines (see
+        #      `LiteLLMRouterAdapter.aclose`). `insert(0, …)` so the LIFO drain runs it LAST, and
+        #      that position was CORRECTED by measurement, not chosen: appended (i.e. drained
+        #      first) it still leaked, because litellm ends every async call with a bare
+        #      `asyncio.create_task(_client_async_logging_helper(...))` — a deferred task that
+        #      RE-STARTS the worker during any await that follows, and the remaining store closers
+        #      are exactly such awaits. Draining last leaves nothing after it to restart it.
+        #      `self.model_router` is always built (ENG-115a), and `aclose()` is a no-op on a
+        #      router that never made a call, so this is unconditional.
+        self._closers.insert(0, self.model_router.aclose)
         # C2 (mirrors `mu_local.composition`): `settings=` threaded from the WIRED
         # `EngineSettings.extraction` — previously bare, so `MU_EXTRACTION__MIN_TOKENS`/vocab
         # overrides never reached the DEFAULT (heuristic) extraction path.

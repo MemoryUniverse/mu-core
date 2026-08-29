@@ -424,6 +424,20 @@ class LocalContainer:
         #     byte-for-byte as before; a configured profile ⇒ the router, pinned to that profile.
         self.model_router: ModelRouter = self._build_plane_router(storage.llm)
         self.llm: ModelRouter | None = self.model_router if storage.llm is not None else None
+        # …and its TEARDOWN, which did not exist. `close()` below promises to "release every store
+        # connection this container opened"; the MODEL layer was outside that promise entirely, so
+        # litellm's process-global logging worker — a `while True: await queue.get()` consumer our
+        # first async model call starts — was left pending on a loop nobody would close it on, and
+        # died as `RuntimeError: Event loop is closed` out of `asyncio.Queue.get`'s bare `except:`
+        # (nine such unraisables measured on the VM's full mu-core suite; see
+        # `LiteLLMRouterAdapter.aclose` for the mechanism). `insert(0, …)` so the LIFO drain runs it
+        # LAST, and that position was CORRECTED by measurement: appended (drained FIRST) it still
+        # leaked, because litellm ends every async call with a bare
+        # `asyncio.create_task(_client_async_logging_helper(...))` that RE-STARTS the worker during
+        # any await that follows — and the remaining store closers are exactly such awaits.
+        # `model_router` is always built (ENG-115a) and `aclose()` is a no-op on a router that
+        # never made a call, so this is unconditional.
+        self._closers.insert(0, self.model_router.aclose)
         # C2: `settings=` threaded from the WIRED `EngineSettings.extraction` — previously bare
         # (`HeuristicSpoExtractor()`), so `MU_EXTRACTION__MIN_TOKENS`/`MU_EXTRACTION__…`-vocab
         # overrides never reached the DEFAULT (heuristic, `storage.llm is None`) extraction path,

@@ -3,7 +3,16 @@
 Mirrors ``test_relational_int.py`` (Postgres) — the SAME ``RelationalControlPlaneAdapter``
 class, the SAME conformance body, only the bound engine's dialect differs (MySQL's
 ``ON DUPLICATE KEY UPDATE`` upsert path instead of Postgres' ``ON CONFLICT DO UPDATE`` — spec
-§6 invariant: a backend swap changes performance/dialect DDL, never correctness)."""
+§6 invariant: a backend swap changes performance/dialect DDL, never correctness).
+
+**The dependency, stated where the reader lands.** This module needs a real ``mu-dev-mysql``
+listening on ``MU_STORAGE__MYSQL__{HOST,PORT}`` (``.env.test`` -> 13306); start it with
+``docker compose -f docker-compose.dev.yml up -d mysql``. When it is absent the ``mysql_engine``
+fixture SKIPS with that sentence rather than raising the driver's connection error — the four
+tests below once reported as four ~40-line setup ERRORs that read like a broken adapter when the
+only true fact was that a container was not started. Export ``MU_REQUIRE_MYSQL=1`` on any machine
+that is supposed to have it (CI, a provisioned VM) and the skip becomes a FAILURE, so "the tier
+did not run" can never pass for "the tier passed"."""
 
 from __future__ import annotations
 

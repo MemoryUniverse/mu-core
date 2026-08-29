@@ -37,7 +37,7 @@ Acceptance items closed here (memory-lifecycle-manager-spec.md §8/§13.2, AC-3.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 
 import pytest
@@ -154,16 +154,26 @@ async def _mtm_point_state(
 
 
 # ------------------------------------------------------------------------------------- fixtures
+# A ModelRouter is a RESOURCE, not a value: its `LiteLLMRouterAdapter` makes litellm start a
+# process-global logging worker (`while True: await queue.get()`) on THIS test's event loop, which
+# pytest-asyncio closes at the end of the test. Returned unclosed (as these two fixtures used to),
+# the consumer is collected against a dead loop and `asyncio.Queue.get`'s bare `except:` raises
+# ``RuntimeError: Event loop is closed`` — measured as unraisable warnings in the full mu-core
+# suite, one of them attributed to this very file. So both fixtures now YIELD and `aclose()`.
 @pytest.fixture
-def slm_router() -> ModelRouter:
+async def slm_router() -> AsyncIterator[ModelRouter]:
     models, catalog = _build_slm_catalog(_SLM_CFG)
-    return _router(models, catalog)
+    router = _router(models, catalog)
+    yield router
+    await router.aclose()
 
 
 @pytest.fixture
-def down_router() -> ModelRouter:
+async def down_router() -> AsyncIterator[ModelRouter]:
     models, catalog = _unreachable_slm_catalog()
-    return _router(models, catalog)
+    router = _router(models, catalog)
+    yield router
+    await router.aclose()
 
 
 # ==========================================================================================

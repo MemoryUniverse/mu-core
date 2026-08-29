@@ -182,12 +182,19 @@ async def test_the_local_endpoint_never_receives_the_operators_cloud_key(
         chunk_token_ratio=0.75,
     )
 
-    await router.generate(Task.ROUTINE_EXTRACT, [Message(role=MessageRole.USER, content="hi")])
+    try:
+        await router.generate(Task.ROUTINE_EXTRACT, [Message(role=MessageRole.USER, content="hi")])
 
-    assert _Recorder.seen, "the request never reached the local endpoint"
-    for headers in _Recorder.seen:
-        assert _PLANTED_CLOUD_KEY not in json.dumps(headers)
-        assert "sk-mu-local-placeholder" not in json.dumps(headers)
+        assert _Recorder.seen, "the request never reached the local endpoint"
+        for headers in _Recorder.seen:
+            assert _PLANTED_CLOUD_KEY not in json.dumps(headers)
+            assert "sk-mu-local-placeholder" not in json.dumps(headers)
+    finally:
+        # A ModelRouter is a RESOURCE: the completed call above makes litellm start a
+        # process-global logging worker (`while True: await queue.get()`) on THIS test's loop,
+        # which pytest-asyncio then closes. Left unclosed it is collected against a dead loop and
+        # `asyncio.Queue.get`'s bare `except:` raises ``RuntimeError: Event loop is closed``.
+        await router.aclose()
 
 
 # ---------------------------------------------------------------------------------------------

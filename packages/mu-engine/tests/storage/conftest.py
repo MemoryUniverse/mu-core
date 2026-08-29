@@ -5,12 +5,20 @@ central Settings tree (``.env.test`` -> ``get_settings()``), never a hardcoded l
 Tests isolate themselves with a unique ``org``/``workspace``/``session`` per test so no
 cross-test contamination, and tear down the collections/graphs/keys they create.
 
-If a container is not up, the fixture RAISES (test is BLOCKED/errored) — it is never faked
-(DEV-STANDARDS: "if a real dependency isn't up, the test is BLOCKED, never faked").
+If a container is not up, the fixture NEVER fakes it (DEV-STANDARDS: "if a real dependency
+isn't up, the test is BLOCKED (**reported**), never faked"). The reported half is the part that
+was missing: raising the driver's own connection error makes a machine-state fact arrive as a
+~40-line setup ERROR that reads exactly like a broken tier. ``mysql_engine`` below therefore
+translates *connection* failure — and only connection failure — into a one-line named report that
+says which container, which endpoint, and the command that starts it, with
+``MU_REQUIRE_MYSQL=1`` to turn that report into a hard FAILURE where the container was supposed
+to be up. Every other fixture here still raises the raw error; same latent noise, different
+owner's item.
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import AsyncIterator, Callable
 
@@ -20,6 +28,8 @@ import pytest_asyncio
 from falkordb.asyncio import FalkorDB
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from mu_contracts.config import Settings
@@ -190,12 +200,77 @@ async def pg_engine(settings: Settings) -> AsyncIterator[AsyncEngine]:
         await engine.dispose()
 
 
+#: Turns the ``mu-dev-mysql``-is-absent SKIP below into a hard FAILURE. Set it wherever the
+#: container is *supposed* to be up — a CI lane, or a VM run whose provisioning claims to have
+#: started it — so "the tier did not run" cannot be mistaken for "the tier passed". Named for
+#: the store, not for a lane, so a future ``MU_REQUIRE_<STORE>`` reads the same way.
+MYSQL_REQUIRED_ENV = "MU_REQUIRE_MYSQL"
+
+
+def _mysql_absent(settings: Settings, exc: BaseException) -> str:
+    """The one message a missing ``mu-dev-mysql`` gets, whether it skips or fails.
+
+    It names the store, the endpoint it looked at, the driver's own words, and the command that
+    fixes it — everything the reader needs without opening a file. The DSN is NOT interpolated:
+    it carries the dev password, and a skip line is printed into logs and CI summaries.
+
+    The last sentence differs by mode on purpose. Telling a reader who ALREADY set
+    ``MU_REQUIRE_MYSQL=1`` to set it is advice they have taken, printed on the run where it fired
+    — the reader would reasonably conclude the flag did nothing. In that mode the sentence states
+    which flag turned this into a hard stop instead.
+    """
+    where = f"{settings.storage.mysql.host}:{settings.storage.mysql.port}"
+    cause = getattr(exc, "orig", exc)
+    verdict = (
+        f"{MYSQL_REQUIRED_ENV}=1 is set, so this is a FAILURE and not a skip."
+        if os.environ.get(MYSQL_REQUIRED_ENV)
+        else f"Set {MYSQL_REQUIRED_ENV}=1 to make this a FAILURE instead of a skip."
+    )
+    return (
+        f"mu-dev-mysql is not reachable at {where} ({type(cause).__name__}: {cause}). "
+        f"Start it with `docker compose -f docker-compose.dev.yml up -d mysql` "
+        f"(host port from MU_STORAGE__MYSQL__* in .env.test). {verdict}"
+    )
+
+
 @pytest_asyncio.fixture
 async def mysql_engine(settings: Settings) -> AsyncIterator[AsyncEngine]:
+    """The REAL ``mu-dev-mysql`` relational engine — and a NAMED report when it is not there.
+
+    **Why the probe is separate from ``create_all``.** This fixture used to open the engine and
+    run the DDL in one breath, so a container that was simply not started surfaced as four
+    setup ERRORs, each ~40 lines of SQLAlchemy pool internals with
+    ``Can't connect to MySQL server on 'localhost' ([Errno 111] ...)`` as the last line. That is
+    not the "BLOCKED (reported)" DEV-STANDARDS asks for — it is indistinguishable, at a glance,
+    from the tier being broken, and it is the same shape as the 41 push-tier tests that once
+    vanished into a green headline: a machine-state fact wearing the costume of a code fact.
+
+    So connectivity is established FIRST, on its own, and only that failure is translated. A
+    ``create_all`` that fails once MySQL *is* answering is a real dialect/DDL defect (this schema
+    binds Postgres, SQLite and MySQL — see ``relational/schema.py``) and is deliberately left to
+    raise untouched: it must never be swallowed by an environment excuse.
+    """
     engine = create_async_engine(settings.storage.mysql.dsn, pool_pre_ping=True)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)  # idempotent (checkfirst)
     try:
+        absent: str | None = None
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("select 1"))
+        except (OperationalError, OSError) as exc:
+            # Reached only when the SERVER never answered: refused/unreachable/unauthenticated.
+            # A live server that rejects the *schema* raises a different class and is not caught.
+            absent = _mysql_absent(settings, exc)
+        # Raised OUTSIDE the ``except`` on purpose. Raising in the handler makes Python chain the
+        # driver exception onto it, and pytest then prints the whole
+        # "The above exception was the direct cause of ..." tower ABOVE the message — measured:
+        # the require-flag run reported the named sentence buried under 3 chained frames per test,
+        # i.e. exactly the noise this fixture exists to remove. Here the sentence is the report.
+        if absent is not None:
+            if os.environ.get(MYSQL_REQUIRED_ENV):
+                pytest.fail(absent, pytrace=False)
+            pytest.skip(absent)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)  # idempotent (checkfirst)
         yield engine
     finally:
         await engine.dispose()

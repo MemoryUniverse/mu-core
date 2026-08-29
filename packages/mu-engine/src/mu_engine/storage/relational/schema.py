@@ -47,6 +47,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKeyConstraint,
@@ -566,6 +567,107 @@ class UsageRollupRow(Base):
     quantity: Mapped[int] = mapped_column(BigInteger, nullable=False)
     qualifiers: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     source_high_water_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+# ------------------------------------------------------------ §2.7b the hosted-plane usage CHAIN
+# Revision ``e7c1b4d90a36`` (AD-161) migrates ``usage_event_chain`` + ``usage_chain_head``; these
+# two classes are the declarative half, and they close the trap that revision reports on
+# itself under *"⚠ NO ORM MODEL DECLARES THESE TWO TABLES, AND THAT IS A REPORTED TRAP, NOT A
+# DESIGN"* — which named this file as the fix and deliberately did not make it.
+#
+# **Why a model at all, when nothing in this repo reads these tables.** The only reader is
+# ``mu_server.metering.ledger_pg``, which speaks raw SQL and needs no ORM class — so for one
+# revision these were the ONLY migrated tables with no entry in ``Base.metadata``. That is not a
+# cosmetic gap: ``migrations/env.py`` hands ``Base.metadata`` to alembic as the target, so a
+# routine ``alembic revision --autogenerate`` compared model-absent against database-with-table
+# and generated ``op.drop_table('usage_event_chain')`` + ``op.drop_table('usage_chain_head')`` —
+# MEASURED against a real migrated Postgres, not predicted. Applying that
+# generated revision would delete the rows an invoice is computed from
+# (``observability-metering-spec.md`` §A0: "the invoice is computed from these rows and from
+# nothing else"). ``room_log``, ``room_session``, ``room_participant`` and ``trust_ledger_entries``
+# are all modelled here despite being read only by ``mu-server``, so the convention already
+# existed; these two simply missed it.
+#
+# **The shape below is the migration's, column for column.** A model that DISAGREES with the
+# migration is worse than no model, because autogenerate would then emit an ``op.alter_column``
+# that silently changes a billing column instead of an obvious drop. Every width, nullability,
+# constraint name and index here is the literal from ``e7c1b4d90a36``; the reasoning for each
+# (why ``to_prefix`` is 768 and not 128, why ``prev_hash`` is NOT NULL with a ``'GENESIS'`` value,
+# why ``quantity >= 0``, why the head watermark is a separate table) lives in that revision's
+# module docstring and is not restated here. The drift belt is
+# ``tests/storage/test_schema_autogenerate_drift_int.py``, which runs the REAL autogenerate
+# against a REAL migrated database and fails on any proposed op.
+#
+# **Content-free** (CLAUDE.md rule 3): every column is an id, a bounded enum value, a
+# non-negative count, a hash or a timestamp. No column here can hold text a caller wrote.
+class UsageEventChainRow(Base):
+    """The hosted plane's append-only metering ledger — one row per billable event."""
+
+    __tablename__ = "usage_event_chain"
+
+    # Tenancy is un-collapsed (CANONICAL §1 rule 5): `seq` is authoritative per
+    # `(org_id, workspace_id)`, never per workspace name alone.
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)  # per-(org,workspace) monotonic
+    event_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    occurred_at: Mapped[datetime] = _dt()
+    correlation_id: Mapped[str | None] = mapped_column(String(128))  # NULL: edge minted no jti
+    principal_id: Mapped[str] = mapped_column(String(128), nullable=False)  # WHO IS CHARGED
+    namespace_user: Mapped[str] = mapped_column(String(128), nullable=False)
+    session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False)
+    to_prefix: Mapped[str] = mapped_column(String(768), nullable=False)  # six-segment η prefix
+    deployment_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    dimension: Mapped[str] = mapped_column(String(32), nullable=False)  # MeterDimension
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    quantity: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    unit: Mapped[str] = mapped_column(String(16), nullable=False)
+    route: Mapped[str | None] = mapped_column(String(120))  # NULL: unmatched route template
+    device_id: Mapped[str | None] = mapped_column(String(128))  # NULL: non-device caller
+    # NULL rather than a fabricated 0 wherever the measure was not takeable.
+    latency_bucket: Mapped[str | None] = mapped_column(String(16))
+    request_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    response_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    # NOT NULL: genesis is the VALUE 'GENESIS', never a NULL, so link 1 hashes by the same rule
+    # as every other link and a verifier needs no special case.
+    prev_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    row_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    __table_args__ = (
+        PrimaryKeyConstraint("org_id", "workspace_id", "seq", name="pk_usage_event_chain"),
+        # §B8's idempotency key. The adapter's `IntegrityError` branch reads the stored row back
+        # and mints no second `seq`; that branch is only correct because this exists.
+        UniqueConstraint("org_id", "workspace_id", "event_id", name="ux_usage_event_chain_id"),
+        # A negative quantity is a credit note, and this table rates nothing (§B2).
+        CheckConstraint("quantity >= 0", name="ck_usage_event_chain_quantity"),
+        Index("ix_usage_event_chain_rollup", "org_id", "workspace_id", "occurred_at"),
+        Index(
+            "ix_usage_event_chain_principal",
+            "org_id",
+            "workspace_id",
+            "principal_id",
+            "occurred_at",
+        ),
+    )
+
+
+class UsageChainHeadRow(Base):
+    """The chain's monotonic head watermark — one row per ``(org, workspace)``.
+
+    Not decoration: without it a TRUNCATED TAIL leaves no gap and no broken link, so a replay of
+    the links alone would answer ``ok=True`` for a class of tampering it cannot see.
+    """
+
+    __tablename__ = "usage_chain_head"
+
+    org_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    row_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[datetime] = _dt()
+
+    __table_args__ = (PrimaryKeyConstraint("org_id", "workspace_id", name="pk_usage_chain_head"),)
 
 
 # ============================================================ §2.8 devices + private sync-log

@@ -79,6 +79,34 @@ class ModelRouter:
         self.model_name: str = embedder.model_name
         self.dimension: int = embedder.dimension
 
+    # ---- lifecycle ------------------------------------------------------------------------
+    async def aclose(self) -> None:
+        """Release the model layer's background machinery (DEV-STANDARDS async-correctness /
+        resource management: *no client leaks, cancellation-safe*).
+
+        This layer HAD no teardown verb, which is why litellm's process-global logging worker —
+        a `while True: await queue.get()` consumer our first async model call starts — outlived
+        the event loop that created it and raised ``RuntimeError: Event loop is closed`` out of
+        `asyncio.Queue.get`'s bare `except:` at collection time. See
+        :meth:`mu_engine.providers.litellm_provider.LiteLLMRouterAdapter.aclose` for the full
+        mechanism, the measurement, and why cancel-AND-await on the owning loop is the fix.
+
+        Idempotent and safe on a router that never made a call. Every composition root registers
+        it in its LIFO closer list, so `LocalContainer.close()` / `EngineContainer.close()` keep
+        the promise their own docstrings make ("release every ... this container opened").
+
+        The embedder is deliberately NOT closed here: `build_embedder` returns an in-process
+        sentence-transformers singleton with no network client and no background task, shared by
+        construction — closing it from one router would break another that still holds it.
+        """
+        await self._llm.aclose()
+
+    async def __aenter__(self) -> ModelRouter:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
     # ---- canonical LLMProviderPort surface (CANONICAL §6-P2) ------------------------------
     @traced("model.complete")
     async def complete(
