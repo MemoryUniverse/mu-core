@@ -100,9 +100,9 @@ async def test_traversal_hides_shared_fact_from_a_different_room(
     room-included ``to_prefix()``, UNCONDITIONALLY."""
     room_a = make_ns(visibility=Visibility.SHARED, session="roomA")
     room_b = make_ns(visibility=Visibility.SHARED, session="roomB")
-    assert ltm.graph_name_for(room_a) == ltm.graph_name_for(room_b), (
-        "precondition: both rooms must share ONE physical partition, else this test is vacuous"
-    )
+    assert ltm.graph_name_for(room_a) == ltm.graph_name_for(
+        room_b
+    ), "precondition: both rooms must share ONE physical partition, else this test is vacuous"
 
     other_rooms_fact = make_item(
         room_a,
@@ -119,9 +119,9 @@ async def test_traversal_hides_shared_fact_from_a_different_room(
     from_a = await ltm.traverse_entities(
         room_a, query=_QUERY, max_hops=2, limit=10, caller_identity_set=caller
     )
-    assert [h.item.id for h in from_a] == [other_rooms_fact.id], (
-        "precondition: own room must see it"
-    )
+    assert [h.item.id for h in from_a] == [
+        other_rooms_fact.id
+    ], "precondition: own room must see it"
 
     from_b = await ltm.traverse_entities(
         room_b, query=_QUERY, max_hops=2, limit=10, caller_identity_set=caller

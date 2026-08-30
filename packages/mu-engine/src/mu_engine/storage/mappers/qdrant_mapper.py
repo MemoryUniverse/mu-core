@@ -26,9 +26,39 @@ __all__ = [
     "NAMESPACE_PAYLOAD_KEY",
     "QdrantMapper",
     "collection_name",
+    "payload_str_list",
     "point_id",
     "tenant_partition_digest",
 ]
+
+
+def payload_str_list(value: object) -> list[str]:
+    """Narrow ONE ``dict[str, object]`` payload slot to ``list[str]``, or refuse it.
+
+    AD-184 re-homed the StoreModel DTOs to ``mu_contracts.ports.stores``, and the contracts shape
+    — the stricter of the two, which is why it won — types ``QdrantPoint.payload`` as
+    ``dict[str, object]`` where ``mu_engine``'s deleted copy said ``dict[str, Any]``. ``Any``
+    silences every read of that dict; ``object`` does not, which is the point of the stricter
+    shape and also why three sites went red under ``mypy --strict`` the moment the duplicate was
+    deleted (this helper is the fix; it was NOT part of the AD-184 change as first written, and
+    that CI gate was red on the branch).
+
+    A non-sequence RAISES rather than coercing to ``[]`` — deliberately, because the one caller
+    that matters is the ``authorized_ids`` stamp on a SHARED write (``pgvector_mtm``,
+    ``weaviate_mtm``). Reading a malformed stamp as "the empty list" would write a row nobody can
+    read, silently; reading it as "no filter" would be worse. The old ``[str(a) for a in ...]``
+    raised ``TypeError`` on the same input, so this preserves the behaviour exactly while making
+    the narrowing legible. Content-free: the message names the slot, never its value.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list | tuple):
+        return [str(v) for v in value]
+    raise TypeError(
+        f"payload slot expected a sequence, got {type(value).__name__} — "
+        "a malformed indexed key is never silently read as empty"
+    )
+
 
 # The ONE payload/metadata key every MTM backend stores ``Namespace.to_prefix()`` under, defined
 # HERE (the mapper that writes it) so the adapters that must scope a by-id write to a namespace

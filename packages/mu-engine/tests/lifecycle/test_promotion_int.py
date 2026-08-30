@@ -43,6 +43,7 @@ from mu_engine.services.settings import IngestSettings
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
+from mu_engine.storage.authz import INTERNAL_ENGINE_READ
 from mu_engine.storage.domain.memory import MemoryItem, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
@@ -406,7 +407,18 @@ async def test_promote_session_refuses_a_shared_namespace_and_writes_nothing(
         "the MTM collection for this SHARED η exists — the sweep reached the write leg before "
         "refusing, so the refusal is not the fail-closed guard it claims to be."
     )
-    assert await ltm.graph_recall(ns, subject="Ada", limit=10) == []
+    # AD-179: a SHARED-η ``graph_recall`` with NO caller identity set now fail-CLOSES, so this
+    # consequence assertion has to say which kind of principal-less read it is. It is the
+    # engine's own "did anything get written" probe, not a read on behalf of anybody — exactly
+    # what ``INTERNAL_ENGINE_READ`` exists to name — and asserting ``== []`` through it is
+    # STRICTER than the old bare ``None``: the sentinel skips Model-A entirely, so the graph
+    # would have to be empty for EVERY principal, not just for one unauthorized caller.
+    assert (
+        await ltm.graph_recall(
+            ns, subject="Ada", limit=10, caller_identity_set=INTERNAL_ENGINE_READ
+        )
+        == []
+    )
 
 
 async def test_promote_session_still_promotes_on_a_private_namespace(

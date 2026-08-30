@@ -202,15 +202,15 @@ async def test_point_get_refuses_another_namespaces_memory_in_the_same_org_works
     ws = f"shared-ws-{uuid.uuid4().hex[:8]}"
     victim_ns = make_ns(workspace=ws, user="u_victim")
     caller_ns = make_ns(workspace=ws, user="u_caller")
-    assert tenant_name(victim_ns) == tenant_name(caller_ns), (
-        "the pre-condition did not hold: the two namespaces are in different tenants"
-    )
+    assert tenant_name(victim_ns) == tenant_name(
+        caller_ns
+    ), "the pre-condition did not hold: the two namespaces are in different tenants"
     victim = make_item(victim_ns, "the victim's secret")
     await mtm.upsert(victim)
     assert await mtm.get(victim_ns, victim.id) is not None, "the victim is not even stored"
-    assert await mtm.get(caller_ns, victim.id) is None, (
-        "a point-get resolved a memory from another principal's partition"
-    )
+    assert (
+        await mtm.get(caller_ns, victim.id) is None
+    ), "a point-get resolved a memory from another principal's partition"
 
 
 async def test_state_active_supersede_drop(

@@ -168,9 +168,9 @@ async def test_invalidate_refuses_another_namespaces_memory(
         "owner's active recall"
     )
     doc = (got.get("documents") or [None])[0]
-    assert "superseded_by" not in json.loads(doc or "{}"), (
-        "a foreign invalidate wrote a supersession edge onto the victim's document"
-    )
+    assert "superseded_by" not in json.loads(
+        doc or "{}"
+    ), "a foreign invalidate wrote a supersession edge onto the victim's document"
 
 
 async def test_invalidate_in_its_own_namespace_still_supersedes(

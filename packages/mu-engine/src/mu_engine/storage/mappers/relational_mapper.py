@@ -69,17 +69,23 @@ class RelationalMapper:
                 visibility=vis,
             )
         )
+        # AD-184: ``RelationalRow.cols`` is ``dict[str, object]`` in the contracts shape this
+        # module now imports (the engine's deleted duplicate said ``dict[str, Any]``, which
+        # silenced every read of it). Each slot is narrowed explicitly rather than trusted — the
+        # three enums are str-enums, so ``str()`` is the identity on a well-formed row and a
+        # ``ValueError`` on a malformed one, exactly as before.
+        artifact_ref = c.get("artifact_ref")
         return MemoryItem(
             id=str(row.pk["memory_id"]),
             content=CONTENT_FREE_SHELL,
-            kind=MemoryKind(c["kind"]),
-            tier=MemoryTier(c["tier"]),
-            state=MemoryState(c["state"]),
+            kind=MemoryKind(str(c["kind"])),
+            tier=MemoryTier(str(c["tier"])),
+            state=MemoryState(str(c["state"])),
             namespace=ns,
             owner_id=str(c["owner_id"]),
             workspace_id=str(c["workspace_id"]),
             session_id=session,
             content_hash=str(c["content_hash"]),
-            artifact_ref=c.get("artifact_ref"),
+            artifact_ref=None if artifact_ref is None else str(artifact_ref),
             provenance_id=str(c["provenance_id"]),
         )

@@ -11,6 +11,7 @@ Two obligations (plan's C0 row):
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
 import pytest
@@ -41,12 +42,28 @@ def _clear_engine_settings_cache() -> Iterator[None]:
 
 
 # ------------------------------------------------------------------------------------ (a) no drift
-def test_engine_settings_defaults_match_each_bare_subtree_exactly() -> None:
+def test_engine_settings_defaults_match_each_bare_subtree_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """No behavior change (plan C0): every mounted field, constructed via the aggregator, is
     field-equal to constructing the SAME class bare — the exact "no re-shape" guarantee every
     subtree's own docstring promises ("the composition root wires ``settings.X`` when it lands —
-    no re-shape")."""
-    s = EngineSettings()
+    no re-shape").
+
+    ⚠ **This test is about DEFAULTS, so it has to be asked in an environment that supplies none.**
+    It used to construct a bare ``EngineSettings()``, which reads ``MU_*`` from the process
+    environment AND from ``.env``/``.env.test`` (``model_config.env_file``) — so the assertion held
+    only on a machine that had configured no provider. MEASURED on the VM 2026-08-30: a `.env`
+    written that day for the Azure Foundry work set
+    ``MU_MODEL_CATALOG__SHIPPED__AZURE_API_BASE``, and this test went red with
+    ``ModelCatalogSettings(...) == ModelCatalogSettings(...)`` — an assertion whose two sides print
+    identically at that truncation, which is what made it look nondeterministic ("flaky under
+    load", "a live credential probe") when it is in fact perfectly deterministic and simply
+    env-coupled. Two BARE ``ModelCatalogSettings()`` are, and always were, equal. The isolation
+    below is the fix: no ``MU_`` variable from the ambient environment, and no dotenv file."""
+    for key in [k for k in os.environ if k.startswith("MU_")]:
+        monkeypatch.delenv(key, raising=False)
+    s = EngineSettings(_env_file=None)
 
     assert s.recall == RecallSettings()
     assert s.distill == DistillSettings()

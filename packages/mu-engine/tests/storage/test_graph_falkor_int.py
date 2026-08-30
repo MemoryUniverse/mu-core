@@ -292,9 +292,9 @@ async def test_graph_recall_explicit_session_scope_still_narrows_to_one_session(
     assert narrowed == [], "explicit session_scope did not narrow — the opt-out is broken"
 
     widened = await ltm.graph_recall(ns_b, subject="Ada", limit=10, session_scope="sessionA")
-    assert {h.item.object for h in widened} == {"Paris"}, (
-        "session_scope must be able to target ANY of the user's sessions, not only the caller's"
-    )
+    assert {h.item.object for h in widened} == {
+        "Paris"
+    }, "session_scope must be able to target ANY of the user's sessions, not only the caller's"
 
 
 # =================================================================================================

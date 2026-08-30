@@ -146,9 +146,9 @@ async def test_point_get_refuses_another_namespaces_memory(
     await mtm.upsert(victim)
     assert await mtm.get(victim_ns, victim.id) is not None, "the victim is not even stored"
 
-    assert await mtm.get(caller_ns, victim.id) is None, (
-        "a point-get resolved a memory from another principal's partition"
-    )
+    assert (
+        await mtm.get(caller_ns, victim.id) is None
+    ), "a point-get resolved a memory from another principal's partition"
 
 
 async def test_state_active_supersede_drop(

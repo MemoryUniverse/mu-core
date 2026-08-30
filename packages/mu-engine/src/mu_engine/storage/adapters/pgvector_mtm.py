@@ -38,7 +38,7 @@ from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
 from mu_engine.storage.mappers.pgvector_mapper import PgVectorMapper, pgvector_table_name
-from mu_engine.storage.mappers.qdrant_mapper import point_id
+from mu_engine.storage.mappers.qdrant_mapper import payload_str_list, point_id
 from mu_engine.storage.ports import QdrantPoint
 
 __all__ = ["PgVectorMtmAdapter"]
@@ -154,7 +154,7 @@ class PgVectorMtmAdapter:
         payload = row.payload
         namespace = str(payload.get("namespace", item.namespace.to_prefix()))
         state = str(payload.get("state", item.state.value))
-        authorized_ids = [str(a) for a in (payload.get("authorized_ids") or [])]
+        authorized_ids = payload_str_list(payload.get("authorized_ids"))
         pool = await self._ensure_pool()
         async with pool.acquire() as conn:
             await conn.execute(

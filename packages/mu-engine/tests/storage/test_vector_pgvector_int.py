@@ -209,9 +209,9 @@ async def test_invalidate_refuses_another_namespaces_memory(
         "a foreign namespace superseded the victim's memory — it is now dropped from its "
         "owner's active recall"
     )
-    assert "superseded_by" not in dict(row["payload"]), (
-        "a foreign invalidate wrote a supersession edge onto the victim's row"
-    )
+    assert "superseded_by" not in dict(
+        row["payload"]
+    ), "a foreign invalidate wrote a supersession edge onto the victim's row"
 
 
 async def test_invalidate_in_its_own_namespace_still_supersedes(

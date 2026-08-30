@@ -86,7 +86,7 @@ from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
 from mu_engine.storage.errors import MtmPointAbsentError, StorageError
-from mu_engine.storage.mappers.qdrant_mapper import point_id
+from mu_engine.storage.mappers.qdrant_mapper import payload_str_list, point_id
 from mu_engine.storage.mappers.weaviate_mapper import WeaviateMapper, collection_name, tenant_name
 from mu_engine.storage.ports import QdrantPoint
 
@@ -464,7 +464,7 @@ class WeaviateMtmAdapter:
         if p.get("artifact_ref") is not None:
             props["artifact_ref"] = p["artifact_ref"]
         if "authorized_ids" in p:
-            props["authorized_ids"] = [str(a) for a in p["authorized_ids"]]
+            props["authorized_ids"] = payload_str_list(p["authorized_ids"])
         return props
 
     def _item_from_payload_json(self, payload_json: str, vector: list[float]) -> MemoryItem:
