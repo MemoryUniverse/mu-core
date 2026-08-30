@@ -154,7 +154,49 @@ class RecallSettings(BaseModel):
     # swamp every other channel's relevance signal.
     floor_protect_limit: int = Field(default=3, ge=0)
     channel_pool_size: int = Field(default=20, ge=1)  # per-channel fetch width > limit (ADR 0010)
-    weight_stm: float = Field(default=1.0, ge=0.0)  # in-arm recency-channel weight (§1.3 fuse)
+
+    # AD-204 (channel rank-authority, RETRIEVAL-EVAL-0829.md §5.3 / STATE-AND-DEFECTS-0829.md D3):
+    # equal (1.0/1.0/1.0) in-arm weights gave a ten-item, single-session STM recency window the
+    # SAME RRF rank authority as an MTM ANN search over the WHOLE partition — rank-based RRF only
+    # ever looks at a channel's OWN rank position, never how large or how targeted the pool that
+    # rank came from, so the STM channel's best-of-ten (possibly irrelevant) candidate tied the
+    # MTM channel's genuine best-of-the-corpus candidate for the SAME `1/(k+1)` vote. MEASURED on
+    # LoCoMo (1,531 labelled queries, real Qdrant/Valkey/FalkorDB, `eval/vm_eval.sh baseline`):
+    # equal weights made the shipped 3-channel fuse *worse than its own MTM channel alone at every
+    # cutoff* (recall@1 0.0049 vs 0.1625 — a 33x gap; recall@10 0.3415 vs 0.4553), even with the
+    # floor-position fix (AD-195) already landed.
+    #
+    # `weight_stm=0.1` (a 10:1 discount against MTM/LTM, both left at 1.0 — only the RATIO after
+    # normalization matters, `fusion.py`'s `reciprocal_rank_fusion`) closes it: re-measured on the
+    # SAME 1,531 queries, recall@1/3/5 land within one query's width of the MTM-alone channel
+    # (0.1608/0.2946/0.3668 vs 0.1625/0.2939/0.3675 — @3 actually edges it), and recall@10 is the
+    # ONE cutoff still short (0.4096 vs 0.4553) — but that residual is NOT this defect: re-running
+    # with `floor_protect_limit=0` (non-default, diagnostic-only — isolates the fuse from the
+    # floor) at the SAME `weight_stm=0.1` gives 0.1608/0.2946/0.3668/0.4559, matching or exceeding
+    # the MTM-alone channel at every one of the four cutoffs. The k=10 shortfall at the SHIPPED
+    # `floor_protect_limit=3` is the SEPARATE, already-decided "never evict a just-said fact"
+    # guarantee (AD-195) spending up to 3 of the 10 returned slots on rows fusion ranked outside
+    # the window — a cost AD-195 already priced and chose to keep, not a re-opening of it. This fix
+    # closes the rank-authority mismatch RRF had between channels of very different search breadth;
+    # it does not, and should not, touch that separate trade-off.
+    #
+    # Picked 0.1 (a 10:1 discount) over a more extreme value on purpose: 2.0/3.0/4.0 on
+    # `weight_mtm` (equivalently ~2:1-4:1 against STM) looked sufficient on a 3-conversation subset
+    # (382 queries) — recall@1 rose from 0.0026 to 0.1490 there — but did NOT fully close the gap
+    # on the FULL 1,531-query corpus (recall@1 stalled at 0.1426 vs 0.1625 even with
+    # `floor_protect_limit=0`, i.e. a small subset can look "saturated" at a ratio the full corpus
+    # proves is not yet enough). `weight_stm=0.1` (10:1) was the smallest discount tested that
+    # closed the FULL-corpus gap; `0.05`/`0.02` (20:1/50:1) reproduce it to the same 4 decimals, so
+    # this is the threshold, not an arbitrarily large number picked past it.
+    #
+    # `weight_ltm` is left alone: unlike the STM floor, the LTM channel's own re-measured two-arm
+    # federation numbers (STATE-AND-DEFECTS-0829.md D3b) already improved from the AD-195 floor fix
+    # with no LTM-specific defect found — and empirically the LTM channel contributed ZERO items to
+    # any top-10 result across the whole measurement run (`by tier/channel` provenance never showed
+    # an `ltm/*` entry), so it has no rank authority to correct here. Widening this fix to LTM has
+    # no supporting evidence and is left as a documented non-finding, not a silent skip.
+    # in-arm recency-channel weight (§1.3 fuse; AD-204)
+    weight_stm: float = Field(default=0.1, ge=0.0)
     weight_mtm: float = Field(default=1.0, ge=0.0)  # in-arm dense weight (§1.3 fuse)
     weight_ltm: float = Field(default=1.0, ge=0.0)  # in-arm graph weight (§1.3 fuse)
     weight_private: float = Field(default=1.0, ge=0.0)  # federation: private-arm weight (§1.6)

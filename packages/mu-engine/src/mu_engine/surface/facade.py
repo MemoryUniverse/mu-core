@@ -102,7 +102,7 @@ from mu_engine.pipelines.distill import (
     EventPublisher,
 )
 from mu_engine.platform.clock import SystemClock
-from mu_engine.providers._contracts import Message, MessageRole
+from mu_engine.providers._contracts import EmbeddingPort, Message, MessageRole
 from mu_engine.providers.catalog import Task
 from mu_engine.providers.model_router import ModelRouter
 from mu_engine.services.ingest import IngestResult, IngestService
@@ -165,6 +165,21 @@ class LocalContainerLike(Protocol):
     recall: RecallService
     mode_gate: ManagerModeGate
     llm: ModelRouter | None
+
+    # D1 (STATE-AND-DEFECTS-0829.md): ``promote``'s STM->MTM branch below does its OWN
+    # copy-on-write onto ``mtm`` — a THIRD site duplicating the exact shape
+    # ``PromotionService._promote_to_mtm`` (``lifecycle/promotion.py``) and
+    # ``DeterministicPromoteStage`` (``pipelines/concrete/ingest.py``) use, found only when this
+    # verb's own probe (``eval/mu_eval/probe_promote.py``) was re-run after fixing the other two —
+    # it needs the SAME real embedder those already thread, not a fourth, independently-built one
+    # (DEV-STANDARDS rule 9). Declared as a read-only ``@property`` for the SAME reason ``bus``
+    # is below: the real containers type this ``SentenceTransformerEmbedder`` (a concrete
+    # subtype), and a plain settable-attribute Protocol field is invariant — it would reject that
+    # narrower concrete type even though it structurally satisfies ``EmbeddingPort`` (mypy
+    # --strict caught exactly this on both composition roots). A property matches covariantly, so
+    # both containers satisfy this with ZERO adapter code, same as every other member here.
+    @property
+    def embedder(self) -> EmbeddingPort: ...
 
     # The SAME real ``InprocBus`` ``ingest``/``distill`` publish onto (``LocalContainer.bus`` /
     # ``EngineContainer.bus`` — a read-only PROPERTY returning ``EventBusPort``, structurally an
@@ -428,6 +443,15 @@ class SurfaceFacade:
             promoted.tier = MemoryTier.MTM
             promoted.state = MemoryState.ACTIVE
             promoted.updated_at = now
+            # D1 (STATE-AND-DEFECTS-0829.md): the STM item never carries an embedding — embed it
+            # here before upserting, exactly like ``PromotionService._promote_to_mtm`` does, so
+            # this targeted verb cannot write the vector tier's silent zero-vector any more than
+            # the automatic sweep can (``QdrantMapper.to_store`` now refuses ``embedding=None``
+            # outright, which is what actually caught this third site).
+            if promoted.embedding is None:
+                vectors = await self._container.embedder.embed([promoted.content])
+                promoted.embedding = list(vectors[0])
+                promoted.embedding_model = self._container.embedder.model_name
             await self._container.mtm.upsert(promoted)
             events = await self._publish(
                 MemoryPromoted(

@@ -44,6 +44,7 @@ from mu_engine.lifecycle.settings import LifecycleSettings, ManagerModeSettings,
 from mu_engine.pipelines.distill import DistillPipeline
 from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import FrozenClock
+from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
@@ -276,6 +277,7 @@ async def test_one_automatic_sweep_promotes_demotes_and_retains(
     ltm: FalkorLtmAdapter,
     qdrant_client: AsyncQdrantClient,
     make_stm: Callable[..., ValkeyStmAdapter],
+    embedder: EmbeddingPort,
 ) -> None:
     ns = make_ns(session="sess-full")
     now = _T0 + timedelta(days=10)
@@ -326,7 +328,7 @@ async def test_one_automatic_sweep_promotes_demotes_and_retains(
     await ltm.upsert_fact(ephemeral)
     await ltm.upsert_fact(permanent)
 
-    manager = _build_manager(stm=stm, mtm=mtm, ltm=ltm, clock=clock, bus=bus)
+    manager = _build_manager(stm=stm, mtm=mtm, ltm=ltm, clock=clock, bus=bus, embedder=embedder)
 
     # Exactly the MaintenanceLoop-style automatic call: register the ns via a bus event, then sweep
     # the whole user — NO explicit candidates, NO manual verb, NO mode-gate manual path.
@@ -392,10 +394,15 @@ def _build_manager(
     ltm: FalkorLtmAdapter | None,
     clock: FrozenClock,
     bus: InprocBus,
+    embedder: EmbeddingPort | None = None,
 ) -> MemoryLifecycleManager:
     """Build a manager over the REAL adapters exactly as ``LocalContainer.build_lifecycle_manager``
     does: ``mtm=`` powers the demotion auto-drive; ``retention=`` a REAL ``RetentionService`` over
-    the real ``FalkorLtmAdapter`` when one is supplied (else an honest None)."""
+    the real ``FalkorLtmAdapter`` when one is supplied (else an honest None). ``embedder=`` is
+    optional here (default None) because only the full-lifecycle PROMOTE test actually seeds an
+    un-embedded STM item that reaches ``PromotionService._promote_to_mtm`` (D1) — the demotion-
+    and retention-only tests never populate STM, so ``promote_session``'s self-fetched window is
+    always empty and the embedder is never called."""
     salience = SalienceStrategy(SalienceSettings())
     mtm_for_services: object = mtm if mtm is not None else _EmptyMtm()
     if ltm is not None:
@@ -415,6 +422,7 @@ def _build_manager(
         mtm=mtm_for_services,  # type: ignore[arg-type]
         distill=distill,  # type: ignore[arg-type]
         salience=salience,
+        embedder=embedder,
         stm=stm,
         clock=clock,
         bus=bus,

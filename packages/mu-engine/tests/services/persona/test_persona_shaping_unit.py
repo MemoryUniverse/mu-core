@@ -223,13 +223,15 @@ async def test_a_tie_keeps_the_rankers_own_relative_order(ns: Namespace):
 
 
 async def test_the_protected_stm_floor_still_leads_after_shaping(ns: Namespace):
-    """The ranked read this shaper wraps is TWO blocks, not one sorted list.
+    """The ranked read this shaper wraps is TWO score scales, not one sorted list.
 
-    ``ThreeChannelRecallRanker`` returns ``[*protected_floor_views, *fused_tail]``
-    (``recall/ranker.py:_merge_floor``: *"fusion may reorder but never evict a protected floor
-    member"*), and the blocks are scored on two different scales — an STM query-relevance score
-    versus an RRF rank score. A shaper that sorted the whole list would compare incomparable
-    numbers and pull a fused hit ahead of a protected floor member.
+    A protected floor member carries an STM query-relevance score and a fused hit carries an RRF
+    rank score, so a shaper that sorted the whole list would compare incomparable numbers and pull
+    a fused hit past a protected floor member. This case's incoming order happens to be
+    floor-first — the shape ``_merge_floor`` always produced before D3 — so what it pins is that
+    the shaper does not REORDER ACROSS the two scales. Which slots are floor slots is the ranker's
+    decision now, and
+    :func:`test_shaping_keeps_an_interleaved_floor_member_at_the_rank_fusion_gave_it` pins that.
 
     **The numbers are chosen to DISCRIMINATE, and the first version of this test was not** — it
     used floor scores of 0.30/0.20 against RRF scores of 0.016, where a single global sort happens
@@ -264,6 +266,44 @@ async def test_shaping_reorders_inside_the_floor_block(ns: Namespace):
     shaper = await _with_profile(ns, value="kayaking")
 
     assert [h.memory_id for h in await shaper.shape(ns, hits)] == ["f2", "f1", "t1"]
+
+
+async def test_shaping_keeps_an_interleaved_floor_member_at_the_rank_fusion_gave_it(
+    ns: Namespace,
+):
+    """D3 (STATE-AND-DEFECTS-0829.md): the shaper must not re-prepend the floor.
+
+    ``ranker.py:_merge_floor`` and ``recall/service.py:_protect_floor`` were both changed so a
+    protected member keeps whatever rank fusion actually earned it — the fix for the measured
+    ``recall@1 = 0.0003`` (LoCoMo, 1,531 queries), where the top ``floor_protect_limit`` slots of
+    every result were the most-recently-written memories, chosen without reference to the query.
+    ``is_floor`` entries therefore arrive INTERLEAVED.
+
+    ``_reorder`` used to rebuild the list as ``[*floor_block, *fused_block]``. Against an
+    interleaved input that CONCATENATION silently restores the query-blind prefix one decorator
+    downstream of the fix — and persona is wrapped around ``recall`` on every deployment that
+    wires a model (``mu_local/composition.py``, ``mu_engine_server/composition.py``), so it would
+    have undone D3 in the product while the ranker's own unit tests stayed green.
+
+    Two things are asserted, and the second is the one that fails against the pre-fix code:
+    persona still re-orders WITHIN the fused block (``t2`` overtakes ``t1``), and the floor member
+    ``f1`` stays in the slot fusion gave it.
+    """
+    hits = [
+        _hit("t1", "gamma", 0.016),  # fusion ranked this first — no persona signal
+        _hit("f1", "alpha", 0.011, is_floor=True),  # protected, but fusion ranked it SECOND
+        _hit("t2", "delta kayaking", 0.015),  # persona matches; must overtake t1, not f1
+    ]
+    shaper = await _with_profile(ns, value="kayaking")
+
+    shaped = await shaper.shape(ns, hits)
+
+    assert [h.memory_id for h in shaped] == [
+        "t2",
+        "f1",
+        "t1",
+    ], "the floor member was re-prepended (or the fused block was not re-ordered)"
+    assert shaped[1].is_floor, "the floor member left the slot rank fusion gave it"
 
 
 async def test_a_persona_that_matches_nothing_perturbs_a_two_block_result_not_at_all(

@@ -223,15 +223,31 @@ class PersonaAffinityShaper:
         most 15 %, which is the "re-orders but cannot dominate semantic evidence" bound spec line
         194 asks for, stated as an inequality rather than a hope.
 
-        **WITHIN EACH BLOCK, because the list this decorator receives is not one sorted list.**
-        ``ThreeChannelRecallRanker`` returns ``[*protected_floor_views, *fused_tail]``
-        (``recall/ranker.py:_merge_floor``): the floor block leads unconditionally — *"fusion may
-        reorder but never evict a protected floor member"* — and the two blocks carry scores on
-        two DIFFERENT scales, an STM query-relevance score (``_score_stm``, order ~1e-1) versus an
-        RRF rank score (``fusion.py``, order ~1e-2). A single sort over the whole list therefore
-        does two wrong things at once: it compares incomparable numbers, and it can pull a fused
-        hit ahead of a protected floor member, silently undoing a guarantee persona has no
-        business touching.
+        **WITHIN EACH BLOCK, IN PLACE — because the list this decorator receives is not one
+        sorted list, and since D3 it is not two contiguous blocks either.** The two blocks carry
+        scores on two DIFFERENT scales: an STM query-relevance score (``_score_stm``, order ~1e-1)
+        for a protected floor member versus an RRF rank score (``fusion.py``, order ~1e-2) for a
+        fused hit. A single sort over the whole list would compare incomparable numbers.
+
+        ⚠ **The block-CONCATENATION this method used to do is now a defect of its own (D3,
+        STATE-AND-DEFECTS-0829.md).** It built ``[*floor_block, *fused_block]``, which was
+        faithful to the ``_merge_floor`` of the time (*"floor members lead, then the fused tail"*)
+        — and that leading floor is exactly what LoCoMo measured as ``recall@1 = 0.0003`` against
+        ``0.1625`` for the same corpus's dense channel alone: the top ``floor_protect_limit`` slots
+        of every result were the most-recently-written memories, chosen without reference to the
+        query. ``ranker.py:_merge_floor`` and ``recall/service.py:_protect_floor`` were both fixed
+        to keep a protected member at whatever rank fusion actually earned it (rescuing only a
+        member ranked outside the window, at the END), so ``is_floor`` entries now arrive
+        INTERLEAVED. Re-concatenating them here would have silently restored the query-blind
+        prefix one decorator downstream of the fix, on every deployment that wires a model —
+        ``build_persona`` returns a wiring whenever a router exists, and both composition roots
+        then wrap ``self.recall`` with it.
+
+        So the sort is **positional**: the floor subsequence and the fused subsequence are each
+        sorted on their own scale, then written back into the SLOTS THEY CAME FROM. Persona
+        re-orders within a block, as §5.2 asks; which slots are floor slots stays the ranker's
+        decision, as ``is_floor``'s own docstring says it must (*"a protection flag and a display-
+        block marker"*, never a position instruction).
 
         **Found by consequence, not by reading.** The first version of this method did sort
         globally. The integration test that asserts a real persona re-orders a real recall caught
@@ -241,14 +257,14 @@ class PersonaAffinityShaper:
         is not a prior, it is a bug with a config knob.
         """
         weight = self._settings.affinity_weight
-        reordered = [
-            hit
-            for block in (
-                [h for h in hits if h.is_floor],
-                [h for h in hits if not h.is_floor],
-            )
-            for hit in self._sort_block(block, terms, weight)
-        ]
+        reordered = list(hits)
+        for slots in (
+            [i for i, h in enumerate(hits) if h.is_floor],
+            [i for i, h in enumerate(hits) if not h.is_floor],
+        ):
+            block = self._sort_block([hits[i] for i in slots], terms, weight)
+            for slot, hit in zip(slots, block, strict=True):
+                reordered[slot] = hit
         if all(a is b for a, b in zip(hits, reordered, strict=True)):
             return hits  # nothing moved — hand back the identical object, not a copy
         return reordered

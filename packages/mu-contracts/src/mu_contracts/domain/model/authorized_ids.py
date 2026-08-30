@@ -29,10 +29,30 @@ mechanism or the pre-truncation property.
 
 **Fail-closed is the whole point.** An item whose stamp is absent or empty is an item no
 governance decision has been recorded for; :func:`model_a_permits` answers ``False`` for it. A
-caller with no identity set is a caller nobody resolved; it answers ``False`` too. Neither is a
-silent empty at the call site — the tier repositories raise
-:class:`~mu_contracts.domain.errors.CallerIdentitySetRequiredError` when a SHARED read arrives with
-no caller set, because that is a wiring bug, not a denial.
+caller with no identity set is a caller nobody resolved; it answers ``False`` too.
+
+**WHERE the "no caller set on a SHARED read" wiring bug is actually refused — corrected 2026-08-30
+(ARCHITECTURE-DELTAS AD-179).** This paragraph used to say *"the tier repositories raise
+:class:`~mu_contracts.domain.errors.CallerIdentitySetRequiredError`"*, flatly, and that was FALSE
+of five of the six tier reads — a reader who grepped for the guarantee found the sentence and
+stopped looking, which is the false-conformance-citation shape that lets a real gap survive. The
+truth, verified by reading every site:
+
+* **STM** (``mu_engine/storage/authz.py:69,110`` — :func:`authorized_window` /
+  :func:`authorized_item`) does raise, and argues at length that it must.
+* **Every filterable-index adapter** — ``qdrant_mtm.py``, ``pgvector_mtm.py``, ``chroma_mtm.py``,
+  ``weaviate_mtm.py``, ``falkor_ltm.py`` — instead reads ``if ns.visibility is SHARED and
+  caller_identity_set is not None:`` and so silently OMITS the ``authorized_ids`` clause on a
+  ``None``. Fail-OPEN, at the layer §7.4 names as the mechanism.
+* The guarantee is therefore held ONE layer up, by a single service-layer gate:
+  ``mu_engine/services/recall/ranker.py`` refuses a SHARED rank with ``caller_identity_set is
+  None`` before any arm runs. **Measured 2026-08-30:** that gate plus
+  ``lifecycle/centrality.py:522`` are the ONLY two callers of ``semantic``/``graph_recall``/
+  ``traverse_entities`` in the whole tree (``mu-server`` and ``mu-client`` reach these tiers only
+  through the ranker), and the centrality sweep passes ``None`` deliberately and documents why —
+  so the fail-open branch is not reachable by a principal today. It is a defence-in-depth gap and
+  a second-call-site trap, NOT a live bypass, and AD-179 carries the fix-impl verdict plus the
+  owner ruling the sweep's no-caller case needs.
 """
 
 from __future__ import annotations

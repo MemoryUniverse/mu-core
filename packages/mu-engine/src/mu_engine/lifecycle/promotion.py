@@ -84,6 +84,7 @@ from mu_engine.platform.observability import (
     NoopTracer,
     TraceScope,
 )
+from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.services.settings import IngestSettings
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -230,6 +231,7 @@ class PromotionService:
         mtm: MtmTierRepository,
         distill: DistillPipeline,
         salience: SalienceStrategy,
+        embedder: EmbeddingPort | None = None,
         stm: StmTierRepository | None = None,
         settings: LifecycleSettings | None = None,
         ingest_settings: IngestSettings | None = None,
@@ -242,6 +244,14 @@ class PromotionService:
         self._mtm = mtm
         self._distill = distill
         self._salience = salience
+        # D1 (STATE-AND-DEFECTS-0829.md): the SAME embedder the ingest-time deterministic gate
+        # uses (`DeterministicPromoteStage`, `pipelines/concrete/ingest.py`) — every composition
+        # root already builds exactly one (`self.embedder`) and threads it into that stage's
+        # sibling pipeline, so this is the SAME instance, never a second one (DEV-STANDARDS rule
+        # 9: one composition root). Optional only so unit tests exercising the salience gate in
+        # isolation need not construct a real embedder; :meth:`_promote_to_mtm` refuses loudly if
+        # it is actually needed and missing (rule 8: never a silent wrong answer).
+        self._embedder = embedder
         self._stm = stm
         self._settings = settings or LifecycleSettings()
         self._ingest_settings = ingest_settings or IngestSettings()
@@ -487,6 +497,25 @@ class PromotionService:
         promoted.tier = MemoryTier.MTM
         promoted.state = MemoryState.ACTIVE
         promoted.updated_at = now
+        # D1 (STATE-AND-DEFECTS-0829.md): the STM item never carries an embedding — STM is a
+        # Valkey/Redis KV tier, embedded only lazily at MTM-write time (same design the ingest
+        # gate already uses, `DeterministicPromoteStage._execute`, ingest.py:437-450). This path
+        # used to skip that step entirely and hand the un-embedded copy straight to
+        # `mtm.upsert`, which `QdrantMapper.to_store` then silently zero-filled — cosine 0
+        # forever, rank inside the channel arbitrary. Re-embed here whenever the item does not
+        # already carry one (a caller-supplied embedding, if one ever exists on an STM item, is
+        # trusted rather than redundantly recomputed).
+        if promoted.embedding is None:
+            if self._embedder is None:
+                raise RuntimeError(
+                    "PromotionService._promote_to_mtm requires an injected EmbeddingPort to "
+                    "promote an un-embedded STM item to MTM (none was configured on this "
+                    "PromotionService instance) — never a silent zero-vector write (D1, "
+                    "DEV-STANDARDS rule 8)."
+                )
+            vectors = await self._embedder.embed([promoted.content])
+            promoted.embedding = list(vectors[0])
+            promoted.embedding_model = self._embedder.model_name
         await self._mtm.upsert(promoted)
         self._metrics.inc(_PROMOTION_METRIC, labels={"frm": "stm", "to": "mtm"})
         if self._bus is not None:

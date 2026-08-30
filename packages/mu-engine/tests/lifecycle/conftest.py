@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import contextlib
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import datetime
+from hashlib import sha256
 
 import pytest
 import pytest_asyncio
@@ -21,6 +22,7 @@ from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
+from mu_engine.providers._contracts import EmbeddingPort, Vector
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
@@ -37,6 +39,36 @@ from mu_engine.storage.mappers.redis_mapper import RedisMapper
 # Tiny deterministic dim — no ML dep needed to prove the store/gate/promote wiring (matches
 # tests/pipelines/conftest.py's own `_MTM_TEST_DIM`).
 _MTM_TEST_DIM = 8
+
+
+class _DeterministicEmbedder:
+    """A tiny, deterministic :class:`EmbeddingPort` stand-in — dimension matches
+    ``_MTM_TEST_DIM`` (8), no ML dependency needed (same "no ML dep needed" rationale as the
+    dim choice above; the REAL ``SentenceTransformerEmbedder`` + MiniLM path is already covered
+    end-to-end by ``tests/services/test_ingest_int.py``).
+
+    D1 (STATE-AND-DEFECTS-0829.md): this exists so ``PromotionService``'s STM->MTM leg can be
+    proven to actually call an embedder rather than upserting an un-embedded copy — the bug was
+    that it never did. Content -> vector is a pure hash (deterministic + distinct per distinct
+    content), so a test can assert both "some real, non-zero vector landed" and "two different
+    memories got two different vectors" without pulling in a real model.
+    """
+
+    model_name = "lifecycle-test-fixture-embedder"
+    dimension = _MTM_TEST_DIM
+
+    async def embed(self, texts: Sequence[str]) -> list[Vector]:
+        return [self._vector(t) for t in texts]
+
+    @staticmethod
+    def _vector(text: str) -> Vector:
+        digest = sha256(text.encode("utf-8")).digest()
+        return [b / 255.0 for b in digest[:_MTM_TEST_DIM]]
+
+
+@pytest.fixture
+def embedder() -> EmbeddingPort:
+    return _DeterministicEmbedder()
 
 
 @pytest.fixture(scope="session")

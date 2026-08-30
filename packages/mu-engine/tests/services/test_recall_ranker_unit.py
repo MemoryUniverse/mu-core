@@ -218,6 +218,98 @@ async def test_full_session_floor_no_longer_swamps_the_relevant_mtm_hit() -> Non
 
 
 @pytest.mark.asyncio
+async def test_fused_score_carries_the_real_rrf_value_not_the_channel_native_score() -> None:
+    """D2 (STATE-AND-DEFECTS-0829.md): ``RecallItemView.fused_score`` used to be silently
+    overwritten with the CHANNEL-NATIVE score (``Scored.score``) instead of the value
+    ``reciprocal_rank_fusion`` actually computed for that candidate (``ranker.py``'s
+    ``for scored, _score in fused_pairs`` discarded ``_score``). With STM/LTM empty, an MTM hit
+    at rank 0 has channel-native score ``1.0`` (``_FakeMtm``'s scoring), but its REAL RRF score —
+    its channel weighted a third of three, at rank 0, with the default ``k=60`` — is
+    ``(1/3) * (1/61)`` ~= ``0.00546``: a completely different, much smaller number. If
+    ``fused_score`` still equalled ``1.0`` the discard bug would be back.
+
+    ``weight_stm=1.0`` is pinned explicitly (AD-204 lowered the CLASS default to ``0.1`` — a
+    separate fix, for a separate defect, argued and measured on real IR data, not on this unit
+    test's arithmetic) so this test keeps proving D2's plumbing claim in isolation, at the exact
+    equal-thirds weighting its own docstring states, regardless of where the default sits."""
+    target = _item(
+        "Ada's flight to Denver is on Thursday",
+        tier=MemoryTier.MTM,
+        at=datetime(2026, 7, 31, tzinfo=UTC),
+    )
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=[],
+        mtm_hits_by_query={query_vec: [target]},
+        settings=RecallSettings(stm_scoring="recency", weight_stm=1.0),
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "irrelevant-this-phase",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    hit = next(it for it in result.items if it.memory_id == target.id)
+    expected_rrf = (1.0 / 3.0) * (1.0 / (60 + 0 + 1))
+    assert hit.fused_score == pytest.approx(expected_rrf)
+    assert hit.fused_score != pytest.approx(
+        1.0
+    ), "fused_score equals the raw channel-native score again — the D2 discard bug is back"
+
+
+@pytest.mark.asyncio
+async def test_a_protected_floor_row_also_carries_the_rrf_value_not_its_stm_native_score() -> None:
+    """D2's other half: the test above runs with ``stm_items=[]``, so it never sees the ONE path
+    that re-stamps ``fused_score`` after fusion — ``_merge_floor``'s protected-floor restore.
+
+    That restore used to swap the whole ``floor_views`` twin back in, and the twin is built by
+    ``_to_view(s, "stm")`` with NO ``fused_score`` override — i.e. it carried the STM-native
+    relevance score, which is exactly the number D2 exists to keep out of this field. It also put
+    two incomparable scales (~1e-1 STM against ~1e-2 RRF) into one returned list. The restore now
+    re-stamps the FLAG only.
+
+    With one STM item and nothing else, the STM channel is weighted one of three and the row is at
+    rank 0, so its RRF value is ``(1/3) * (1/61)``. ``_FakeStm`` scores the floor on the
+    ``"recency"`` scorer, whose score is ``1.0`` for the most recent row — so if the twin were
+    swapped back in, ``fused_score`` would read ``1.0`` here.
+
+    ``weight_stm=1.0`` pinned for the same reason as the sibling test above: AD-204 changed the
+    CLASS default weighting, not this D2 plumbing claim's equal-thirds arithmetic.
+    """
+    just_said = _item(
+        "Ada just said the deploy passphrase is violet-anchor-77",
+        tier=MemoryTier.STM,
+        at=datetime(2026, 7, 31, tzinfo=UTC),
+    )
+    ranker = _build_ranker(
+        stm_items=[just_said],
+        mtm_hits_by_query={},
+        settings=RecallSettings(stm_scoring="recency", weight_stm=1.0),
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "irrelevant-this-phase",
+        [0.9, 0.1],
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    hit = next(it for it in result.items if it.memory_id == just_said.id)
+    assert hit.is_floor, "the protected-floor membership flag was not restored"
+    assert hit.fused_score == pytest.approx((1.0 / 3.0) * (1.0 / (60 + 0 + 1)))
+    assert hit.fused_score != pytest.approx(1.0), (
+        "a protected floor row carries its STM-native score again — the whole floor_views twin "
+        "was swapped back in and D2 is only two-thirds fixed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_nonsense_query_yields_a_different_result_than_a_targeted_query() -> None:
     """THE BUG's headline symptom: four different queries in the same session returned a
     BYTE-IDENTICAL top-10 (assessment §3.1). With the MTM channel now genuinely contributing to
@@ -239,6 +331,101 @@ async def test_nonsense_query_yields_a_different_result_than_a_targeted_query() 
     assert target.id in targeted_ids
     assert target.id not in nonsense_ids
     assert targeted_ids != nonsense_ids, "recall is still query-blind (session-dump artifact)"
+
+
+@pytest.mark.asyncio
+async def test_floor_no_longer_forces_a_query_blind_item_ahead_of_a_relevant_hit() -> None:
+    """D3 (STATE-AND-DEFECTS-0829.md): a protected (most-recently-written) STM item used to lead
+    the result UNCONDITIONALLY regardless of relevance (``_merge_floor``'s pre-fix
+    ``[*floor_views, *tail]``) — measured on LoCoMo (1,531 labelled queries,
+    RETRIEVAL-EVAL-0829.md §5) as ``floor_items = 1531 x 3`` exactly: the top THREE slots of
+    EVERY single result, chosen without reference to the query. With the floor's own fused rank
+    now deciding position (a protected member is rescued at the TAIL only if it does not earn a
+    competitive rank on its own), a clearly more relevant MTM hit must rank AHEAD of the
+    just-said, irrelevant chatter that used to automatically occupy rank 0 — while the SAME
+    protected set stays guaranteed present (membership, not position, is what "never evicted"
+    means now).
+
+    ``weight_mtm=2.0`` is explicit here rather than relying on the class default (AD-204 later
+    made that default equal this override — see the companion test right below, which proves the
+    SAME claim with zero explicit weight, i.e. proves the shipped default actually clears this
+    bar): pinning it keeps THIS test's claim scoped to D3's "position, not just presence" fix,
+    independent of wherever the default sits."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    stm_items = [
+        _item(f"session chatter #{n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n))
+        for n in range(10)
+    ]
+    target = _item("Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base)
+    query_vec = (0.9, 0.1)
+    # weight_mtm > weight_stm breaks the rank-0-vs-rank-0 RRF tie (both channels' best candidate
+    # lands at rank 0) cleanly in the genuinely-relevant channel's favor — a principled knob
+    # already exposed on RecallSettings, not a thumb on the scale specific to this test.
+    settings = RecallSettings(stm_scoring="recency", weight_mtm=2.0)
+    ranker = _build_ranker(
+        stm_items=stm_items, mtm_hits_by_query={query_vec: [target]}, settings=settings
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "irrelevant-this-phase",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ids = [it.memory_id for it in result.items]
+    protected_ids = {it.id for it in stm_items[-3:]}  # floor_protect_limit default = 3, recency
+    assert ids[0] == target.id, (
+        "a protected-but-irrelevant STM item still leads — the pre-D3 unconditional-prepend "
+        "shape is back"
+    )
+    assert protected_ids <= set(ids), "a protected member was evicted, not merely reordered"
+
+
+@pytest.mark.asyncio
+async def test_default_settings_also_rank_the_relevant_hit_ahead_of_recency_noise() -> None:
+    """AD-204 (RETRIEVAL-EVAL-0829.md §5.3 / STATE-AND-DEFECTS-0829.md D3): equal (1.0/1.0/1.0)
+    in-arm weights gave the STM channel's best-of-ten recency candidate the SAME RRF rank
+    authority as the MTM channel's genuine best-of-the-corpus candidate — measured on LoCoMo as a
+    shipped 3-channel fuse WORSE than its own MTM channel alone at every cutoff (recall@1 0.0049
+    vs 0.1625). This is the sibling test above's ``weight_mtm=2.0`` override removed entirely —
+    bare ``RecallSettings(stm_scoring="recency")``, the actual shipped default (AD-204 landed as
+    ``weight_stm=0.1``, a 10:1 discount, not a raised ``weight_mtm``) — to prove the fix is live in
+    the field default an operator gets with no config at all, not only demonstrable with a
+    hand-picked override. Mutation check: reverting ``RecallSettings.weight_stm``'s default to
+    ``1.0`` must fail this test (the rank-0-vs-rank-0 RRF tie would then go the other way, exactly
+    as it did before AD-204)."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    stm_items = [
+        _item(f"session chatter #{n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n))
+        for n in range(10)
+    ]
+    target = _item("Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base)
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={query_vec: [target]},
+        settings=RecallSettings(stm_scoring="recency"),  # bare default — no weight override
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "irrelevant-this-phase",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ids = [it.memory_id for it in result.items]
+    protected_ids = {it.id for it in stm_items[-3:]}
+    assert ids[0] == target.id, (
+        "the SHIPPED DEFAULT still lets a protected-but-irrelevant STM item lead — AD-204's "
+        "weight_mtm default was reverted or never actually reached RecallSettings()"
+    )
+    assert protected_ids <= set(ids), "a protected member was evicted, not merely reordered"
 
 
 @pytest.mark.asyncio

@@ -135,6 +135,7 @@ def test_qdrant_mapper_places_same_id_in_disjoint_org_collections() -> None:
         workspace_id="w",
         session_id="s",
         polarity=Polarity.POSITIVE,
+        embedding=[0.1, 0.2, 0.3, 0.4],  # D1: to_store now refuses embedding=None (not under test)
     )
     item_b = item_a.model_copy(update={"namespace": ns_b, "content": "org-b secret"})
     row_a = m.to_store(item_a)

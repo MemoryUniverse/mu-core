@@ -68,6 +68,24 @@ fi
 
 ARGS=""
 for a in "$@"; do ARGS+=" $(printf '%q' "$a")"; done
+# ---------------------------------------------------------------------------------------------
+# HOLD THE VM-SIDE RECLAIM FOR THE DURATION OF THE RUN.
+# ---------------------------------------------------------------------------------------------
+# `infra/mu-vm/vm_side_reclaim.sh` runs from the VM's own crontab every 20 minutes and DELETES
+# every `mu_mtm__*` collection and every `mu_g__*` graph. Its guard used to be `pgrep -f
+# "[p]ytest"` alone — and this harness is not pytest, it is a measurement CLI (see this file's own
+# header for why). MEASURED 2026-08-30: the cron fired at 14:20:02 mid-baseline, logged
+# `deleted=121 failed=0`, and the run died two seconds later with `Not found: Collection
+# mu_mtm__… doesn't exist!` inside `deterministic_promote` — a stack trace that reads like an
+# engine defect (ARCHITECTURE-DELTAS AD-201). That guard now also matches `[m]u_eval`, which is
+# the primary fix; the hold file below is the belt-and-braces half, so a RENAME of this harness
+# cannot silently re-open the hole. Released in a trap, and the reclaim ignores a hold older than
+# MU_RECLAIM_HOLD_MAX_S (4 h) so a killed run cannot disable the sweep for ever.
+"${SSH[@]}" "touch ~/.mu_reclaim_hold" || true
+release_hold() { ssh -n -i "$SSH_KEY" -o StrictHostKeyChecking=no "user@$IP" \
+  "rm -f ~/.mu_reclaim_hold" >/dev/null 2>&1 || true; }
+trap release_hold EXIT
+
 echo "[3/3] running: python -m mu_eval$ARGS"
 "${SSH[@]}" "export PATH=\$HOME/.local/bin:\$PATH; export MU_ON_VM=1; $REMOTE_ENV \
   cd ~/mu_project/mu-core && PYTHONPATH=eval uv run python -m mu_eval$ARGS"

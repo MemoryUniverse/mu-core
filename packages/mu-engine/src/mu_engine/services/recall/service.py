@@ -125,7 +125,16 @@ class RecallService:
                 weights=[self._settings.weight_private, self._settings.weight_shared],
                 k=self._settings.rrf_k,
             )
-            deduped = dedup_by_content_hash([view for view, _score in fused_pairs])
+            # D2 (STATE-AND-DEFECTS-0829.md): this fuse's OWN rrf_score used to be discarded
+            # (`for view, _score in fused_pairs`), leaving each view's `fused_score` at whatever
+            # its SOURCE arm's single-arm fuse already computed — the wrong number one federation
+            # layer up from where the same bug lived in `ranker.py`. Re-stamp it with the score
+            # THIS fuse actually produced.
+            fused_views = [
+                view.model_copy(update={"fused_score": rrf_score})
+                for view, rrf_score in fused_pairs
+            ]
+            deduped = dedup_by_content_hash(fused_views)
 
             # (7) floor-protect: a floor member (from either arm) is reorderable, never evicted.
             items = _protect_floor(deduped, limit=q.limit)
@@ -178,12 +187,26 @@ class RecallService:
 
 
 def _protect_floor(items: list[RecallItemView], *, limit: int) -> list[RecallItemView]:
-    """Floor members lead and are never evicted; the fused tail fills up to ``limit`` (§1.3)."""
-    floor = [v for v in items if v.is_floor]
-    floor_ids = {v.memory_id for v in floor}
-    tail = [v for v in items if v.memory_id not in floor_ids]
-    room = max(0, limit - len(floor))
-    return [*floor, *tail[:room]]
+    """Floor members are never evicted; ``items`` already carries the fused rank order (§1.3) —
+    THIS fuse's own, over the two ALREADY-authorized arms, one layer up from the in-arm fuse each
+    ``ThreeChannelRecallRanker`` already ran.
+
+    **D3 (STATE-AND-DEFECTS-0829.md) — the SAME "floor leads unconditionally" shape lived here
+    too, one federation layer up**, and RETRIEVAL-EVAL-0829.md §5.4 measured its cost directly: a
+    private-plane STM floor member force-led the two-arm fuse's result, so at k<=5 the FUSED
+    recall was WORSE than the shared arm used alone (e.g. ``recall@3``: private-only 0.0000,
+    shared-only 0.1723, fused 0.0000 — conv-26, 149 queries) even though federation genuinely
+    found evidence neither arm could reach alone (fused beat both at k=10). ``is_floor`` is a
+    MEMBERSHIP flag (which ids are protected), never a position instruction — a member keeps
+    whatever rank THIS fuse actually gave it; only a member ranked outside the returned window is
+    rescued at the END, not the front, exactly mirroring ``ranker.py``'s in-arm
+    :func:`~mu_engine.services.recall.ranker._merge_floor` fix (never edit one without the
+    other — the SAME shape, DEV-STANDARDS rule 6)."""
+    head = items[:limit]
+    head_ids = {v.memory_id for v in head}
+    rescued = [v for v in items if v.is_floor and v.memory_id not in head_ids]
+    room = max(0, limit - len(rescued))
+    return [*items[:room], *rescued]
 
 
 def _union_channels(a: RecallChannels, b: RecallChannels) -> RecallChannels:

@@ -18,6 +18,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.errors import MissingEmbeddingError
 from mu_engine.storage.mappers.tenancy import tenant_partition_digest
 from mu_engine.storage.ports import QdrantPoint
 
@@ -86,7 +87,18 @@ class QdrantMapper:
         if item.namespace.visibility is Visibility.SHARED:
             authorized = item.metadata.get("authorized_ids")
             payload["authorized_ids"] = list(authorized) if authorized else []
-        vector = item.embedding if item.embedding is not None else [0.0] * self.dim
+        # D1 (STATE-AND-DEFECTS-0829.md): a silent `[0.0] * dim` substitution used to sit here —
+        # cosine against an all-zero vector is 0 forever, and it hid a whole write path
+        # (LifecyclePromotionService._promote_to_mtm) never embedding at all. Fail loud instead
+        # (DEV-STANDARDS rule 8): a caller that reaches this write path with no embedding has a
+        # bug to fix at the call site, never a vector this mapper should fabricate.
+        if item.embedding is None:
+            raise MissingEmbeddingError(
+                f"QdrantMapper.to_store: memory {item.id!r} (ns={item.namespace.to_prefix()!r}) "
+                "has embedding=None — refusing to silently substitute a zero vector into the "
+                "vector tier (D1). Embed before upserting."
+            )
+        vector = item.embedding
         return QdrantPoint(
             point_id=point_id(item.id),
             vector=list(vector),

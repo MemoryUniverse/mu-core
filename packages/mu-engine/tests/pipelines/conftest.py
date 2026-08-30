@@ -84,6 +84,15 @@ def make_item() -> Callable[..., MemoryItem]:
         kwargs: dict[str, object] = {"id": memory_id} if memory_id is not None else {}
         if created_at is not None:
             kwargs["created_at"] = created_at
+        # D1 (STATE-AND-DEFECTS-0829.md): items produced by this factory land in real Qdrant MTM
+        # via bare `mtm.upsert(...)` in several tests here (the DISTILL/conflict-adjudication
+        # flows this fixture serves, not the promotion gate) — `QdrantMapper.to_store` now
+        # refuses `embedding=None` loudly instead of silently zero-filling it. A tiny,
+        # content-derived (so distinct memories still get distinct vectors), deterministic
+        # embedding is enough here: none of these tests do semantic search, they only need a
+        # REAL point to exist (same rationale as `tests/storage/conftest.py`'s own `make_item`).
+        seed = sum(ord(c) for c in content)
+        embedding = [((seed + i) % 17) / 17.0 for i in range(_MTM_TEST_DIM)]
         return MemoryItem(
             content=content,
             kind=MemoryKind.PROPOSITION,
@@ -98,6 +107,8 @@ def make_item() -> Callable[..., MemoryItem]:
             tier=tier,
             source=MemorySource.USER,
             valid_at=valid_at,
+            embedding=embedding,
+            embedding_model="test-fixture",
             **kwargs,
         )
 

@@ -68,6 +68,7 @@ from mu_engine.lifecycle.settings import LifecycleSettings, ManagerModeSettings,
 from mu_engine.pipelines.distill import DistillPipeline, EventPublisher
 from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import FrozenClock
+from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
@@ -466,6 +467,7 @@ async def test_sweep_user_promotes_end_to_end_against_real_containers(
     make_ns: Callable[..., Namespace],
     make_item: Callable[..., MemoryItem],
     make_stm: Callable[..., ValkeyStmAdapter],
+    embedder: EmbeddingPort,
 ) -> None:
     """The acceptance-critical end-to-end proof: a full ``sweep_user`` pass (exactly as
     ``MaintenanceLoop``/a daemonless manual trigger would call it) against REAL mu-dev-cache +
@@ -486,6 +488,7 @@ async def test_sweep_user_promotes_end_to_end_against_real_containers(
         mtm=mtm,
         distill=distill,
         salience=SalienceStrategy(SalienceSettings()),
+        embedder=embedder,
         stm=stm,
         clock=clock,
         bus=bus,

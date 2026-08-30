@@ -139,6 +139,12 @@ class _FakeContainer:
         self.mode_gate = MagicMock(spec=ManagerModeGate)
         self.llm: Any = None
         self.bus: Any = None
+        # D1 (STATE-AND-DEFECTS-0829.md): ``promote``'s STM->MTM branch now embeds an un-embedded
+        # source item before upserting (``LocalContainerLike.embedder``) — a fixed, non-zero fake
+        # vector is enough here; the REAL embedder is exercised by the integration tier below.
+        self.embedder = MagicMock()
+        self.embedder.model_name = "fake-embedder"
+        self.embedder.embed = AsyncMock(return_value=[[0.1, 0.2, 0.3, 0.4]])
 
 
 @pytest.mark.unit
@@ -353,6 +359,12 @@ async def test_promote_stm_to_mtm_copies_on_write_and_upserts() -> None:
     container.mtm.upsert.assert_awaited_once()
     (promoted,), _ = container.mtm.upsert.await_args
     assert promoted.tier is MemoryTier.MTM
+    # D1 (STATE-AND-DEFECTS-0829.md): this THIRD copy-on-write site must embed too — an
+    # un-embedded STM source must not reach ``mtm.upsert`` still carrying ``embedding=None``
+    # (the real ``QdrantMapper.to_store`` now refuses exactly that, loudly).
+    assert promoted.embedding == [0.1, 0.2, 0.3, 0.4]
+    assert promoted.embedding_model == "fake-embedder"
+    container.embedder.embed.assert_awaited_once_with([promoted.content])
     assert isinstance(result, MemoryVerbResult)
     assert result.verb == "promote"
     assert result.from_tier == "stm" and result.to_tier == "mtm"
@@ -692,19 +704,25 @@ async def test_facade_recall_consolidate_ask_and_unbuilt_verbs(
     # (0.5 < 0.6 gate), so promote(to_tier="mtm") moves it up — proven by a direct MTM point-get.
     promoted = await facade.promote(r1.memory_id, to_tier="mtm", user=_USER, session=_SESSION)
     assert promoted.verb == "promote" and promoted.to_tier == "mtm"
-    assert (
-        await container.mtm.get(
-            Namespace(
-                org=f"{_ORG}{uid}",
-                workspace=f"{_WORKSPACE}{uid}",
-                user=_USER,
-                session=_SESSION,
-                visibility=Visibility.PRIVATE,
-            ),
-            r1.memory_id,
-        )
-        is not None
-    ), "promote did not create the MTM point"
+    promoted_point = await container.mtm.get(
+        Namespace(
+            org=f"{_ORG}{uid}",
+            workspace=f"{_WORKSPACE}{uid}",
+            user=_USER,
+            session=_SESSION,
+            visibility=Visibility.PRIVATE,
+        ),
+        r1.memory_id,
+    )
+    assert promoted_point is not None, "promote did not create the MTM point"
+    # D1 (STATE-AND-DEFECTS-0829.md): this is the exact THIRD write path the D1 probe caught —
+    # ``r1``'s STM copy never carried an embedding, so a point existing is not enough; it must
+    # carry a REAL, non-zero vector from the container's own embedder (``QdrantMapper.to_store``
+    # now refuses ``embedding=None`` outright, so a stale zero-vector substitution can no longer
+    # hide behind "the point exists").
+    assert promoted_point.embedding is not None
+    assert any(v != 0.0 for v in promoted_point.embedding)
+    assert promoted_point.embedding_model == container.embedder.model_name
 
     # (8) demote is REAL — moves it back down; the MTM point is then gone (direct read).
     demoted = await facade.demote(r1.memory_id, to_tier="stm", user=_USER, session=_SESSION)

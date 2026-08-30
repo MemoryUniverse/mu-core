@@ -17,6 +17,7 @@ __all__ = [
     "DegradeReason",
     "InvalidBackendError",
     "MandatoryBackendMissingError",
+    "MissingEmbeddingError",
     "MtmPointAbsentError",
     "StorageError",
     "TierRepositoryUnavailableError",
@@ -71,6 +72,27 @@ class MtmPointAbsentError(StorageError):
 class TierRepositoryUnavailableError(StorageError):
     """A store cannot serve; the CALLER maps this to a 4-field DegradedModeEntered
     (the store/mapper never emits it — platform is the sole consumer, CANONICAL §2)."""
+
+
+class MissingEmbeddingError(StorageError):
+    """A ``MemoryItem`` with ``embedding is None`` reached the vector-tier mapper's write path.
+
+    **D1 (STATE-AND-DEFECTS-0829.md).** ``QdrantMapper.to_store`` (and, by delegation, every
+    other vector mapper — chroma/faiss/pgvector/weaviate all wrap it) used to substitute a
+    ``[0.0] * dim`` vector SILENTLY when ``item.embedding`` was ``None``. Cosine similarity
+    against an all-zero vector is 0 forever, so the point's rank inside its channel became
+    arbitrary — and this hid, for weeks, that ``LifecyclePromotionService._promote_to_mtm``
+    (``lifecycle/promotion.py``) deep-copied the STM item straight into MTM without ever calling
+    the embedder, while ``DeterministicPromoteStage`` (``pipelines/concrete/ingest.py``) — the
+    ONLY other path that writes this tier — does embed. Since the client-side hook path sends no
+    ``importance`` (default 0.5, below the ingest gate's 0.6), EVERY hook-captured memory reached
+    the vector tier exclusively through the path that silently zero-filled.
+
+    Fail-loud instead (DEV-STANDARDS rule 8: never a silent wrong answer): a caller that means to
+    write the vector tier without a real embedding is a bug at the call site, not a degrade this
+    layer should paper over. The fix is to embed before calling ``upsert`` — see
+    :meth:`~mu_engine.lifecycle.promotion.PromotionService._promote_to_mtm`, which now does.
+    """
 
 
 class DegradeReason(StrEnum):

@@ -55,6 +55,26 @@ recency) AND the protected-floor DISPLAY order — protection membership (WHICH 
 evicted) stays recency-selected (the "never evict a just-said fact" guarantee is unchanged), but the
 protected block is now reorderable BY RELEVANCE within itself so a just-said, irrelevant fact no
 longer sits at rank 1 ahead of the actual answer.
+
+AD-204 channel rank-authority (RETRIEVAL-EVAL-0829.md §5.3 / STATE-AND-DEFECTS-0829.md D3,
+2026-08-30, the fix D3 itself named as still open): D1/D3 above fixed WHAT the STM channel's
+candidates are ordered/protected by, but every channel still entered the ``fusion.fuse`` call
+below at EQUAL weight — and RRF only ever looks at a channel's OWN rank position, never the
+breadth of the pool that rank came from. A ten-item, single-session STM recency window and an MTM
+ANN search over the WHOLE partition therefore gave their respective rank-0 candidates the exact
+same ``1/(k+1)`` vote, even after D1 made the STM candidate genuinely query-scored. MEASURED: with
+equal weights the shipped 3-channel fuse was worse than its own MTM channel alone at EVERY cutoff
+(recall@1 0.0049 vs 0.1625, a 33x gap). Fix: ``RecallSettings.weight_stm`` default lowered 1.0 ->
+0.1, a 10:1 discount against MTM/LTM (see its own docstring in ``dto.py`` for the full measurement,
+including why a smaller discount that looked sufficient on a small sample was NOT enough on the
+full corpus) — no new mechanism, the weighting knob this module already threaded into
+``self._fusion.fuse(...)`` below was simply left at a value nothing had measured. Re-measured:
+recall@1/3/5 now land within one query's width of the MTM-alone channel; recall@10 sits ~10% below
+it at the SHIPPED ``floor_protect_limit=3``, and that residual is the SEPARATE, already-decided
+``floor_protect_limit`` presence guarantee (AD-195) spending result slots on rows fusion ranked
+outside the window — confirmed by re-measuring with ``floor_protect_limit=0`` (diagnostic-only),
+which matches or exceeds the MTM-alone channel at every cutoff. Not a re-opening of AD-195's
+trade-off, only of the rank-authority mismatch this fix's own diagnosis names.
 """
 
 from __future__ import annotations
@@ -111,7 +131,15 @@ class RecallRanker(Protocol):
     ) -> RecallResult: ...
 
 
-def _to_view(scored: Scored[MemoryItem], channel: str) -> RecallItemView:
+def _to_view(
+    scored: Scored[MemoryItem], channel: str, *, fused_score: float | None = None
+) -> RecallItemView:
+    """``fused_score`` defaults to the channel-native ``scored.score`` — the right value for a
+    candidate that never went THROUGH fusion (the protected-floor block below, which is
+    recency/relevance-selected, not RRF-ranked). A caller handing back an actual
+    :func:`~mu_engine.services.recall.fusion.reciprocal_rank_fusion` result MUST pass that value
+    explicitly (D2, STATE-AND-DEFECTS-0829.md) — see the ``fused_views`` comprehension below,
+    which used to silently drop it via ``for scored, _score in fused_pairs``."""
     item = scored.item
     return RecallItemView(
         memory_id=item.id,
@@ -120,7 +148,7 @@ def _to_view(scored: Scored[MemoryItem], channel: str) -> RecallItemView:
         tier=item.tier,
         channel=channel,
         namespace=item.namespace,
-        fused_score=scored.score,
+        fused_score=scored.score if fused_score is None else fused_score,
         is_floor=scored.is_floor,
         artifact_ref=item.artifact_ref,
     )
@@ -250,9 +278,19 @@ class ThreeChannelRecallRanker:
         # recency pool, redis_stm.py `recent()`) — force it False here so ONLY the explicitly
         # protected prefix below is exempt from eviction; a fused-in STM item that didn't make the
         # protected prefix must compete for its slot exactly like an MTM/LTM hit.
+        #
+        # D2 (STATE-AND-DEFECTS-0829.md): `rrf_score` — the value `reciprocal_rank_fusion` actually
+        # computed — used to be discarded here (`for scored, _score in fused_pairs`), so
+        # `fused_score` carried whatever channel-native score `scored.score` happened to be (a raw
+        # MTM cosine, an LTM hop count, ...) instead of the fused rank the field's NAME promises. A
+        # negative `fused_score` was observed in the wild, which an RRF score (a sum of positive
+        # `1/(k+rank+1)` terms) can never be — proof the field held the wrong number. Pass the real
+        # value through explicitly now.
         fused_views = [
-            _to_view(scored, _channel_label(scored)).model_copy(update={"is_floor": False})
-            for scored, _score in fused_pairs
+            _to_view(scored, _channel_label(scored), fused_score=rrf_score).model_copy(
+                update={"is_floor": False}
+            )
+            for scored, rrf_score in fused_pairs
         ]
 
         # D1 (b): WHICH items are unconditionally protected stays RECENCY-selected — `floor` (not
@@ -445,26 +483,69 @@ def _merge_floor(
     limit: int,
     cross_tier_dedup: bool,
 ) -> list[RecallItemView]:
-    """Merge the (now BOUNDED, §3.1/#1 bug fix) STM floor in AFTER fusion (hybrid.py:247): fusion
-    may reorder but never evict a protected floor member. ``floor_views`` is capped upstream to
-    ``settings.floor_protect_limit`` — NOT the whole STM candidate pool — so it always leaves room
-    for the fused, query-relevant tail. Floor members lead (always recallable), then fused
-    non-duplicates fill up to ``limit``.
+    """Merge the (BOUNDED, §3.1/#1 bug fix) STM floor in AFTER fusion (hybrid.py:247): fusion may
+    reorder but never evict a protected floor member. ``floor_views`` is capped upstream to
+    ``settings.floor_protect_limit`` — NOT the whole STM candidate pool.
+
+    **D3 (STATE-AND-DEFECTS-0829.md) — floor members no longer lead unconditionally.** Every
+    protected member's id is already IN ``fused`` (``floor_scored``, the pool ``floor_views`` is
+    drawn from, is one of the three channels ``ThreeChannelRecallRanker.rank`` hands to
+    ``fusion.fuse`` above) — the RRF-competed rank fusion already gave it a real signal, not a
+    fallback. The pre-fix code discarded that rank for every protected member and force-prepended
+    it instead, which is exactly what made the top ``floor_protect_limit`` slots of EVERY result
+    the ``floor_protect_limit`` most-recently-written memories, chosen without reference to the
+    query: measured on LoCoMo (1,531 labelled queries, RETRIEVAL-EVAL-0829.md §5), ``floor_items =
+    4593 = 1531 x 3`` exactly, ``recall@1`` was ``0.0003`` against ``0.1625`` for the MTM channel
+    used alone, and disabling the floor outright (non-default) recovered most but not all of that
+    gap — the fuse was STILL worse than its own dense channel at every cutoff. §5.3 there names
+    the design question this answers: *"what should 'never evict a just-said fact' mean when the
+    just-said fact is irrelevant?"* This function answers it as: **a protected member keeps
+    whatever position fusion actually earned it; only a member fusion ranked OUTSIDE the returned
+    window is rescued — appended at the END, not the front** — so "never evicted" still holds
+    (every protected id is guaranteed present) without a query-blind item pre-empting a slot a
+    genuinely relevant hit earned. ``is_floor`` stays a MEMBERSHIP flag (which ids are protected),
+    never a position instruction: :func:`_to_view` already forces it False on every ``fused``
+    entry (a fused-in STM item competes like any other channel once it is not protected), so this
+    function re-stamps ``is_floor=True`` onto each protected id's ``fused`` occurrence IN PLACE, at
+    whatever rank fusion gave it — the FLAG only, never the whole ``floor_views`` twin, whose
+    ``fused_score`` is the STM-native relevance score and not the RRF value D2 requires this field
+    to carry — before deciding who needs rescuing.
 
     D4 cross-tier dedup (conformance D-8, ``settings.cross_tier_dedup``): the STM/MTM/LTM fuse
     above merges by ``MemoryItem.id`` only, so the SAME fact surfaced from two different tiers
     under two different ids (e.g. its STM row and an already-promoted MTM/LTM copy sharing
     ``content_hash``) would otherwise occupy two of the ``limit`` slots below. Deduping by
-    ``content_hash`` HERE — floor members first, so a protected floor row always wins its
-    duplicate — before the ``[:limit]`` slice means a dup never crowds out a genuinely distinct
-    fact (matches the read-time half of the ``ada_coffee`` double-write finding, DATA-QUALITY-
-    ASSESSMENT.md §3.1/#5: "Coffee-query context contained each fact twice"). With the toggle off
-    this reduces to the identical ``[*floor_views, *tail][:limit]`` slice the pre-fix code took
-    (``floor_views`` is always <= ``limit`` in practice, so slicing the concatenation is equivalent
-    to the old two-part ``room``-bounded merge)."""
-    floor_ids = {v.memory_id for v in floor_views}
-    tail = [v for v in fused if v.memory_id not in floor_ids]
-    candidates = [*floor_views, *tail]
+    ``content_hash`` HERE, over the fused rank order (a rescued protected row can still lose its
+    slot to an earlier, better-ranked duplicate — the SAME "the returned window already earned its
+    position" principle this function now applies throughout, a deliberate change from the pre-fix
+    "floor members first" precedence), means a dup never crowds out a genuinely distinct fact
+    (matches the read-time half of the ``ada_coffee`` double-write finding, DATA-QUALITY-
+    ASSESSMENT.md §3.1/#5: "Coffee-query context contained each fact twice")."""
+    # D2 (STATE-AND-DEFECTS-0829.md), the half the first pass missed: restore MEMBERSHIP only.
+    # Substituting the whole `floor_views` twin — which is what this line did first — swapped the
+    # RRF value back out for the STM-native relevance score `_to_view(s, "stm")` stamped on it,
+    # i.e. it re-introduced D2's exact bug for precisely the protected rows, and it made the
+    # returned list carry TWO incomparable score scales (~1e-1 STM against ~1e-2 RRF), which is
+    # the shape AD-194 had to teach `PersonaAffinityShaper` to work around. There is nothing else
+    # to restore: `fusion.reciprocal_rank_fusion` keeps "the FIRST occurrence of a key (by channel
+    # order) as the representative element" and `floor_scored` is channel 0, so a protected
+    # member's fused view already carries `channel="stm"` and the same `MemoryItem` — the twin
+    # differed in `fused_score` (wrongly) and `is_floor` (rightly) and in nothing else.
+    protected_ids = {v.memory_id for v in floor_views}
+    natural = [
+        v.model_copy(update={"is_floor": True}) if v.memory_id in protected_ids else v
+        for v in fused
+    ]
+    head_ids = {v.memory_id for v in natural[:limit]}
+    # Every protected id IS in `fused` (`floor_scored` is one of the three fused channels and RRF
+    # returns the union, never a truncation), so the comprehension below finds them all. The
+    # `absent` tail is a defence in depth against a future channel-list change quietly breaking
+    # "never evicted", not a case that can fire today.
+    rescued = [v for v in natural if v.is_floor and v.memory_id not in head_ids]
+    present = {v.memory_id for v in natural}
+    rescued += [v for v in floor_views if v.memory_id not in present]
+    room = max(0, limit - len(rescued))
+    candidates = [*natural[:room], *rescued]
     if cross_tier_dedup:
         candidates = dedup_by_content_hash(candidates)
     return candidates[:limit]

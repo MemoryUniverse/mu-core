@@ -624,6 +624,10 @@ class EngineContainer:
             mtm=self.mtm,
             distill=self.distill,  # SAME object LocalMemory-shaped `consolidate()` delegates to
             salience=lifecycle_salience,
+            # D1 (STATE-AND-DEFECTS-0829.md): the SAME embedder instance the ingest-time gate
+            # (`DeterministicPromoteStage`, wired above) and the recall ranker already use —
+            # never a second one (DEV-STANDARDS rule 9).
+            embedder=self.embedder,
             stm=self.stm,
             settings=self.lifecycle_settings,
             clock=self._clock,

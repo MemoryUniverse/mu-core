@@ -5,17 +5,34 @@ Every port is fully async (DEV-STANDARDS rule 1). Shapes follow
 ``storage-schema-rowmapper-spec.md §5`` (RowMapper/StoreModel), §1.4 (ConflictEdgeReader),
 and ``storage-pluggable-spec.md §2`` (tier repos).
 
-RE-HOME NOTE: CANONICAL pins these ports into ``mu-contracts/ports/``; defined here because
-that package is a scaffold this phase (empty ``ports/__init__.py``).
+**StoreModels + RowMapper are NOT defined here** (ARCHITECTURE-DELTAS **AD-184**, fix-impl,
+2026-08-30). Until that fix this module declared its OWN, incompatible, second copy of
+``RedisRecord``/``QdrantPoint``/``EdgeSpec``/``GraphNodeRow``/``RelationalRow``/``RowMapper`` —
+``mu_contracts.ports.stores`` published one shape (``QdrantPoint.sparse`` optional,
+``extra="forbid"``) while every mapper and adapter in THIS package imported a second, looser one
+(``sparse`` required with no default, no ``extra`` guard) — the exact two-spellings failure
+ADR 0047 exists to prevent, reproduced inside one repo (it already cost a full day once, across
+repos: WIRE-CONFORMANCE-FINDING-0821.md). They are now imported from ``mu_contracts.ports.stores``
+— the STRICTER of the two shapes — and re-exported here so every existing
+``from mu_engine.storage.ports import QdrantPoint`` (etc.) import keeps working unchanged. Do NOT
+redeclare any of them in this module again; the one legal home is ``mu-contracts`` (CANONICAL
+pins storage-vocabulary DTOs there — pure wire shapes both planes must agree on).
 """
 
 from __future__ import annotations
 
-from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
-
-from pydantic import BaseModel
+from typing import Any, Protocol, TypeVar
 
 from mu_contracts.domain.model.recall import CallerIdentitySet
+from mu_contracts.ports.stores import (
+    EdgeSpec,
+    GraphNodeRow,
+    QdrantPoint,
+    RedisRecord,
+    RelationalRow,
+    RowMapper,
+    StoreModel,
+)
 from mu_engine.storage.domain.artifact import ContextArtifact
 from mu_engine.storage.domain.conflict import ConflictEdges
 from mu_engine.storage.domain.entity import EntityResolution
@@ -40,69 +57,11 @@ __all__ = [
     "StoreModel",
 ]
 
-
-# ------------------------------------------------------------------ StoreModels (spec §5)
-class RedisRecord(BaseModel, frozen=True):
-    """Redis STM row — ``blob`` is ``MemoryItem`` JSON (LOSSLESS)."""
-
-    key: str
-    ttl_s: int | None
-    blob: str
-
-
-class QdrantPoint(BaseModel, frozen=True):
-    """Qdrant MTM point — vector nulled out of the payload."""
-
-    point_id: str
-    vector: list[float]
-    sparse: dict[str, Any] | None
-    payload: dict[str, Any]
-    collection: str
-
-
-class EdgeSpec(BaseModel, frozen=True):
-    """One openCypher edge to MERGE alongside a graph node."""
-
-    rel_type: str
-    props: dict[str, Any] = {}
-    target_labels: tuple[str, ...] = ()
-    target_merge_key: dict[str, Any] = {}
-
-
-class GraphNodeRow(BaseModel, frozen=True):
-    """FalkorDB LTM node + its edges."""
-
-    labels: tuple[str, ...]
-    merge_key: dict[str, Any]
-    props: dict[str, Any]
-    edges: tuple[EdgeSpec, ...] = ()
-
-
-class RelationalRow(BaseModel, frozen=True):
-    """A content-free relational row (spec §0 — ids/hashes/enums/counts/timestamps only)."""
-
-    table: str
-    pk: dict[str, Any]
-    cols: dict[str, Any]
-
-
-StoreModel = RedisRecord | QdrantPoint | GraphNodeRow | RelationalRow
-
-SM = TypeVar("SM", RedisRecord, QdrantPoint, GraphNodeRow, RelationalRow)
-
-
-# ------------------------------------------------------------------ RowMapper (spec §5)
-@runtime_checkable
-class RowMapper(Protocol, Generic[SM]):
-    """The ``to_store``/``from_store`` seam — the ONLY place field-projection lives (spec §5).
-
-    Contract (spec §5): round-trip fidelity, id-stability, tenancy via ``to_prefix()``,
-    first-class ``artifact_ref``/``embedding_ref``/``provenance_id`` (never JSON overflow).
-    """
-
-    def to_store(self, item: MemoryItem) -> SM: ...
-
-    def from_store(self, row: SM) -> MemoryItem: ...
+# TypeVar retained for any downstream annotation spelled ``SM`` against this module (none in-tree
+# today — verified: no concrete mapper parameterizes ``RowMapper[...]`` at runtime, every mapper
+# satisfies it structurally). Bound to ``StoreModel`` rather than re-declared against the four
+# classes individually so it cannot silently re-diverge from the imported union.
+SM = TypeVar("SM", bound=StoreModel)
 
 
 # ------------------------------------------------------------------ tier repositories

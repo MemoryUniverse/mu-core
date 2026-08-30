@@ -38,6 +38,7 @@ from mu_engine.lifecycle.salience import SalienceStrategy
 from mu_engine.lifecycle.settings import LifecycleSettings, SalienceSettings
 from mu_engine.pipelines.distill import DistillPipeline
 from mu_engine.platform.clock import FrozenClock
+from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.services.settings import IngestSettings
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
@@ -62,6 +63,13 @@ async def _mtm_payload(
     return dict(points[0].payload or {})
 
 
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    return dot / (norm_a * norm_b)
+
+
 # =================================================================================================
 # path (i) — immediate: documented + value-guarded, NOT re-implemented/re-tested here.
 # =================================================================================================
@@ -84,6 +92,7 @@ async def test_periodic_sweep_promotes_high_salience_stm_to_mtm(
     qdrant_client: AsyncQdrantClient,
     make_ns: Callable[..., Namespace],
     make_item: Callable[..., MemoryItem],
+    embedder: EmbeddingPort,
 ) -> None:
     ns = make_ns()
     clock = FrozenClock(_T0)
@@ -91,6 +100,7 @@ async def test_periodic_sweep_promotes_high_salience_stm_to_mtm(
         mtm=mtm,
         distill=DistillPipeline(ltm=ltm, mtm=mtm, clock=clock),
         salience=SalienceStrategy(SalienceSettings()),
+        embedder=embedder,
         clock=clock,
     )
 
@@ -113,6 +123,26 @@ async def test_periodic_sweep_promotes_high_salience_stm_to_mtm(
     assert promoted_payload["current_tier"] == "mtm"
     assert promoted_payload["state"] == "active"
     assert await _mtm_payload(qdrant_client, ns, quiet.id, dim=dim) is None
+
+    # D1 (STATE-AND-DEFECTS-0829.md): the point Qdrant actually holds carries a REAL, non-zero
+    # vector produced by the injected embedder — not the silent `[0.0] * dim` this path used to
+    # write. Read back through the SAME port a recall query would use (`mtm.get`), never the raw
+    # Qdrant payload, so this proves the round-trip the bug broke: cosine-searchable, not just
+    # "a payload exists".
+    roundtripped = await mtm.get(ns, salient.id)
+    assert roundtripped is not None
+    assert roundtripped.embedding is not None
+    assert len(roundtripped.embedding) == dim
+    assert any(v != 0.0 for v in roundtripped.embedding)
+    expected = (await embedder.embed([salient.content]))[0]
+    # This collection uses `Distance.COSINE` (qdrant_mtm.py), and Qdrant L2-normalizes a vector
+    # to unit length AT INSERT TIME for that metric — so the stored vector is a same-direction,
+    # different-magnitude copy of what the embedder produced, never bit-identical to it even on
+    # a bug-free path. Compare by cosine similarity (~1.0 = same direction) rather than value
+    # equality, so this test does not confuse the store's own normalization with D1's bug (a
+    # vector that is all zeros, whose cosine is undefined/0 against everything).
+    assert _cosine(roundtripped.embedding, expected) == pytest.approx(1.0, abs=1e-6)
+    assert roundtripped.embedding_model == embedder.model_name
 
 
 # =================================================================================================
@@ -186,6 +216,7 @@ async def test_pre_ttl_rescue_saves_item_before_redis_ttl_deletes_it(
     make_ns: Callable[..., Namespace],
     make_item: Callable[..., MemoryItem],
     make_stm: Callable[..., ValkeyStmAdapter],
+    embedder: EmbeddingPort,
 ) -> None:
     ns = make_ns()
     clock = FrozenClock(_T0)
@@ -196,6 +227,7 @@ async def test_pre_ttl_rescue_saves_item_before_redis_ttl_deletes_it(
         distill=DistillPipeline(ltm=ltm, mtm=mtm, clock=clock),
         salience=SalienceStrategy(SalienceSettings()),
         stm=stm,
+        embedder=embedder,
         settings=LifecycleSettings(pre_ttl_window_s=stm_ttl_s + 3),  # remaining TTL always <= this
         ingest_settings=IngestSettings(stm_ttl_s=stm_ttl_s),
         clock=clock,
@@ -227,6 +259,7 @@ async def test_promote_session_promotes_and_distills_the_whole_session(
     make_ns: Callable[..., Namespace],
     make_item: Callable[..., MemoryItem],
     make_stm: Callable[..., ValkeyStmAdapter],
+    embedder: EmbeddingPort,
 ) -> None:
     ns = make_ns(session="sess-A")
     clock = FrozenClock(_T0)
@@ -236,6 +269,7 @@ async def test_promote_session_promotes_and_distills_the_whole_session(
         distill=DistillPipeline(ltm=ltm, mtm=mtm, clock=clock),
         salience=SalienceStrategy(SalienceSettings()),
         stm=stm,
+        embedder=embedder,
         clock=clock,
     )
 
@@ -381,6 +415,7 @@ async def test_promote_session_still_promotes_on_a_private_namespace(
     make_ns: Callable[..., Namespace],
     make_item: Callable[..., MemoryItem],
     make_stm: Callable[..., ValkeyStmAdapter],
+    embedder: EmbeddingPort,
 ) -> None:
     """The control for the refusal above: AD-142's guard is scoped to SHARED and nothing else.
 
@@ -396,6 +431,7 @@ async def test_promote_session_still_promotes_on_a_private_namespace(
         distill=DistillPipeline(ltm=ltm, mtm=mtm, clock=clock),
         salience=SalienceStrategy(SalienceSettings()),
         stm=stm,
+        embedder=embedder,
         clock=clock,
     )
     await stm.put(

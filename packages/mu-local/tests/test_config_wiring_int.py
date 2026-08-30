@@ -169,8 +169,10 @@ async def test_recall_weight_mtm_override_changes_result_membership(settings: Se
         os.environ["MU_RECALL__STM_SCORING"] = "recency"
 
         # (1) DEFAULT — no override; `EngineSettings().recall.weight_mtm == 1.0` (RecallSettings'
-        # own class default, unchanged by this fix). The oldest-but-relevant fact's rank-1 MTM
-        # bonus outweighs its rank-last STM penalty and it SURFACES in the result.
+        # own class default, unchanged by AD-204 — that fix retuned `weight_stm` down to `0.1`
+        # instead, which only WIDENS this test's margin: the oldest-but-relevant fact's rank-1 MTM
+        # bonus outweighs its rank-last STM penalty by even more now, and it SURFACES in the
+        # result either way, so this premise is unaffected by the default change.
         get_engine_settings.cache_clear()
         assert get_engine_settings().recall.stm_scoring == "recency"
         default_contents = await _seed_and_recall(settings, uid_default)
