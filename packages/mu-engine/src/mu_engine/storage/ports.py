@@ -57,10 +57,10 @@ __all__ = [
     "StoreModel",
 ]
 
-# TypeVar retained for any downstream annotation spelled ``SM`` against this module (none in-tree
-# today — verified: no concrete mapper parameterizes ``RowMapper[...]`` at runtime, every mapper
-# satisfies it structurally). Bound to ``StoreModel`` rather than re-declared against the four
-# classes individually so it cannot silently re-diverge from the imported union.
+# Retained for any downstream annotation spelled ``SM`` against this module (none in-tree today —
+# verified: no concrete mapper parameterizes ``RowMapper[...]`` at runtime, every mapper satisfies
+# it structurally). Bound to the imported union rather than re-declared against the four classes
+# individually so it cannot silently re-diverge from it.
 SM = TypeVar("SM", bound=StoreModel)
 
 

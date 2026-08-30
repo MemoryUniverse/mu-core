@@ -28,6 +28,7 @@ from mu_engine.lifecycle.centrality import (
     LtmCentralityStorePort,
     projection_key,
 )
+from mu_engine.storage.authz import INTERNAL_ENGINE_READ, InternalEngineRead
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, Polarity
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored
@@ -87,7 +88,9 @@ class FakeLtm:
 
     def __init__(self, *, delay_s: float = 0.0) -> None:
         self.by_key: dict[str, list[MemoryItem]] = {}
-        self.read_calls: list[tuple[str, int, str | None, frozenset[str] | None]] = []
+        self.read_calls: list[
+            tuple[str, int, str | None, frozenset[str] | InternalEngineRead | None]
+        ] = []
         self._delay_s = delay_s
 
     def seed(self, ns: Namespace, *items: MemoryItem) -> None:
@@ -100,7 +103,7 @@ class FakeLtm:
         subject: str | None = None,
         predicate: str | None = None,
         limit: int,
-        caller_identity_set: frozenset[str] | None = None,
+        caller_identity_set: frozenset[str] | InternalEngineRead | None = None,
         session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]:
         self.read_calls.append((ns.to_prefix(), limit, session_scope, caller_identity_set))
@@ -337,14 +340,20 @@ async def test_shared_rooms_are_exact_and_never_federated() -> None:
 async def test_a_sweep_forges_no_caller_identity() -> None:
     """A sweep has no caller; inventing one would be an authorization forgery. The SHARED-plane
     consequence (room-exact but not principal-partitioned) is stated in the module docstring and
-    escalated to ARCHITECTURE-DELTAS, not silently traded away here."""
+    escalated to ARCHITECTURE-DELTAS, not silently traded away here.
+
+    AD-179: a bare ``None`` here would now be indistinguishable, at the adapter, from a caller-set
+    wiring bug (``require_shared_caller_identity_set`` raises on exactly that input on SHARED) —
+    so the sweep passes the explicit :data:`~mu_engine.storage.authz.INTERNAL_ENGINE_READ`
+    sentinel instead, and THIS is the property this test now pins: not merely "no caller was
+    invented" but "the one sanctioned, auditable way to say so was used"."""
     ns = _ns(visibility=Visibility.SHARED, session="roomA")
     store, index = FakeLtm(), CentralityIndex(CentralitySettings())
     store.seed(ns, _fact(ns, "Ada", "Bo"))
 
     await _service(store, index).refresh(ns)
 
-    assert store.read_calls[0][3] is None
+    assert store.read_calls[0][3] is INTERNAL_ENGINE_READ
 
 
 # ----------------------------------------------------------- truncation, bounds and deadlines ---

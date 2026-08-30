@@ -197,13 +197,19 @@ class ThreeChannelRecallRanker:
         # resolution — see docstring); it never reads `query`.
         # FAIL-CLOSED GATE (AD-128; CANONICAL §7.4). On a SHARED η the `to_prefix()` partition
         # separates ORGS, not the MEMBERS of one org — the session slot is caller-supplied — so
-        # Model-A is the WHOLE gate and `None` cannot be a legal caller set here. Every tier
-        # adapter reads `caller_identity_set is None` as "omit the Model-A clause entirely"
-        # (`qdrant_mtm.py:402`, `falkor_ltm.py:561`, `weaviate_mtm.py`, `pgvector_mtm.py`,
-        # `chroma_mtm.py`), so a caller that forgot to thread the set would get an UNFILTERED
-        # shared read from all three arms. Refuse it HERE, once, at the one place that knows both
-        # the η and the caller set — rather than relying on every present and future call site
-        # remembering (the convention-at-the-call-sites shape that produced C2, C3 and 7ccc405).
+        # Model-A is the WHOLE gate and `None` cannot be a legal caller set here. Refuse it HERE,
+        # at the one place that knows both the η and the caller set, so a caller that forgot to
+        # thread the set never even reaches a tier adapter. This is now the FIRST of two
+        # instruments, not the only one (AD-179): every tier adapter also refuses
+        # `caller_identity_set=None` on SHARED itself (`qdrant_mtm.py`, `falkor_ltm.py`,
+        # `weaviate_mtm.py`, `pgvector_mtm.py`, `chroma_mtm.py` — via
+        # `mu_engine.storage.authz.require_shared_caller_identity_set`; the STM tier's
+        # `authorized_window`/`authorized_item` always did). Before AD-179 those five adapters
+        # instead read `caller_identity_set is None` as "omit the Model-A clause entirely" and
+        # this gate was the ONLY thing standing between a forgotten caller set and an UNFILTERED
+        # shared read — kept here regardless, because a service-layer refusal that never reaches
+        # the store is strictly better than one that does (the convention-at-the-call-sites shape
+        # that produced C2, C3 and 7ccc405 is exactly "relying on one layer to remember").
         # An EMPTY set is legal and authorizes NOTHING: `RecallService` coerces a missing shared
         # caller set to `frozenset()` deliberately ("the safe direction, never an over-broad
         # match"), and every arm's predicate denies on it.

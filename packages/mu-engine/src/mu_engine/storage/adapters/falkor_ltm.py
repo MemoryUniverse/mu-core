@@ -71,6 +71,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from mu_contracts.ports.time import Clock
 from mu_engine.platform.clock import SystemClock
 from mu_engine.platform.decorators import retry_io
+from mu_engine.storage.authz import InternalEngineRead, require_shared_caller_identity_set
 from mu_engine.storage.domain.entity import EntityCandidate, EntityResolution
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -594,8 +595,7 @@ class FalkorLtmAdapter:
         g = await self._graph(ns)
         at_iso = at.isoformat()
         await g.query(
-            "MATCH (m:Memory {namespace: $ns, id: $id}) "
-            "SET m.state = $expired, m.invalid_at = $at",
+            "MATCH (m:Memory {namespace: $ns, id: $id}) SET m.state = $expired, m.invalid_at = $at",
             params={
                 "ns": ns.to_prefix(),
                 "id": memory_id,
@@ -612,7 +612,7 @@ class FalkorLtmAdapter:
         subject: str | None = None,
         predicate: str | None = None,
         limit: int,
-        caller_identity_set: frozenset[str] | None = None,
+        caller_identity_set: frozenset[str] | InternalEngineRead | None = None,
         session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]:
         return await self._retry(self._graph_recall_impl)(
@@ -631,9 +631,15 @@ class FalkorLtmAdapter:
         subject: str | None = None,
         predicate: str | None = None,
         limit: int,
-        caller_identity_set: frozenset[str] | None = None,
+        caller_identity_set: frozenset[str] | InternalEngineRead | None = None,
         session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]:
+        # AD-179 fix-impl: fail CLOSED on `SHARED + None` (a wiring bug), never silently omit the
+        # authorized_ids clause below — that omission was an unfiltered SHARED read.
+        # `InternalEngineRead` (see mu_engine.storage.authz) passes through deliberately.
+        require_shared_caller_identity_set(
+            ns=ns, caller_identity_set=caller_identity_set, operation="falkor_ltm.graph_recall"
+        )
         ns_predicate, ns_value = _resolve_memory_namespace_filter(ns, session_scope=session_scope)
         where = [
             ns_predicate,
@@ -652,7 +658,7 @@ class FalkorLtmAdapter:
         if predicate is not None:
             where.append("m.predicate = $predicate")
             params["predicate"] = predicate
-        if ns.visibility is Visibility.SHARED and caller_identity_set is not None:
+        if ns.visibility is Visibility.SHARED and isinstance(caller_identity_set, frozenset):
             where.append("ANY(cid IN $caller WHERE cid IN m.authorized_ids)")
             params["caller"] = list(caller_identity_set)
         cypher = (
@@ -1125,6 +1131,13 @@ class FalkorLtmAdapter:
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
     ) -> list[Scored[MemoryItem]]:
+        # AD-179 fix-impl: fail CLOSED on `SHARED + None` (a wiring bug), never silently omit the
+        # authorized_ids clause the hydration step below compiles.
+        require_shared_caller_identity_set(
+            ns=ns,
+            caller_identity_set=caller_identity_set,
+            operation="falkor_ltm.traverse_entities",
+        )
         tokens = {t.casefold() for t in re.findall(r"[A-Za-z0-9]+", query) if len(t) > 1}
         if not tokens:
             return []

@@ -31,28 +31,38 @@ mechanism or the pre-truncation property.
 governance decision has been recorded for; :func:`model_a_permits` answers ``False`` for it. A
 caller with no identity set is a caller nobody resolved; it answers ``False`` too.
 
-**WHERE the "no caller set on a SHARED read" wiring bug is actually refused — corrected 2026-08-30
-(ARCHITECTURE-DELTAS AD-179).** This paragraph used to say *"the tier repositories raise
-:class:`~mu_contracts.domain.errors.CallerIdentitySetRequiredError`"*, flatly, and that was FALSE
-of five of the six tier reads — a reader who grepped for the guarantee found the sentence and
-stopped looking, which is the false-conformance-citation shape that lets a real gap survive. The
-truth, verified by reading every site:
+**WHERE the "no caller set on a SHARED read" wiring bug is refused — corrected 2026-08-30
+(ARCHITECTURE-DELTAS AD-179).** This paragraph used to say, flatly, that "the tier repositories
+raise :class:`~mu_contracts.domain.errors.CallerIdentitySetRequiredError` when a SHARED read
+arrives with no caller set." That was FALSE of five of the six tier reads — a reader who grepped
+for the guarantee found the sentence and stopped looking, which is the false-conformance-citation
+shape that let the gap survive a month (the same shape ``qdrant_mtm.py``'s own now-corrected §8
+docstring had). The truth, now also the fix:
 
-* **STM** (``mu_engine/storage/authz.py:69,110`` — :func:`authorized_window` /
-  :func:`authorized_item`) does raise, and argues at length that it must.
+* **STM** (``mu_engine/storage/authz.py`` — :func:`~mu_engine.storage.authz.authorized_window` /
+  :func:`~mu_engine.storage.authz.authorized_item`) always raised, and argues at length for it.
 * **Every filterable-index adapter** — ``qdrant_mtm.py``, ``pgvector_mtm.py``, ``chroma_mtm.py``,
-  ``weaviate_mtm.py``, ``falkor_ltm.py`` — instead reads ``if ns.visibility is SHARED and
-  caller_identity_set is not None:`` and so silently OMITS the ``authorized_ids`` clause on a
-  ``None``. Fail-OPEN, at the layer §7.4 names as the mechanism.
-* The guarantee is therefore held ONE layer up, by a single service-layer gate:
-  ``mu_engine/services/recall/ranker.py`` refuses a SHARED rank with ``caller_identity_set is
-  None`` before any arm runs. **Measured 2026-08-30:** that gate plus
-  ``lifecycle/centrality.py:522`` are the ONLY two callers of ``semantic``/``graph_recall``/
-  ``traverse_entities`` in the whole tree (``mu-server`` and ``mu-client`` reach these tiers only
-  through the ranker), and the centrality sweep passes ``None`` deliberately and documents why —
-  so the fail-open branch is not reachable by a principal today. It is a defence-in-depth gap and
-  a second-call-site trap, NOT a live bypass, and AD-179 carries the fix-impl verdict plus the
-  owner ruling the sweep's no-caller case needs.
+  ``weaviate_mtm.py``, ``falkor_ltm.py`` (``semantic``/``graph_recall``/``traverse_entities``) —
+  used to read ``if ns.visibility is SHARED and caller_identity_set is not None:`` and so silently
+  OMITTED the ``authorized_ids`` clause on a ``None``, running an unfiltered SHARED query
+  server-side. They now call
+  :func:`~mu_engine.storage.authz.require_shared_caller_identity_set` before compiling that
+  clause — the SAME fail-closed guard STM already applied, held ONCE at the repository layer
+  instead of re-derived per adapter.
+* The property no longer rests SOLELY on the one service-layer gate this used to name
+  (``services/recall/ranker.py``) — that gate still refuses a SHARED rank with no caller set
+  before any arm runs (two independent instruments is the right shape, not one), but it is no
+  longer the only thing standing between a ``None`` and an unfiltered SHARED read: every adapter
+  now refuses that input itself.
+* The one engine-internal caller that legitimately has no principal
+  (``lifecycle/centrality.py``'s degree-centrality sweep) passes the explicit
+  :data:`~mu_engine.storage.authz.INTERNAL_ENGINE_READ` sentinel instead of relying on the
+  ``None`` default — see that sentinel's own docstring for why a real caller-set omission must
+  never reach the same code path. Whether an engine-internal sweep may compute structural scores
+  over a room's data ignoring per-member ``authorized_ids`` at all remains a design question the
+  owner has not formally ruled on (recorded in ARCHITECTURE-DELTAS); this fix does not decide it,
+  it only makes the EXISTING, already-shipped exception explicit and auditable instead of
+  indistinguishable from the bug it used to share a code path with.
 """
 
 from __future__ import annotations

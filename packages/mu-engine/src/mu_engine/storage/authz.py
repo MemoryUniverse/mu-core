@@ -30,6 +30,21 @@ The window is filtered, never widened: the caller asked for the ``limit`` most-r
 receives the authorized subset of exactly those. Refilling by reading deeper would be the
 over-fetch §7.4 rejects (Model B), and it would leak the fact that unreadable rows exist by way of
 how far back the floor reaches.
+
+**AD-179 (2026-08-30) — the SAME fail-closed property, for the filterable-index tiers.**
+:func:`require_shared_caller_identity_set` is the twin of the ``None`` check embedded in
+:func:`authorized_window`/:func:`authorized_item` above, pulled out into its own function because
+five OTHER adapters needed it and had each grown their own, WRONG, answer instead: every
+filterable-index adapter (``qdrant_mtm.py``, ``weaviate_mtm.py``, ``pgvector_mtm.py``,
+``chroma_mtm.py``, ``falkor_ltm.py``) read ``if ns.visibility is SHARED and caller_identity_set is
+not None:`` before compiling their ``authorized_ids`` filter clause — so a ``None`` did not raise,
+it silently OMITTED the clause and ran an unfiltered SHARED query server-side. Measured: the STM
+tier (this module) was fail-CLOSED and the five vector/graph tiers were fail-OPEN, disagreeing on
+one security property, with the whole guarantee resting on a single service-layer gate
+(``services/recall/ranker.py``) that happened to refuse ``None`` before any adapter ever saw it.
+Call this function BEFORE compiling that clause in every one of those five adapters so the
+property is held ONCE, at the repository layer §7.4 names as the mechanism, not re-derived
+per-adapter.
 """
 
 from __future__ import annotations
@@ -41,7 +56,65 @@ from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import Scored
 
-__all__ = ["authorized_item", "authorized_window"]
+__all__ = [
+    "INTERNAL_ENGINE_READ",
+    "InternalEngineRead",
+    "authorized_item",
+    "authorized_window",
+    "require_shared_caller_identity_set",
+]
+
+
+class InternalEngineRead:
+    """Sentinel for ``caller_identity_set``, distinct from ``None``: a deliberate, PRINCIPAL-LESS
+    engine-internal read that returns no content and no ranked result to any external caller
+    (CLAUDE.md rule 3 content-free discipline is not at stake — nothing crosses back out).
+
+    ``None`` is always a wiring bug on a SHARED read (:func:`require_shared_caller_identity_set`
+    raises on it, no exceptions) — that is the whole point of AD-179's fix. This sentinel is the
+    ONE narrow, explicit, grep-able way to say "this read is not on behalf of a principal" instead
+    of reaching the exact same code path a forgotten caller set would reach. Exactly one
+    legitimate production use today: ``lifecycle/centrality.py``'s degree-centrality sweep, which
+    needs every ACTIVE fact in a namespace to compute a structural score for the engine's OWN
+    salience bookkeeping — not the authorized subset of one caller's read — and says so at length
+    in its own module docstring (ARCHITECTURE-DELTAS **AD-179**/**AD-197**: recorded as an open
+    design question the owner has not formally ruled on; this sentinel makes the existing,
+    already-shipped exception explicit and auditable — ``grep`` for it finds every use — rather
+    than indistinguishable from the ``None`` a caller-set wiring bug produces.)
+    """
+
+    def __repr__(self) -> str:
+        return "INTERNAL_ENGINE_READ"
+
+
+#: The one instance — compare with ``is``, never construct a second one.
+INTERNAL_ENGINE_READ = InternalEngineRead()
+
+
+def require_shared_caller_identity_set(
+    *,
+    ns: Namespace,
+    caller_identity_set: CallerIdentitySet | InternalEngineRead | None,
+    operation: str,
+) -> None:
+    """Fail CLOSED (§7.4) on a SHARED-η filterable-index read with ``caller_identity_set=None`` —
+    always a wiring bug, never a "no filter" instruction. Call this BEFORE compiling any
+    ``authorized_ids`` filter clause; PRIVATE is untouched (§1 rule 5: the partition already
+    authorizes it) and :data:`INTERNAL_ENGINE_READ` passes without raising (see its own
+    docstring for the one legitimate caller and why it must not be reachable via a plain
+    ``None``).
+
+    ``operation`` names the call site in the raised error only — never memory content, never an
+    id (content-free discipline, CLAUDE.md rule 3), mirroring :func:`authorized_window`.
+    """
+    if ns.visibility is Visibility.SHARED and caller_identity_set is None:
+        raise CallerIdentitySetRequiredError(
+            f"{operation}: a SHARED-η semantic/graph read requires the Model-A caller identity "
+            "set (CANONICAL §7.4); omitting it here would silently drop the authorized_ids "
+            "filter clause and run an UNFILTERED SHARED query (ARCHITECTURE-DELTAS AD-179). Pass "
+            "the caller's identity set, or mu_engine.storage.authz.INTERNAL_ENGINE_READ for a "
+            "genuine principal-less engine read that returns no content to any caller."
+        )
 
 
 def authorized_window(

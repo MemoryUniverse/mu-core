@@ -21,6 +21,7 @@ import pytest
 import pytest_asyncio
 import weaviate
 
+from mu_contracts.domain.errors import CallerIdentitySetRequiredError
 from mu_engine.storage.adapters.weaviate_mtm import WeaviateMtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -201,15 +202,15 @@ async def test_point_get_refuses_another_namespaces_memory_in_the_same_org_works
     ws = f"shared-ws-{uuid.uuid4().hex[:8]}"
     victim_ns = make_ns(workspace=ws, user="u_victim")
     caller_ns = make_ns(workspace=ws, user="u_caller")
-    assert tenant_name(victim_ns) == tenant_name(
-        caller_ns
-    ), "the pre-condition did not hold: the two namespaces are in different tenants"
+    assert tenant_name(victim_ns) == tenant_name(caller_ns), (
+        "the pre-condition did not hold: the two namespaces are in different tenants"
+    )
     victim = make_item(victim_ns, "the victim's secret")
     await mtm.upsert(victim)
     assert await mtm.get(victim_ns, victim.id) is not None, "the victim is not even stored"
-    assert (
-        await mtm.get(caller_ns, victim.id) is None
-    ), "a point-get resolved a memory from another principal's partition"
+    assert await mtm.get(caller_ns, victim.id) is None, (
+        "a point-get resolved a memory from another principal's partition"
+    )
 
 
 async def test_state_active_supersede_drop(
@@ -266,6 +267,21 @@ async def test_shared_authorized_ids_completeness(
     ids = {h.item.id for h in hits}
     assert mine.id in ids  # authorized-and-relevant surfaces
     assert not_mine.id not in ids  # unauthorized filtered pre-truncation (Model A)
+
+
+async def test_shared_semantic_with_no_caller_set_fails_closed(
+    mtm: WeaviateMtmAdapter,
+    make_ns: _NamespaceFactory,
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """AD-179 — before this fix, omitting ``caller_identity_set`` on a SHARED ``semantic`` read
+    silently dropped the ``authorized_ids`` GraphQL ``where`` clause and ran an UNFILTERED SHARED
+    query. It must instead raise, exactly as the STM tier already does for the identical shape."""
+    ns = make_ns(visibility=Visibility.SHARED)
+    someone_elses = make_item(ns, "someone else fact", authorized_ids=["p_carol"])
+    await mtm.upsert(someone_elses)
+    with pytest.raises(CallerIdentitySetRequiredError):
+        await mtm.semantic(ns, someone_elses.embedding or [], limit=10)
 
 
 async def test_remove_is_scoped_and_atomic(

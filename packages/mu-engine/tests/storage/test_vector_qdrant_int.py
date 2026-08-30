@@ -15,6 +15,7 @@ import pytest_asyncio
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 
+from mu_contracts.domain.errors import CallerIdentitySetRequiredError
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -145,9 +146,9 @@ async def test_point_get_refuses_another_namespaces_memory(
     await mtm.upsert(victim)
     assert await mtm.get(victim_ns, victim.id) is not None, "the victim is not even stored"
 
-    assert (
-        await mtm.get(caller_ns, victim.id) is None
-    ), "a point-get resolved a memory from another principal's partition"
+    assert await mtm.get(caller_ns, victim.id) is None, (
+        "a point-get resolved a memory from another principal's partition"
+    )
 
 
 async def test_state_active_supersede_drop(
@@ -184,4 +185,22 @@ async def test_shared_authorized_ids_completeness(
     ids = {h.item.id for h in hits}
     assert mine.id in ids  # authorized-and-relevant surfaces
     assert not_mine.id not in ids  # unauthorized filtered pre-truncation (Model A)
+    await qdrant_client.delete_collection(collection_name(ns, VECTOR_DIM))
+
+
+async def test_shared_semantic_with_no_caller_set_fails_closed(
+    qdrant_client: AsyncQdrantClient,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """AD-179 — before this fix ``semantic`` on a SHARED namespace with ``caller_identity_set``
+    OMITTED silently dropped the ``authorized_ids`` filter clause and ran an UNFILTERED SHARED
+    query: this would have returned ``someone else fact`` to a caller nobody identified. It must
+    instead raise, exactly as the STM tier already does for the identical input shape."""
+    adapter = QdrantMtmAdapter(qdrant_client, dim=VECTOR_DIM)
+    ns = make_ns(visibility=Visibility.SHARED)
+    someone_elses = make_item(ns, "someone else fact", authorized_ids=["p_carol"])
+    await adapter.upsert(someone_elses)
+    with pytest.raises(CallerIdentitySetRequiredError):
+        await adapter.semantic(ns, someone_elses.embedding or [], limit=10)
     await qdrant_client.delete_collection(collection_name(ns, VECTOR_DIM))
