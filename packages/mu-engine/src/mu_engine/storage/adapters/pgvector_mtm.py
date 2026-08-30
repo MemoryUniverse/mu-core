@@ -33,6 +33,7 @@ import asyncpg
 from pgvector.asyncpg import register_vector
 
 from mu_engine.platform.decorators import retry_io
+from mu_engine.storage.authz import require_shared_caller_identity_set
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
@@ -210,6 +211,11 @@ class PgVectorMtmAdapter:
             params: list[Any] = [query_vector, ns.to_prefix(), MemoryState.ACTIVE.value]
             where = "namespace = $2 AND state = $3"
             # Model A — SHARED only; PRIVATE is isolated by to_prefix() + the plane split.
+            # AD-179 fix-impl: fail CLOSED on `SHARED + None` (a wiring bug), never silently omit
+            # this clause — that omission was an unfiltered SHARED read compiled server-side.
+            require_shared_caller_identity_set(
+                ns=ns, caller_identity_set=caller_identity_set, operation="pgvector_mtm.semantic"
+            )
             if ns.visibility is Visibility.SHARED and caller_identity_set is not None:
                 params.append(list(caller_identity_set))
                 where += f" AND authorized_ids && ${len(params)}"

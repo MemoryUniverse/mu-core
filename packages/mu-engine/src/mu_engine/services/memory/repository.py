@@ -266,15 +266,20 @@ class TieredMemoryRepository:
         **``authorized_ids`` is passed THROUGH, never coerced — an EMPTY set is a real answer.**
         ``CallerIdentitySet`` is a bare ``frozenset[str]`` (``domain/model/recall.py:27``) with no
         non-empty constraint, so ``frozenset()`` is legal input and means "this caller is
-        authorized for nothing". The MTM adapters gate the Model-A clause on
-        ``caller_identity_set is not None`` (``qdrant_mtm.py:402``, ``falkor_ltm.py:561``,
-        ``weaviate_mtm.py:657``, ``pgvector_mtm.py:213``, ``chroma_mtm.py:167``), so ``None`` is
-        their sentinel for *omit the filter entirely*. Turning the empty set into ``None`` would
-        therefore hand a caller authorized for NOTHING every memory in a SHARED room. This is the
-        rule ``RecallService`` states in words two files away and applies in the opposite
-        direction (``services/recall/service.py:108-112`` — *"an empty set (defensive default)
-        authorizes NOTHING server-side — the safe direction, never an over-broad match"*), and it
-        coerces ``None -> frozenset()``. The façade does the same, never the inverse.
+        authorized for nothing", and it must never be turned into ``None`` — that would hand a
+        caller authorized for NOTHING every memory in a SHARED room. Before AD-179's fix-impl this
+        was because the MTM adapters read ``caller_identity_set is not None`` as their sentinel to
+        *omit the Model-A clause entirely* (fail-OPEN); after it, ``None`` on a SHARED read instead
+        RAISES ``CallerIdentitySetRequiredError`` at the adapter (fail-CLOSED, ``qdrant_mtm.py``,
+        ``falkor_ltm.py``, ``weaviate_mtm.py``, ``pgvector_mtm.py``, ``chroma_mtm.py`` — see
+        ``mu_engine.storage.authz.require_shared_caller_identity_set``) — so the distinction this
+        docstring protects matters MORE now, not less: coercing the empty set to ``None`` would
+        turn a legitimate deny-all into a crash instead of an over-broad read, but it is still the
+        wrong answer for the same reason. This is the rule ``RecallService`` states in words two
+        files away and applies in the opposite direction (``services/recall/service.py:108-112`` —
+        *"an empty set (defensive default) authorizes NOTHING server-side — the safe direction,
+        never an over-broad match"*), and it coerces ``None -> frozenset()``. The façade does the
+        same, never the inverse.
         """
         embedder = self._embedder
         if embedder is None:

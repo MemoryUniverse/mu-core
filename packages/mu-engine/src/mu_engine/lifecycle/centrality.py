@@ -108,16 +108,20 @@ would be both a leak and a wrong number. ``session_scope=None`` is passed delibe
 session-scoped read would compute a session-local degree over a user-scoped graph and would
 silently vary by which session happened to run the sweep.
 
-**SHARED plane, principal granularity — a stated limitation, escalated not buried.** No
-``caller_identity_set`` is passed: a sweep genuinely has no caller, and inventing one would be an
-authorization forgery. Room isolation therefore holds exactly (verified live: a second room's facts
-never enter another room's projection), but WITHIN a room the degree is computed over every ACTIVE
-fact regardless of Model-A ``authorized_ids``. That is defensible — the sweep is the engine acting
-on the room's own data, no principal is reading, and no score or content is returned to anyone —
-but it is a real design question the owner has not ruled on, so it is recorded as an open item in
-ARCHITECTURE-DELTAS rather than settled here. ``storage/ports.py:285-286``'s "an implementation that
-ignores it on SHARED is an authorization bypass" governs ``traverse_entities`` HYDRATING rows *for
-a caller*; this path has no caller and returns no rows.
+**SHARED plane, principal granularity — a stated limitation, escalated not buried.**
+``caller_identity_set=INTERNAL_ENGINE_READ`` (AD-179; ``mu_engine.storage.authz``), not a caller
+set: a sweep genuinely has no caller, and inventing one would be an authorization forgery — and
+after AD-179's fix-impl the plain default ``None`` this used to pass is unconditionally a
+SHARED-η wiring-bug error at the adapter, not "no filter", so the sentinel is what keeps this
+already-shipped exception EXPLICIT rather than indistinguishable from that bug. Room isolation
+therefore holds exactly (verified live: a second room's facts never enter another room's
+projection), but WITHIN a room the degree is computed over every ACTIVE fact regardless of Model-A
+``authorized_ids``. That is defensible — the sweep is the engine acting on the room's own data, no
+principal is reading, and no score or content is returned to anyone — but it is a real design
+question the owner has not ruled on, so it is recorded as an open item in ARCHITECTURE-DELTAS
+rather than settled here. ``storage/ports.py:285-286``'s "an implementation that ignores it on
+SHARED is an authorization bypass" governs ``traverse_entities`` HYDRATING rows *for a caller*;
+this path has no caller and returns no rows.
 
 **Truncation withholds; it never publishes a lower bound.** ``graph_recall`` orders
 ``valid_at DESC LIMIT $limit`` (``falkor_ltm.py:565``), so a namespace larger than
@@ -154,6 +158,7 @@ from mu_engine.platform.observability import (
     NoopTracer,
     TraceScope,
 )
+from mu_engine.storage.authz import INTERNAL_ENGINE_READ, InternalEngineRead
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import Scored
@@ -221,7 +226,7 @@ class LtmCentralityStorePort(Protocol):
         subject: str | None = None,
         predicate: str | None = None,
         limit: int,
-        caller_identity_set: frozenset[str] | None = None,
+        caller_identity_set: frozenset[str] | InternalEngineRead | None = None,
         session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]: ...
 
@@ -514,12 +519,17 @@ class CentralityService:
 
         ``subject``/``predicate`` are left ``None`` so this is the full namespace enumeration;
         ``session_scope=None`` federates the user's sessions to match the user-grained ``:Entity``
-        sub-graph (module docstring); no ``caller_identity_set`` is passed because a sweep has no
-        caller — see the module docstring's SHARED-plane paragraph.
+        sub-graph (module docstring); ``caller_identity_set=INTERNAL_ENGINE_READ`` (AD-179 —
+        this used to pass the DEFAULT ``None``, which after AD-179's fix-impl is unconditionally a
+        SHARED-η wiring-bug error, not "no filter") because a sweep has no caller — see the module
+        docstring's SHARED-plane paragraph and ``mu_engine.storage.authz.InternalEngineRead``'s
+        own docstring for why this is the one legitimate, explicit, non-``None`` way to say so.
         """
         probe = cfg.max_facts_per_pass + 1
         async with asyncio.timeout(cfg.read_timeout_s):
-            hits = await self._ltm.graph_recall(ns, limit=probe, session_scope=None)
+            hits = await self._ltm.graph_recall(
+                ns, limit=probe, caller_identity_set=INTERNAL_ENGINE_READ, session_scope=None
+            )
         if len(hits) > cfg.max_facts_per_pass:
             return [hit.item for hit in hits[: cfg.max_facts_per_pass]], True
         return [hit.item for hit in hits], False

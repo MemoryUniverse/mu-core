@@ -32,6 +32,7 @@ from typing import Any
 from qdrant_client import AsyncQdrantClient, models
 
 from mu_engine.platform.decorators import retry_io
+from mu_engine.storage.authz import require_shared_caller_identity_set
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
@@ -399,6 +400,11 @@ class QdrantMtmAdapter:
             ),
         ]
         # Model A — SHARED only; PRIVATE is isolated by the resolved namespace match above.
+        # AD-179 fix-impl: fail CLOSED on `SHARED + None` (a wiring bug), never silently omit
+        # this clause — that omission was an unfiltered SHARED read compiled server-side.
+        require_shared_caller_identity_set(
+            ns=ns, caller_identity_set=caller_identity_set, operation="qdrant_mtm.semantic"
+        )
         if ns.visibility is Visibility.SHARED and caller_identity_set is not None:
             must.append(
                 models.FieldCondition(

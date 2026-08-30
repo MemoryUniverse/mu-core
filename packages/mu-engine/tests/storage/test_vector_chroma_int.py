@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from mu_contracts.domain.errors import CallerIdentitySetRequiredError
 from mu_engine.storage.adapters.chroma_mtm import ChromaMtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -111,6 +112,22 @@ async def test_shared_authorized_ids_completeness(
     assert not_mine.id not in ids  # unauthorized filtered before truncation (Model A)
 
 
+async def test_shared_semantic_with_no_caller_set_fails_closed(
+    mtm: ChromaMtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """AD-179 — before this fix, omitting ``caller_identity_set`` on a SHARED ``semantic`` read
+    left ``needs_authz`` False, so the Python-side ``authorized_ids_joined`` containment check
+    below never ran and the read was UNFILTERED. It must instead raise, exactly as the STM tier
+    already does for the identical input shape."""
+    ns = make_ns(visibility=Visibility.SHARED)
+    someone_elses = make_item(ns, "someone else fact", authorized_ids=["p_carol"])
+    await mtm.upsert(someone_elses)
+    with pytest.raises(CallerIdentitySetRequiredError):
+        await mtm.semantic(ns, someone_elses.embedding or [], limit=10)
+
+
 async def test_invalidate_refuses_another_namespaces_memory(
     mtm: ChromaMtmAdapter,
     make_ns: Callable[..., Namespace],
@@ -151,9 +168,9 @@ async def test_invalidate_refuses_another_namespaces_memory(
         "owner's active recall"
     )
     doc = (got.get("documents") or [None])[0]
-    assert "superseded_by" not in json.loads(
-        doc or "{}"
-    ), "a foreign invalidate wrote a supersession edge onto the victim's document"
+    assert "superseded_by" not in json.loads(doc or "{}"), (
+        "a foreign invalidate wrote a supersession edge onto the victim's document"
+    )
 
 
 async def test_invalidate_in_its_own_namespace_still_supersedes(

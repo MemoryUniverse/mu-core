@@ -18,6 +18,7 @@ import pytest
 import pytest_asyncio
 
 from mu_contracts.config import Settings
+from mu_contracts.domain.errors import CallerIdentitySetRequiredError
 from mu_engine.storage.adapters.pgvector_mtm import PgVectorMtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -128,6 +129,29 @@ async def test_shared_authorized_ids_completeness(
     await adapter.close()
 
 
+async def test_shared_semantic_with_no_caller_set_fails_closed(
+    settings: Settings,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """AD-179 — before this fix, omitting ``caller_identity_set`` on a SHARED ``semantic`` read
+    silently dropped the ``authorized_ids && $n`` SQL predicate and ran an UNFILTERED SHARED
+    query. It must instead raise, exactly as the STM tier already does for the identical shape."""
+    adapter = PgVectorMtmAdapter(dsn=settings.storage.pgvector.dsn, dim=VECTOR_DIM)
+    ns = make_ns(visibility=Visibility.SHARED)
+    someone_elses = make_item(ns, "someone else fact", authorized_ids=["p_carol"])
+    await adapter.upsert(someone_elses)
+    try:
+        with pytest.raises(CallerIdentitySetRequiredError):
+            await adapter.semantic(ns, someone_elses.embedding or [], limit=10)
+    finally:
+        table = pgvector_table_name(ns, VECTOR_DIM)
+        pool = await adapter._ensure_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(f"DROP TABLE IF EXISTS {table}")
+        await adapter.close()
+
+
 async def test_extension_and_table_are_provisioned(settings: Settings) -> None:
     """Fail-loud probe: the `vector` extension must exist on the real mu-dev-pgvector container
     (D3-adjacent "BLOCKED, never mock" — this is the honesty check the data reviewer wants)."""
@@ -185,9 +209,9 @@ async def test_invalidate_refuses_another_namespaces_memory(
         "a foreign namespace superseded the victim's memory — it is now dropped from its "
         "owner's active recall"
     )
-    assert "superseded_by" not in dict(
-        row["payload"]
-    ), "a foreign invalidate wrote a supersession edge onto the victim's row"
+    assert "superseded_by" not in dict(row["payload"]), (
+        "a foreign invalidate wrote a supersession edge onto the victim's row"
+    )
 
 
 async def test_invalidate_in_its_own_namespace_still_supersedes(

@@ -33,6 +33,7 @@ from chromadb.api import ClientAPI
 from chromadb.config import Settings as ChromaClientSettings
 
 from mu_engine.platform.decorators import retry_io
+from mu_engine.storage.authz import require_shared_caller_identity_set
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
@@ -156,6 +157,11 @@ class ChromaMtmAdapter:
         caller_identity_set: frozenset[str] | None = None,
         sparse_query: SparseQuery | None = None,
     ) -> list[Scored[MemoryItem]]:
+        # AD-179 fix-impl: fail CLOSED on `SHARED + None` (a wiring bug), never silently omit the
+        # authz check below — that omission was an unfiltered SHARED read.
+        require_shared_caller_identity_set(
+            ns=ns, caller_identity_set=caller_identity_set, operation="chroma_mtm.semantic"
+        )
         async with self._lock:
             col = await self._collection(ns)
             where = {

@@ -30,6 +30,7 @@ import pytest
 import pytest_asyncio
 from falkordb.asyncio import FalkorDB
 
+from mu_contracts.domain.errors import CallerIdentitySetRequiredError
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -99,9 +100,9 @@ async def test_traversal_hides_shared_fact_from_a_different_room(
     room-included ``to_prefix()``, UNCONDITIONALLY."""
     room_a = make_ns(visibility=Visibility.SHARED, session="roomA")
     room_b = make_ns(visibility=Visibility.SHARED, session="roomB")
-    assert ltm.graph_name_for(room_a) == ltm.graph_name_for(
-        room_b
-    ), "precondition: both rooms must share ONE physical partition, else this test is vacuous"
+    assert ltm.graph_name_for(room_a) == ltm.graph_name_for(room_b), (
+        "precondition: both rooms must share ONE physical partition, else this test is vacuous"
+    )
 
     other_rooms_fact = make_item(
         room_a,
@@ -118,9 +119,9 @@ async def test_traversal_hides_shared_fact_from_a_different_room(
     from_a = await ltm.traverse_entities(
         room_a, query=_QUERY, max_hops=2, limit=10, caller_identity_set=caller
     )
-    assert [h.item.id for h in from_a] == [
-        other_rooms_fact.id
-    ], "precondition: own room must see it"
+    assert [h.item.id for h in from_a] == [other_rooms_fact.id], (
+        "precondition: own room must see it"
+    )
 
     from_b = await ltm.traverse_entities(
         room_b, query=_QUERY, max_hops=2, limit=10, caller_identity_set=caller
@@ -200,3 +201,28 @@ async def test_traversal_on_private_still_walks_across_the_users_own_sessions(
 
     from_intruder = await ltm.traverse_entities(intruder_ns, query=_QUERY, max_hops=2, limit=10)
     assert from_intruder == [], "cross-USER leak — PRIVATE federation widened past the user wall"
+
+
+async def test_traversal_on_shared_with_no_caller_set_fails_closed(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """AD-179 — before this fix, omitting ``caller_identity_set`` on a SHARED traversal silently
+    dropped the ``m.authorized_ids`` predicate this file's OWN first test proves is otherwise
+    enforced, and hydrated every reachable fact regardless of its ACL. It must instead raise, the
+    same way the STM tier and this arm's ``caller_identity_set=<wrong principal>`` case already
+    refuse/deny."""
+    room = make_ns(visibility=Visibility.SHARED, session="roomA")
+    secret = make_item(
+        room,
+        "Ada manages Bo",
+        subject="Ada",
+        predicate="manages",
+        obj="Bo",
+        authorized_ids=["principal-alice"],
+    )
+    await ltm.upsert_fact(secret)
+
+    with pytest.raises(CallerIdentitySetRequiredError):
+        await ltm.traverse_entities(room, query=_QUERY, max_hops=2, limit=10)

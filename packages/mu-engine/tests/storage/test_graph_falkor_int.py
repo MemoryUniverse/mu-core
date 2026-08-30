@@ -17,7 +17,9 @@ import pytest_asyncio
 from falkordb.asyncio import FalkorDB
 
 from mu_contracts.config import get_settings
+from mu_contracts.domain.errors import CallerIdentitySetRequiredError
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
+from mu_engine.storage.authz import INTERNAL_ENGINE_READ
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.factories import STORE_REGISTRY
@@ -54,6 +56,38 @@ async def test_upsert_and_graph_recall(
     hits = await ltm.graph_recall(ns, subject="Ada", limit=5)
     assert [h.item.id for h in hits] == [item.id]
     assert hits[0].item.content == item.content  # lossless memory_json carrier round-trip
+
+
+async def test_shared_graph_recall_with_no_caller_set_fails_closed(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """AD-179 — before this fix, ``graph_recall`` on a SHARED namespace with
+    ``caller_identity_set`` OMITTED silently dropped the ``m.authorized_ids`` cypher predicate and
+    ran an UNFILTERED SHARED query. It must instead raise, exactly as the STM tier already does
+    for the identical input shape, and exactly as this same adapter's own ``traverse_entities``
+    now does (test_falkor_traverse_authz_int.py)."""
+    room = make_ns(visibility=Visibility.SHARED, session="roomA")
+    secret = make_item(
+        room,
+        "Ada uses Postgres",
+        subject="Ada",
+        predicate="uses",
+        obj="Postgres",
+        authorized_ids=["principal-alice"],
+    )
+    await ltm.upsert_fact(secret)
+
+    with pytest.raises(CallerIdentitySetRequiredError):
+        await ltm.graph_recall(room, subject="Ada", limit=5)
+
+    # the one legitimate, EXPLICIT bypass (the lifecycle centrality sweep) must still work, and
+    # must still see the fact — it is an engine-internal read, not a per-caller filtered one.
+    internal = await ltm.graph_recall(
+        room, subject="Ada", limit=5, caller_identity_set=INTERNAL_ENGINE_READ
+    )
+    assert [h.item.id for h in internal] == [secret.id]
 
 
 async def test_namespace_isolation(
@@ -258,9 +292,9 @@ async def test_graph_recall_explicit_session_scope_still_narrows_to_one_session(
     assert narrowed == [], "explicit session_scope did not narrow — the opt-out is broken"
 
     widened = await ltm.graph_recall(ns_b, subject="Ada", limit=10, session_scope="sessionA")
-    assert {h.item.object for h in widened} == {
-        "Paris"
-    }, "session_scope must be able to target ANY of the user's sessions, not only the caller's"
+    assert {h.item.object for h in widened} == {"Paris"}, (
+        "session_scope must be able to target ANY of the user's sessions, not only the caller's"
+    )
 
 
 # =================================================================================================

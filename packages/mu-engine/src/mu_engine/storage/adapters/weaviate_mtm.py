@@ -81,6 +81,7 @@ from weaviate.classes.tenants import Tenant
 from weaviate.collections.classes.internal import _RawGQLReturn
 
 from mu_engine.platform.decorators import retry_io
+from mu_engine.storage.authz import require_shared_caller_identity_set
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
@@ -654,6 +655,11 @@ class WeaviateMtmAdapter:
             _where_eq("state", MemoryState.ACTIVE.value),
         ]
         # Model A — SHARED only; PRIVATE is isolated by the tenant + namespace match above.
+        # AD-179 fix-impl: fail CLOSED on `SHARED + None` (a wiring bug), never silently omit
+        # this clause — that omission was an unfiltered SHARED read compiled server-side.
+        require_shared_caller_identity_set(
+            ns=ns, caller_identity_set=caller_identity_set, operation="weaviate_mtm.semantic"
+        )
         if ns.visibility is Visibility.SHARED and caller_identity_set is not None:
             clauses.append(_where_contains_any("authorized_ids", sorted(caller_identity_set)))
         return _where_and(clauses)
