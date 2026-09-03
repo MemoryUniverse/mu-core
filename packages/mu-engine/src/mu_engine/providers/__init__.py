@@ -43,6 +43,7 @@ from mu_engine.providers._contracts import (
     Vector,
 )
 from mu_engine.providers.catalog import (
+    HttpEmbedConfig,
     ModelDeployment,
     ModelKind,
     ProviderKind,
@@ -50,7 +51,12 @@ from mu_engine.providers.catalog import (
     Task,
     WarmLocalConfig,
 )
-from mu_engine.providers.embedding import SentenceTransformerEmbedder, build_embedder
+from mu_engine.providers.embedding import (
+    HttpEmbedder,
+    HttpEmbedError,
+    SentenceTransformerEmbedder,
+    build_embedder,
+)
 from mu_engine.providers.model_router import ModelRouter, build_model_router
 from mu_engine.providers.plane import (
     PlaneModelLayer,
@@ -97,6 +103,9 @@ __all__ = [
     "DegradeReason",
     "DegradedModeEntered",
     "EmbeddingPort",
+    "HttpEmbedConfig",
+    "HttpEmbedError",
+    "HttpEmbedder",
     "LLMProviderPort",
     "LegacyModelGroup",
     "LocalFallbackPosture",

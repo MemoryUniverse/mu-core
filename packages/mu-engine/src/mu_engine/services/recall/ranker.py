@@ -75,6 +75,13 @@ it at the SHIPPED ``floor_protect_limit=3``, and that residual is the SEPARATE, 
 outside the window — confirmed by re-measuring with ``floor_protect_limit=0`` (diagnostic-only),
 which matches or exceeds the MTM-alone channel at every cutoff. Not a re-opening of AD-195's
 trade-off, only of the rank-authority mismatch this fix's own diagnosis names.
+
+Rerank gate (ACCURACY-PLAN-0831.md item 6, 2026-09-01): the three-channel RRF fuse above now
+passes through an :class:`~mu_engine.services.recall.rerank_gate.AdaptiveRerankGate` before the
+STM-floor merge (`rank()`'s own inline comment marks the exact insertion point) — the seam
+`ModelRouter.rerank` had been built for but never had a caller. See `rerank_gate.py`'s module
+docstring for the full design (dark-by-default semantics, empty-gate/model-unavailable fallback,
+why the floor's "never evicted" guarantee needed no change here).
 """
 
 from __future__ import annotations
@@ -88,7 +95,7 @@ from mu_contracts.domain.errors import CallerIdentitySetRequiredError, StoreUnav
 from mu_contracts.domain.events import DegradeReason
 from mu_contracts.domain.model.recall import CallerIdentitySet, Vector
 from mu_contracts.ports.time import Clock
-from mu_engine.providers._contracts import EmbeddingPort
+from mu_engine.providers._contracts import EmbeddingPort, RerankProviderPort
 from mu_engine.services.recall.dto import (
     RecallChannels,
     RecallItemView,
@@ -96,6 +103,7 @@ from mu_engine.services.recall.dto import (
     RecallSettings,
 )
 from mu_engine.services.recall.fusion import FusionStrategy, dedup_by_content_hash
+from mu_engine.services.recall.rerank_gate import AdaptiveRerankGate
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored
@@ -169,6 +177,7 @@ class ThreeChannelRecallRanker:
         settings: RecallSettings,
         clock: Clock,
         embedder: EmbeddingPort | None = None,
+        reranker: RerankProviderPort | None = None,
     ) -> None:
         self._stm = stm
         self._mtm = mtm
@@ -181,6 +190,16 @@ class ThreeChannelRecallRanker:
         # embedded once at that façade boundary, §6-P2/m4); the ranker reuses it to embed STM
         # candidate CONTENT so a cosine score can be computed against the already-embedded query.
         self._embedder = embedder
+        # ACCURACY-PLAN-0831.md item 6 (`rerank_gate.py`'s own module docstring has the full
+        # design): `reranker=None` (composition root wired nothing) or `settings.rerank_enabled=
+        # False` both leave the gate DARK — byte-identical to the pre-rerank behaviour every
+        # existing ranker test already exercises.
+        self._rerank_gate = AdaptiveRerankGate(
+            reranker if settings.rerank_enabled else None,
+            min_score=settings.rerank_min_score,
+            top_fraction=settings.rerank_top_fraction,
+            pool_size=settings.rerank_pool_size,
+        )
 
     async def rank(
         self,
@@ -219,7 +238,7 @@ class ThreeChannelRecallRanker:
                 "(CANONICAL §7.4) — pass frozenset() to authorize nothing, never None"
             )
 
-        pool = self._settings.channel_pool_size
+        pool = self._effective_pool(limit)
         floor_limit = self._settings.recency_floor_limit
 
         # Channels run concurrently under a STRUCTURED-CONCURRENCY TaskGroup (DEV-STANDARDS rule 1):
@@ -299,6 +318,18 @@ class ThreeChannelRecallRanker:
             for scored, rrf_score in fused_pairs
         ]
 
+        # ACCURACY-PLAN-0831.md item 6 (`rerank_gate.py` module docstring — the full design):
+        # the rerank gate runs over the RRF-fused pool, BEFORE the STM-floor merge below —
+        # matching recall-service-design.md's own pipeline order ("FusionStrategy.fuse -> ...
+        # -> RerankGate.apply", §1 diagram) while relying on `_merge_floor`'s ALREADY-EXISTING
+        # "protected id missing from `fused`" rescue path to keep the floor's "never evicted"
+        # guarantee intact even for a protected member the gate scores below `min_score` and
+        # prunes — see `rerank_gate.py`'s own docstring ("A pruned member is not necessarily
+        # EVICTED") for why this needed no change to `_merge_floor` itself. Dark
+        # (`settings.rerank_enabled=False` or no reranker injected) returns `fused_views`
+        # unchanged, so every pre-existing test of this method is unaffected.
+        fused_views = await self._rerank_gate.apply(fused_views, query)
+
         # D1 (b): WHICH items are unconditionally protected stays RECENCY-selected — `floor` (not
         # `floor_scored`) picks the `floor_protect_limit` most-recent candidates, preserving the
         # "never evict a just-said fact" guarantee unchanged. But the block is now REORDERABLE
@@ -331,6 +362,21 @@ class ThreeChannelRecallRanker:
             degraded=DegradeReason.LTM_UNAVAILABLE if ltm_degraded else None,
             generated_at=self._clock.now(),
         )
+
+    def _effective_pool(self, limit: int) -> int:
+        """POOL-TRAP FIX (``dto.py``'s ``channel_pool_multiplier`` docstring, ACCURACY-PLAN-0831.md
+        §1.4): ``channel_pool_size`` is now a FLOOR on the per-channel fetch width, not the whole
+        story — the pool SCALES with whatever ``limit`` this call actually resolved to (the
+        caller's explicit limit, or the context-budget-derived one from ``RecallService``), so
+        ``dto.py``'s own documented invariant ("per-channel fetch width > limit", ADR 0010) holds
+        by construction instead of silently inverting the moment ``limit`` grows past the
+        historically-fixed ``channel_pool_size=20``. MEASURED cost of the pre-fix shape
+        (RETRIEVAL-EVAL-0829.md §13.1): raising the pool alone, independent of ``limit``, recovered
+        recall@10 0.4093 -> 0.4546 (11% relative) — this makes that recovery the DEFAULT behaviour
+        rather than something an operator has to remember to configure by hand on every width
+        experiment."""
+        scaled = math.ceil(limit * self._settings.channel_pool_multiplier)
+        return max(self._settings.channel_pool_size, scaled)
 
     async def _ltm_channel(
         self, ns: Namespace, pool: int, caller: CallerIdentitySet | None, query: str

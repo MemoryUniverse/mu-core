@@ -592,6 +592,11 @@ class EngineContainer:
             # the RecallService façade — the ranker reuses it to score STM candidate content
             # against the query vector (`recall_settings.stm_scoring`, default "embed").
             embedder=self.embedder,
+            # ACCURACY-PLAN-0831.md item 6 (mirrors `mu_local.composition`'s identical wiring, C6
+            # "never edit one without the other"): `self.model_router` is always built (ENG-115a),
+            # so this plane's rerank gate is armed unconditionally — see the sibling comment in
+            # `mu_local/composition.py` for the full reasoning.
+            reranker=self.model_router,
         )
         authz = RecallAuthorizationFilter(
             tenancy=DefaultTenancyGuard(), authorized_ids=PrincipalAuthorizedIdsResolver()
@@ -606,6 +611,12 @@ class EngineContainer:
             clock=self._clock,
             metrics=self.metrics,
             tracer=self.tracer,
+            # ACCURACY-PLAN-0831.md item 4 (mirrors `mu_local.composition`'s identical wiring, C6
+            # "never edit one without the other"): `self.model_router` is always built (ENG-115a),
+            # so this plane's width derivation is armed unconditionally — a pure catalog metadata
+            # read, never gated on `self.llm`/`settings.llm.enabled` (see this file's own (6)
+            # comment for why chunking's identical lookup is already unconditional).
+            context_budget=self.model_router,
         )
 
         # (9) T2 fix (CONFIG-AND-DATA-FIX-PLAN.md) — the real MemoryLifecycleManager (MLM) + the

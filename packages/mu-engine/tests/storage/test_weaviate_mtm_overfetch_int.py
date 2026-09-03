@@ -31,10 +31,12 @@ from collections.abc import AsyncIterator, Callable
 import pytest
 import pytest_asyncio
 import weaviate
+from weaviate.classes.config import Configure, DataType, Property, Tokenization
 
 from mu_engine.storage.adapters.weaviate_mtm import (
     _DEFAULT_SEMANTIC_OVERFETCH_FACTOR,
     _DEFAULT_SEMANTIC_OVERFETCH_MAX_EXTRA,
+    USER_PREFIX_PROPERTY,
     WeaviateMtmAdapter,
     _overfetch_limit,
 )
@@ -43,7 +45,34 @@ from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.mappers.weaviate_mapper import collection_name, tenant_name
 
 _WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://127.0.0.1:18080")
-VECTOR_DIM = 8  # mirrors test_weaviate_mtm_int.py's own tiny deterministic vectors
+# ⚠ NOT 8 — deliberately its OWN dimension/class (VM-deployment lane PREMISE FIX, same rationale
+# as test_weaviate_mtm_scan_leak_int.py's module docstring: the WORD-tokenized premise this file's
+# int tests need used to depend on an undocumented, un-reproducible hand-run instance's leftover
+# schema, and silently broke on a clean deployment because a sibling file's alphabetically-earlier
+# run had already claimed the shared class FIELD-tokenized).
+VECTOR_DIM = 109
+_VECTOR_NAME = "default"
+
+_LEGACY_PROPERTIES = [
+    Property(name="memory_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="content", data_type=DataType.TEXT),
+    Property(name="namespace", data_type=DataType.TEXT, tokenization=Tokenization.WORD),
+    Property(name="session_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="state", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="visibility", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="authorized_ids", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.FIELD),
+    Property(name="current_tier", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="owner_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="content_hash", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="artifact_ref", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name=USER_PREFIX_PROPERTY, data_type=DataType.TEXT, tokenization=Tokenization.WORD),
+    Property(
+        name="payload_json",
+        data_type=DataType.TEXT,
+        index_filterable=False,
+        index_searchable=False,
+    ),
+]
 
 
 # ------------------------------------------------------------------ pure bound arithmetic (unit)
@@ -164,6 +193,20 @@ async def mtm(
     adapter = WeaviateMtmAdapter(client, http_url=_WEAVIATE_URL, dim=VECTOR_DIM)
     await adapter._ensure_connected()
     assert await client.is_ready()  # fail-loud if the tunnelled instance is not actually up
+
+    # PREMISE FIX (module + class-list docstrings): pre-create this file's OWN class,
+    # WORD-tokenized on `namespace`/`user_prefix`, before `_ensure_partition` would create it
+    # FIELD-tokenized.
+    class_name = collection_name(VECTOR_DIM)
+    if not await client.collections.exists(class_name):
+        await client.collections.create(
+            class_name,
+            vector_config=Configure.Vectors.self_provided(name=_VECTOR_NAME),
+            multi_tenancy_config=Configure.multi_tenancy(enabled=True),
+            properties=_LEGACY_PROPERTIES,
+        )
+    adapter._class_ensured = True
+
     yield adapter
     class_name = collection_name(VECTOR_DIM)
     if await client.collections.exists(class_name):

@@ -24,8 +24,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from mu_contracts.contracts.defaults import DEFAULT_RECALL_LIMIT
 from mu_contracts.domain.events import DegradeReason
 from mu_engine.storage.domain.memory import MemoryTier
 from mu_engine.storage.domain.namespace import Namespace
@@ -66,7 +67,14 @@ class RecallQuery(BaseModel):
 
     namespace: Namespace  # η — the tenancy partition (to_prefix scoping, §1.4)
     text: str = Field(min_length=1)
-    limit: int = Field(default=10, ge=1)
+    # ``None`` (the default) means "derive it from the consuming model's context budget"
+    # (`RecallService._effective_limit` / `services/recall/width.py`, ACCURACY-PLAN-0831.md item
+    # 4) — an explicit int ALWAYS wins over derivation (§ "explicit config still wins"), which is
+    # exactly why this is not simply defaulted to `DEFAULT_RECALL_LIMIT` any more: a caller that
+    # wants that WIRE default has to say so (the wire-layer `RecallRequest.limit`, `mu_contracts.
+    # contracts.requests`, still defaults to `DEFAULT_RECALL_LIMIT` explicitly for API callers
+    # that have not opted into derivation — the two defaults are deliberately different layers).
+    limit: int | None = Field(default=None, ge=1)
     channels: RecallChannels = RecallChannels()
     mode: RecallMode = RecallMode.RANKED
     persona: str | None = None  # reserved for the DEFERRED answer/inject persona adaptation (§3.2)
@@ -101,7 +109,11 @@ class RecallItemView(BaseModel):
     channel: str  # "stm" | "mtm" | "ltm" — provenance of the hit
     namespace: Namespace  # the η the hit came from (belt-and-suspenders re-assert, §1.4)
     fused_score: float
-    rerank_score: float | None = None  # None when the rerank gate is dark (deferred this phase)
+    # None when the rerank gate is dark (no reranker configured / `rerank_enabled=False`), when
+    # the reranker's own model call failed, when the gate's empty-fallback fired, or on any
+    # candidate beyond `rerank_pool_size` the gate never sent to the model (`rerank_gate.py`'s own
+    # module docstring has the full design — the gate WAS dark unconditionally until it landed).
+    rerank_score: float | None = None
     is_floor: bool = False  # STM recency-floor member — reorderable, NEVER evicted (§1.3)
     artifact_ref: str | None = None  # CANONICAL §3/§7.10 (G5): the linked ContextArtifact id
 
@@ -155,6 +167,48 @@ class RecallSettings(BaseModel):
     floor_protect_limit: int = Field(default=3, ge=0)
     channel_pool_size: int = Field(default=20, ge=1)  # per-channel fetch width > limit (ADR 0010)
 
+    # POOL-TRAP FIX (ACCURACY-PLAN-0831.md §1.4, "channel_pool_size does not scale with limit, so
+    # a naive width experiment measures nothing"): `channel_pool_size` above used to be the WHOLE
+    # per-channel fetch width, independent of the caller's `limit` — so `dto.py`'s own documented
+    # invariant ("per-channel fetch width > limit", ADR 0010) silently inverted at `limit >= 20`,
+    # and MEASURED the entire candidate universe was ~30 items (20 dense + 10 recency) regardless
+    # of what `limit` asked for (RETRIEVAL-EVAL-0829.md §13.1). `ThreeChannelRecallRanker` now
+    # takes the per-channel pool as
+    # ``max(channel_pool_size, ceil(limit * channel_pool_multiplier))``
+    # — `channel_pool_size` becomes a FLOOR, not the whole story, so the pool follows whatever
+    # `limit` the caller (or the width derivation above) actually resolves to. The 2.0 default is
+    # not arbitrary: it is exactly the ratio §13.1's own k-curve run used by hand (pool=120 at
+    # limit=60) to close the "does the fuse cost recall vs its own dense channel" question for
+    # every cutoff up to k=60 — this makes that ratio the DEFAULT instead of something an operator
+    # has to remember to set per width experiment.
+    channel_pool_multiplier: float = Field(default=2.0, ge=1.0)
+
+    # WIDTH DERIVATION (ACCURACY-PLAN-0831.md item 4, `services/recall/width.py`). A `RecallQuery`
+    # with `limit=None` (the DTO default, above) asks `RecallService` to derive the width from the
+    # consuming model's own context budget instead of a hardcoded constant — see `width.py`'s
+    # module docstring for the formula and for why every constant below is what it is. An explicit
+    # `RecallQuery.limit` always overrides every field in this block (§ "explicit config still
+    # wins"); `derive_limit_from_budget=False` opts a deployment out entirely (falls back to
+    # `DEFAULT_RECALL_LIMIT`, the same wire default this engine always shipped, never a silent 0).
+    # Env override: `MU_RECALL__DERIVE_LIMIT_FROM_BUDGET=false`.
+    derive_limit_from_budget: bool = Field(default=True)
+    # ~370-token mem0 `ANSWER_PROMPT` scaffold overhead (measured — see width.py docstring).
+    prompt_reserve_tokens: int = Field(default=370, ge=0)
+    # Reserved for the model's own completion — the DEFERRED ANSWER mode's budget, not this
+    # (RANKED-only) phase's; kept here because a width big enough to leave the answering model no
+    # room to reply is a regression regardless of which mode consumes the recall.
+    answer_reserve_tokens: int = Field(default=800, ge=0)
+    # ~45 tokens per rendered memory line (measured — see width.py docstring: (823 - 370) / 10).
+    tokens_per_memory: float = Field(default=45.0, gt=0.0)
+    # Never derive BELOW the wire default — a starved budget still gets a WORKING window, never a
+    # crippled one (FULL-LOCAL boundary rule; `width.py`'s own floor-clamp docstring).
+    min_derived_limit: int = Field(default=DEFAULT_RECALL_LIMIT, ge=0)
+    # Capped at the last width actually shown to help ANSWER accuracy (k=30, §13.2), not merely to
+    # raise recall (k=60 was recall-only, never answer-quality-validated) — see width.py's own
+    # "why 30, not 60" docstring section for the full citation. Raise this explicitly once a wider
+    # answer-quality run reports where the curve turns.
+    max_derived_limit: int = Field(default=30, ge=1)
+
     # AD-204 (channel rank-authority, RETRIEVAL-EVAL-0829.md §5.3 / STATE-AND-DEFECTS-0829.md D3):
     # equal (1.0/1.0/1.0) in-arm weights gave a ten-item, single-session STM recency window the
     # SAME RRF rank authority as an MTM ANN search over the WHOLE partition — rank-based RRF only
@@ -189,16 +243,37 @@ class RecallSettings(BaseModel):
     # closed the FULL-corpus gap; `0.05`/`0.02` (20:1/50:1) reproduce it to the same 4 decimals, so
     # this is the threshold, not an arbitrarily large number picked past it.
     #
-    # `weight_ltm` is left alone: unlike the STM floor, the LTM channel's own re-measured two-arm
-    # federation numbers (STATE-AND-DEFECTS-0829.md D3b) already improved from the AD-195 floor fix
-    # with no LTM-specific defect found — and empirically the LTM channel contributed ZERO items to
-    # any top-10 result across the whole measurement run (`by tier/channel` provenance never showed
-    # an `ltm/*` entry), so it has no rank authority to correct here. Widening this fix to LTM has
-    # no supporting evidence and is left as a documented non-finding, not a silent skip.
-    # in-arm recency-channel weight (§1.3 fuse; AD-204)
+    # `weight_ltm` update (accuracy lane, 2026-08-31, RETRIEVAL-EVAL-0829.md §11): AD-204 above
+    # left this at 1.0 because "the LTM channel contributed ZERO items to any top-10 result across
+    # the whole measurement run" — true when written, but only because NO eval command in this
+    # repo had ever called `LocalMemory.consolidate()` (MTM->LTM DISTILL): the graph tier was
+    # UNCONDITIONALLY EMPTY in every baseline/answer-quality run on record, so `weight_ltm` had
+    # never been exercised against real content. Fixed the harness gap (`eval/mu_eval/corpus.py`
+    # `consolidate=` param) and re-measured with the graph tier actually populated: at the shipped
+    # `weight_ltm=1.0`, once populated the LTM channel wins ~30% of result slots (4,603/15,310 in
+    # the full 1,531-query LoCoMo run) and recall@10 COLLAPSES (0.4096 with LTM empty -> 0.3329
+    # with LTM populated at weight 1.0, -27% relative) — and the SAME collapse reproduces on the
+    # real end-to-end metric: `mu_eval answer-quality`, full corpus, gpt-5 answerer+judge, overall
+    # accuracy 37.2% (§10, LTM empty) -> **11.9%** with LTM populated at weight 1.0, every category
+    # worse including multi-hop (14.4% -> 1.8%). Root cause is EXACTLY AD-204's own diagnosis,
+    # replayed for the channel AD-204 couldn't yet test: `graph_recall`'s flat seed is
+    # RECENCY-ordered over the WHOLE partition, `subject=None` — query-blind, like the STM window
+    # AD-204 already fixed — and it was competing at FULL rank authority (`weight_ltm=1.0`, equal
+    # to the query-aware MTM dense search) the moment it had real candidates to rank. Applying
+    # AD-204's own already-proven fix pattern here (discount 1.0 -> 0.1, a 10:1 handicap, same
+    # ratio as `weight_stm`) drops LTM's slot share to ~0 and recovers recall@10 to 0.4055 — within
+    # noise of the LTM-EMPTY baseline (0.4096), i.e. the fix stops the collapse. It does not yet
+    # show LTM populated beats LTM empty (that would need the flat seed to stop being query-blind,
+    # a bigger change, not attempted here) — only that a populated-but-uncorrected-weight graph
+    # tier is actively harmful, and the correction available today is the one already proven for
+    # the sibling channel. `weight_stm=0.1`/`weight_ltm=1.0` (the pre-fix combination) is therefore
+    # DANGEROUS specifically the day something starts actually writing the graph tier in
+    # production (a lifecycle sweep, a manual `consolidate` call) — this was a live, armed
+    # regression waiting for exactly that trigger, caught here only because the harness gap that
+    # hid it (§11) was closed in the same pass. In-arm recency-channel weight (§1.3 fuse; AD-204).
     weight_stm: float = Field(default=0.1, ge=0.0)
     weight_mtm: float = Field(default=1.0, ge=0.0)  # in-arm dense weight (§1.3 fuse)
-    weight_ltm: float = Field(default=1.0, ge=0.0)  # in-arm graph weight (§1.3 fuse)
+    weight_ltm: float = Field(default=0.1, ge=0.0)  # in-arm graph weight (§1.3 fuse; see above)
     weight_private: float = Field(default=1.0, ge=0.0)  # federation: private-arm weight (§1.6)
     weight_shared: float = Field(default=1.0, ge=0.0)  # federation: shared-arm weight (§1.6)
 
@@ -249,3 +324,66 @@ class RecallSettings(BaseModel):
     # combinatorial blowup on a shared box, out of this task's scope). Env override:
     # ``MU_RECALL__LTM_MAX_HOPS=0`` (or any int).
     ltm_max_hops: int = Field(default=2, ge=0)
+
+    # Rerank gate (ACCURACY-PLAN-0831.md item 6 / recall-service-design.md §1.5, ADR 0010/0023):
+    # `ModelRouter.rerank` (`providers/model_router.py:265`) was fully built — a local
+    # `BAAI/bge-reranker-v2-m3` configured, a `Task.RERANK` route registered — and had NO caller
+    # anywhere in `services/recall/` until `rerank_gate.py` landed alongside these three fields;
+    # `RecallItemView.rerank_score` stayed permanently `None`. These are the SAME three knobs the
+    # design doc's `RetrievalWeights` names (`recall-service-design.md:576-578`) and the SAME
+    # values ADR 0023 landed on after measurement ("the default configuration is cross_encoder /
+    # min_score=0.5 / top_fraction=0.5 / pool_size=20 (ADR 0023 final combined)") — not
+    # re-guessed here, carried forward from the decision that already measured them.
+    #
+    # `rerank_enabled` is the env-overridable A/B escape hatch this file's sibling knobs already
+    # use (mirrors `cross_tier_dedup`/`ltm_max_hops=0`): `False` makes `AdaptiveRerankGate` dark
+    # regardless of whether a real reranker was injected at the composition root, so a single env
+    # var (`MU_RECALL__RERANK_ENABLED=false`) reverts to pre-rerank behavior for comparison
+    # without a redeploy.
+    #
+    # DEFAULT `False`, and it must stay `False` until something actually serves the rerank group.
+    # MEASURED 2026-09-01, on real stores, with the gate enabled and both shipped roots injecting
+    # `reranker=self.model_router` as they do today:
+    #     ModelRouter.rerank -> ModelGroupUnavailableError ("all deployments exhausted"), EVERY call
+    #     items carrying a rerank_score: 0 of 30
+    #     recall latency: 105 ms -> 4800 ms median, a 46x regression for zero change in results
+    # against an SLO of p95 <= 150 ms (observability-design.md:150). The cause is structural, not a
+    # VM accident: the rerank group's only deployment is the local endpoint on :8080
+    # (`shipped_settings.py:88-90`) and NO compose file in this repo provisions a rerank service, so
+    # the group is unavailable on every dev box, every CI runner, every eval run and every
+    # FULL-LOCAL install. A default of `True` therefore bought nothing anywhere and cost 4.7 s per
+    # recall everywhere. Flip this back the moment a reranker is actually deployed, and re-measure
+    # the SLO in the same pass.
+    rerank_enabled: bool = Field(default=False)
+    # ADR 0023 final combined value (recall-service-design.md:576, `rerank.py`'s own
+    # `adaptive_rerank_gate` floor rule): the top-scored candidate in the pool must clear this
+    # before ANY candidate in the pool is trusted — below it, the whole gate is empty and the
+    # caller falls back to the pre-rerank order (HippoRAG-style, `rerank_gate.py`'s own docstring).
+    rerank_min_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    # ADR 0023 Decision 2 (recall-service-design.md:264): "top_fraction is nondecreasing in the
+    # cutoff -> 0.5 is the LOOSER, safer-for-recall setting, not the aggressive one" — a candidate
+    # survives if its score is within this fraction of the pool's own top score
+    # (`cutoff = max(min_score, top_score * top_fraction)`, `adaptive_rerank_gate`'s own algebra).
+    rerank_top_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
+    # ADR 0010's mem0-defect fix (recall-service-design.md:202): the rerank gate must see a pool
+    # WIDER than the final `limit` or there is nothing left for it to prune. Independent of
+    # `channel_pool_size`/`channel_pool_multiplier` (the per-CHANNEL fetch width,
+    # ACCURACY-PLAN-0831.md §1.4) — this bounds how many of the already-fused, best-first
+    # candidates are sent to the cross-encoder in ONE batched forward pass, priced against the
+    # `recall_e2e_rerank` p95 budget (`language-analysis-server.md`: <=20 pairs ~15-40ms).
+    rerank_pool_size: int = Field(default=20, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_derived_width_range(self) -> RecallSettings:
+        """Fail loud at CONSTRUCTION, not at the first `recall()` call: an inverted
+        ``min_derived_limit > max_derived_limit`` is a misconfiguration
+        (:func:`~mu_engine.services.recall.width.derive_recall_limit` raises the identical
+        ``ValueError`` at call time as a second, defence-in-depth check — this is the earlier,
+        friendlier one, since a settings object is typically built once at composition root)."""
+        if self.min_derived_limit > self.max_derived_limit:
+            raise ValueError(
+                "min_derived_limit "
+                f"({self.min_derived_limit}) must be <= max_derived_limit "
+                f"({self.max_derived_limit})"
+            )
+        return self

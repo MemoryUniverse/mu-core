@@ -25,7 +25,7 @@ from mu_contracts.domain.errors import CallerIdentitySetRequiredError
 from mu_engine.storage.adapters.weaviate_mtm import WeaviateMtmAdapter
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
-from mu_engine.storage.errors import MtmPointAbsentError
+from mu_engine.storage.errors import EmbeddingDimensionMismatchError, MtmPointAbsentError
 from mu_engine.storage.mappers.weaviate_mapper import collection_name, tenant_name
 
 pytestmark = pytest.mark.integration
@@ -190,6 +190,29 @@ async def test_idempotent_upsert_is_id_stable(
     assert [h.item.id for h in hits] == [item.id]
 
 
+async def test_upsert_refuses_a_wrong_dimension_vector(
+    mtm: WeaviateMtmAdapter,
+    make_ns: _NamespaceFactory,
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """``EmbeddingDimensionMismatchError`` (errors.py): unlike Qdrant/pgvector, Weaviate declares
+    no schema-level vector width, so a wrong-length write against a BRAND-NEW tenant would
+    otherwise be silently accepted and poison that shard's dimension forever — verified live: the
+    call below is a fresh tenant's very first write, exactly the case a schema-level guarantee
+    would not exist to catch. The adapter's own client-side check must refuse it BEFORE the
+    write reaches Weaviate, not rely on the store to reject it."""
+    ns = make_ns()
+    item = make_item(ns, "wrong width")
+    item = item.model_copy(update={"embedding": (item.embedding or [])[: VECTOR_DIM - 1]})
+    assert len(item.embedding or []) == VECTOR_DIM - 1
+
+    with pytest.raises(EmbeddingDimensionMismatchError):
+        await mtm.upsert(item)
+
+    # And the fresh tenant's shard was never poisoned — nothing was written at all.
+    assert await mtm.get(ns, item.id) is None
+
+
 async def test_point_get_refuses_another_namespaces_memory_in_the_same_org_workspace(
     mtm: WeaviateMtmAdapter,
     make_ns: _NamespaceFactory,
@@ -276,12 +299,37 @@ async def test_shared_semantic_with_no_caller_set_fails_closed(
 ) -> None:
     """AD-179 — before this fix, omitting ``caller_identity_set`` on a SHARED ``semantic`` read
     silently dropped the ``authorized_ids`` GraphQL ``where`` clause and ran an UNFILTERED SHARED
-    query. It must instead raise, exactly as the STM tier already does for the identical shape."""
+    query. It must instead raise, exactly as the STM tier already does for the identical shape.
+
+    STRENGTHENED (VM-deployment lane): the ADR 0050 brief asks to *"try to construct a bypass"*
+    — the original version of this test covered only the omitted-parameter spelling.
+    ``test_ad179_bypass_probe_int.py`` already re-derives AD-179 adversarially for Qdrant (5
+    spellings: omitted / explicit ``None`` / with ``session_scope`` / an empty-set CONTROL / the
+    positive principal CONTROL) but has no Weaviate counterpart — this closes that gap in-place
+    rather than forking a whole new file, using the fixtures this file already has."""
     ns = make_ns(visibility=Visibility.SHARED)
     someone_elses = make_item(ns, "someone else fact", authorized_ids=["p_carol"])
     await mtm.upsert(someone_elses)
+    vec = someone_elses.embedding or []
+
+    # 1. the parameter omitted entirely (the wiring-bug shape AD-179 names)
     with pytest.raises(CallerIdentitySetRequiredError):
-        await mtm.semantic(ns, someone_elses.embedding or [], limit=10)
+        await mtm.semantic(ns, vec, limit=10)
+    # 2. the parameter passed explicitly as None
+    with pytest.raises(CallerIdentitySetRequiredError):
+        await mtm.semantic(ns, vec, limit=10, caller_identity_set=None)
+    # 3. with a session_scope, in case the second filter path skipped the guard (SHARED ignores
+    #    session_scope entirely per the adapter's own docstring — the guard must still fire)
+    with pytest.raises(CallerIdentitySetRequiredError):
+        await mtm.semantic(ns, vec, limit=10, caller_identity_set=None, session_scope="s1")
+    # 4. THE CONTROL: an EMPTY set is legal and authorizes NOTHING. If this returned the row, the
+    #    guard would be theatre — a caller could simply pass frozenset() instead of None.
+    empty = await mtm.semantic(ns, vec, limit=10, caller_identity_set=frozenset())
+    assert empty == [], "an empty caller identity set authorized a SHARED Weaviate read — BYPASS"
+    # 5. the positive control: the row IS reachable by the principal it is stamped for, so the
+    #    four denials/empty-result above are the filter working, not an empty partition.
+    mine = await mtm.semantic(ns, vec, limit=10, caller_identity_set=frozenset({"p_carol"}))
+    assert [h.item.id for h in mine] == [someone_elses.id]
 
 
 async def test_remove_is_scoped_and_atomic(

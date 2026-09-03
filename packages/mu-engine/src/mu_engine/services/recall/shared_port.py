@@ -63,13 +63,27 @@ class InProcessSharedRecall:
         shared_ns = Namespace.shared(
             org=q.namespace.org, workspace=q.namespace.workspace, session=q.namespace.session
         )
+        # ACCURACY-PLAN-0831.md item 4: `RecallQuery.limit` became `int | None` (width
+        # derivation, `RecallService._effective_limit`) — but that resolution happens ONCE, at
+        # `RecallService.recall`'s own top, BEFORE either arm (including this in-process shared
+        # one) is ever called; every caller reaching this port therefore hands it an
+        # already-concrete `limit`. Guarded rather than assumed: a future caller of this port that
+        # skips `RecallService` entirely gets a NAMED, loud failure here, not a `TypeError` three
+        # frames down inside the ranker (§5 "re-raise loud, not a silent partial").
+        limit = q.limit
+        if limit is None:
+            raise ValueError(
+                "InProcessSharedRecall.recall requires an already-resolved RecallQuery.limit — "
+                "RecallService.recall resolves width derivation before calling either arm; a "
+                "caller reaching this port directly must resolve `limit` first"
+            )
         try:
             vectors = await self._embedder.embed([q.text])
             return await self._ranker.rank(
                 shared_ns,
                 q.text,
                 vectors[0],
-                limit=q.limit,
+                limit=limit,
                 channels=q.channels,
                 caller_identity_set=caller_identity_set,
             )

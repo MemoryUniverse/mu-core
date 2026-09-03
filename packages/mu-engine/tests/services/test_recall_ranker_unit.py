@@ -18,6 +18,7 @@ import pytest
 
 from mu_contracts.domain.model.recall import Vector
 from mu_engine.platform.clock import FrozenClock
+from mu_engine.providers._contracts import RerankHit
 from mu_engine.services.recall.dto import RecallChannels, RecallSettings
 from mu_engine.services.recall.fusion import ReciprocalRankFusion
 from mu_engine.services.recall.ranker import ThreeChannelRecallRanker
@@ -148,6 +149,32 @@ class _EmptyLtm:
         return []  # D-4: no entity edges wired for this test — isolates STM/MTM interaction
 
 
+class _FakeLtm(_EmptyLtm):
+    """Returns a FIXED, query-BLIND hit list, ranked as given — a stand-in for the real
+    ``graph_recall`` flat seed, which is deliberately query-blind (``subject=None``, whole-
+    partition, recency-ordered; ``ranker.py`` module docstring). Unlike ``_FakeMtm`` this does
+    NOT vary its answer by query vector, because the real adapter it stands in for doesn't
+    either — that query-blindness is exactly the property the weight_ltm regression test below
+    depends on."""
+
+    def __init__(self, hits: list[MemoryItem]) -> None:
+        self._hits = hits
+
+    async def graph_recall(
+        self,
+        ns: Namespace,
+        *,
+        subject: str | None = None,
+        predicate: str | None = None,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        return [
+            Scored(item=i, score=1.0 - 0.01 * rank, channel=RecallChannel.LTM_GRAPH, rank=rank)
+            for rank, i in enumerate(self._hits[:limit])
+        ]
+
+
 class _FakeEmbedder:
     """D1 test double for ``EmbeddingPort``: returns a caller-supplied vector per exact content
     string (no real model) so STM "embed" scoring can be exercised deterministically."""
@@ -167,6 +194,7 @@ def _build_ranker(
     mtm_hits_by_query: dict[tuple[float, ...], list[MemoryItem]],
     settings: RecallSettings | None = None,
     embedder: _FakeEmbedder | None = None,
+    ltm_hits: list[MemoryItem] | None = None,
 ) -> ThreeChannelRecallRanker:
     # D1 (§3.1 follow-up): these pre-existing floor/dedup tests target the §3.1/#1 fuse-swamping
     # fix and the D4 cross-tier-dedup fix, NOT the D1 relevance scorer — pin `stm_scoring="recency"`
@@ -175,7 +203,7 @@ def _build_ranker(
     return ThreeChannelRecallRanker(
         stm=_FakeStm(stm_items),
         mtm=_FakeMtm(mtm_hits_by_query),
-        ltm=_EmptyLtm(),  # type: ignore[arg-type]
+        ltm=_EmptyLtm() if ltm_hits is None else _FakeLtm(ltm_hits),  # type: ignore[arg-type]
         fusion=ReciprocalRankFusion(),
         settings=settings or RecallSettings(stm_scoring="recency"),
         clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
@@ -228,10 +256,12 @@ async def test_fused_score_carries_the_real_rrf_value_not_the_channel_native_sco
     ``(1/3) * (1/61)`` ~= ``0.00546``: a completely different, much smaller number. If
     ``fused_score`` still equalled ``1.0`` the discard bug would be back.
 
-    ``weight_stm=1.0`` is pinned explicitly (AD-204 lowered the CLASS default to ``0.1`` — a
-    separate fix, for a separate defect, argued and measured on real IR data, not on this unit
-    test's arithmetic) so this test keeps proving D2's plumbing claim in isolation, at the exact
-    equal-thirds weighting its own docstring states, regardless of where the default sits."""
+    ``weight_stm=1.0``/``weight_ltm=1.0`` are both pinned explicitly (AD-204 lowered the STM
+    CLASS default to ``0.1``, and the weight_ltm fix below it lowered the LTM one the same way —
+    two separate fixes, for two separate defects, each argued and measured on real IR/answer-
+    quality data, not on this unit test's arithmetic) so this test keeps proving D2's plumbing
+    claim in isolation, at the exact equal-thirds weighting its own docstring states, regardless
+    of where either default sits."""
     target = _item(
         "Ada's flight to Denver is on Thursday",
         tier=MemoryTier.MTM,
@@ -241,7 +271,7 @@ async def test_fused_score_carries_the_real_rrf_value_not_the_channel_native_sco
     ranker = _build_ranker(
         stm_items=[],
         mtm_hits_by_query={query_vec: [target]},
-        settings=RecallSettings(stm_scoring="recency", weight_stm=1.0),
+        settings=RecallSettings(stm_scoring="recency", weight_stm=1.0, weight_ltm=1.0),
     )
 
     result = await ranker.rank(
@@ -277,8 +307,9 @@ async def test_a_protected_floor_row_also_carries_the_rrf_value_not_its_stm_nati
     ``"recency"`` scorer, whose score is ``1.0`` for the most recent row — so if the twin were
     swapped back in, ``fused_score`` would read ``1.0`` here.
 
-    ``weight_stm=1.0`` pinned for the same reason as the sibling test above: AD-204 changed the
-    CLASS default weighting, not this D2 plumbing claim's equal-thirds arithmetic.
+    ``weight_stm=1.0``/``weight_ltm=1.0`` pinned for the same reason as the sibling test above:
+    AD-204 and the weight_ltm fix each changed a CLASS default weighting, not this D2 plumbing
+    claim's equal-thirds arithmetic.
     """
     just_said = _item(
         "Ada just said the deploy passphrase is violet-anchor-77",
@@ -288,7 +319,7 @@ async def test_a_protected_floor_row_also_carries_the_rrf_value_not_its_stm_nati
     ranker = _build_ranker(
         stm_items=[just_said],
         mtm_hits_by_query={},
-        settings=RecallSettings(stm_scoring="recency", weight_stm=1.0),
+        settings=RecallSettings(stm_scoring="recency", weight_stm=1.0, weight_ltm=1.0),
     )
 
     result = await ranker.rank(
@@ -426,6 +457,55 @@ async def test_default_settings_also_rank_the_relevant_hit_ahead_of_recency_nois
         "weight_mtm default was reverted or never actually reached RecallSettings()"
     )
     assert protected_ids <= set(ids), "a protected member was evicted, not merely reordered"
+
+
+@pytest.mark.asyncio
+async def test_default_settings_rank_the_relevant_mtm_hit_ahead_of_query_blind_ltm_noise() -> None:
+    """weight_ltm fix (accuracy lane, 2026-08-31, RETRIEVAL-EVAL-0829.md §11) — the LTM sibling of
+    the ``weight_stm`` test above. AD-204 left ``weight_ltm`` at 1.0 because the LTM channel had
+    NEVER contributed a single item to any measured result (no eval command called
+    ``LocalMemory.consolidate()``, so the graph tier was always empty). Once populated, the SAME
+    rank-authority mismatch AD-204 fixed for STM reproduces for LTM: `graph_recall`'s flat seed is
+    query-BLIND (whole-partition, recency-ordered, `subject=None` — module docstring), so it can
+    rank a query-irrelevant candidate at RRF rank 0 with FULL weight — measured on LoCoMo as a
+    full-corpus answer-quality COLLAPSE (37.2% -> 11.9%, gpt-5 judge, every category worse) the
+    moment the graph tier is actually populated at the shipped `weight_ltm=1.0`.
+
+    This reproduces the shape in miniature: an MTM channel with the genuinely relevant fact NOT at
+    its own rank 0 (a realistic case — MTM's own dense search doesn't always put the right answer
+    first) against an LTM channel returning ONE query-blind noise candidate at rank 0. At
+    `weight_ltm=1.0` (pre-fix), `1.0/(60+0+1) = 0.01639` for the noise item beats
+    `1.0/(60+3+1) = 0.015625` for the relevant-but-rank-3 MTM item — the noise item wins the top
+    slot. Mutation check: reverting `RecallSettings.weight_ltm`'s default to `1.0` must fail this
+    test (the noise item would then rank first, exactly as it did in the full-corpus collapse)."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = (0.9, 0.1)
+    decoys = [_item(f"unrelated MTM decoy #{n}", tier=MemoryTier.MTM, at=base) for n in range(3)]
+    target = _item("Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base)
+    noise = _item("Let me know if you need anything", tier=MemoryTier.LTM, at=base)
+    ranker = _build_ranker(
+        stm_items=[],
+        mtm_hits_by_query={query_vec: [*decoys, target]},  # target arrives at MTM's OWN rank 3
+        ltm_hits=[noise],  # query-blind: returned regardless of query_vec, at LTM's rank 0
+        settings=RecallSettings(stm_scoring="recency"),  # bare default — no weight override
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "irrelevant-this-phase",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ids = [it.memory_id for it in result.items]
+    assert ids.index(target.id) < ids.index(noise.id), (
+        "a query-blind LTM candidate at LTM's own rank 0 still outranks a genuinely relevant MTM "
+        "hit at MTM's own rank 3 — the SHIPPED DEFAULT weight_ltm is back to giving the "
+        "query-blind flat graph seed full rank authority, the exact regression measured as a "
+        "full-corpus answer-quality collapse (37.2% -> 11.9%)"
+    )
 
 
 @pytest.mark.asyncio
@@ -677,3 +757,134 @@ async def test_ranker_threads_the_caller_identity_set_to_the_traversal_arm() -> 
         "traverse_entities — the adapter's SHARED ACL clause is then skipped entirely"
     )
     assert ltm.graph_recall_caller == caller, "the flat seed's caller threading regressed"
+
+
+class _ContentScoredReranker:
+    """A ``RerankProviderPort`` test double keyed by document CONTENT (not position) — the
+    ranker's fused pool order depends on RRF, so a content-keyed fake is robust to exactly which
+    rank each candidate lands at, unlike an index-keyed fake."""
+
+    def __init__(self, scores_by_content: dict[str, float]) -> None:
+        self._scores = scores_by_content
+
+    async def rerank(
+        self, query: str, documents: Sequence[str], *, top_n: int | None = None
+    ) -> list[RerankHit]:
+        return [
+            RerankHit(index=i, score=self._scores.get(doc, 0.0)) for i, doc in enumerate(documents)
+        ]
+
+
+@pytest.mark.asyncio
+async def test_reranker_prunes_a_low_relevance_mtm_candidate_end_to_end() -> None:
+    """ACCURACY-PLAN-0831.md item 6, wired end-to-end: an MTM distractor that ranked ahead of the
+    genuinely relevant hit on raw RRF position is pruned once the reranker scores it low, and the
+    surviving item carries its real ``rerank_score`` (previously always ``None`` — the gate had no
+    caller)."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    relevant = _item("Ada's flight to Denver is Thursday", tier=MemoryTier.MTM, at=base)
+    distractor = _item("chatter about the weather", tier=MemoryTier.MTM, at=base)
+    query_vec = [0.5, 0.5]
+    reranker = _ContentScoredReranker({relevant.content: 0.9, distractor.content: 0.1})
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({tuple(query_vec): [distractor, relevant]}),  # type: ignore[arg-type]
+        ltm=_EmptyLtm(),  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(
+            stm_scoring="recency",
+            rerank_enabled=True,
+            rerank_min_score=0.5,
+            rerank_top_fraction=0.5,
+        ),
+        clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+        reranker=reranker,
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "when is Ada's flight",
+        query_vec,
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ids = [it.memory_id for it in result.items]
+    assert distractor.id not in ids, "below the adaptive cutoff (0.1 < 0.5) — must be pruned"
+    assert relevant.id in ids
+    relevant_view = next(it for it in result.items if it.memory_id == relevant.id)
+    assert relevant_view.rerank_score == 0.9
+
+
+@pytest.mark.asyncio
+async def test_reranker_pruning_a_protected_floor_member_does_not_evict_it() -> None:
+    """The "never evict a just-said fact" guarantee (AD-195) survives the rerank gate: a
+    floor-protected STM item the reranker scores BELOW the cutoff must still appear in the final
+    result — rescued by ``_merge_floor``'s pre-existing "protected id missing from `fused`"
+    fallback, which needed no change for this (see ``rerank_gate.py``'s own docstring)."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    floor_item = _item("ok cool", tier=MemoryTier.STM, at=base)  # just-said, irrelevant
+    query_vec = [0.5, 0.5]
+    reranker = _ContentScoredReranker({floor_item.content: 0.05})  # well below min_score
+
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([floor_item]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({}),  # type: ignore[arg-type]
+        ltm=_EmptyLtm(),  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(
+            stm_scoring="recency",
+            floor_protect_limit=1,
+            rerank_enabled=True,
+            rerank_min_score=0.5,
+            rerank_top_fraction=0.5,
+        ),
+        clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+        reranker=reranker,
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "irrelevant query",
+        query_vec,
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ids = [it.memory_id for it in result.items]
+    assert floor_item.id in ids, "protected floor member was evicted by the rerank gate"
+    view = next(it for it in result.items if it.memory_id == floor_item.id)
+    assert view.is_floor is True
+
+
+@pytest.mark.asyncio
+async def test_reranker_dark_by_default_is_byte_identical_to_no_rerank() -> None:
+    """No ``reranker`` injected -> ``rerank_enabled``'s default value is irrelevant, the gate is
+    dark, and every item's ``rerank_score`` stays ``None`` — the pre-existing shipped default
+    (``_build_ranker`` never passes ``reranker=``, so this is also an implicit regression guard
+    for every other test in this file)."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    only = _item("anything", tier=MemoryTier.MTM, at=base)
+    query_vec = [0.1, 0.2]
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({tuple(query_vec): [only]}),  # type: ignore[arg-type]
+        ltm=_EmptyLtm(),  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency"),
+        clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "q",
+        query_vec,
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    assert [it.memory_id for it in result.items] == [only.id]
+    assert result.items[0].rerank_score is None

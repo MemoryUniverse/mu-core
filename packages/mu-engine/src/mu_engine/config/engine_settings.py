@@ -41,6 +41,7 @@ depends on this class existing first.
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -57,6 +58,20 @@ from mu_engine.services.settings import IngestSettings
 
 __all__ = ["EngineSettings", "get_engine_settings"]
 
+#: The fixed user-config home the installer writes (``mu_client.config.USER_CONFIG_ENV_FILE``,
+#: gap-A). ``mu_client.config.ClientSettings`` already reads this file via its own CWD-independent
+#: ``resolve_env_files()``; THIS class did not, even though its own docstring above claims "both
+#: roots share the SAME MU_ env-prefix family... so from the operator's view it is one flat env
+#: namespace" — true for a real OS env var, false for a value that lives only in this file
+#: (embedding-on-the-VPS wiring surfaced the gap: ``MU_MODEL_CATALOG__HTTP_EMBED_API_BASE`` set
+#: only here never reached a bare ``EngineSettings()``). Listed LOWEST-priority, same ordering
+#: ``mu_client.config.resolve_env_files`` documents, so a project-local ``.env``/``.env.test``
+#: still wins for a developer working inside this repo; a real OS env var beats every file
+#: regardless (pydantic-settings default). Expanded eagerly (``Path.expanduser``) because
+#: pydantic-settings' dotenv source does not expand ``~`` itself. A missing file is harmless —
+#: the dotenv source silently skips any path that does not exist.
+_USER_CONFIG_ENV_FILE = Path("~/.memory-universe/config.env").expanduser()
+
 
 class EngineSettings(BaseSettings):
     """The ONE intelligence-knob ``BaseSettings`` root for ``mu-engine`` (plan §0.3).
@@ -71,7 +86,7 @@ class EngineSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="MU_",
         env_nested_delimiter="__",
-        env_file=(".env", ".env.test"),
+        env_file=(_USER_CONFIG_ENV_FILE, ".env", ".env.test"),
         env_file_encoding="utf-8",
         extra="ignore",
     )

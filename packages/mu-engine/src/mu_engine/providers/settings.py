@@ -21,6 +21,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field
 
 from mu_engine.providers.catalog import (
+    HttpEmbedConfig,
     ModelDeployment,
     ModelKind,
     ProviderRecord,
@@ -136,7 +137,7 @@ class RouterSettings(BaseModel):
     fallbacks: list[dict[str, list[str]]] = Field(default_factory=list)  # cross-group chains
     ctx_fallbacks: list[dict[str, list[str]]] = Field(default_factory=list)  # ctx-window fallbacks
     # Fallback token ceiling when neither the deployment catalog nor litellm knows a model
-    # group's context window (``ModelRouter._max_input_tokens``, model-layer-spec §2.7) — a
+    # group's context window (``ModelRouter.max_input_tokens``, model-layer-spec §2.7) — a
     # conservative modern default, never a bare literal in the router's logic (rule 3).
     default_context_window: int = 128_000
 
@@ -155,7 +156,12 @@ class ModelCatalogSettings(BaseModel):
     providers: list[ProviderRecord] = Field(default_factory=list)
     deployments: list[ModelDeployment] = Field(default_factory=list)
     warm_local: list[WarmLocalConfig] = Field(default_factory=list)  # L5 in-proc LLM singletons
-    embedders: dict[str, WarmLocalConfig] = Field(default_factory=dict)  # embed_backend -> config
+    #: embed_backend -> config. A `WarmLocalConfig` value resolves through the in-process
+    #: `SentenceTransformerEmbedder`; an `HttpEmbedConfig` value resolves through `HttpEmbedder`
+    #: (an HTTP-reachable embed endpoint, e.g. the VM-hosted `all-minilm` service) — see
+    #: `embedding.build_embedder`'s dispatch. Both keep the SAME `EmbeddingPort` seam; which one
+    #: activates for a given key is a catalog-content question, not a code branch.
+    embedders: dict[str, WarmLocalConfig | HttpEmbedConfig] = Field(default_factory=dict)
     local_capable_tasks: list[Task] = Field(
         default_factory=lambda: [
             Task.EMBED,
@@ -175,6 +181,22 @@ class ModelCatalogSettings(BaseModel):
     # composition root passes its WIRED `ModelCatalogSettings` in (see that function's docstring).
     default_embed_backend: str = _DEFAULT_EMBED_BACKEND
     default_minilm_path: str = _DEFAULT_MINILM_PATH
+
+    # --- optional HTTP embed backend (owner's ask: embedding on the VPS, not the laptop) -------
+    # ADDITIVE to the in-process entry above, never a replacement of it: `default_local_catalog`
+    # registers this SECOND `embedders` entry (an `HttpEmbedConfig`, keyed by
+    # `http_embed_backend_key`) only when `http_embed_api_base` is set — a keyless/unset box gets
+    # byte-identical behaviour to before this field existed. Which key actually SERVES a given
+    # composition (`ModelSettings.embed_backend` / `mu_local.config.StorageSettings.embedding.
+    # backend`) is a separate selection, left at its own default — so the offline MiniLM singleton
+    # stays the code-level default (CLAUDE.md boundary rule: FULL-LOCAL must work with no VM).
+    # Every field is `MU_MODEL_CATALOG__HTTP_EMBED_*` (nested delimiter `__`, same subtree).
+    http_embed_backend_key: str = "minilm_vm_http"  # the embedders/embed_backend registry key
+    http_embed_api_base: str | None = None  # e.g. "http://127.0.0.1:11435/v1"; None = not offered
+    http_embed_model: str = "all-minilm"  # Ollama's GGUF conversion of all-MiniLM-L6-v2 — 384-dim
+    http_embed_dimension: int = 384  # MUST match the live Qdrant collections' `__384` suffix
+    http_embed_timeout_s: float = 10.0
+    http_embed_batch_size: int = 64
 
     # --- ENG-115a: the wiring knobs. Everything below is reachable as `MU_MODEL_CATALOG__*`
     #     because `EngineSettings.model_catalog` mounts THIS class (config/engine_settings.py:99).
@@ -219,15 +241,25 @@ def default_local_catalog(catalog: ModelCatalogSettings | None = None) -> ModelC
     """
     base = catalog if catalog is not None else ModelCatalogSettings()
     backend = base.default_embed_backend
-    return base.model_copy(
-        update={
-            "embedders": {
-                backend: WarmLocalConfig(
-                    model_id=backend,
-                    kind=ModelKind.EMBED,
-                    model_load_path=base.default_minilm_path,
-                    normalize_embeddings=True,
-                )
-            },
-        }
-    )
+    embedders: dict[str, WarmLocalConfig | HttpEmbedConfig] = {
+        backend: WarmLocalConfig(
+            model_id=backend,
+            kind=ModelKind.EMBED,
+            model_load_path=base.default_minilm_path,
+            normalize_embeddings=True,
+        )
+    }
+    # ADDITIVE, opt-in: only registered when the operator actually named an endpoint
+    # (`MU_MODEL_CATALOG__HTTP_EMBED_API_BASE`). An unset box gets exactly the dict above —
+    # byte-identical to before this backend existed (CLAUDE.md: in-process stays the default).
+    if base.http_embed_api_base is not None:
+        embedders[base.http_embed_backend_key] = HttpEmbedConfig(
+            model_id=base.http_embed_backend_key,
+            kind=ModelKind.EMBED,
+            api_base=base.http_embed_api_base,
+            model=base.http_embed_model,
+            dimension=base.http_embed_dimension,
+            timeout_s=base.http_embed_timeout_s,
+            batch_size=base.http_embed_batch_size,
+        )
+    return base.model_copy(update={"embedders": embedders})

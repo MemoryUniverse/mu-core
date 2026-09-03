@@ -317,13 +317,19 @@ class SurfaceFacade:
         user: str = _DEFAULT_USER,
         session: str | None = None,
         tier: MemoryTier | None = None,
-        limit: int = 10,
+        limit: int | None = None,
     ) -> CanonicalRecallResult:
         """Federate-live RANKED recall. Mirrors ``LocalMemory.recall`` (``mu-local/
         local_memory.py:219-256``), returning the canonical
         :class:`~mu_contracts.contracts.recall.RecallResult` (Decision B) — the un-collapsed
         engine result, mapped field-for-field via :func:`_to_canonical_recall_result` (mirrors
-        ``mu_local.local_memory._to_recall_result``)."""
+        ``mu_local.local_memory._to_recall_result``).
+
+        ``limit=None`` (the default) asks ``RecallService`` to derive the width from the
+        composition root's configured context budget (ACCURACY-PLAN-0831.md item 4) instead of a
+        hardcoded constant — mirrors ``LocalMemory.recall``'s identical default, unchanged for a
+        caller (e.g. ``mu-engine-server``'s HTTP route) that always passes an explicit wire
+        default."""
         ns = self._ns(user, session)
         scope = self._scope(user, session)
         q = RecallQuery(namespace=ns, text=query, limit=limit, channels=_channels_for_tier(tier))

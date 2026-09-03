@@ -24,6 +24,23 @@ regardless of ``k``, because the filter narrows the candidate SET, not the post-
 Reports **completeness** (authorized objects returned ÷ true authorized count) at each ``k``, not
 a recall ratio against noise — a failure here is a real, reportable finding per the ADR's own
 wording, not a test to be softened until it's green.
+
+**⚠ INVALIDITY FIX (VM-deployment lane, corrected before this ever ran green in CI).** This file,
+as committed, tested the WRONG REGIME and would have passed on a technicality identical to the
+one ADR 0050 itself already records catching and withdrawing once (*"the first run measured the
+wrong regime and would have passed on a technicality... 1000-object corpus. Weaviate's default
+``flatSearchCutoff`` is 40000 — below it a filtered query is answered by BRUTE FORCE, where
+completeness is trivially guaranteed and says nothing about HNSW"*). This file's own
+``_CORPUS_SIZE = 1000`` is exactly that invalid regime, and it was never updated to the 45,000-
+object corpus the ADR's Gate 0 table was actually measured against — so the committed regression
+test that is supposed to GUARD this property would pass even against a broken post-filter
+adapter. Fixed here WITHOUT paying a 45k-object-per-run cost: the class is pre-created (before
+the adapter's own ``_ensure_partition`` would create it with Weaviate's default config) with
+``flat_search_cutoff=1`` on its vector index — a per-class HNSW config knob, not a corpus-size
+trick — which forces EVERY query in this file through the real filterable-HNSW traversal
+regardless of how few objects the shard holds. This exercises the identical code path a 45k-
+object corpus would, at a fraction of the run cost, and is the regime the ADR's own gate asks
+for: "evaluated INSIDE Weaviate's filterable-HNSW traversal... not as a post-filter."
 """
 
 from __future__ import annotations
@@ -37,8 +54,13 @@ from collections.abc import AsyncIterator
 import pytest
 import pytest_asyncio
 import weaviate
+from weaviate.classes.config import Configure
 
-from mu_engine.storage.adapters.weaviate_mtm import WeaviateMtmAdapter
+from mu_engine.storage.adapters.weaviate_mtm import (
+    _PROPERTIES,
+    _VECTOR_NAME,
+    WeaviateMtmAdapter,
+)
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.mappers.weaviate_mapper import collection_name, tenant_name
@@ -86,6 +108,53 @@ async def gate0_setup() -> AsyncIterator[tuple[WeaviateMtmAdapter, Namespace, li
     adapter = WeaviateMtmAdapter(client, http_url=_WEAVIATE_URL, dim=_DIM)
     await adapter._ensure_connected()
     assert await client.is_ready()
+
+    # ⚠ INVALIDITY FIX (module docstring): pre-create the class with a forced-low
+    # `flat_search_cutoff` BEFORE `_ensure_partition` would create it with Weaviate's default
+    # (40000) — this file's whole corpus (1000 objects) sits under that default and would
+    # otherwise be answered by brute force, where the authz predicate is trivially complete
+    # regardless of whether the adapter/Weaviate apply it before or after ANN truncation. Same
+    # declared properties `_ensure_partition` itself would use (imported, not duplicated), so
+    # this stays byte-identical to production except for the one HNSW knob under test.
+    class_name = collection_name(_DIM)
+    if not await client.collections.exists(class_name):
+        await client.collections.create(
+            class_name,
+            vector_config=Configure.Vectors.self_provided(
+                name=_VECTOR_NAME,
+                vector_index_config=Configure.VectorIndex.hnsw(flat_search_cutoff=1),
+            ),
+            multi_tenancy_config=Configure.multi_tenancy(enabled=True),
+            properties=_PROPERTIES,
+        )
+    adapter._class_ensured = True
+
+    # ⚠ PREMISE ASSERTION (VERIFY lane, 2026-08-31 — the invalidity fix above was itself
+    # state-dependent, and the state it depends on is not hypothetical). `create` above runs
+    # ONLY when the class does not already exist. Against a deployment where `MuMtm16` was
+    # already created with Weaviate's DEFAULT `flatSearchCutoff` (40000) — which is every
+    # deployment that ran this file before the fix, and any deployment where something else
+    # declares this class first — the `create` silently no-ops, the corpus (1000 objects) sits
+    # under the default cutoff, and every query below is answered by BRUTE FORCE. **MEASURED:
+    # this file was run against a deliberately-recreated `MuMtm16` at `flatSearchCutoff=40000`
+    # and PASSED GREEN, printing the same 100%-completeness table — i.e. it silently reverted to
+    # the exact invalid regime the fix exists to eliminate, and the ADR's own security gate would
+    # have gone on reporting a pass that proves nothing about filterable-HNSW.** Tokenization is
+    # immutable on a declared property and the index config is not re-declared on an existing
+    # class, so the only correct response is to FAIL LOUDLY and tell the operator to drop the
+    # class — never to soften the assertion, and never to auto-drop a class this test does not
+    # own. This is the same premise-assertion discipline `test_weaviate_mtm_scan_leak_int.py`
+    # already applies for its own tokenization premise, applied here to the one file whose
+    # subject is an AUTHORIZATION gate.
+    cfg = await client.collections.get(class_name).config.get()
+    cutoff = cfg.vector_config[_VECTOR_NAME].vector_index_config.flat_search_cutoff  # type: ignore[union-attr,index]
+    assert cutoff == 1, (
+        f"class {class_name!r} already exists with flatSearchCutoff={cutoff} (Weaviate's default "
+        f"is 40000); this file's {_CORPUS_SIZE}-object corpus sits UNDER it, so every query below "
+        "would be answered by BRUTE FORCE and the completeness table would prove nothing about "
+        "filterable-HNSW — the exact invalid regime ADR 0050 records withdrawing a Gate 0 result "
+        f"over. Drop the class and re-run: DELETE {_WEAVIATE_URL}/v1/schema/{class_name}"
+    )
 
     uid = uuid.uuid4().hex[:12]
     ns = Namespace.shared(org=f"gate0-org-{uid}", workspace=f"gate0-ws-{uid}", session="gate0")

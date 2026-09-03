@@ -36,6 +36,14 @@ class IngestReport(BaseModel):
     promoted: int
     duplicate_bodies: int
     seconds: float
+    # LTM distillation (``consolidate=True`` only; all zero/False when the caller left the graph
+    # tier unpopulated — the eval's PRE-EXISTING default, see ``ingest_conversation`` docstring).
+    consolidated: bool = False
+    facts_extracted: int = 0
+    ltm_added: int = 0
+    ltm_superseded: int = 0
+    ltm_noop: int = 0
+    consolidate_seconds: float = 0.0
 
 
 class TurnIndex:
@@ -174,8 +182,31 @@ async def ingest_conversation(
     session: str,
     importance: float,
     turns: Sequence[Turn] | None = None,
+    consolidate: bool = False,
+    consolidate_limit: int | None = None,
 ) -> tuple[TurnIndex, IngestReport]:
-    """Write every turn through ``LocalMemory.add`` and build the gold-label join index."""
+    """Write every turn through ``LocalMemory.add`` and build the gold-label join index.
+
+    ``consolidate=False`` (the default, and every prior use of this function) reproduces the
+    harness's PRE-EXISTING behaviour exactly: only ``LocalMemory.add`` runs, so the LTM graph
+    tier is never written by this harness at all — ``LocalMemory.consolidate()`` (MTM->LTM
+    DISTILL, ``local_memory.py``) is a separate, manually-driven verb that no eval command was
+    calling. Measured consequence: every prior baseline/answer-quality run (``RETRIEVAL-
+    EVAL-0829.md`` §5, §10) had an UNCONDITIONALLY EMPTY graph — ``by tier/channel`` provenance
+    never shows an ``ltm/*`` entry — so the LTM multi-hop traversal arm (D6,
+    ``ranker.py::_ltm_channel``) has had nothing to traverse in every measurement to date. That is
+    a harness gap, not evidence the traversal code itself is weak; ``consolidate=True`` closes it
+    so the multi-hop category can be measured with the graph tier actually populated, for the
+    first time.
+
+    ``consolidate_limit`` bounds the STM window ``LocalMemory.consolidate`` distills
+    (``stm.recent(ns, limit=...)``, itself a bounded ``ZREVRANGE`` over an UNTRIMMED recency
+    ZSET — promotion to MTM does not evict the STM row, so every turn ingested this call remains
+    in that ZSET for the life of the run). Defaults to ``max(written, DEFAULT_CONSOLIDATE_LIMIT)``
+    so a full LoCoMo conversation (400-700 turns) is not silently truncated to the verb's own
+    50-item default — the point of this flag is to distill the WHOLE conversation once ingest
+    finishes, not just its most recent tail.
+    """
     loop = asyncio.get_running_loop()
     started = loop.time()
     index = TurnIndex()
@@ -190,10 +221,33 @@ async def ingest_conversation(
         written += 1
         if getattr(result, "promoted", False):
             promoted += 1
+
+    facts_extracted = ltm_added = ltm_superseded = ltm_noop = 0
+    consolidate_seconds = 0.0
+    if consolidate and written:
+        from mu_contracts.contracts.defaults import DEFAULT_CONSOLIDATE_LIMIT
+
+        c_started = loop.time()
+        limit = consolidate_limit or max(written, DEFAULT_CONSOLIDATE_LIMIT)
+        report = await memory.consolidate(  # type: ignore[attr-defined]
+            user=user, session=session, limit=limit
+        )
+        consolidate_seconds = loop.time() - c_started
+        facts_extracted = report.facts_extracted
+        ltm_added = report.added
+        ltm_superseded = report.superseded
+        ltm_noop = report.noop
+
     return index, IngestReport(
         turns_total=len(selected),
         turns_written=written,
         promoted=promoted,
         duplicate_bodies=index.duplicate_bodies,
         seconds=loop.time() - started,
+        consolidated=consolidate,
+        facts_extracted=facts_extracted,
+        ltm_added=ltm_added,
+        ltm_superseded=ltm_superseded,
+        ltm_noop=ltm_noop,
+        consolidate_seconds=consolidate_seconds,
     )

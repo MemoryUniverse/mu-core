@@ -82,6 +82,13 @@ mypy_path = [
     "packages/mu-engine/src",
     "packages/mu-local/src",
     "packages/mu-engine-server/src",
+    # `eval` itself (not `eval/mu_eval`): `mu_eval`'s own internal imports (`from mu_eval.corpus
+    # import ...`) need the PARENT of the package on the path to resolve as a namespace-package
+    # base — pointing this at `eval/mu_eval` resolves the package's OWN files but leaves every
+    # sibling-module import inside it unresolved ("Cannot find implementation or library stub for
+    # module named mu_eval.corpus"), which is what produced 53 of the 55 pre-fix errors here
+    # (HOW-THEY-MEASURE-0901.md F6; the other 2 were real, fixed in the same pass).
+    "eval",
 ]
 namespace_packages = true
 explicit_package_bases = true

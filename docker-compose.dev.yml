@@ -157,6 +157,43 @@ services:
       start_period: 10s
     networks: [mu-dev]
 
+  weaviate:
+    # SHARED-plane MTM vector backend (ADR 0050: native multi-tenancy IS the physical partition —
+    # rule 5, "not a filter"). host 18080 -> container 8080 (REST/GraphQL); host 18081 -> container
+    # 50051 (gRPC) is published for parity with the vendor's own default two-port shape, but is
+    # NEVER dialed by this adapter and is NOT tunnelled by vm_reup.sh — `weaviate_mtm.py`'s module
+    # docstring: every gRPC-backed SDK call hangs against this deployment (verified live), so the
+    # adapter is REST/GraphQL-only by design. Pinned to 1.28.4 — the exact version ADR 0050's own
+    # Gate 0 measurement ran against (`semitechnologies/weaviate:1.28.4`, matching this project's
+    # `weaviate-client` test-container default), so a re-run of that measurement is against the
+    # same server this compose file ships, not merely "some 1.28.x".
+    image: cr.weaviate.io/semitechnologies/weaviate:1.28.4
+    container_name: mu-dev-weaviate
+    environment:
+      QUERY_DEFAULTS_LIMIT: "25"
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      # DEFAULT_VECTORIZER_MODULE=none + ENABLE_MODULES='' — this deployment is BYOV (bring your
+      # own vector) only, matching `Configure.Vectors.self_provided` in weaviate_mtm.py; no
+      # vectorizer module is ever asked to embed anything server-side.
+      DEFAULT_VECTORIZER_MODULE: "none"
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: "node1"
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:18081:50051"
+    volumes:
+      - mu-dev-weaviate-data:/var/lib/weaviate
+    healthcheck:
+      # the image ships BusyBox wget (no curl) — `/v1/.well-known/ready` is the same endpoint the
+      # `weaviate-client` test-container library's own HttpWaitStrategy polls.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/v1/.well-known/ready || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    networks: [mu-dev]
+
 volumes:
   mu-dev-postgres-data:
   mu-dev-pgvector-data:
@@ -164,6 +201,7 @@ volumes:
   mu-dev-qdrant-data:
   mu-dev-falkordb-data:
   mu-dev-mysql-data:
+  mu-dev-weaviate-data:
 
 networks:
   mu-dev:

@@ -95,9 +95,15 @@ class ModelRouter:
         it in its LIFO closer list, so `LocalContainer.close()` / `EngineContainer.close()` keep
         the promise their own docstrings make ("release every ... this container opened").
 
-        The embedder is deliberately NOT closed here: `build_embedder` returns an in-process
-        sentence-transformers singleton with no network client and no background task, shared by
-        construction — closing it from one router would break another that still holds it.
+        The embedder is deliberately NOT closed here, and that holds for BOTH shapes. When this
+        router built its own, `build_embedder` returned an in-process sentence-transformers
+        singleton — no network client, no background task, shared by construction, so closing it
+        from one router would break another that still holds it. When the embedder was INJECTED
+        (`build_model_router(embedder=...)`), the composition root that passed it owns its
+        lifecycle and closes it in its own closer list — e.g. `LocalContainer` registers its
+        `EmbeddingPort` with `_register_closer`, which is what releases an `HttpEmbedder`'s httpx
+        client. Closing an injected embedder here would double-close it and tear it out from under
+        every engine service still holding the same instance.
         """
         await self._llm.aclose()
 
@@ -120,7 +126,7 @@ class ModelRouter:
     ) -> Completion:
         """Single-shot completion against a model-GROUP. Chunks via L6 if the input exceeds the
         group's largest context window; delegates routing/failover to the Router (L2)."""
-        max_input = self._max_input_tokens(model)
+        max_input = self.max_input_tokens(model)
         if self._chunker.needs_chunking(messages, max_input_tokens=max_input):
             text = await self._chunked_complete(
                 messages, model=model, max_tokens=max_tokens, temperature=temperature
@@ -182,7 +188,7 @@ class ModelRouter:
 
         return await self._chunker.map_reduce(
             messages,
-            max_input_tokens=self._max_input_tokens(model),
+            max_input_tokens=self.max_input_tokens(model),
             map_call=_call,
             reduce_call=_reduce,
         )
@@ -285,7 +291,17 @@ class ModelRouter:
         ]
 
     # ---- helpers --------------------------------------------------------------------------
-    def _max_input_tokens(self, model_group: str) -> int:
+    def max_input_tokens(self, model_group: str) -> int:
+        """PUBLIC (was ``_max_input_tokens`` — renamed, no behaviour change, ACCURACY-PLAN-0831.md
+        item 4): the largest declared input context window for ``model_group`` — the catalog's own
+        ``ModelDeployment.max_input_tokens`` where declared (§2.1's "no invented numbers" rule),
+        else LiteLLM's own table, else the DI-threaded ``default_context_window`` fallback. Was
+        private because the only callers were `complete`'s own L6 chunking math (below); it is now
+        also the ONE method `services/recall/width.ContextBudgetPort` needs — recall's width
+        derivation asks the SAME question chunking already asks ("how much context does this model
+        group actually have"), so this is reused rather than re-implemented a second time
+        (DEV-STANDARDS rule 6: never edit one without the other applies just as much to "never
+        build a second copy of a lookup that already exists")."""
         explicit = self._registry.max_input_tokens(model_group)
         if explicit is not None:
             return explicit
@@ -298,6 +314,16 @@ class ModelRouter:
         except Exception as exc:  # a logical group id litellm does not know
             log.debug("max_tokens_unknown_group", model_group=model_group, err=type(exc).__name__)
         return self._default_context_window
+
+    def context_window(self, task: Task) -> int:
+        """``services/recall/width.ContextBudgetPort`` — resolves ``task`` to its configured
+        model-group via the SAME :class:`~mu_engine.providers.task_map.TaskClassMapper` every
+        other model call already routes through (see ``rerank`` above for the identical
+        ``group_for`` pattern), then :meth:`max_input_tokens` for that group's context window.
+        No network call, no health probe — a pure catalog/registry lookup, cheap enough to call on
+        every `recall()` that opts into width derivation."""
+        group = self._task_map.group_for(task)
+        return self.max_input_tokens(group)
 
     @staticmethod
     def _as_wire(messages: Sequence[Message]) -> list[dict[str, str]]:
@@ -340,6 +366,7 @@ def build_model_router(
     degrade_emitter: DegradeEmitterPort | None = None,
     secret_resolver: Any | None = None,
     chunk_token_ratio: float = _DEFAULT_CHUNK_TOKEN_RATIO,
+    embedder: EmbeddingPort | None = None,
 ) -> ModelRouter:
     """Composition root (model-layer-spec §7). Constructs the whole layer from settings ONCE.
 
@@ -354,6 +381,20 @@ def build_model_router(
     `chunk_token_ratio` (CONFIG-AND-DATA-FIX-PLAN.md §1.1 Group A) is the ONE knob threaded into
     the `LongTextChunker` this factory builds; each composition root passes its wired
     `EngineSettings.extraction.chunk_token_ratio` (`get_engine_settings()`), not a bare literal.
+
+    `embedder` lets a composition root that ALREADY owns the plane's one `EmbeddingPort` INJECT it
+    instead of having this factory build a second one from `models.embed_backend`. That second
+    build was a real defect, measured 2026-08-31: `mu-local`'s `LocalContainer` selects its
+    embedder from `StorageSettings.embedding.backend` (`MU_EMBED_BACKEND`) and injects THAT one
+    into every engine service, while this factory independently resolved `ModelSettings.
+    embed_backend` (`MU_MODEL__EMBED_BACKEND`, still `minilm_local`). With the laptop daemon
+    pointed at the VM embed endpoint, the process therefore still imported torch +
+    sentence-transformers and loaded MiniLM in-process — 1139 MB RSS, two live
+    `SentenceTransformer` instances — for a `ModelRouter.embed` that has ZERO callers, and logged
+    `model_router_built embed_backend=minilm_local` while the engine was in fact embedding over
+    HTTP. Two independent selectors for ONE seam is the bug; injection collapses them to one.
+    When `embedder` is None (every other root, and every existing caller) this builds its own
+    exactly as before — byte-identical behaviour.
     """
     # L5: load warm singletons ONCE, wrap as CustomLLM handlers (one provider prefix per model_id).
     custom_handlers: list[dict[str, Any]] = []
@@ -376,8 +417,12 @@ def build_model_router(
     )
     model_list = registry.compile_model_list()  # fails loud on invalid catalog
 
-    # embed seam (dedicated EmbeddingPort, §6-P5) — the ONE active embedding backend.
-    embedder = build_embedder(models.embed_backend, catalog)
+    # embed seam (dedicated EmbeddingPort, §6-P5) — the ONE active embedding backend. Injected by
+    # a root that already owns it (no second build, no second model load, no second network
+    # client); otherwise resolved here from `models.embed_backend` exactly as before.
+    owns_embedder = embedder is None
+    if embedder is None:
+        embedder = build_embedder(models.embed_backend, catalog)
 
     # L2: one litellm.Router, health/cooldown/fallback DELEGATED into it.
     router = LiteLLMRouterAdapter(
@@ -389,7 +434,11 @@ def build_model_router(
         "model_router_built",
         deployments=len(model_list),
         warm=len(custom_handlers),
-        embed_backend=models.embed_backend,
+        # Report what the router ACTUALLY holds, not what a setting says it should hold — the
+        # pre-injection version logged `models.embed_backend` unconditionally, which was a lie the
+        # moment a root selected its embedder anywhere else.
+        embed_backend=models.embed_backend if owns_embedder else "<injected by composition root>",
+        embed_model=embedder.model_name,
         embed_dim=embedder.dimension,
     )
     return ModelRouter(

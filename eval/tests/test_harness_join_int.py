@@ -107,3 +107,66 @@ async def test_a_body_the_harness_never_wrote_is_never_credited() -> None:
         exact = "Caroline: She is four, and she sleeps about nineteen hours a day."
         assert index.resolve(exact) == ["D1:3"]
         assert index.resolve("Caroline owns a greyhound named Pepper") == []
+
+
+async def test_consolidate_flag_actually_populates_the_ltm_graph_tier() -> None:
+    """Mutation check for the ``consolidate=True`` wiring (RETRIEVAL-EVAL-0829.md follow-up,
+    2026-08-31): every baseline/answer-quality run to date called ``LocalMemory.add`` only, so
+    ``LocalMemory.consolidate()`` (MTM->LTM DISTILL) never ran and the graph tier was
+    UNCONDITIONALLY EMPTY for the whole measurement — the D6 multi-hop traversal arm
+    (``ranker.py::_ltm_channel``) had nothing to traverse in every prior run. This pins the fix:
+    with ``consolidate=True``, (a) the ingest report says so and reports a non-zero fact count,
+    and (b) an ``LTM``-tier-only recall — which returns NOTHING unless the graph tier actually has
+    rows — comes back non-empty. Reverting ``ingest_conversation``'s consolidate call (or leaving
+    the flag unwired) fails this at (a) or (b) respectively.
+    """
+    from mu_engine.storage.domain.memory import MemoryTier
+
+    conversation = _conversation()
+    async with local_memory_for(conversation, run_id=f"j{uuid.uuid4().hex[:6]}") as memory:
+        _, report = await ingest_conversation(
+            memory, conversation, user="evaluser", session="s", importance=0.9, consolidate=True
+        )
+        assert report.consolidated is True
+        assert report.facts_extracted > 0, (
+            "consolidate=True ran but extracted zero facts from a 5-turn conversation with a "
+            "clear SPO fact in it ('the deploy passphrase ... is violet-anchor-77') — the "
+            "distill call is wired but not doing real work"
+        )
+
+        ltm_only = await memory.recall(
+            "deploy passphrase", user="evaluser", session="s", limit=10, tier=MemoryTier.LTM
+        )
+        assert ltm_only.items, (
+            "an LTM-tier-only recall returned nothing after consolidate() ran — the graph tier "
+            "is still empty from this reader's point of view even though distill reported facts "
+            "extracted, which is exactly the gap that left the multi-hop traversal arm untested "
+            "in every prior baseline/answer-quality run"
+        )
+
+
+async def test_without_the_flag_the_ltm_tier_stays_empty_the_prior_behaviour() -> None:
+    """The control for the mutation check above: ``consolidate`` defaults to ``False`` and MUST
+    reproduce the harness's prior behaviour exactly (every run before 2026-08-31) — an LTM-only
+    recall after a plain ``ingest_conversation`` call returns nothing, because nothing ever wrote
+    the graph tier. If this goes green with items present, ``consolidate`` stopped defaulting to
+    off, and every non-consolidate run this repo has on record silently changed meaning.
+    """
+    from mu_engine.storage.domain.memory import MemoryTier
+
+    conversation = _conversation()
+    async with local_memory_for(conversation, run_id=f"j{uuid.uuid4().hex[:6]}") as memory:
+        _, report = await ingest_conversation(
+            memory, conversation, user="evaluser", session="s", importance=0.9
+        )
+        assert report.consolidated is False
+        assert report.facts_extracted == 0
+
+        ltm_only = await memory.recall(
+            "deploy passphrase", user="evaluser", session="s", limit=10, tier=MemoryTier.LTM
+        )
+        assert not ltm_only.items, (
+            "the LTM tier had items with no consolidate() call anywhere in this run — "
+            "consolidate's default flipped, or something else now writes the graph tier at add() "
+            "time; either way this is no longer the harness's documented prior behaviour"
+        )

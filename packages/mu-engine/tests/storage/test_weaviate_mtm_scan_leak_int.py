@@ -43,6 +43,7 @@ from collections.abc import AsyncIterator, Callable
 import pytest
 import pytest_asyncio
 import weaviate
+from weaviate.classes.config import Configure, DataType, Property, Tokenization
 
 from mu_engine.storage.adapters.weaviate_mtm import (
     USER_PREFIX_PROPERTY,
@@ -56,7 +57,48 @@ from mu_engine.storage.mappers.weaviate_mapper import collection_name, tenant_na
 pytestmark = pytest.mark.integration
 
 _WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://127.0.0.1:18080")
-VECTOR_DIM = 8  # mirrors the sibling Weaviate integration files' tiny deterministic vectors
+# ⚠ NOT 8 — deliberately its OWN dimension/class, never shared with the sibling Weaviate
+# integration files (VM-deployment lane fix; see the module docstring's "PREMISE FIX" note).
+VECTOR_DIM = 108
+_VECTOR_NAME = "default"
+
+# ---- PREMISE FIX (VM-deployment lane) -----------------------------------------------------
+# This file's whole point is the Python-side re-check that protects an ALREADY-WORD-tokenized
+# class — one created by an OLDER adapter version, before the FIELD-tokenization fix landed,
+# which Weaviate can never retokenize (`Tokenization` is immutable per-property). That state
+# used to exist by ACCIDENT: a single hand-run dev-tunnel Weaviate instance had accumulated it
+# across sessions, undocumented and un-reproducible — nothing in this repo created it, and a
+# fresh deployment (this project's own docker-compose.dev.yml, added in the same change as this
+# fix) creates every class FIELD-tokenized from the start, closing the leak structurally and
+# making the ambient premise this file relied on FALSE. Measured live: on a clean instance, this
+# file's own `_prefilter_matches` premise assertions failed — "the class is no longer WORD-
+# tokenized" — because `test_weaviate_mtm_int.py` (same VECTOR_DIM=8, alphabetically first) had
+# already created `MuMtm8` correctly, and the guard this file exists to pin was silently
+# untested. So: this file now creates its OWN class, at its OWN dimension, explicitly
+# WORD-tokenized on the two properties it probes — deterministic regardless of run order, run
+# history, or which other Weaviate deployment happens to be live, forever, on any Weaviate
+# server. This is not softening the test; it is the fixture doing what the ADR 0050 amendment
+# it accompanies discovered was missing: a controlled fixture instead of ambient state.
+_LEGACY_PROPERTIES = [
+    Property(name="memory_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="content", data_type=DataType.TEXT),
+    Property(name="namespace", data_type=DataType.TEXT, tokenization=Tokenization.WORD),
+    Property(name="session_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="state", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="visibility", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="authorized_ids", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.FIELD),
+    Property(name="current_tier", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="owner_id", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="content_hash", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name="artifact_ref", data_type=DataType.TEXT, tokenization=Tokenization.FIELD),
+    Property(name=USER_PREFIX_PROPERTY, data_type=DataType.TEXT, tokenization=Tokenization.WORD),
+    Property(
+        name="payload_json",
+        data_type=DataType.TEXT,
+        index_filterable=False,
+        index_searchable=False,
+    ),
+]
 
 
 def _parse_host_port(url: str) -> tuple[str, int]:
@@ -135,6 +177,19 @@ async def mtm(make_ns: _NamespaceFactory) -> AsyncIterator[WeaviateMtmAdapter]:
     adapter = WeaviateMtmAdapter(client, http_url=_WEAVIATE_URL, dim=VECTOR_DIM)
     await adapter._ensure_connected()
     assert await client.is_ready()  # fail-loud if the tunnelled instance is not actually up
+
+    # PREMISE FIX (module docstring): pre-create this file's OWN class, WORD-tokenized on the
+    # two properties under test, BEFORE `_ensure_partition` would create it FIELD-tokenized.
+    class_name = collection_name(VECTOR_DIM)
+    if not await client.collections.exists(class_name):
+        await client.collections.create(
+            class_name,
+            vector_config=Configure.Vectors.self_provided(name=_VECTOR_NAME),
+            multi_tenancy_config=Configure.multi_tenancy(enabled=True),
+            properties=_LEGACY_PROPERTIES,
+        )
+    adapter._class_ensured = True
+
     yield adapter
     class_name = collection_name(VECTOR_DIM)
     if await client.collections.exists(class_name):

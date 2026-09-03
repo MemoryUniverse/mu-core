@@ -23,7 +23,13 @@ from mu_eval.corpus import IngestReport, TurnIndex, ingest_conversation, local_m
 from mu_eval.locomo import CATEGORY_NAMES, Conversation, LabelledQuery
 from mu_eval.metrics import QueryScores, aggregate, score_query
 
-__all__ = ["ArmReport", "RunReport", "ScoreProvenance", "run_baseline"]
+__all__ = [
+    "ArmReport",
+    "RunReport",
+    "ScoreProvenance",
+    "gold_ids_present",
+    "run_baseline",
+]
 
 
 class ScoreProvenance(BaseModel):
@@ -90,6 +96,22 @@ def _resolve_ranked_ids(items: Sequence[Any], index: TurnIndex, gold: set[str]) 
         else:
             ranked.append(f"__not_in_corpus__#{position}")
     return ranked
+
+
+def gold_ids_present(items: Sequence[Any], index: TurnIndex, gold: set[str]) -> bool:
+    """True iff ANY item's body resolves (via ``TurnIndex``) to a turn id in ``gold``.
+
+    This is per-row RETRIEVAL ATTRIBUTION (HOW-THEY-MEASURE-0901.md F1 / ACCURACY-MEASUREMENT-
+    TRUSTWORTHINESS item 1): the single most useful thing the answer-quality harness did not
+    record before this — whether a wrong judged answer had its gold evidence in front of the
+    model at all. Uses the SAME resolution ``_resolve_ranked_ids`` uses (candidates =
+    ``index.resolve(item.content)``), so "was gold retrieved" and "what rank was gold retrieved
+    at" are answered by literally the same join, never two joins that could quietly disagree.
+    """
+    for item in items:
+        if any(candidate in gold for candidate in index.resolve(item.content)):
+            return True
+    return False
 
 
 class _ProvenanceAccumulator:
@@ -162,6 +184,7 @@ async def run_baseline(
     settings: object | None = None,
     dataset_label: str = "locomo10",
     tier: str | None = None,
+    consolidate: bool = False,
 ) -> RunReport:
     ks = tuple(sorted(ks))
     limit = recall_limit or max(ks)
@@ -191,10 +214,22 @@ async def run_baseline(
             # than by widening that contract.
             memory: Any = opaque
             index, report = await ingest_conversation(
-                memory, conversation, user=user, session=session, importance=importance
+                memory,
+                conversation,
+                user=user,
+                session=session,
+                importance=importance,
+                consolidate=consolidate,
             )
             ingest_reports.append(report)
             corpus_turns += report.turns_written
+            if report.consolidated:
+                notes.append(
+                    f"{conversation.sample_id}: consolidated "
+                    f"facts_extracted={report.facts_extracted} added={report.ltm_added} "
+                    f"superseded={report.ltm_superseded} noop={report.ltm_noop} "
+                    f"({report.consolidate_seconds:.1f}s)"
+                )
             if conversation.turns:
                 visible = await _await_index(
                     memory, conversation.turns[0].text[:120], user=user, session=session

@@ -44,17 +44,23 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from mu_eval.token_budget import count_tokens, truncate_to_tokens
+
 __all__ = [
     "ANSWER_PROMPT",
+    "COMPACT_JUDGE_SYSTEM_PROMPT",
     "JUDGE_SYSTEM_PROMPT",
+    "MINISTRAL_JUDGE_MAX_COMPLETION_TOKENS",
     "ChatPort",
     "ControlSetResult",
     "answer_prompt",
+    "compact_judge_prompt",
+    "estimated_prompt_tokens",
     "judge_control_set",
     "judge_prompt",
     "parse_judgement",
@@ -139,6 +145,78 @@ def judge_prompt(*, question: str, gold_answer: str, response: str) -> str:
     """
 
 
+# --- COMPACT VARIANT: fits Azure Foundry Ministral-3B's 400-token-total ceiling --------------
+#
+# NOT a verbatim port, and deliberately not a paraphrase of one either — a DIFFERENT prompt,
+# argued here, because the verbatim ``JUDGE_SYSTEM_PROMPT``/``judge_prompt()`` above measure at
+# ~442 tokens for even a short row (Ministral-8B-Instruct-2410 tokenizer, chat-template applied —
+# see ``token_budget.py`` for why that tokenizer stands in for the un-published 3B one), which
+# already exceeds the 400-token ceiling before a single completion token is spent: every call
+# 429s on size alone, independent of the 1-req/60s quota. CLAUDE.md rule 12 applies to a prompt
+# the way it applies to code: when reality (a hard 400-token wall) contradicts what exists (a
+# 428-442 token prompt), the prompt changes, recorded here rather than silently drifting.
+#
+# What was CUT and why it does not weaken the rubric:
+#   * the worked example ("Do you remember what I got... / A shell necklace") — the generosity
+#     rule it illustrates is stated directly below instead of shown; a 3B instruct model follows
+#     an explicit rule at least as well as it infers one from a single example, and the example
+#     cost ~45 tokens for zero additional decision content.
+#   * the chain-of-thought instruction ("first, a one-sentence explanation, then the verdict") —
+#     the whole point of a fixed-budget judge is a capped completion (see
+#     ``MINISTRAL_JUDGE_MAX_COMPLETION_TOKENS``); asking for prose before the label spends
+#     completion tokens the ceiling does not have, and the harness never reads the explanation.
+#   * the JSON-output instruction — ``parse_judgement`` already accepts a bare label (documented
+#     deviation above, extended to this variant); JSON syntax has zero decision content and costs
+#     both prompt tokens (the instruction) and completion tokens (the wrapper punctuation).
+# What was KEPT, unweakened, because these are the actual test:
+#   * "same topic/fact counts CORRECT even if longer or reworded" — the rule that makes the judge
+#     generous the way the official rubric is generous, not stricter than it.
+#   * the time-question carve-out ("same date/period counts CORRECT even if the format differs")
+#     — this is the rule the LoCoMo temporal-category questions specifically exercise.
+#   * an explicit WRONG condition ("different topic or fact") — the rule the negative controls in
+#     ``judge_control_set`` exist to verify the judge actually enforces, not just default-accepts.
+COMPACT_JUDGE_SYSTEM_PROMPT = (
+    "Grade a GENERATED answer against a GOLD answer for the same QUESTION.\n"
+    "CORRECT: same topic/fact as gold, even if worded differently or longer. Time answers: "
+    'same date/period counts CORRECT even if the format differs (e.g. "7 May" = "May 7th").\n'
+    "WRONG: different topic or fact than gold.\n"
+    "Reply with exactly one word, CORRECT or WRONG. Nothing else."
+)
+
+# Per-field truncation caps (tokens, Ministral-family tokenizer). Calibrated against this
+# project's own LoCoMo corpus (1540 scoreable rows, measured with ``token_budget.count_tokens``):
+# question tokens max 33 / p95 21, gold-answer tokens max 70 / p95 18 — so 40 covers the dataset's
+# question distribution outright and the gold-answer distribution save one 70-token outlier, which
+# a 40-token prefix still carries the leading (topic-bearing) clause of. ``response`` is the one
+# field NOT bounded by the dataset (it is whatever the system under test produced, and the answer
+# prompt's own "less than 5-6 words" instruction is not enforced), so it gets a taller 80-token
+# cap: enough headroom that truncation is the rare path, not the common one.
+MINISTRAL_QUESTION_MAX_TOKENS = 40
+MINISTRAL_GOLD_ANSWER_MAX_TOKENS = 40
+MINISTRAL_RESPONSE_MAX_TOKENS = 80
+# 1-3 tokens covers a bare "CORRECT"/"WRONG" (measured: "CORRECT"=3, " WRONG"=2 on the Ministral-
+# family tokenizer); a couple of tokens of margin for a leading space or stray punctuation without
+# opening the door to the paragraph-length completions this budget cannot afford.
+MINISTRAL_JUDGE_MAX_COMPLETION_TOKENS = 6
+
+
+def estimated_prompt_tokens(system: str, user: str) -> int:
+    """Cheap pre-flight estimate (see ``token_budget``) of ``system + user`` token cost, BEFORE
+    the provider's own chat template/special tokens. Used only to decide whether to even attempt
+    a call; the authoritative count is always the live response's ``usage.prompt_tokens``."""
+    return count_tokens(system) + count_tokens(user)
+
+
+def compact_judge_prompt(*, question: str, gold_answer: str, response: str) -> str:
+    """Compact, truncated user turn for :data:`COMPACT_JUDGE_SYSTEM_PROMPT`. Truncation keeps the
+    PREFIX of each field (see ``token_budget.truncate_to_tokens``) — the rubric only needs the
+    topic/fact, which both gold answers and on-topic generated answers state up front."""
+    q = truncate_to_tokens(question, MINISTRAL_QUESTION_MAX_TOKENS)
+    g = truncate_to_tokens(gold_answer, MINISTRAL_GOLD_ANSWER_MAX_TOKENS)
+    r = truncate_to_tokens(response, MINISTRAL_RESPONSE_MAX_TOKENS)
+    return f"Question: {q}\nGold: {g}\nGenerated: {r}"
+
+
 _BARE_LABEL = re.compile(r"\b(CORRECT|WRONG)\b", re.IGNORECASE)
 
 
@@ -172,7 +250,14 @@ def parse_judgement(content: str) -> bool | None:
 class ChatPort(Protocol):
     """Narrow chat seam so the judge can be pointed at any OpenAI-compatible endpoint."""
 
-    async def complete(self, *, system: str, user: str, temperature: float = 0.0) -> str: ...
+    async def complete(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> str: ...
 
 
 class ControlSetResult(BaseModel):
@@ -204,6 +289,9 @@ async def judge_control_set(
     *,
     questions: Sequence[str],
     gold_answers: Sequence[str],
+    system_prompt: str = JUDGE_SYSTEM_PROMPT,
+    build_prompt: Callable[..., str] = judge_prompt,
+    max_tokens: int | None = None,
 ) -> ControlSetResult:
     """Grade the judge before believing it.
 
@@ -211,6 +299,13 @@ async def judge_control_set(
     rubric ("as long as it touches on the same topic as the gold answer") makes CORRECT the only
     defensible label. NEGATIVE controls: each question is paired with a DIFFERENT row's gold
     answer (rotate by one), which the rubric must call WRONG.
+
+    ``system_prompt``/``build_prompt``/``max_tokens`` default to the verbatim MemOS-ported prompt
+    (unbounded completion) — the original qwen2.5:0.5b lineage. Pass
+    ``system_prompt=COMPACT_JUDGE_SYSTEM_PROMPT``, ``build_prompt=compact_judge_prompt``,
+    ``max_tokens=MINISTRAL_JUDGE_MAX_COMPLETION_TOKENS`` for the token-budget-fit Ministral-3B
+    variant (``build_prompt`` must accept ``question``/``gold_answer``/``response`` keywords,
+    matching :func:`judge_prompt`'s and :func:`compact_judge_prompt`'s shared shape).
     """
     if len(questions) != len(gold_answers):
         raise ValueError("questions and gold_answers must be the same length")
@@ -225,10 +320,11 @@ async def judge_control_set(
     for i in range(n):
         verdict = parse_judgement(
             await chat.complete(
-                system=JUDGE_SYSTEM_PROMPT,
-                user=judge_prompt(
+                system=system_prompt,
+                user=build_prompt(
                     question=questions[i], gold_answer=gold_answers[i], response=gold_answers[i]
                 ),
+                max_tokens=max_tokens,
             )
         )
         if verdict is None:
@@ -240,10 +336,11 @@ async def judge_control_set(
         mismatched = gold_answers[(i + 1) % n]
         verdict = parse_judgement(
             await chat.complete(
-                system=JUDGE_SYSTEM_PROMPT,
-                user=judge_prompt(
+                system=system_prompt,
+                user=build_prompt(
                     question=questions[i], gold_answer=gold_answers[i], response=mismatched
                 ),
+                max_tokens=max_tokens,
             )
         )
         if verdict is None:

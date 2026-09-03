@@ -54,7 +54,7 @@ Four house rules are load-bearing here:
    unless the operator explicitly sets `local_serves_remote_preferred_groups`, which is logged.
 4. **No invented numbers.** `max_input_tokens` is declared ONLY where the context window is
    unambiguous (a vendor-published figure, or a size named in the model id itself). Everywhere
-   else the field is left `None` and `ModelRouter._max_input_tokens` falls back to
+   else the field is left `None` and `ModelRouter.max_input_tokens` falls back to
    `litellm.get_max_tokens` and then `RouterSettings.default_context_window`
    (`model_router.py:260-272`) — an omitted number, never a guessed one.
 
@@ -79,7 +79,7 @@ opt-in call: `recommended_model_settings()`.
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from enum import StrEnum
 from typing import Protocol
 
@@ -98,11 +98,14 @@ from mu_engine.providers.shipped_settings import ShippedCatalogSettings
 
 __all__ = [
     "CredentialProbe",
+    "DeclaredDeploymentProbe",
+    "DeploymentProbe",
     "LegacyModelGroup",
     "ModelGroup",
     "ProviderKey",
     "ShippedCatalogSettings",
     "active_catalog",
+    "deployment_name",
     "group_tasks",
     "recommended_model_settings",
     "resolvable_credential_refs",
@@ -244,6 +247,68 @@ class CredentialProbe(Protocol):
     """
 
     def resolve(self, credential_ref: str) -> str: ...
+
+
+class DeploymentProbe(Protocol):
+    """Does this deployment EXIST on the provider account? (AD-205)
+
+    The seam `active_catalog` was missing. A `CredentialProbe` answers *"can we reach the
+    account"*; nothing answered *"is this deployment name hosted there"* -- so a row naming a
+    deployment that does not exist was activated on the strength of a key, and its group was
+    thereby non-empty and never reached its declared fallback chain.
+
+    Three-valued ON PURPOSE:
+
+      * ``True``  -- known to exist; keep the row.
+      * ``False`` -- known NOT to exist. This is a PERMANENT configuration error (Azure answers
+        `404 DeploymentNotFound` every time, forever), categorically unlike the transient failure
+        LiteLLM's cooldown/health machinery is built for -- cooling down a row that will never
+        come back just hides it, and hides it *inside* a group that is still nominally populated.
+        Drop the row so the group can empty and its fallback can fire.
+      * ``None``  -- UNKNOWN. Keep the row. Nobody checked, and a probe that cannot answer must
+        not be allowed to delete an operator's working deployments.
+
+    `Protocol` (not a base class) so a live-listing probe, a first-call quarantine, or the
+    config-declared :class:`DeclaredDeploymentProbe` below all satisfy it structurally.
+    """
+
+    def exists(self, deployment: ModelDeployment) -> bool | None: ...
+
+
+def deployment_name(deployment: ModelDeployment) -> str:
+    """The provider-native DEPLOYMENT NAME inside a `model_id`.
+
+    `model_id` is litellm-prefixed (`azure/gpt-4o`, `hosted_vllm/qwen2.5:7b-instruct`); the name
+    an operator sees in their portal, and the one a 404 is about, is the part after the FIRST
+    slash. Rows without a prefix are returned unchanged.
+    """
+    _, _, name = deployment.model_id.partition("/")
+    return name or deployment.model_id
+
+
+class DeclaredDeploymentProbe:
+    """A :class:`DeploymentProbe` over DECLARED data -- no network, no I/O, no async.
+
+    Existence comes from config (`ShippedCatalogSettings.known_deployments`: `provider_key` ->
+    the deployment names that account hosts), so the check runs inside a synchronous composition
+    root at zero cost and is fully deterministic in tests. A provider the operator said nothing
+    about answers ``None`` (unknown -> keep), NOT ``False``: silence is not evidence of absence.
+
+    This is the shipped implementation of the seam, not the only possible one -- a probe that
+    lists the provider's deployments over the wire, or one that quarantines a row after its
+    first `404`, plugs into the same `exists()` without touching `active_catalog`.
+    """
+
+    __slots__ = ("_known",)
+
+    def __init__(self, known: Mapping[str, Collection[str]]) -> None:
+        self._known = {key: frozenset(names) for key, names in known.items()}
+
+    def exists(self, deployment: ModelDeployment) -> bool | None:
+        names = self._known.get(deployment.provider_key)
+        if names is None:
+            return None
+        return deployment_name(deployment) in names
 
 
 # ---------------------------------------------------------------------------------------------
@@ -683,6 +748,7 @@ def active_catalog(
     catalog: ModelCatalogSettings,
     *,
     available_credentials: Collection[str],
+    deployment_probe: DeploymentProbe | None = None,
 ) -> ModelCatalogSettings:
     """Narrow a DECLARED catalog to the providers whose credentials are actually available.
 
@@ -695,9 +761,14 @@ def active_catalog(
         that is what keeps FULL-LOCAL a complete system with zero API keys;
       * a credentialed provider survives iff its ref is in `available_credentials`;
       * a dropped provider takes its deployments with it, so no row is left pointing at an
-        unknown `provider_key` (which `registry._validate` rejects).
+        unknown `provider_key` (which `registry._validate` rejects);
+      * **a surviving provider's row survives iff the deployment it names EXISTS** -- asked of
+        `deployment_probe` (AD-205). A credential says the ACCOUNT is reachable and nothing
+        about which deployment names are hosted on it, so without this the two questions were
+        conflated and the wrong one was answered. No probe, or a probe answering `None`, means
+        nobody checked: the row is kept.
 
-    A group that credential absence emptied ADOPTS its DECLARED fallback chain
+    A group that credential absence OR deployment absence emptied ADOPTS its DECLARED fallback chain
     (`router.fallbacks`, written by `shipped_router_fallbacks`): the chain is precisely the
     catalog's declared answer to "this group is unavailable", so honouring it here is following
     declared data, not inventing a route. Only a group the catalog already declared can adopt
@@ -736,6 +807,7 @@ def active_catalog(
             deployments_dropped=len(catalog.deployments) - len(deployments),
             providers_active=len(kept),
         )
+    deployments = _existing_deployments(deployments, deployment_probe)
     deployments = [*deployments, *_promoted_fallback_rows(catalog, deployments)]
     emptied = sorted(
         {d.model_group for d in catalog.deployments} - {d.model_group for d in deployments}
@@ -746,6 +818,33 @@ def active_catalog(
             groups=emptied,
         )
     return catalog.model_copy(update={"providers": kept, "deployments": deployments})
+
+
+def _existing_deployments(
+    deployments: list[ModelDeployment], probe: DeploymentProbe | None
+) -> list[ModelDeployment]:
+    """Drop rows the probe says do NOT exist (AD-205). `None`/unknown keeps the row.
+
+    Dropped BEFORE `_promoted_fallback_rows` runs, deliberately: emptying the group is exactly
+    what makes its declared fallback chain reachable, which is the half of AD-205 that made a
+    valid credential worse than none -- the dead rows kept the group nominally populated, so the
+    local chain that existed to cover precisely this never fired.
+    """
+    if probe is None:
+        return deployments
+    kept: list[ModelDeployment] = []
+    absent: list[ModelDeployment] = []
+    for dep in deployments:
+        (absent if probe.exists(dep) is False else kept).append(dep)
+    if absent:
+        log.warning(
+            "model_catalog_deployment_absent",  # content-free: config names + counts, no values
+            deployments=sorted({deployment_name(d) for d in absent}),
+            providers=sorted({d.provider_key for d in absent}),
+            groups=sorted({d.model_group for d in absent}),
+            rows_dropped=len(absent),
+        )
+    return kept
 
 
 def _promoted_fallback_rows(

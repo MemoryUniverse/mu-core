@@ -25,7 +25,12 @@ each composition root is one call rather than four opinions:
   3. **probe + activate** — ask the secret seam which `credential_ref`s actually resolve
      (`resolvable_credential_refs`) and narrow the table to them (`active_catalog`). A provider
      with no `credential_ref` — every local one — always survives, which is what makes a
-     zero-credential box a complete system rather than an empty one;
+     zero-credential box a complete system rather than an empty one. **A resolving credential is
+     not a live deployment (AD-205):** the same call also narrows to the rows whose deployment
+     the operator says EXISTS (`ShippedCatalogSettings.known_deployments` →
+     `DeclaredDeploymentProbe`), because a key admits an account, not a model — and a row naming
+     an undeployed model kept its group nominally populated, which suppressed the very fallback
+     chain declared to cover that group being unavailable;
   4. **task map** — point the per-task fields the operator did NOT set at the logical
      `ModelGroup`s (`recommended_model_settings`), chosen on capability / cost / latency / context
      / local-vs-remote. A field the operator set anywhere — in code, or via `MU_MODEL__*` — is
@@ -38,8 +43,10 @@ frontier-only) and `ProviderModelRegistry` then refuses to start — pinned by
 The catalog ships its own answer for that box, `local_serves_remote_preferred_groups`, whose
 docstring calls it *"the posture of a box with NO remote credentials at all"*. This module makes
 adopting it **conditional on the probe and NAMED**: `LocalFallbackPosture.AUTO` (the default)
-adopts it only when no remote credential resolved at all, and emits
-`model_layer_no_remote_credentials_posture`. For the adjudicating groups that is the deliberate,
+adopts it only when no remote deployment can actually serve — measured as *a remote row whose
+credential resolved AND whose deployment is not known-absent*, not as "a credential resolved"
+(AD-205) — and emits `model_layer_no_remote_credentials_posture`. For the adjudicating groups
+that is the deliberate,
 logged ADR 0037 deviation the flag itself describes; `NEVER` keeps the fail-loud original and
 `ALWAYS` forces local primacy. It is a config field with three named values, not an accident.
 
@@ -55,7 +62,7 @@ from collections.abc import Mapping, Sequence
 import structlog
 from pydantic import BaseModel, ConfigDict, SecretStr
 
-from mu_engine.providers._contracts import DegradeEmitterPort
+from mu_engine.providers._contracts import DegradeEmitterPort, EmbeddingPort
 from mu_engine.providers.catalog import ModelDeployment, ProviderRecord
 from mu_engine.providers.model_router import ModelRouter, build_model_router
 from mu_engine.providers.secrets import SecretSeamResolver
@@ -69,6 +76,8 @@ from mu_engine.providers.settings import (
 )
 from mu_engine.providers.shipped_catalog import (
     CredentialProbe,
+    DeclaredDeploymentProbe,
+    DeploymentProbe,
     active_catalog,
     recommended_model_settings,
     resolvable_credential_refs,
@@ -179,16 +188,29 @@ def resolve_plane_model_layer(
             update={"providers": operator_providers, "deployments": operator_deployments}
         )
         task_models = resolve_task_models(models, task_defaults=TaskDefaults.LEGACY)
-        return _activate(declared, task_models, available=_probe(declared, resolver), adopted=False)
+        return _activate(
+            declared,
+            task_models,
+            available=_probe(declared, resolver),
+            adopted=False,
+            deployment_probe=DeclaredDeploymentProbe(catalog.shipped.known_deployments),
+        )
 
     cfg = catalog.shipped
     declared = shipped_catalog(base, cfg=cfg)
     available = _probe(declared, resolver)
     adopted = False
 
+    dep_probe = DeclaredDeploymentProbe(cfg.known_deployments)
     remote_refs = {p.credential_ref for p in declared.providers if p.credential_ref is not None}
+    # AD-205: the AUTO posture used to key off "did a remote CREDENTIAL resolve". That is the
+    # wrong question, and answering it made a valid key strictly worse than none: the key
+    # resolved, so the box was declared remote-capable and the local posture was NOT adopted --
+    # while every remote row the key admitted named a deployment that does not exist. The
+    # question AUTO actually means is "can any remote deployment serve this box", so ask that.
+    serving_remote = _surviving_remote_rows(declared, available=available, probe=dep_probe)
     wants_local_primary = catalog.local_fallback is LocalFallbackPosture.ALWAYS or (
-        catalog.local_fallback is LocalFallbackPosture.AUTO and not (available & remote_refs)
+        catalog.local_fallback is LocalFallbackPosture.AUTO and not serving_remote
     )
     if wants_local_primary and not cfg.local_serves_remote_preferred_groups:
         # NAMED, content-free, and stating the ADR 0037 consequence explicitly — never silent.
@@ -198,6 +220,7 @@ def resolve_plane_model_layer(
             remote_credential_refs=len(remote_refs),
             resolved_credential_refs=len(available & remote_refs),
             adjudication="local_serves_adjudicating_groups",  # the ADR 0037 deviation, opted into
+            remote_rows_serving=serving_remote,  # AD-205: 0 here with a key means dead rows
         )
         cfg = cfg.model_copy(update={"local_serves_remote_preferred_groups": True})
         declared = shipped_catalog(base, cfg=cfg)
@@ -213,7 +236,37 @@ def resolve_plane_model_layer(
     task_models = resolve_task_models(models, task_defaults=catalog.task_defaults)
     # The overlay may add its own credentialed rows, so probe once more over the FINAL table —
     # `_probe` is the only thing that touches the seam and it is called once per distinct table.
-    return _activate(declared, task_models, available=_probe(declared, resolver), adopted=adopted)
+    return _activate(
+        declared,
+        task_models,
+        available=_probe(declared, resolver),
+        adopted=adopted,
+        deployment_probe=dep_probe,
+    )
+
+
+def _surviving_remote_rows(
+    catalog: ModelCatalogSettings, *, available: frozenset[str], probe: DeploymentProbe
+) -> int:
+    """How many REMOTE deployments would actually survive activation (AD-205).
+
+    "Remote" = its provider declares a `credential_ref`. A row survives when that ref resolved
+    AND the deployment it names is not known-absent. This is the predicate the AUTO local-fallback
+    posture needs; credential resolution alone is not it.
+    """
+    remote_keys = {p.key for p in catalog.providers if p.credential_ref is not None}
+    credentialed = {
+        p.key
+        for p in catalog.providers
+        if p.credential_ref is not None and p.credential_ref in available
+    }
+    return sum(
+        1
+        for d in catalog.deployments
+        if d.provider_key in remote_keys
+        and d.provider_key in credentialed
+        and probe.exists(d) is not False
+    )
 
 
 def _probe(catalog: ModelCatalogSettings, resolver: CredentialProbe | None) -> frozenset[str]:
@@ -230,8 +283,11 @@ def _activate(
     *,
     available: frozenset[str],
     adopted: bool,
+    deployment_probe: DeploymentProbe | None = None,
 ) -> PlaneModelLayer:
-    active = active_catalog(declared, available_credentials=available)
+    active = active_catalog(
+        declared, available_credentials=available, deployment_probe=deployment_probe
+    )
     log.info(
         "model_layer_resolved",  # content-free: names and counts only
         providers=len(active.providers),
@@ -257,12 +313,18 @@ def build_plane_router(
     overlay_providers: Sequence[ProviderRecord] = (),
     overlay_deployments: Sequence[ModelDeployment] = (),
     degrade_emitter: DegradeEmitterPort | None = None,
+    embedder: EmbeddingPort | None = None,
 ) -> ModelRouter:
     """`resolve_plane_model_layer` + `build_model_router` — what a composition root calls.
 
     The resolver is threaded into the registry as well as the probe, so the SAME seam that decided
     a provider is active supplies its key at compile time (`registry.compile_model_list`) — a
     provider can never be activated by one path and credential-less on the other.
+
+    `embedder` is a straight pass-through to `build_model_router` (see ITS docstring for why the
+    injection exists): a root that already owns the plane's one `EmbeddingPort` hands it over
+    rather than letting the factory resolve a SECOND one from `models.embed_backend`. None — every
+    existing caller — keeps the build-my-own behaviour unchanged.
     """
     layer = resolve_plane_model_layer(
         models=models,
@@ -277,4 +339,5 @@ def build_plane_router(
         degrade_emitter=degrade_emitter,
         secret_resolver=resolver,
         chunk_token_ratio=chunk_token_ratio,
+        embedder=embedder,
     )

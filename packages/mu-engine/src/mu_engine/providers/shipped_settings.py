@@ -39,6 +39,28 @@ class ShippedCatalogSettings(BaseModel):
     deepseek_credential_ref: str = "deepseek_api_key"
     moonshot_credential_ref: str = "moonshot_api_key"
 
+    # --- WHICH declared deployments actually EXIST on the operator's account (AD-205) ---------
+    # A credential proves the ACCOUNT is reachable. It proves nothing about whether the deployment
+    # names below are hosted on it -- those are chosen per tenant, and a name that is not deployed
+    # answers `404 DeploymentNotFound`, permanently. MEASURED 2026-08-30 on the Foundry resource
+    # this project uses: one valid key activated all ten declared Azure rows and SEVEN of them
+    # 404, while the groups they filled were no longer "empty" and so never adopted their declared
+    # local fallback chains -- a working credential made routing strictly WORSE than no credential
+    # at all.
+    #
+    # This map is the operator's statement of what their account HOSTS, keyed by
+    # `ProviderRecord.key`, valued by the DEPLOYMENT NAMES (the part of `model_id` after the
+    # `<litellm_provider>/` prefix). `active_catalog` drops any row for a listed provider whose
+    # deployment is not named here, which is what lets the emptied group reach its fallback chain.
+    #
+    # A provider ABSENT from this map is UNSTATED, not empty: its rows are kept exactly as today.
+    # That is deliberate -- this must not silently delete an operator's working deployments
+    # because they never filled the map in. Absence means "nobody checked", and the honest
+    # response to "nobody checked" is to change nothing.
+    #
+    #   MU_MODEL_CATALOG__SHIPPED__KNOWN_DEPLOYMENTS='{"azure": ["Ministral-3B"]}'
+    known_deployments: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+
     # --- Azure: deployment names are chosen PER TENANT, so they are config, not table data -----
     azure_enabled: bool = True
     azure_api_base: str | None = None  # https://<resource>.openai.azure.com — per tenant

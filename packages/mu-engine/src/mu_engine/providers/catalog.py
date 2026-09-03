@@ -19,6 +19,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
+    "HttpEmbedConfig",
     "ModelDeployment",
     "ModelKind",
     "ProviderKind",
@@ -130,3 +131,32 @@ class WarmLocalConfig(BaseModel):
     # --- embed params (our extension) ---
     normalize_embeddings: bool = True
     device: str | None = None  # sentence-transformers device override; None = auto
+
+
+class HttpEmbedConfig(BaseModel):
+    """Config for an HTTP-backed `EmbeddingPort` adapter (model-layer-spec §6-P5, §2.5 sibling).
+
+    The `embedders` registry (`ModelCatalogSettings.embedders`, keyed by `embed_backend`) is a
+    `dict[str, WarmLocalConfig | HttpEmbedConfig]`: a value of THIS type routes through
+    `embedding.HttpEmbedder` instead of the in-process `SentenceTransformerEmbedder`. The
+    motivating deployment is the owner's ask to run embedding on the VPS, not the laptop — e.g.
+    the VM-hosted Ollama `all-minilm` service reached over the laptop's SSH tunnel
+    (`infra/mu-vm/vm_reup.sh`), an OpenAI-compatible `/v1/embeddings` route.
+
+    `dimension` is REQUIRED, never inferred: `HttpEmbedder.embed` checks every returned vector
+    against it and refuses (raises, never truncates/pads/zero-fills) on a mismatch. The Qdrant
+    MTM collections are named `mu_mtm__<hash>__<visibility>__<dim>` — a silent dimension drift
+    here would make every new vector incomparable to the existing corpus, exactly the D1 postmortem
+    (a silent zero vector) but for a live corpus rather than an empty one, so this stays a hard
+    refusal, not a soft one.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    model_id: str  # the embed_backend registry key AND the log/identity label
+    kind: ModelKind = ModelKind.EMBED
+    api_base: str  # e.g. "http://127.0.0.1:11435/v1" (OpenAI-compatible base, /embeddings appended)
+    model: str  # the model name sent in the request body (e.g. "all-minilm")
+    dimension: int  # REQUIRED — the vector width the store expects; NEVER inferred (§6-P5, D1)
+    timeout_s: float = 10.0  # per-attempt timeout (retry_io wraps each attempt with this budget)
+    batch_size: int = 64  # texts per HTTP call — batched, never one call per item

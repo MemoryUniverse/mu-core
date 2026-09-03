@@ -15,6 +15,7 @@ from enum import StrEnum
 
 __all__ = [
     "DegradeReason",
+    "EmbeddingDimensionMismatchError",
     "InvalidBackendError",
     "MandatoryBackendMissingError",
     "MissingEmbeddingError",
@@ -92,6 +93,29 @@ class MissingEmbeddingError(StorageError):
     write the vector tier without a real embedding is a bug at the call site, not a degrade this
     layer should paper over. The fix is to embed before calling ``upsert`` — see
     :meth:`~mu_engine.lifecycle.promotion.PromotionService._promote_to_mtm`, which now does.
+    """
+
+
+class EmbeddingDimensionMismatchError(StorageError):
+    """A vector reaching an MTM adapter's write path does not have the adapter's own ``dim``.
+
+    **Weaviate-specific gap, closed here (ADR 0050 spike item, VM-deployment lane).** Qdrant
+    declares ``VectorParams(size=self._dim, ...)`` at collection creation, and pgvector declares
+    ``embedding vector({self._dim}) NOT NULL`` at table creation — both get a HARD, server-side
+    dimension guarantee on every write, for free, from the store's own schema. Weaviate's
+    self-provided (BYOV) vector config (``Configure.Vectors.self_provided`` — verified against
+    the installed ``weaviate-client`` signature: no ``dimensions``/size argument exists anywhere
+    on it) has **no schema-level dimension field at all**. Empirically, an HNSW shard only starts
+    enforcing a fixed width once its FIRST object sets it implicitly — and in Weaviate's native
+    multi-tenancy mode, that "first object" rule applies PER TENANT SHARD, so a wrong-width write
+    to a brand-new tenant is accepted silently and poisons that shard's dimension from then on,
+    with no cross-check against sibling tenants in the same class. This is the same silent-
+    corruption SHAPE as the D1 zero-vector defect and AD-213's live-corpus zero-vector gap — a
+    right-*something* vector that is subtly wrong never errors, and everything downstream just
+    ranks it wrong (or, here, poisons the shard) forever. ``WeaviateMtmAdapter._upsert_impl``
+    therefore asserts ``len(row.vector) == self._dim`` itself, client-side, BEFORE the write
+    reaches Weaviate — the same fail-loud posture DEV-STANDARDS rule 8 already requires, applied
+    to the one registered vector backend whose own store does not enforce it.
     """
 
 

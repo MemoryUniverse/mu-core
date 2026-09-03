@@ -92,8 +92,9 @@ from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import SystemClock
 from mu_engine.platform.observability import build_audit, build_metrics, build_tracer
 from mu_engine.platform.tenancy import DefaultTenancyGuard
+from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.providers.catalog import ModelDeployment, ModelKind, ProviderKind, ProviderRecord
-from mu_engine.providers.embedding import SentenceTransformerEmbedder, build_embedder
+from mu_engine.providers.embedding import build_embedder
 from mu_engine.providers.model_router import ModelRouter, build_model_router
 from mu_engine.providers.plane import (
     PlaneModelLayer,
@@ -193,7 +194,11 @@ _SUPPORTED_KV = frozenset({"redis", "valkey", "memory", "memcached"})
 _SUPPORTED_VECTOR = frozenset({"qdrant", "pgvector", "chroma", "faiss"})
 _SUPPORTED_GRAPH = frozenset({"falkordb"})
 _SUPPORTED_RELATIONAL = frozenset({"sqlite", "postgres", "mysql"})
-_SUPPORTED_EMBEDDING = frozenset({"minilm_local"})
+# "minilm_vm_http" must match `ModelCatalogSettings.http_embed_backend_key`'s default (settings.py)
+# — the key `default_local_catalog` registers the HTTP embed config under when
+# `http_embed_api_base` is set. Both are literals (mirrors every other row here); a rename of one
+# without the other is a `RegistryError`/`EmbedderConfigError` at composition, not a silent gap.
+_SUPPORTED_EMBEDDING = frozenset({"minilm_local", "minilm_vm_http"})
 
 
 def _profile_rows(
@@ -335,9 +340,15 @@ class LocalContainer:
         )
         self._assert_supported(storage)
 
-        # (1) the REAL local embedder (offline MiniLM); dimension is read FROM the live model,
+        # (1) the REAL embedder — in-process MiniLM by default, or the HTTP/VM backend when
+        #     `storage.embedding.backend` selects it; dimension is read FROM the resolved adapter,
         #     never from config (storage-indexing-design §239-240) — the vector store binds to it.
-        self.embedder: SentenceTransformerEmbedder = self._build_embedder(storage.embedding)
+        self.embedder: EmbeddingPort = self._build_embedder(storage.embedding)
+        # Best-effort close of whatever network client the resolved embedder owns (e.g.
+        # `HttpEmbedder`'s httpx client) — a no-op for the in-process singleton, which has none
+        # (mirrors the `_register_closer` docstring's own "embedded backends ... yield nothing to
+        # close" contract, generalized here from storage adapters to the embedder).
+        self._register_closer(self.embedder)
 
         # (2) STM (kv role: redis by default) — built through the STORE_REGISTRY seam, exactly
         #     like every other role (spec §4.2). The durable KV write is the facade's durability
@@ -422,7 +433,10 @@ class LocalContainer:
         #     flipping the second one silently would turn every heuristic-mode caller into a
         #     caller of a local endpoint that may not be running. `llm=None` ⇒ heuristic mode,
         #     byte-for-byte as before; a configured profile ⇒ the router, pinned to that profile.
-        self.model_router: ModelRouter = self._build_plane_router(storage.llm)
+        # `self.embedder` (built at (1) above) is INJECTED — the model layer must NOT resolve a
+        # second `EmbeddingPort` of its own from `ModelSettings.embed_backend`. See
+        # `_build_plane_router` and `build_model_router`'s docstring for the defect this closes.
+        self.model_router: ModelRouter = self._build_plane_router(storage.llm, self.embedder)
         self.llm: ModelRouter | None = self.model_router if storage.llm is not None else None
         # …and its TEARDOWN, which did not exist. `close()` below promises to "release every store
         # connection this container opened"; the MODEL layer was outside that promise entirely, so
@@ -654,6 +668,14 @@ class LocalContainer:
             # the RecallService façade — the ranker reuses it to score STM candidate content
             # against the query vector (`recall_settings.stm_scoring`, default "embed").
             embedder=self.embedder,
+            # ACCURACY-PLAN-0831.md item 6: `self.model_router` is ALWAYS built (ENG-115a, gate
+            # G6 — see the (6) comment above), so this plane's rerank gate is armed exactly as
+            # unconditionally as its context-budget width derivation already is
+            # (`context_budget=self.model_router` below) — never gated on `self.llm`/`storage.llm`
+            # for the same reason: `AdaptiveRerankGate.apply` never calls the model until a real
+            # `recall()` needs it, and `settings.recall.rerank_enabled` (default True, env-
+            # overridable `MU_RECALL__RERANK_ENABLED=false`) is the one A/B off-switch this needs.
+            reranker=self.model_router,
         )
         authz = RecallAuthorizationFilter(
             tenancy=DefaultTenancyGuard(), authorized_ids=PrincipalAuthorizedIdsResolver()
@@ -668,6 +690,17 @@ class LocalContainer:
             clock=self._clock,
             metrics=self.metrics,
             tracer=self.tracer,
+            # ACCURACY-PLAN-0831.md item 4 / CLAUDE.md boundary rule ("FULL-LOCAL must stay good
+            # on the same mechanism"): `self.model_router` is ALWAYS built (ENG-115a, gate G6 —
+            # see the (6) comment above), so THIS plane's recall width derivation is armed exactly
+            # as unconditionally as chunking's identical `max_input_tokens` lookup already is —
+            # never gated on `self.llm`/`storage.llm` (the SLM-profile-only, synthesis-capable
+            # seam), because deriving a width is a pure catalog/registry metadata read, not a live
+            # model call: it costs nothing to leave armed even when no deployment's credentials
+            # actually resolved (`derive_recall_limit`'s own ceiling clamp bounds the worst case —
+            # an unknown/unresolved group lands at the SAME validated `max_derived_limit` a
+            # correctly-configured large-context model would, never an unbounded guess).
+            context_budget=self.model_router,
         )
 
         # (9) the MemoryRepository FAÇADE + the two services that could not exist without it
@@ -964,21 +997,27 @@ class LocalContainer:
                     "mu_engine.storage.factories) is a tracked gap — no silent fallback"
                 )
 
-    def _build_embedder(self, choice: BackendChoice) -> SentenceTransformerEmbedder:
+    def _build_embedder(self, choice: BackendChoice) -> EmbeddingPort:
         # C2: the catalog backing this embedder is now the WIRED `EngineSettings.model_catalog`
-        # (`MU_MODEL_CATALOG__DEFAULT_EMBED_BACKEND`/`MU_MODEL_CATALOG__DEFAULT_MINILM_PATH`
-        # reach `default_local_catalog`'s embedder-default derivation), not a bare call. `choice.
-        # backend` (from `StorageSettings.embedding`, the storage-layer BACKEND-SELECTION knob)
-        # is unchanged — a deliberately separate concern from the model-layer's own default id.
+        # (`MU_MODEL_CATALOG__DEFAULT_EMBED_BACKEND`/`MU_MODEL_CATALOG__DEFAULT_MINILM_PATH`, and
+        # now also `MU_MODEL_CATALOG__HTTP_EMBED_*` for the opt-in HTTP/VM backend — settings.py
+        # `default_local_catalog`), not a bare call. `choice.backend` (from `StorageSettings.
+        # embedding`, the storage-layer BACKEND-SELECTION knob, `MU_EMBED_BACKEND` via
+        # `mu_client.config.ClientSettings.embed_backend`) selects WHICH registered key resolves
+        # — "minilm_local" (default, in-process) or "minilm_vm_http" (the VM endpoint); which
+        # concrete `EmbeddingPort` implementation that key resolves to is `build_embedder`'s
+        # config-type dispatch (embedding.py), not decided here.
         catalog = default_local_catalog(self._engine_settings.model_catalog)
         embedder = build_embedder(choice.backend, catalog)
-        if not isinstance(embedder, SentenceTransformerEmbedder):  # fail-loud, never a silent None
+        if not isinstance(embedder, EmbeddingPort):  # fail-loud, never a silent None
             raise BackendUnavailableError(
-                f"embedding backend {choice.backend!r} did not resolve to a local embedder"
+                f"embedding backend {choice.backend!r} did not resolve to an EmbeddingPort"
             )
         return embedder
 
-    def _build_plane_router(self, profile: ModelProfileSettings | None) -> ModelRouter:
+    def _build_plane_router(
+        self, profile: ModelProfileSettings | None, embedder: EmbeddingPort
+    ) -> ModelRouter:
         """Build the plane's REAL ``ModelRouter`` through the ONE model-layer entry point.
 
         Two shapes, one call site:
@@ -993,6 +1032,22 @@ class LocalContainer:
 
         C1: threads `chunk_token_ratio` from the WIRED `EngineSettings.extraction` (was a bare
         `LongTextChunker()`/hardcoded `* 3 // 4` in `chunking.py`, plan §1.1 Group A).
+
+        `embedder` is THIS container's own `EmbeddingPort` — the same instance already injected
+        into ingest/recall/rank/promote — handed to the model layer so it does not resolve a
+        SECOND one. Before this, the container selected its embedder from `StorageSettings.
+        embedding.backend` (`MU_EMBED_BACKEND`) while `build_model_router` independently resolved
+        `EngineSettings.model.embed_backend` (`MU_MODEL__EMBED_BACKEND`). The two disagreed by
+        default, so pointing the laptop daemon at the VM embed endpoint still imported torch and
+        loaded MiniLM in-process for a `ModelRouter.embed` with zero callers — measured
+        2026-08-31 at 1139 MB RSS and two live `SentenceTransformer` instances, with
+        `model_router_built` reporting `embed_backend=minilm_local` while every real embed went
+        over HTTP. ONE container, ONE embedder, ONE closer (`_register_closer` at (1)).
+
+        This is deliberately NOT mirrored in `mu_engine_server.composition`: on the server the
+        engine and the model are on the SAME host, so an in-process embedder there is the correct
+        deployment, not an accident. The defect is specific to a composition root whose embedding
+        was moved OFF-box.
         """
         ratio = self._engine_settings.extraction.chunk_token_ratio
         catalog = self._engine_settings.model_catalog
@@ -1002,6 +1057,7 @@ class LocalContainer:
                 catalog=catalog,
                 chunk_token_ratio=ratio,
                 resolver=build_plane_secret_resolver(catalog),
+                embedder=embedder,
             )
         layer = _resolve_profile_layer(profile, self._engine_settings.model, catalog)
         return build_model_router(
@@ -1009,6 +1065,7 @@ class LocalContainer:
             catalog=layer.catalog,
             secret_resolver=_profile_resolver(profile, catalog),
             chunk_token_ratio=ratio,
+            embedder=embedder,
         )
 
     def _kv_cfg(self, choice: BackendChoice) -> dict[str, Any]:

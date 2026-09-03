@@ -25,11 +25,13 @@ from mu_engine.providers.local_priority import LOCAL_ORDER, REMOTE_ORDER, LocalP
 from mu_engine.providers.registry import ProviderModelRegistry, RegistryError
 from mu_engine.providers.settings import ModelCatalogSettings, ModelSettings, default_local_catalog
 from mu_engine.providers.shipped_catalog import (
+    DeclaredDeploymentProbe,
     LegacyModelGroup,
     ModelGroup,
     ProviderKey,
     ShippedCatalogSettings,
     active_catalog,
+    deployment_name,
     group_tasks,
     recommended_model_settings,
     resolvable_credential_refs,
@@ -227,7 +229,7 @@ def test_every_task_group_is_reachable_with_zero_keys_or_is_frontier_by_decision
 
 def test_max_input_tokens_is_declared_only_where_it_is_known() -> None:
     """Never an invented number: the field is set for the vendor-published windows and left
-    `None` everywhere else, so `ModelRouter._max_input_tokens` falls back to litellm.
+    `None` everywhere else, so `ModelRouter.max_input_tokens` falls back to litellm.
 
     Keyed by (group, model_id): 13 model_ids repeat across groups, so a `model_id`-keyed dict
     would silently drop 19 of the 40 rows and let a shadowed row carry any number at all —
@@ -1002,3 +1004,145 @@ def test_structlog_capture_is_wired(caplog: pytest.LogCaptureFixture) -> None:
         structlog.get_logger("mu_engine.providers").info("probe_event", n=1)
 
     assert [e["event"] for e in events] == ["probe_event"]
+
+
+# ---------------------------------------------------------------------------------------------
+# D2. deployment-EXISTENCE-aware activation (AD-205)
+#
+# The defect these pin, MEASURED 2026-08-30 against the live Azure Foundry resource this project
+# uses: `active_catalog` admitted a provider on CREDENTIAL PRESENCE alone, so one valid key
+# activated all ten declared Azure rows -- and seven of them named deployments that answer
+# `404 DeploymentNotFound`, permanently. The sharper half is the second test below: a group full
+# of DEAD rows is not "emptied", so `_promoted_fallback_rows` never fired and the declared local
+# chain that exists to cover exactly this was suppressed. Adding a working key replaced a serving
+# local model with a dead remote one. Every assertion here fails on the pre-fix code.
+# ---------------------------------------------------------------------------------------------
+_LIVE_AZURE_DEPLOYMENT = "Ministral-3B"  # the ONE deployment that answers 200 on that resource
+
+
+def _azure_only_key() -> set[str]:
+    return {ShippedCatalogSettings().azure_credential_ref}
+
+
+def _azure_shipped(**kwargs: object) -> ShippedCatalogSettings:
+    """The measured resource: `Ministral-3B` is the only deployment that exists on it."""
+    return ShippedCatalogSettings(
+        azure_small_deployment=_LIVE_AZURE_DEPLOYMENT,
+        known_deployments={ProviderKey.AZURE.value: (_LIVE_AZURE_DEPLOYMENT,)},
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_a_declared_deployment_that_does_not_exist_is_dropped_not_activated() -> None:
+    """A credential admits an ACCOUNT, never a model. A row naming a deployment the account does
+    not host must not be activated by the mere presence of a key."""
+    cfg = _azure_shipped()
+    declared = shipped_catalog(cfg=cfg)
+    probe = DeclaredDeploymentProbe(cfg.known_deployments)
+
+    active = active_catalog(
+        declared, available_credentials=_azure_only_key(), deployment_probe=probe
+    )
+
+    azure_rows = [d for d in active.deployments if d.provider_key == ProviderKey.AZURE]
+    assert azure_rows, "the one deployment that DOES exist must still be activated"
+    assert {deployment_name(d) for d in azure_rows} == {_LIVE_AZURE_DEPLOYMENT}
+    # ...and the dead ones are gone, rather than sitting in a pool waiting to 404 at first call.
+    declared_azure = {
+        deployment_name(d) for d in declared.deployments if d.provider_key == ProviderKey.AZURE
+    }
+    assert len(declared_azure) > 1, "fixture must declare rows that do NOT exist"
+
+
+def test_a_group_left_with_only_dead_remote_rows_reaches_its_declared_fallback() -> None:
+    """The half that made a working credential WORSE than no credential.
+
+    `mu-chat` declares a local fallback chain precisely for "this group is unavailable". Pre-fix,
+    the dead `azure/gpt-5-chat` row kept the group non-empty, so the chain never fired and the
+    group's SOLE deployment was one that 404s. Post-fix the dead row is dropped, the group empties,
+    and the declared chain promotes the local row -- following declared data, not inventing a route.
+    """
+    cfg = _azure_shipped()
+    declared = shipped_catalog(cfg=cfg)
+
+    active = active_catalog(
+        declared,
+        available_credentials=_azure_only_key(),
+        deployment_probe=DeclaredDeploymentProbe(cfg.known_deployments),
+    )
+
+    chat_rows = [d for d in active.deployments if d.model_group == ModelGroup.CHAT]
+    assert chat_rows, "mu-chat must not be left empty when a declared local chain exists"
+    assert all(d.provider_key != ProviderKey.AZURE for d in chat_rows)
+    assert any(d.provider_key == ProviderKey.LOCAL_OPENAI_HTTP for d in chat_rows)
+
+
+def test_a_dropped_deployment_is_named_content_free_never_silent() -> None:
+    """Same honesty rule as `model_catalog_provider_excluded`: a row that vanished says so, with
+    config NAMES and counts only (no key, no api_base, no value)."""
+    cfg = _azure_shipped()
+    declared = shipped_catalog(cfg=cfg)
+
+    with capture_logs() as events:
+        active_catalog(
+            declared,
+            available_credentials=_azure_only_key(),
+            deployment_probe=DeclaredDeploymentProbe(cfg.known_deployments),
+        )
+
+    named = [e for e in events if e["event"] == "model_catalog_deployment_absent"]
+    assert len(named) == 1
+    assert named[0]["rows_dropped"] > 0
+    assert named[0]["providers"] == [ProviderKey.AZURE.value]
+    assert _LIVE_AZURE_DEPLOYMENT not in named[0]["deployments"]
+    assert _Resolver.VALUE not in repr(named[0])
+
+
+def test_an_unstated_provider_is_unknown_not_absent() -> None:
+    """Silence is not evidence of absence: an operator who never filled the map in keeps every
+    row they have today. This is what stops the fix deleting working deployments."""
+    declared = shipped_catalog()
+    probe = DeclaredDeploymentProbe({})  # nothing stated about anybody
+
+    with_probe = active_catalog(declared, available_credentials=_all_refs(), deployment_probe=probe)
+    without_probe = active_catalog(declared, available_credentials=_all_refs())
+
+    assert with_probe.deployments == without_probe.deployments
+
+
+def test_the_probe_reads_the_deployment_name_not_the_litellm_prefix() -> None:
+    """`model_id` is litellm-prefixed (`azure/gpt-4o`); a 404 is about the part AFTER the slash.
+    Matching the whole `model_id` would make every operator's map wrong in the same way."""
+    cfg = _azure_shipped()
+    row = next(
+        d
+        for d in shipped_catalog(cfg=cfg).deployments
+        if d.provider_key == ProviderKey.AZURE and deployment_name(d) == _LIVE_AZURE_DEPLOYMENT
+    )
+    assert row.model_id == f"azure/{_LIVE_AZURE_DEPLOYMENT}"
+    assert DeclaredDeploymentProbe(cfg.known_deployments).exists(row) is True
+    assert DeclaredDeploymentProbe({ProviderKey.AZURE.value: (row.model_id,)}).exists(row) is False
+
+
+def test_a_valid_credential_is_never_worse_than_no_credential_at_all() -> None:
+    """The whole of AD-205 in one assertion, as it was MEASURED both ways.
+
+    With NO key, `mu-chat` resolved to the local row. With a valid key it resolved to a SOLE
+    `azure/gpt-5-chat` that 404s -- strictly worse. Post-fix, adding the key can only ADD a
+    reachable deployment; it can never remove one the keyless box had.
+    """
+    cfg = _azure_shipped()
+    declared = shipped_catalog(cfg=cfg)
+    probe = DeclaredDeploymentProbe(cfg.known_deployments)
+
+    keyless = active_catalog(declared, available_credentials=NO_KEYS, deployment_probe=probe)
+    keyed = active_catalog(
+        declared, available_credentials=_azure_only_key(), deployment_probe=probe
+    )
+
+    def reachable(catalog: object) -> set[tuple[str, str]]:
+        return {(d.model_group, d.model_id) for d in catalog.deployments}  # type: ignore[attr-defined]
+
+    assert reachable(keyless) <= reachable(
+        keyed
+    ), "a working credential removed a deployment the keyless box could serve"

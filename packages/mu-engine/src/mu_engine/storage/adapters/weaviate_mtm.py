@@ -85,7 +85,11 @@ from mu_engine.storage.authz import require_shared_caller_identity_set
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
-from mu_engine.storage.errors import MtmPointAbsentError, StorageError
+from mu_engine.storage.errors import (
+    EmbeddingDimensionMismatchError,
+    MtmPointAbsentError,
+    StorageError,
+)
 from mu_engine.storage.mappers.qdrant_mapper import payload_str_list, point_id
 from mu_engine.storage.mappers.weaviate_mapper import WeaviateMapper, collection_name, tenant_name
 from mu_engine.storage.ports import QdrantPoint
@@ -487,6 +491,21 @@ class WeaviateMtmAdapter:
     async def _upsert_impl(self, item: MemoryItem) -> None:
         tenant = await self._ensure_partition(item.namespace)
         row = self._mapper.to_store(item)
+        # EmbeddingDimensionMismatchError (errors.py docstring has the full rationale): unlike
+        # Qdrant (`VectorParams(size=self._dim, ...)`) and pgvector (`vector({self._dim})`),
+        # Weaviate's self-provided vector config declares NO schema-level dimension, and native
+        # multi-tenancy means each tenant's shard only learns its own width from whichever
+        # object reaches it FIRST — a wrong-width write to a brand-new tenant would otherwise be
+        # accepted silently and poison that shard forever, the same silent-corruption shape as
+        # D1 / AD-213. Checked client-side, before the write, because the store cannot be
+        # trusted to catch it.
+        if len(row.vector) != self._dim:
+            raise EmbeddingDimensionMismatchError(
+                f"WeaviateMtmAdapter.upsert: memory {item.id!r} "
+                f"(ns={item.namespace.to_prefix()!r}) carries a {len(row.vector)}-dim vector, "
+                f"this adapter is bound to dim={self._dim} (class {self._class!r}). Refusing to "
+                "write — Weaviate has no schema-level dimension guarantee to catch this itself."
+            )
         properties = self._properties_for(row, item)
         scoped = self._weaviate.collections.get(self._class).with_tenant(tenant)
         # Neither ``insert`` nor ``replace`` alone is an upsert (verified live: ``insert`` 422s
@@ -698,6 +717,26 @@ class WeaviateMtmAdapter:
         session_scope: str | None = None,
     ) -> list[Scored[MemoryItem]]:
         if not await self._partition_ready(ns):
+            return []
+        # ADVERSARIAL FINDING (VM-deployment lane, ADR 0050 spike item 3 — "try to construct a
+        # bypass"): an EMPTY ``caller_identity_set`` is a legal, meaningful Model-A control input
+        # (CANONICAL §7.4's own contract test names it: "authorizes NOTHING") and Qdrant/pgvector
+        # answer it with a clean ``[]``. Weaviate's GraphQL does not — ``ContainsAny`` with a
+        # zero-length value list is a SCHEMA ERROR (*"got operator 'ContainsAny', but no
+        # value<Type> field set"*, verified live), which without this guard surfaces as a raw
+        # ``StorageError`` instead of the empty result every other adapter gives for the same
+        # input. Not a security bypass — no row is ever returned, and `require_shared_caller_
+        # identity_set` below still fires for the actually-dangerous ``None`` case — but it is a
+        # genuine cross-backend behavioural divergence the config-driven "any registered vector
+        # backend swaps in behaviour-identically" claim (docker-compose.dev.yml's own pgvector
+        # comment) depends on not existing. Short-circuit BEFORE building a query Weaviate cannot
+        # parse, exactly the way an empty `authorized_ids` clause is uncompileable rather than
+        # merely unsatisfiable.
+        if (
+            ns.visibility is Visibility.SHARED
+            and caller_identity_set is not None
+            and len(caller_identity_set) == 0
+        ):
             return []
         match_prop, match_value = _resolve_namespace_match(ns, session_scope=session_scope)
         where = self._recall_where(ns, caller_identity_set, session_scope=session_scope)

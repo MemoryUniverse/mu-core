@@ -68,10 +68,7 @@ import uuid
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from mu_contracts.contracts.defaults import (
-    DEFAULT_CONSOLIDATE_LIMIT,
-    DEFAULT_RECALL_LIMIT,
-)
+from mu_contracts.contracts.defaults import DEFAULT_CONSOLIDATE_LIMIT
 from mu_contracts.contracts.memory import MemoryResponse
 from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallResult
 from mu_contracts.contracts.views import (
@@ -296,7 +293,7 @@ class LocalMemory:
         user: str = _DEFAULT_USER,
         session: str | None = None,
         tier: MemoryTier | None = None,
-        limit: int = DEFAULT_RECALL_LIMIT,
+        limit: int | None = None,
         # SHARED-plane fields — same discipline as :meth:`add`; always rejected when non-None
         # (LocalMemory is private-plane-only by construction).
         visibility: Visibility | None = None,
@@ -307,6 +304,14 @@ class LocalMemory:
         """Federate-live RANKED recall over the private-own partition (STM floor ⊕ MTM dense ⊕ LTM
         graph), fused once. LOCAL mode has no shared arm (spec §3.2). ``tier`` narrows to one
         channel; ``None`` runs all three.
+
+        ``limit=None`` (the default, ACCURACY-PLAN-0831.md item 4 — "FULL-LOCAL must stay good on
+        the same mechanism" as every other plane) asks the engine to DERIVE the width from the
+        configured model's context budget (`RecallService._effective_limit`) instead of the old
+        hardcoded ``DEFAULT_RECALL_LIMIT`` constant — an explicit ``limit=`` here always overrides
+        it, unchanged. In heuristic mode (no LLM configured) derivation has no context budget to
+        read and falls back to that SAME static default, so this stays 100% backward compatible
+        for a caller that never passes ``limit`` at all in heuristic mode.
 
         Returns the canonical :class:`~mu_contracts.contracts.recall.RecallResult` (Decision B) —
         the un-collapsed engine result (``namespace``/``channels_run``/``generated_at``, richer
@@ -335,7 +340,7 @@ class LocalMemory:
         user: str = _DEFAULT_USER,
         session: str | None = None,
         tier: MemoryTier | None = None,
-        limit: int = DEFAULT_RECALL_LIMIT,
+        limit: int | None = None,
     ) -> RecallResult:
         """mem0 muscle-memory alias for :meth:`recall` (spec verb-alias policy, §CC-6): ``recall``
         is the canonical read verb; ``search`` is a documented alias, one single behaviour."""
@@ -371,7 +376,7 @@ class LocalMemory:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
-        limit: int = DEFAULT_RECALL_LIMIT,
+        limit: int | None = None,
         max_chars: int | None = None,
     ) -> ContextView:
         """Assemble a context window from recalled hits by DETERMINISTIC concatenation (no LLM
@@ -395,7 +400,7 @@ class LocalMemory:
         *,
         user: str = _DEFAULT_USER,
         session: str | None = None,
-        limit: int = DEFAULT_RECALL_LIMIT,
+        limit: int | None = None,
     ) -> str:
         """Synthesise an answer over recalled context via the configured LLM's ANSWER task.
         Heuristic mode (``llm=None``, the default) refuses loudly — mu-local NEVER returns an

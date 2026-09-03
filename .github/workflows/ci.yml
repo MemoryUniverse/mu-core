@@ -198,6 +198,7 @@ jobs:
           packages/mu-engine/src
           packages/mu-local/src
           packages/mu-engine-server/src
+          eval/mu_eval
 
       # THE SDK-DRIFT GATE, run the way that CANNOT skip. `check-sdks` reports an absent sibling as
       # a FAILURE naming the path it looked in, so if either checkout above is ever removed,
