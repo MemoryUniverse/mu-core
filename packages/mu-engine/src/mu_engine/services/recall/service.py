@@ -28,6 +28,7 @@ import structlog
 from mu_contracts.contracts.defaults import DEFAULT_RECALL_LIMIT
 from mu_contracts.domain.events import DegradeReason
 from mu_contracts.domain.model.scope import ClientScope
+from mu_contracts.ports.model import SparseEncoderPort
 from mu_contracts.ports.observability import MetricSink, Tracer
 from mu_contracts.ports.time import Clock
 from mu_engine.platform.observability import NoopMetricSink, NoopTracer, sanitize_label_value
@@ -64,6 +65,7 @@ class RecallService:
         *,
         embedder: EmbeddingPort,
         private_ranker: RecallRanker,
+        sparse_encoder: SparseEncoderPort | None = None,
         shared_recall: SharedRecallPort,
         authz: RecallAuthorizationFilter,
         fusion: FusionStrategy,
@@ -74,6 +76,14 @@ class RecallService:
         context_budget: ContextBudgetPort | None = None,
     ) -> None:
         self._embedder = embedder
+        # mtm-retrieval-design.md §1.3, "the M2 resolution": this façade is the ONE place that
+        # already holds the EmbeddingPort, so it is also where the SPARSE encoder lives. It
+        # encodes the query to a `SparseQuery` value object here, at the boundary, and threads it
+        # down beside `query_vec` — so BM25 gets the query TOKENS it needs without any tier repo
+        # ever receiving raw text (CANONICAL §6-P2/m4). `None` (the default, and what the
+        # composition root wires whenever `RecallSettings.sparse_enabled` is off) leaves every
+        # arm dense-only and byte-identical to the pre-hybrid engine.
+        self._sparse_encoder = sparse_encoder
         self._private_ranker = private_ranker
         self._shared_recall = shared_recall
         self._authz = authz
@@ -118,6 +128,15 @@ class RecallService:
 
             # (2) embed the query ONCE at the façade boundary (§6-P2/m4).
             query_vec = (await self._embedder.embed([q.text]))[0]
+            #     ... and, when the hybrid MTM arm is wired, encode the SPARSE query once here
+            #     too, for the same reason the dense embed happens once: both arms of the same
+            #     intra-MTM fuse must be derived from the same query text, and neither belongs
+            #     in a tier adapter.
+            sparse_query = (
+                self._sparse_encoder.encode_query(q.text)
+                if self._sparse_encoder is not None
+                else None
+            )
 
             # (3) PRIVATE arm — own partition, authorized_ids=None (§1.4 Layer 1 authorizes it).
             private = await self._private_ranker.rank(
@@ -127,6 +146,7 @@ class RecallService:
                 limit=effective_limit,
                 channels=q.channels,
                 caller_identity_set=private_caller,
+                sparse_query=sparse_query,
             )
 
             # (4) SHARED arm — authorized at the source; failure is a NAMED degrade, not a drop.

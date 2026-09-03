@@ -27,10 +27,11 @@ truncated in storage. SHARED and any session-narrowed PRIVATE recall keep the ex
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Final
 
 from qdrant_client import AsyncQdrantClient, models
 
+from mu_contracts.ports.model import SparseEncoderPort
 from mu_engine.platform.decorators import retry_io
 from mu_engine.storage.authz import require_shared_caller_identity_set
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
@@ -48,12 +49,36 @@ from mu_engine.storage.tier_capabilities import with_pin_group
 
 __all__ = ["QdrantMtmAdapter"]
 
+
+def _dense_of(raw: object) -> list[float]:
+    """The DENSE vector out of whatever ``with_vectors=True`` returned.
+
+    A dense-only collection answers with a bare ``list[float]``; a hybrid collection answers with
+    a NAME->vector map in which the unnamed dense vector sits under the empty-string key and
+    ``sparse`` holds a ``SparseVector`` (which is not a dense vector and must never be coerced
+    into one). Returning ``[]`` for anything unrecognised preserves this adapter's existing
+    contract exactly: ``QdrantMapper.from_store`` leaves ``item.embedding`` unset for an empty
+    vector rather than fabricating one (the D1 "never substitute a zero vector" rule).
+    """
+    if isinstance(raw, dict):
+        raw = raw.get(_UNNAMED_DENSE_KEY, [])
+    if not isinstance(raw, list):
+        return []
+    return [float(v) for v in raw if isinstance(v, int | float)]
+
+
 # Constructor DEFAULT only (DEV-STANDARDS rule 3: no hardcoded constant lives in adapter LOGIC).
 # The live value is DI-threaded from the central Settings tree
 # (``QdrantSettings.store_io_timeout_s``) by the ``STORE_REGISTRY`` factory
 # (``mu_engine.storage.factories._build_qdrant``); a bare ``QdrantMtmAdapter(client, dim=...)``
 # (e.g. in a unit test) still gets a sane, named default.
 _DEFAULT_STORE_IO_TIMEOUT_S = 10.0
+
+# The collection's NAMED sparse vector (mtm-retrieval-design.md §1.2: `sparse` —
+# `SparseVectorParams()` for BM25-style / SPLADE term weights). The dense vector alongside it
+# stays UNNAMED, which Qdrant addresses by the empty-string key in the per-point vector map.
+_SPARSE_VECTOR_NAME: Final = "sparse"
+_UNNAMED_DENSE_KEY: Final = ""
 
 # Per-page size for the bounded demotion-candidate scroll (``scan_for_demotion`` below). The
 # caller-supplied ``limit`` (from ``LifecycleSettings.max_items_per_user_sweep``) is the hard cap;
@@ -209,12 +234,29 @@ class QdrantMtmAdapter:
         *,
         dim: int,
         store_io_timeout_s: float = _DEFAULT_STORE_IO_TIMEOUT_S,
+        sparse_encoder: SparseEncoderPort | None = None,
     ) -> None:
         self._qdrant = client
         self._dim = dim
         self._mapper = QdrantMapper(dim=dim)
         self._ensured: set[str] = set()
         self._retry = retry_io(timeout_s=store_io_timeout_s)
+        # HYBRID MTM (mtm-retrieval-design.md §1.2/§1.3). ``None`` -> this adapter is
+        # byte-identical to its dense-only self: no sparse vector in the collection shape, no
+        # sparse vector written, and ``semantic``'s ``sparse_query`` argument (which has been in
+        # the port signature, and ignored by every implementation, since the port was written)
+        # continues to be ignored. The composition root supplies one only when
+        # ``RecallSettings.sparse_enabled`` is on.
+        self._sparse_encoder = sparse_encoder
+        # Per-collection sparse CAPABILITY, resolved once at ensure-time. This is not the same
+        # question as "is an encoder configured": a collection created by an earlier version of
+        # this adapter has no ``sparse`` vector, and Qdrant 1.12.5 CANNOT add one afterwards —
+        # verified live against the deployment before this code was written:
+        # ``update_collection(sparse_vectors_config=...)`` answers
+        # ``400 Wrong input: Not existing vector name error: sparse``. So the capability is a
+        # property of the COLLECTION, discovered from the server, never assumed from config; a
+        # pre-existing collection keeps working dense-only instead of failing every read.
+        self._sparse_capable: dict[str, bool] = {}
 
     async def _ensure_collection(self, ns: Namespace) -> str:
         name = collection_name(ns, self._dim)
@@ -224,6 +266,23 @@ class QdrantMtmAdapter:
             await self._qdrant.create_collection(
                 collection_name=name,
                 vectors_config=models.VectorParams(size=self._dim, distance=models.Distance.COSINE),
+                # The DENSE vector stays UNNAMED — deliberately a delta from
+                # mtm-retrieval-design.md §1.2, which names it ``dense`` (recorded in
+                # ARCHITECTURE-DELTAS.md as AD-222). Naming it would rewrite the vector shape of
+                # every point this adapter has ever written and every read site that unpacks it,
+                # for no retrieval gain; Qdrant accepts an unnamed dense vector and a NAMED sparse
+                # vector in one collection (verified live), which is all the hybrid query needs.
+                #
+                # ``Modifier.IDF`` is what makes this BM25 rather than raw term-frequency
+                # matching: Qdrant computes each term's inverse document frequency from THIS
+                # collection's real statistics at query time, so the encoder never has to make a
+                # corpus pass and stopwords are suppressed by arithmetic instead of by a
+                # hardcoded word list (``providers/sparse_encoder.py`` module docstring).
+                sparse_vectors_config=(
+                    {_SPARSE_VECTOR_NAME: models.SparseVectorParams(modifier=models.Modifier.IDF)}
+                    if self._sparse_encoder is not None
+                    else None
+                ),
             )
             for field in _KEYWORD_INDEXES:
                 await self._qdrant.create_payload_index(
@@ -243,8 +302,46 @@ class QdrantMtmAdapter:
                 field_name=bool_field,
                 field_schema=models.PayloadSchemaType.BOOL,
             )
+        # Resolve the collection's REAL sparse capability from the server (see ``__init__``:
+        # config cannot answer this for a collection that predates the hybrid shape).
+        self._sparse_capable[name] = await self._collection_has_sparse(name)
         self._ensured.add(name)
         return name
+
+    async def _sparse_capable_for(self, name: str) -> bool:
+        """Memoized sparse capability for one collection, resolved on FIRST NEED.
+
+        The write path learns this via :meth:`_ensure_collection`, but the read path never calls
+        that — so a process that only RECALLS (a fresh daemon, an eval arm querying a corpus
+        another process ingested, any read replica) would find nothing in the cache and silently
+        fall back to dense-only retrieval forever. That is the worst possible failure shape for
+        this feature: no error, no log, just the sparse arm quietly not running and a measurement
+        that looks like "hybrid did not help". Resolving lazily here makes read-only processes
+        behave identically to read-write ones.
+        """
+        cached = self._sparse_capable.get(name)
+        if cached is None:
+            cached = await self._collection_has_sparse(name)
+            self._sparse_capable[name] = cached
+        return cached
+
+    async def _collection_has_sparse(self, name: str) -> bool:
+        """Does this collection actually carry the named ``sparse`` vector?
+
+        Asked of the SERVER, once per collection per process. A pre-existing dense-only
+        collection answers ``False`` and every path below degrades to the dense-only behaviour
+        rather than issuing a hybrid query the server would reject — the alternative (assuming
+        the configured encoder implies a hybrid collection) turns a harmless version skew into a
+        total recall outage.
+        """
+        if self._sparse_encoder is None:
+            return False
+        info = await self._qdrant.get_collection(name)
+        sparse_vectors = getattr(info.config.params, "sparse_vectors", None)
+        return isinstance(sparse_vectors, dict) and _SPARSE_VECTOR_NAME in sparse_vectors
+
+    def _sparse_vector_for(self, sq: SparseQuery) -> models.SparseVector:
+        return models.SparseVector(indices=list(sq.indices), values=list(sq.values))
 
     async def _raise_if_write_missed(
         self, name: str, ns: Namespace, memory_id: str, *, verb: str
@@ -293,8 +390,34 @@ class QdrantMtmAdapter:
         row.payload[_USER_PREFIX_KEY] = _user_prefix(item.namespace)
         await self._qdrant.upsert(
             collection_name=name,
-            points=[models.PointStruct(id=row.point_id, vector=row.vector, payload=row.payload)],
+            points=[
+                models.PointStruct(
+                    id=row.point_id,
+                    vector=self._point_vector(name, item.content, row.vector),
+                    payload=row.payload,
+                )
+            ],
         )
+
+    def _point_vector(self, name: str, content: str, dense: list[float]) -> models.VectorStruct:
+        """The per-point vector payload — a bare dense list (dense-only collection, unchanged) or
+        the ``{unnamed-dense, sparse}`` map a hybrid collection takes.
+
+        ``mtm-retrieval-design.md`` §1.3 write path: *"sparse = self.sparse_encoder.encode(
+        item.content) if enabled"*. The sparse key is omitted when the content tokenises to
+        nothing (a URL-only or emoji-only memory): Qdrant has no use for an all-zero sparse
+        vector and the point must still be dense-retrievable, so an empty encode is a
+        dense-only point, never a write failure.
+        """
+        if self._sparse_encoder is None or not self._sparse_capable.get(name, False):
+            return dense
+        sq = self._sparse_encoder.encode(content)
+        if not sq.indices:
+            return {_UNNAMED_DENSE_KEY: dense}
+        return {
+            _UNNAMED_DENSE_KEY: dense,
+            _SPARSE_VECTOR_NAME: self._sparse_vector_for(sq),
+        }
 
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         return await self._retry(self._get_impl)(ns, memory_id)
@@ -317,8 +440,7 @@ class QdrantMtmAdapter:
         if not records:
             return None
         rec = records[0]
-        raw = rec.vector if isinstance(rec.vector, list) else []
-        vector = [float(v) for v in raw if isinstance(v, int | float)]
+        vector = _dense_of(rec.vector)
         payload: dict[str, Any] = rec.payload or {}
         item = self._mapper.from_store(
             QdrantPoint(
@@ -446,23 +568,81 @@ class QdrantMtmAdapter:
         name = collection_name(ns, self._dim)
         if not await self._qdrant.collection_exists(name):
             return []
-        hits = await self._qdrant.query_points(
-            collection_name=name,
-            query=query_vector,
-            query_filter=self._recall_filter(ns, caller_identity_set, session_scope=session_scope),
-            limit=limit,
-            with_payload=True,
-            with_vectors=True,
+        # ONE authz filter object, compiled once and applied to EVERY arm below (Model A,
+        # CANONICAL §7.4) — the outer fusion query AND both prefetches. There is no code path
+        # here that builds a second one.
+        #
+        # WHICH of those placements actually enforces the tenancy boundary was MEASURED against
+        # the live deployment rather than assumed, because the assumption was wrong: Qdrant
+        # 1.12.5 PROPAGATES the outer `query_filter` down into every prefetch, so removing the
+        # per-prefetch `filter=` below leaks nothing and loses no recall (verified — a foreign
+        # row carrying the query's rare term is absent from the result either way, and an
+        # own-namespace row that BM25 ranks below nine foreign rows is still returned). The
+        # outer `query_filter` is therefore the gate; the per-prefetch filters are belt-and-
+        # suspenders, kept deliberately for the same reason `ranker.rank`'s fail-closed gate is
+        # kept even though every adapter now refuses a missing caller set too (AD-179): a
+        # guarantee that rests on one layer remembering is the shape that produced C2 and C3.
+        # They are NOT load-bearing today and no test can prove they are — stated here so a
+        # future reader does not mistake redundancy for the mechanism.
+        recall_filter = self._recall_filter(ns, caller_identity_set, session_scope=session_scope)
+        # A `SparseVector` or nothing — computed rather than flagged, so the type checker sees
+        # the narrowing the branch below depends on without an `assert` standing in for it.
+        # `None` covers all three "no lexical arm" cases: no encoder configured upstream, a query
+        # that tokenised to nothing, and a collection that predates the hybrid shape.
+        sparse_vec = (
+            self._sparse_vector_for(sparse_query)
+            if sparse_query is not None
+            and sparse_query.indices
+            and await self._sparse_capable_for(name)
+            else None
         )
+        if sparse_vec is not None:
+            # INTRA-MTM fusion (mtm-retrieval-design.md §1.1): dense ⊕ sparse are fused HERE,
+            # inside the MTM channel, by Qdrant's own RRF — and the recall service's
+            # cross-channel `FusionStrategy` still sees exactly one channel and one list. The
+            # two fusion layers are deliberately not conflated (§1.1 table).
+            #
+            # Both prefetches take the SAME `limit` the caller asked this channel for, rather
+            # than the spec's fixed `dense_prefetch_limit`/`sparse_prefetch_limit` = 50: that
+            # `limit` is already the derived, width-scaled channel pool
+            # (`ranker._effective_pool`), and AD-219 measured what a per-arm constant that does
+            # NOT scale with the requested width costs — recall@10 0.4093 -> 0.4546 purely from
+            # letting the pool follow the width. A fixed 50 here would reintroduce that trap on
+            # the sparse arm. Recorded as AD-222.
+            hits = await self._qdrant.query_points(
+                collection_name=name,
+                prefetch=[
+                    models.Prefetch(query=query_vector, filter=recall_filter, limit=limit),
+                    models.Prefetch(
+                        query=sparse_vec,
+                        using=_SPARSE_VECTOR_NAME,
+                        filter=recall_filter,
+                        limit=limit,
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                query_filter=recall_filter,
+                limit=limit,
+                with_payload=True,
+                with_vectors=True,
+            )
+        else:
+            hits = await self._qdrant.query_points(
+                collection_name=name,
+                query=query_vector,
+                query_filter=recall_filter,
+                limit=limit,
+                with_payload=True,
+                with_vectors=True,
+            )
+        channel = RecallChannel.MTM_HYBRID if sparse_vec is not None else RecallChannel.MTM_DENSE
         out: list[Scored[MemoryItem]] = []
         for rank, hit in enumerate(hits.points):
-            raw = hit.vector if isinstance(hit.vector, list) else []
-            vector = [float(v) for v in raw if isinstance(v, int | float)]
             payload: dict[str, Any] = hit.payload or {}
             item = self._mapper.from_store(
                 QdrantPoint(
                     point_id=str(hit.id),
-                    vector=vector,
+                    vector=_dense_of(hit.vector),
                     sparse=None,
                     payload=payload,
                     collection=name,
@@ -472,7 +652,7 @@ class QdrantMtmAdapter:
                 Scored(
                     item=item,
                     score=float(hit.score),
-                    channel=RecallChannel.MTM_DENSE,
+                    channel=channel,
                     rank=rank,
                 )
             )

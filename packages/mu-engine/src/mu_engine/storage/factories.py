@@ -140,6 +140,15 @@ def _build_qdrant(*, dim: int, **cfg: Any) -> QdrantMtmAdapter:
         client,
         dim=dim,
         store_io_timeout_s=cfg.get("store_io_timeout_s", qdrant_settings.store_io_timeout_s),
+        # HYBRID MTM (mtm-retrieval-design.md §1.2/§1.3): the sparse producer is threaded in
+        # by the caller, because the setting that governs it (`RecallSettings.sparse_enabled`)
+        # lives on `EngineSettings`, which this store factory deliberately cannot reach —
+        # `get_settings()` here resolves only the STORAGE tree. The composition root holds both
+        # and is the one place that can keep the WRITE side (this adapter stamping a sparse
+        # vector onto every point) and the READ side (`RecallService` encoding the query) in
+        # step; configuring them apart yields a store full of sparse vectors nobody queries, or
+        # a sparse query against points that carry none — both silent zero-value states.
+        sparse_encoder=cfg.get("sparse_encoder"),
     )
 
 

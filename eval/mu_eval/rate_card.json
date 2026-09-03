@@ -1,0 +1,7 @@
+{
+  "gpt-5": {
+    "prompt_usd_per_1m": 1.25,
+    "completion_usd_per_1m": 10.0,
+    "source": "docs/tracking/MULTIHOP-AND-LLM-TESTS-0831.md §7 -- the gpt-5 list rate the author had on hand. EXPLICITLY NOT verified against the live Azure Foundry price sheet for the libo-ai resource (that doc's own words: 'not verified in this session against the Azure Foundry price sheet for the libo-ai resource; verify before quoting it to anyone'). Verify, then update this number -- a JSON edit, no code change needed. Matched by substring against the SERVED model string (e.g. 'gpt-5-2025-08-07'), so this one entry covers every dated snapshot."
+  }
+}

@@ -62,9 +62,10 @@ from mu_eval.judge import (
     parse_judgement,
 )
 from mu_eval.locomo import CATEGORY_NAMES, Conversation, LabelledQuery
-from mu_eval.openai_chat import OpenAICompatChat, RateLimitError
+from mu_eval.openai_chat import CompletionResult, OpenAICompatChat, RateLimitError
 from mu_eval.repeats import RepeatSummary, summarize_repeats
 from mu_eval.runner import gold_ids_present
+from mu_eval.usage import CallUsage
 
 __all__ = [
     "ANSWER_SYSTEM_PROMPT",
@@ -72,6 +73,7 @@ __all__ = [
     "CategoryStats",
     "QueryResult",
     "RepeatedAnswerQualityReport",
+    "eligible_query_count",
     "run_answer_quality",
     "run_answer_quality_repeated",
 ]
@@ -107,6 +109,14 @@ class QueryResult(BaseModel):
     # and got it wrong anyway); `gold_in_context=False` is a RETRIEVAL failure (the model never
     # had a chance). See `CategoryStats.wrong_retrieved`/`wrong_not_retrieved` for the aggregate.
     gold_in_context: bool
+
+    # PER-ROW COST (CLAUDE.md eval lane: "per-row usage too, not only totals, so an expensive
+    # category can be found"). One `CallUsage` per LLM call this row made — `None` only when the
+    # row predates this fix (an older artifact) or the call itself never returned a usage block
+    # (`usage.parse_call_usage` docstring). Two separate fields, not one summed total, because the
+    # answer and judge calls are usually different models at different prices.
+    answer_usage: CallUsage | None = None
+    judge_usage: CallUsage | None = None
 
 
 class CategoryStats(BaseModel):
@@ -189,19 +199,31 @@ class AnswerQualityReport(BaseModel):
     # turn "the engine gained a setting" into "every older artifact fails to load".
     provenance: dict[str, Any] | None = None
 
+    # Same merge-at-write-time pattern as `provenance` (`__main__._cmd_answer_quality`: `report.
+    # model_dump(...) | {"provenance": ..., "usage": ...}`), and declared here for the identical
+    # reason `provenance` is: `extra="forbid"` above means an undeclared merged key is a hard
+    # ValidationError the moment `mu_eval compare` re-opens the artifact
+    # (`usage.RunUsage.model_dump(mode="json")` — see `usage.build_run_usage`).
+    usage: dict[str, Any] | None = None
+
 
 async def _complete_with_retry(
     chat: OpenAICompatChat, *, system: str, user: str, max_tokens: int
-) -> str:
+) -> CompletionResult:
     """ONE reactive retry on 429 — same backoff contract as ``PacedOpenAICompatChat`` (sleep the
     server's own ``Retry-After``/reset header, never retry instantly), minus the proactive
     per-request floor gpt-5's quota does not need. Concurrency is gated by the CALLER (the whole
-    per-query pipeline, recall included — see ``run_answer_quality``'s ``sem``), not here."""
+    per-query pipeline, recall included — see ``run_answer_quality``'s ``sem``), not here.
+
+    Returns ``CompletionResult`` (content + usage IN-BAND), not a bare string: this coroutine runs
+    concurrently, up to ``concurrency`` at a time, against ONE shared chat client per role — see
+    ``CompletionResult``'s own docstring for why reading ``chat.last_usage`` after the fact would
+    be a race under that concurrency, and why returning it bundled with the content is not."""
     try:
-        return await chat.complete(system=system, user=user, max_tokens=max_tokens)
+        return await chat.complete_with_usage(system=system, user=user, max_tokens=max_tokens)
     except RateLimitError as exc:
         await asyncio.sleep(exc.retry_after_s if exc.retry_after_s is not None else 5.0)
-        return await chat.complete(system=system, user=user, max_tokens=max_tokens)
+        return await chat.complete_with_usage(system=system, user=user, max_tokens=max_tokens)
 
 
 def _eligible_queries(
@@ -226,6 +248,17 @@ def _eligible_queries(
             continue
         eligible.append(query)
     return eligible, skipped_adversarial, skipped_no_gold
+
+
+def eligible_query_count(
+    conversations: Sequence[Conversation], max_queries_per_sample: int | None = None
+) -> int:
+    """Total rows a ``run_answer_quality`` call over ``conversations`` will actually score — the
+    SAME admission rule ``_eligible_queries`` applies per-conversation, summed. Public (not
+    ``_``-prefixed like its per-conversation sibling) because the CLI needs it BEFORE a run starts,
+    to print a projected cost (``usage.project_cost``) from the real row count rather than a guess
+    — the whole point being that a run can be abandoned before it is paid for, not after."""
+    return sum(len(_eligible_queries(c, max_queries_per_sample)[0]) for c in conversations)
 
 
 def _stats(rows: Sequence[QueryResult]) -> CategoryStats:
@@ -292,9 +325,7 @@ async def run_answer_quality(
     skipped_adversarial = 0
     skipped_no_gold = 0
     rows: list[QueryResult] = []
-    total_eligible = sum(
-        len(_eligible_queries(c, max_queries_per_sample)[0]) for c in conversations
-    )
+    total_eligible = eligible_query_count(conversations, max_queries_per_sample)
     done = 0
 
     for conversation in conversations:
@@ -365,13 +396,14 @@ async def run_answer_quality(
                         "\n".join(f"- {_context_line(item.content)}" for item in result.items)
                         or "(no memories retrieved)"
                     )
-                    generated = await _complete_with_retry(
+                    answer_result = await _complete_with_retry(
                         answer_chat,
                         system=ANSWER_SYSTEM_PROMPT,
                         user=answer_prompt(context=context, question=query.question),
                         max_tokens=answer_max_tokens,
                     )
-                    verdict_raw = await _complete_with_retry(
+                    generated = answer_result.content
+                    judge_result = await _complete_with_retry(
                         judge_chat,
                         system=COMPACT_JUDGE_SYSTEM_PROMPT,
                         user=compact_judge_prompt(
@@ -379,6 +411,7 @@ async def run_answer_quality(
                         ),
                         max_tokens=judge_max_tokens,
                     )
+                    verdict_raw = judge_result.content
                 row = QueryResult(
                     query_id=query.query_id,
                     category=query.category,
@@ -388,6 +421,8 @@ async def run_answer_quality(
                     context_items=len(result.items),
                     verdict=parse_judgement(verdict_raw),
                     gold_in_context=gold_ids_present(result.items, index, gold),
+                    answer_usage=answer_result.usage,
+                    judge_usage=judge_result.usage,
                 )
                 done += 1
                 if progress is not None:

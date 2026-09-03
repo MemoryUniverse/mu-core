@@ -101,6 +101,7 @@ from mu_engine.providers.settings import (
     ModelSettings,
     default_local_catalog,
 )
+from mu_engine.providers.sparse_encoder import build_sparse_encoder
 from mu_engine.services.conflict.policy_resolver import ConflictPolicyResolver
 from mu_engine.services.conflict.ports import (
     InMemoryMemoryConflictPolicyStore,
@@ -342,8 +343,17 @@ class EngineContainer:
         )
 
         # (3) MTM (vector role: qdrant) — dim from the LIVE embedder.
+        #     HYBRID MTM (mtm-retrieval-design.md §1.2/§1.3): ONE sparse producer for the write
+        #     side (here) and the read side (`RecallService`, below) — see mu-local's identical
+        #     wiring for why they must be the same instance. `None` when
+        #     `RecallSettings.sparse_enabled` is off, which is the default.
+        self.sparse_encoder = build_sparse_encoder(self._engine_settings.recall)
         self.mtm: MtmTierRepository = STORE_REGISTRY.build(
-            "vector", _VECTOR_BACKEND, url=settings.qdrant.url, dim=self.embedder.dimension
+            "vector",
+            _VECTOR_BACKEND,
+            url=settings.qdrant.url,
+            dim=self.embedder.dimension,
+            sparse_encoder=self.sparse_encoder,
         )
         self._register_closer(self.mtm, "_qdrant")
 
@@ -604,6 +614,9 @@ class EngineContainer:
         self.recall = RecallService(
             embedder=self.embedder,
             private_ranker=ranker,
+            # §1.3 "M2 resolution": the façade encodes the sparse query at the same boundary it
+            # embeds the dense one — the SAME instance the MTM adapter writes with, above.
+            sparse_encoder=self.sparse_encoder,
             shared_recall=_NullSharedRecall(clock=self._clock),
             authz=authz,
             fusion=fusion,

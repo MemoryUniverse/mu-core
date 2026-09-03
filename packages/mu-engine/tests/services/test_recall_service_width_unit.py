@@ -60,6 +60,11 @@ class _RecordingRanker:
         limit: int,
         channels: RecallChannels,
         caller_identity_set: CallerIdentitySet | None,
+        # The RecallRanker Protocol grew an optional `sparse_query` (hybrid MTM,
+        # mtm-retrieval-design.md §1.3). This double accepts it and ignores it — width
+        # derivation is what is under test here, and a double that refused the argument would
+        # fail for a reason that has nothing to do with width.
+        sparse_query: object = None,
     ) -> RecallResult:
         self.limits_seen.append(limit)
         return RecallResult(

@@ -109,6 +109,7 @@ from mu_engine.providers.settings import (
     ModelSettings,
     default_local_catalog,
 )
+from mu_engine.providers.sparse_encoder import build_sparse_encoder
 from mu_engine.services.extract import (
     FactExtractorPort,
     HeuristicSpoExtractor,
@@ -379,10 +380,19 @@ class LocalContainer:
 
         # (3) MTM (vector role: qdrant by default) — dim from the LIVE embedder, built through
         #     the same STORE_REGISTRY seam.
+        #
+        #     HYBRID MTM (mtm-retrieval-design.md §1.2/§1.3): ONE sparse producer, built here and
+        #     threaded into BOTH sides that need it — this adapter (write side: the document term
+        #     weights stamped onto every point) and `RecallService` below (read side: the query
+        #     term weights). One instance, one config, so the two can never be enabled apart.
+        #     `RecallSettings.sparse_enabled=False` (the default) makes this `None` and the whole
+        #     engine is byte-identical to its dense-only self.
+        self.sparse_encoder = build_sparse_encoder(self._engine_settings.recall)
         self.mtm: MtmTierRepository = STORE_REGISTRY.build(
             "vector",
             storage.vector.backend,
             dim=self.embedder.dimension,
+            sparse_encoder=self.sparse_encoder,
             **self._vector_cfg(storage.vector),
         )
         self._register_closer(self.mtm, "_qdrant")
@@ -683,6 +693,9 @@ class LocalContainer:
         self.recall = RecallService(
             embedder=self.embedder,
             private_ranker=ranker,
+            # §1.3 "the M2 resolution": the façade encodes the sparse query at the SAME boundary
+            # it embeds the dense one — the same instance the MTM adapter writes with, above.
+            sparse_encoder=self.sparse_encoder,
             shared_recall=LocalNullSharedRecall(clock=self._clock),
             authz=authz,
             fusion=fusion,

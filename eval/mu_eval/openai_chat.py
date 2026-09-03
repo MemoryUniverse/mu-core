@@ -24,7 +24,16 @@ import asyncio
 import time
 from typing import Any
 
-__all__ = ["OpenAICompatChat", "PacedOpenAICompatChat", "RateLimitError"]
+from pydantic import BaseModel, ConfigDict
+
+from mu_eval.usage import CallUsage, UsageAccumulator, UsageTotals, parse_call_usage
+
+__all__ = [
+    "CompletionResult",
+    "OpenAICompatChat",
+    "PacedOpenAICompatChat",
+    "RateLimitError",
+]
 
 
 # Bounded retry for TRANSPORT-level timeouts only (see `_post_with_timeout_retry`). Measured
@@ -53,11 +62,30 @@ def _parse_float(value: str | None) -> float | None:
         return None
 
 
+class CompletionResult(BaseModel):
+    """``complete_with_usage``'s return: the visible content PLUS the exact usage that call
+    billed, bundled together on purpose. A caller that read ``chat.last_usage`` after the fact
+    (the pre-existing pattern ``__main__ judge-probe`` still uses) is only safe when nothing else
+    can run between the call and the read; under ``run_answer_quality``'s concurrency (many
+    coroutines sharing ONE chat client via a bounded semaphore), a second call can complete and
+    overwrite ``last_usage`` before a slower caller gets back to read it. Returning usage
+    IN-BAND with its own content removes that hazard entirely — there is nothing to race."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    content: str
+    usage: CallUsage | None = None
+    served_model: str | None = None
+
+
 class OpenAICompatChat:
     """``ChatPort`` over any ``/v1/chat/completions`` endpoint (ollama, vLLM, OpenAI, Azure
     Foundry's OpenAI-compatible route). Captures the raw usage block and rate-limit headers from
     the most recent call on ``last_usage`` / ``last_headers`` so a caller can prove or pace
-    against them, rather than a client that hides both."""
+    against them, rather than a client that hides both. Every call's usage is ALSO accumulated
+    onto ``usage_totals`` (run totals over this client's whole lifetime) and, per-call, returned
+    in-band by ``complete_with_usage`` — see that method's own docstring for why the mutable
+    ``last_usage`` alone is not safe to read under concurrency."""
 
     def __init__(
         self,
@@ -88,6 +116,10 @@ class OpenAICompatChat:
         # the last one) so a mid-run deployment change is visible rather than overwritten away.
         self.last_model: str | None = None
         self.served_models: set[str] = set()
+        # RUN-TOTALS usage, accumulated over this client's whole lifetime — same "accumulate on
+        # the instance" discipline `served_models` already uses, and safe under concurrency for
+        # the same reason (see `UsageAccumulator`'s own docstring): `.add()` never awaits.
+        self._usage_accumulator = UsageAccumulator()
         # gpt-5 (and other reasoning-family models behind an OpenAI-compatible route) reject the
         # legacy `max_tokens` field outright (400) and require `max_completion_tokens` instead;
         # LiteLLM translates this automatically for `azure/gpt-5`, but this is a hand-rolled
@@ -107,6 +139,39 @@ class OpenAICompatChat:
         temperature: float = 0.0,
         max_tokens: int | None = None,
     ) -> str:
+        """Unchanged public contract: returns the visible content only. Usage from this call is
+        still captured on ``last_usage``/``usage_totals`` (below) — only the RETURN VALUE is
+        unchanged, for every pre-existing caller (``judge_control_set``, ``judge-probe``,
+        ``PacedOpenAICompatChat``) that expects a bare string."""
+        result = await self._complete_full(
+            system=system, user=user, temperature=temperature, max_tokens=max_tokens
+        )
+        return result.content
+
+    async def complete_with_usage(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> CompletionResult:
+        """Same call as ``complete``, but returns usage IN-BAND with the content instead of
+        requiring the caller to read the mutable ``last_usage`` afterward — see
+        ``CompletionResult``'s own docstring for why that matters under concurrency. This is what
+        ``run_answer_quality`` uses to attach a per-row usage figure to every graded query."""
+        return await self._complete_full(
+            system=system, user=user, temperature=temperature, max_tokens=max_tokens
+        )
+
+    async def _complete_full(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int | None,
+    ) -> CompletionResult:
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
@@ -128,11 +193,22 @@ class OpenAICompatChat:
         response.raise_for_status()
         body: Any = response.json()
         self.last_usage = body.get("usage")
+        call_usage = parse_call_usage(self.last_usage)
+        self._usage_accumulator.add(call_usage)
         served_model = body.get("model")
-        if isinstance(served_model, str) and served_model:
-            self.last_model = served_model
-            self.served_models.add(served_model)
-        return str(body["choices"][0]["message"]["content"])
+        served_model_str = served_model if isinstance(served_model, str) and served_model else None
+        if served_model_str is not None:
+            self.last_model = served_model_str
+            self.served_models.add(served_model_str)
+        content = str(body["choices"][0]["message"]["content"])
+        return CompletionResult(content=content, usage=call_usage, served_model=served_model_str)
+
+    @property
+    def usage_totals(self) -> UsageTotals:
+        """Run totals over this client's whole lifetime — see ``UsageAccumulator``'s docstring for
+        why accumulating here (rather than requiring every caller to sum per-call usage itself) is
+        the safe place to do it under ``run_answer_quality``'s bounded concurrency."""
+        return self._usage_accumulator.snapshot()
 
     @property
     def requested_model(self) -> str:
@@ -222,6 +298,10 @@ class PacedOpenAICompatChat:
     def requested_model(self) -> str:
         return self._inner.requested_model
 
+    @property
+    def usage_totals(self) -> UsageTotals:
+        return self._inner.usage_totals
+
     async def _wait_for_slot(self) -> None:
         now = time.monotonic()
         if self._next_allowed_at > now:
@@ -261,6 +341,36 @@ class PacedOpenAICompatChat:
             await asyncio.sleep(backoff_s)
             retry_start = time.monotonic()
             result = await self._inner.complete(
+                system=system, user=user, temperature=temperature, max_tokens=max_tokens
+            )
+            self._reschedule_from_headers(retry_start)
+            return result
+        self._reschedule_from_headers(request_start)
+        return result
+
+    async def complete_with_usage(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+    ) -> CompletionResult:
+        """Same pacing contract as ``complete``, returning usage in-band — see
+        ``OpenAICompatChat.complete_with_usage``'s own docstring for why."""
+        await self._wait_for_slot()
+        request_start = time.monotonic()
+        try:
+            result = await self._inner.complete_with_usage(
+                system=system, user=user, temperature=temperature, max_tokens=max_tokens
+            )
+        except RateLimitError as exc:
+            backoff_s = (
+                exc.retry_after_s if exc.retry_after_s is not None else self._min_interval_s * 2
+            )
+            await asyncio.sleep(backoff_s)
+            retry_start = time.monotonic()
+            result = await self._inner.complete_with_usage(
                 system=system, user=user, temperature=temperature, max_tokens=max_tokens
             )
             self._reschedule_from_headers(retry_start)

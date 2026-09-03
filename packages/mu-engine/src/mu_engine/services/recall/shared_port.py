@@ -22,6 +22,7 @@ from typing import Protocol, runtime_checkable
 
 from mu_contracts.domain.errors import BackendUnavailableError, StoreUnavailableError
 from mu_contracts.domain.model.recall import CallerIdentitySet
+from mu_contracts.ports.model import SparseEncoderPort
 from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.services.recall.dto import RecallQuery, RecallResult
 from mu_engine.services.recall.ranker import RecallRanker
@@ -51,11 +52,30 @@ class InProcessSharedRecall:
     repos (§4.2a). Embeds the query with the SAME EmbeddingPort seam the private arm uses (§6-P5;
     the remote REST adapter embeds server-side — this one embeds in-process, warm-once), then ranks
     the SHARED partition with the caller identity set. Store failures surface as the NAMED
-    :class:`SharedRecallUnavailableError` (never a silent empty)."""
+    :class:`SharedRecallUnavailableError` (never a silent empty).
 
-    def __init__(self, *, ranker: RecallRanker, embedder: EmbeddingPort) -> None:
+    AD-222 FOLLOW-UP (verified in this session): every shipped composition root wires this arm's
+    `RecallService` counterpart with a `SparseEncoderPort` and threads the resulting `SparseQuery`
+    into the PRIVATE ranker call (`RecallService.recall`, "M2 resolution") — but this port's own
+    `recall()` called `self._ranker.rank(...)` with no `sparse_query=` at all, defaulting it to
+    `None` three frames deep in the SAME `ThreeChannelRecallRanker` the private arm uses. The
+    result: with `sparse_enabled=True`, a private-session federated recall got hybrid dense+sparse
+    on its private half and silently fell back to dense-only on its shared half — an asymmetry
+    that showed up nowhere in AD-222's measurement (the LoCoMo eval harness never has shared data)
+    and was not among AD-222's three recorded gaps. `sparse_encoder` mirrors `RecallService.
+    __init__`'s own optional param exactly: `None` (the default) makes this byte-identical to the
+    pre-fix behaviour, so no committed measurement changes."""
+
+    def __init__(
+        self,
+        *,
+        ranker: RecallRanker,
+        embedder: EmbeddingPort,
+        sparse_encoder: SparseEncoderPort | None = None,
+    ) -> None:
         self._ranker = ranker
         self._embedder = embedder
+        self._sparse_encoder = sparse_encoder
 
     async def recall(
         self, q: RecallQuery, *, caller_identity_set: CallerIdentitySet
@@ -79,6 +99,14 @@ class InProcessSharedRecall:
             )
         try:
             vectors = await self._embedder.embed([q.text])
+            # SAME "M2 resolution" the private arm's façade applies (`RecallService.recall`):
+            # encode the sparse query once, here, at this arm's own boundary — `None` when no
+            # encoder is configured, leaving the MTM arm dense-only exactly as before this fix.
+            sparse_query = (
+                self._sparse_encoder.encode_query(q.text)
+                if self._sparse_encoder is not None
+                else None
+            )
             return await self._ranker.rank(
                 shared_ns,
                 q.text,
@@ -86,6 +114,7 @@ class InProcessSharedRecall:
                 limit=limit,
                 channels=q.channels,
                 caller_identity_set=caller_identity_set,
+                sparse_query=sparse_query,
             )
         except StoreUnavailableError as exc:  # a real shared-plane store failure → NAMED degrade
             raise SharedRecallUnavailableError("shared recall unavailable") from exc

@@ -355,6 +355,40 @@ class RecallSettings(BaseModel):
     # recall everywhere. Flip this back the moment a reranker is actually deployed, and re-measure
     # the SLO in the same pass.
     rerank_enabled: bool = Field(default=False)
+
+    # HYBRID MTM — dense ⊕ sparse inside the MTM channel (mtm-retrieval-design.md §1.2/§1.3,
+    # `HybridConfig`). Fusion tuning belongs under `RecallSettings`, never `ModelSettings`
+    # (§1.2: "IDF needs no model") — the BM25 producer downloads nothing and adds no LLM call to
+    # the read path.
+    #
+    # DARK BY DEFAULT, exactly like `rerank_enabled` above and for the same reason: with
+    # `sparse_enabled=False` the composition root wires NO encoder into the MTM adapter, so the
+    # collection shape, the write path and the read path are all byte-identical to the dense-only
+    # engine every existing test and every committed measurement was taken against. Turning it on
+    # is the A/B arm (`MU_RECALL__SPARSE_ENABLED=true`).
+    #
+    # WHY IT EXISTS AT ALL — the measurement, not a hunch. On the full 1,531-query LoCoMo corpus
+    # at `mu-core@0261c6a` (`docs/tracking/K10-VS-K30-RECONCILED-0903.md` §4), 74.7% of wrong
+    # answers at k=10 and 59.6% at k=30 never had the gold turn in context: the ceiling is
+    # first-stage retrieval, not synthesis. And that first stage is dense-alone — the shipped
+    # 3-channel fuse tracks its own MTM dense channel to within 0.5% relative at every cutoff
+    # from k=3 to k=60 (`RETRIEVAL-EVAL-0829.md` §13.1), with the LTM graph empty and the STM
+    # floor discounted to 0.1. A MiniLM bi-encoder over short conversational turns is weakest on
+    # exactly the rare proper nouns, dates and numbers LoCoMo questions turn on, which is the
+    # textbook sparse-retrieval strength.
+    sparse_enabled: bool = Field(default=False)
+    # Registry key carried into `SparseQuery.encoder` as provenance (§1.5:
+    # "bm25" | "splade" | "none"). Only "bm25" is implemented in-repo; "splade" is the design's
+    # named optional upgrade and would be a new provider, not a new branch here.
+    sparse_encoder: str = Field(default="bm25")
+    # BM25 knobs — the textbook Robertson/Sparck-Jones values, and the length-normalisation
+    # reference FastEmbed's own `Qdrant/bm25` ships. Named and overridable rather than literals
+    # buried in the encoder (DEV-STANDARDS rule 3); see `providers/sparse_encoder.py` for why
+    # `avg_len` is a constant and not a real corpus average.
+    sparse_bm25_k1: float = Field(default=1.2, ge=0.0)
+    sparse_bm25_b: float = Field(default=0.75, ge=0.0, le=1.0)
+    sparse_bm25_avg_len: float = Field(default=256.0, gt=0.0)
+    sparse_min_token_len: int = Field(default=2, ge=1)
     # ADR 0023 final combined value (recall-service-design.md:576, `rerank.py`'s own
     # `adaptive_rerank_gate` floor rule): the top-scored candidate in the pool must clear this
     # before ANY candidate in the pool is trusted — below it, the whole gate is empty and the

@@ -106,7 +106,7 @@ from mu_engine.services.recall.fusion import FusionStrategy, dedup_by_content_ha
 from mu_engine.services.recall.rerank_gate import AdaptiveRerankGate
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
-from mu_engine.storage.domain.recall import RecallChannel, Scored
+from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
 from mu_engine.storage.ports import LtmTierRepository, MtmTierRepository, StmTierRepository
 
 __all__ = ["RecallRanker", "StmScoringConfigError", "ThreeChannelRecallRanker"]
@@ -136,6 +136,7 @@ class RecallRanker(Protocol):
         limit: int,
         channels: RecallChannels,
         caller_identity_set: CallerIdentitySet | None,
+        sparse_query: SparseQuery | None = None,
     ) -> RecallResult: ...
 
 
@@ -210,7 +211,13 @@ class ThreeChannelRecallRanker:
         limit: int,
         channels: RecallChannels,
         caller_identity_set: CallerIdentitySet | None,
+        sparse_query: SparseQuery | None = None,
     ) -> RecallResult:
+        # `sparse_query` is the façade-encoded BM25 term weights (mtm-retrieval-design.md §1.3
+        # "the M2 resolution"): the RecallService holds the SparseEncoderPort exactly as it holds
+        # the EmbeddingPort, encodes the query ONCE at that boundary, and threads the resulting
+        # value object down beside `query_vec`. The tier repo still never receives raw text
+        # (CANONICAL §6-P2/m4). `None` -> the MTM arm is dense-only, byte-identical to before.
         # `query` (raw text) is used ONLY by the D1 STM relevance scorer below ("lexical" mode) —
         # the LTM graph arm remains the deterministic recency seed this phase (no LLM entity
         # resolution — see docstring); it never reads `query`.
@@ -259,7 +266,11 @@ class ThreeChannelRecallRanker:
                 )
                 mtm_t = tg.create_task(
                     self._mtm.semantic(
-                        ns, query_vec, limit=pool, caller_identity_set=caller_identity_set
+                        ns,
+                        query_vec,
+                        limit=pool,
+                        caller_identity_set=caller_identity_set,
+                        sparse_query=sparse_query,
                     )
                     if channels.mtm
                     else _empty_scored()

@@ -1,0 +1,12 @@
+{
+  "answer": {
+    "mean_prompt_tokens": 823,
+    "mean_completion_tokens": 400,
+    "source": "docs/tracking/MULTIHOP-AND-LLM-TESTS-0831.md §7. Prompt tokens are MEASURED over real locomo10.json turns (ANSWER_SYSTEM_PROMPT + answer_prompt() with 10 recalled turns). Completion tokens are this CLI's own --answer-max-tokens DEFAULT (400) used as an upper-bound placeholder -- NOT a measured mean; no run had ever accumulated usage before this fix. Overwrite this file, or pass --projection-source pointing at a real run's --out artifact, once one exists."
+  },
+  "judge": {
+    "mean_prompt_tokens": 127,
+    "mean_completion_tokens": 300,
+    "source": "docs/tracking/MULTIHOP-AND-LLM-TESTS-0831.md §7. Prompt tokens are MEASURED over the compact judge prompt. Completion tokens are this CLI's own --judge-max-tokens DEFAULT (300) used as an upper-bound placeholder -- NOT a measured mean; see the 'answer' entry's note."
+  }
+}

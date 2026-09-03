@@ -395,17 +395,124 @@ def _print_answer_quality_report(report: Any, *, elapsed: float) -> None:
         )
 
 
+def _fmt_cost(cost: float | None) -> str:
+    if cost is not None:
+        return f"${cost:.2f}"
+    return "UNPRICED (no rate for this model in the rate card)"
+
+
+def _print_projected_cost(
+    *,
+    n_queries: int,
+    answer_model: str,
+    judge_model: str,
+    rate_card_path: str | None,
+    means: dict[str, Any],
+) -> None:
+    """Printed BEFORE the run starts (CLAUDE.md eval lane): "a run can be abandoned before it is
+    paid for rather than after". ``means`` is ``{label: MeanQueryUsage}`` — see
+    ``_resolve_projection_means`` for where it comes from (a prior run's own measured mean when
+    ``--projection-source`` is given, else the shipped, honestly-labelled defaults).
+
+    AND IT IS FLUSHED, which is not a nicety here. ``_print`` writes to ``sys.stdout`` without
+    flushing; CPython block-buffers stdout (8 KB) whenever it is NOT a TTY, and every real
+    invocation of this harness is exactly that — ``vm_eval.sh`` runs it over ``ssh`` and callers
+    redirect it to a log. MEASURED on this VM: with the projection unflushed, the block did not
+    reach the terminal before the run's own ingest logging did, so the one line that says
+    "abandon now with Ctrl-C ... nothing has been spent yet" arrived AFTER the spending had
+    started. A pre-spend warning that is buffered past the spend is not a warning, so the flush
+    is part of the feature, not formatting."""
+    from mu_eval.usage import load_rate_card, project_cost
+
+    rate_card = load_rate_card(rate_card_path)
+    projected = project_cost(
+        n_queries=n_queries,
+        means=means,
+        models={"answer": answer_model, "judge": judge_model},
+        rate_card=rate_card,
+    )
+    _print(f"\nPROJECTED COST for {n_queries} eligible queries (answer+judge calls):")
+    _print("  (BEFORE this run starts — nothing has been spent yet)")
+    for label, info in sorted(projected.by_role.items()):
+        _print(
+            f"  {label:<8} ~{info['projected_prompt_tokens']:.0f} prompt + "
+            f"~{info['projected_completion_tokens']:.0f} completion tokens  ->  "
+            f"{_fmt_cost(info['estimated_cost_usd'])}"
+        )
+        _print(f"    source: {info['source']}")
+    _print(f"  TOTAL projected: {_fmt_cost(projected.total_estimated_cost_usd)}")
+    _print("  (abandon now with Ctrl-C if this is not worth it — nothing has been spent yet)")
+    sys.stdout.flush()
+
+
+def _resolve_projection_means(*, projection_source: str | None) -> dict[str, Any]:
+    """A REAL measured mean from ``--projection-source`` (a prior ``answer-quality --out``
+    artifact) when given and it actually carries a usage block, else the shipped defaults —
+    per-label, so a role missing from the prior artifact (e.g. it used ``--no-rows`` before usage
+    existed) still gets SOME basis rather than being silently dropped from the projection total."""
+    from mu_eval.usage import load_projection_defaults, mean_usage_from_prior_artifact
+
+    defaults = load_projection_defaults()
+    if projection_source is None:
+        return defaults
+    measured = mean_usage_from_prior_artifact(projection_source)
+    if measured is None:
+        _print(
+            f"  ! --projection-source {projection_source!r} carries no usage block "
+            "(an artifact from before this fix) — falling back to the shipped defaults."
+        )
+        return defaults
+    return {**defaults, **measured}  # measured wins per-label; defaults fill any gap
+
+
+def _print_usage_summary(usage: dict[str, Any]) -> None:
+    """The ACTUAL usage/cost this run billed — printed after the run the same way
+    ``_print_projected_cost`` prints the estimate before it, so the two are easy to compare by
+    eye."""
+    _print("\nUSAGE (actual, this run)")
+    for label, role in sorted(usage.get("by_role", {}).items()):
+        totals = role["totals"]
+        reasoning = totals.get("reasoning_tokens", 0)
+        reasoning_calls = totals.get("calls_with_reasoning_reported", 0)
+        reasoning_note = (
+            f"  reasoning={reasoning} (over {reasoning_calls}/{totals['calls']} calls "
+            "that reported it)"
+            if reasoning_calls
+            else "  reasoning=not reported by this deployment"
+        )
+        _print(
+            f"  {label:<8} calls={totals['calls']:<5} prompt={totals['prompt_tokens']:<8} "
+            f"completion={totals['completion_tokens']:<8} total={totals['total_tokens']:<8}"
+            f"{reasoning_note}"
+        )
+        _print(f"    served={role.get('served_models') or ['(none — no call completed)']}")
+        _print(f"    estimated cost: {_fmt_cost(role.get('estimated_cost_usd'))}")
+    _print(f"  TOTAL estimated cost: {_fmt_cost(usage.get('total_estimated_cost_usd'))}")
+
+
 async def _cmd_answer_quality(args: argparse.Namespace) -> int:
     import time
 
-    from mu_eval.answer_quality import run_answer_quality
+    from mu_eval.answer_quality import eligible_query_count, run_answer_quality
     from mu_eval.openai_chat import OpenAICompatChat
     from mu_eval.provenance import build_provenance
     from mu_eval.repeats import run_n_times, summarize_repeats
+    from mu_eval.usage import build_run_usage, load_rate_card
 
     conversations = load_locomo(args.dataset, samples=args.samples)
     run_id_base = args.run_id or uuid.uuid4().hex[:8]
     recall_limit = args.limit or max(args.k)
+
+    n_eligible = eligible_query_count(conversations, args.max_queries)
+    means = _resolve_projection_means(projection_source=args.projection_source)
+    _print_projected_cost(
+        n_queries=n_eligible,
+        answer_model=args.answer_model,
+        judge_model=args.judge_model,
+        rate_card_path=args.rate_card,
+        means=means,
+    )
+
     api_key = _resolve_api_key(args, subcommand="answer-quality")
     answer_chat = OpenAICompatChat(
         base_url=args.base_url,
@@ -461,7 +568,15 @@ async def _cmd_answer_quality(args: argparse.Namespace) -> int:
                 dataset_path=args.dataset,
                 chats={"answer": answer_chat, "judge": judge_chat},
             )
-            _write(args.out, report.model_dump(mode="json") | {"provenance": provenance})
+            usage = build_run_usage(
+                chats={"answer": answer_chat, "judge": judge_chat},
+                rate_card=load_rate_card(args.rate_card),
+            ).model_dump(mode="json")
+            _print_usage_summary(usage)
+            _write(
+                args.out,
+                report.model_dump(mode="json") | {"provenance": provenance, "usage": usage},
+            )
             return 0
 
         reports = await run_n_times(
@@ -486,12 +601,23 @@ async def _cmd_answer_quality(args: argparse.Namespace) -> int:
             dataset_path=args.dataset,
             chats={"answer": answer_chat, "judge": judge_chat},
         )
+        # NOTE: `answer_chat`/`judge_chat` are shared across ALL `args.num_runs` repeats (same
+        # instances threaded through every `_once` call above), so `usage_totals` here — like
+        # `provenance`'s own `served_models` above it — is the sum over EVERY repeat this
+        # invocation performed, not one run's share of it. Same precedent `provenance` already
+        # set for this repeated path; not a new inconsistency.
+        usage = build_run_usage(
+            chats={"answer": answer_chat, "judge": judge_chat},
+            rate_card=load_rate_card(args.rate_card),
+        ).model_dump(mode="json")
+        _print_usage_summary(usage)
         _write(
             args.out,
             {
                 "runs": [r.model_dump(mode="json") for r in reports],
                 "repeat_summary": summary.model_dump(mode="json"),
                 "provenance": provenance,
+                "usage": usage,
             },
         )
         return 0
@@ -534,8 +660,7 @@ async def _cmd_compare(args: argparse.Namespace) -> int:
         f"regressed (correct->wrong): {len(result.regressed)}"
     )
     _print(
-        f"unchanged_correct={result.unchanged_correct}  "
-        f"unchanged_wrong={result.unchanged_wrong}"
+        f"unchanged_correct={result.unchanged_correct}  unchanged_wrong={result.unchanged_wrong}"
     )
     _print(
         f"became_unparseable={len(result.became_unparseable)}  "
@@ -551,7 +676,15 @@ async def _cmd_compare(args: argparse.Namespace) -> int:
         _print(f"REGRESSED query ids: {result.regressed}")
     if result.fixed:
         _print(f"FIXED query ids: {result.fixed}")
+    # COST DELTA alongside the accuracy delta above (CLAUDE.md eval lane): a gain that triples the
+    # bill is a different decision from a free one, so it is never left for the reader to compute
+    # by hand from two separate artifacts.
+    _print(f"A cost: {_fmt_cost(result.a_cost_usd)}   B cost: {_fmt_cost(result.b_cost_usd)}")
+    if result.cost_delta_usd is not None:
+        _print(f"cost delta (B-A): {result.cost_delta_usd:+.2f}")
     _print(f"\n{result.verdict}")
+    if result.cost_note:
+        _print(result.cost_note)
     _write(args.out, result.model_dump(mode="json"))
     return 0
 
@@ -679,7 +812,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     aq.add_argument("--answer-model", required=True)
     aq.add_argument("--judge-model", required=True)
-    aq.add_argument("--answer-max-tokens", type=int, default=400)
+    # MEASURED 2026-09-03: a budget of 400 produced 12/12 EMPTY answers and 0.00% accuracy on a
+    # real gpt-5 run costing $0.07 for nothing. gpt-5 is a reasoning model and spends the completion
+    # budget on hidden reasoning before emitting a visible token: that run reported 4,800 completion
+    # tokens of which 4,800 were reasoning. The arm that actually produced the project's headline
+    # numbers used 1500, and at 1500 the same rows scored 27.3%. A default that silently returns
+    # nothing while charging full price is worse than one that costs slightly more, so the default
+    # is the budget that works. `K10-VS-K30-RECONCILED-0903.md` §2 already traced a past
+    # contradiction to exactly this, and the default was never moved.
+    aq.add_argument("--answer-max-tokens", type=int, default=1500)
     aq.add_argument("--judge-max-tokens", type=int, default=300)
     aq.add_argument("--concurrency", type=int, default=12)
     aq.add_argument(
@@ -689,6 +830,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     aq.add_argument("--omit-temperature", action="store_true", default=True)
     aq.add_argument("--no-rows", action="store_true", help="omit per-query rows from --out")
+    aq.add_argument(
+        "--rate-card",
+        default=None,
+        help="path to a JSON rate card ({model_substring: {prompt_usd_per_1m, "
+        "completion_usd_per_1m, source}}) — default: mu_eval/rate_card.json (config, not "
+        "hardcoded; edit that file, or point here, to correct or extend the priced models).",
+    )
+    aq.add_argument(
+        "--projection-source",
+        default=None,
+        help="path to a PRIOR answer-quality --out artifact whose own usage block (recorded by "
+        "this run's own predecessor) supplies the measured mean tokens/query for the PROJECTED "
+        "cost printed before this run starts. Default: mu_eval/projection_defaults.json, a "
+        "documented, EXPLICITLY-NOT-A-MEASURED-MEAN placeholder until a real run exists.",
+    )
     aq.add_argument(
         "--consolidate",
         action="store_true",

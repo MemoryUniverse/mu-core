@@ -31,6 +31,14 @@ class RecallChannel(StrEnum):
     STM_FLOOR = "stm_floor"
     MTM_DENSE = "mtm_dense"
     MTM_SPARSE = "mtm_sparse"
+    # The INTRA-MTM dense⊕sparse fused list (mtm-retrieval-design.md §1.1): one Qdrant
+    # Query-API call whose two prefetches the server fuses by RRF. It is a distinct value
+    # from MTM_DENSE/MTM_SPARSE because a fused hit cannot honestly claim either arm
+    # alone produced it, and store-level provenance is how a run proves the hybrid arm
+    # actually ran. The cross-channel fuse is unaffected: `ranker._channel_label` maps
+    # every non-ltm/non-stm channel to "mtm", so this is still ONE channel to the
+    # FusionStrategy, exactly as §1.1 requires.
+    MTM_HYBRID = "mtm_hybrid"
     LTM_GRAPH = "ltm_graph"
     LTM_FULLTEXT = "ltm_fulltext"
 

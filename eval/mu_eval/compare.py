@@ -83,6 +83,36 @@ class CompareResult(BaseModel):
 
     verdict: str  # a human-readable one-line summary of the above
 
+    # COST DELTA (CLAUDE.md eval lane: "the delta in accuracy alongside the delta in cost, because
+    # a gain that triples the bill is a different decision from a free one"). `None`, not 0.0, when
+    # either report carries no `usage` block (an artifact from before this fix, or a run whose
+    # model had no matching rate card entry) — a missing cost must never read as a FREE one.
+    a_cost_usd: float | None = None
+    b_cost_usd: float | None = None
+    cost_delta_usd: float | None = None  # b_cost_usd - a_cost_usd
+    cost_note: str | None = None  # None when either side's cost is unknown
+
+
+def _total_cost(report: AnswerQualityReport) -> float | None:
+    """The run's own ``total_estimated_cost_usd`` (``usage.build_run_usage``'s output, merged onto
+    the artifact the same way ``provenance`` is), or ``None`` when the artifact carries no usage
+    block, or a usage block whose total was itself ``None`` (an unpriced model — see
+    ``usage.build_run_usage``'s own docstring for why that is never silently ``$0.00``)."""
+    if not report.usage:
+        return None
+    value = report.usage.get("total_estimated_cost_usd")
+    return float(value) if isinstance(value, int | float) else None
+
+
+def _cost_note(a_cost: float | None, b_cost: float | None) -> str | None:
+    if a_cost is None or b_cost is None:
+        return None
+    delta = b_cost - a_cost
+    return (
+        f"COST: A=${a_cost:.2f}  B=${b_cost:.2f}  (delta ${delta:+.2f}) — weigh this against the "
+        "accuracy delta above; a gain that costs more is a different decision from a free one."
+    )
+
 
 def _rows_by_id(report: AnswerQualityReport) -> dict[str, QueryResult]:
     if not report.rows:
@@ -139,6 +169,10 @@ def compare_runs(a: AnswerQualityReport, b: AnswerQualityReport) -> CompareResul
         regressed=len(regressed),
     )
 
+    a_cost = _total_cost(a)
+    b_cost = _total_cost(b)
+    cost_delta = (b_cost - a_cost) if (a_cost is not None and b_cost is not None) else None
+
     return CompareResult(
         run_a=a.run_id,
         run_b=b.run_id,
@@ -162,6 +196,10 @@ def compare_runs(a: AnswerQualityReport, b: AnswerQualityReport) -> CompareResul
         mcnemar_p_value=p_value,
         significant_at_p05=significant,
         verdict=verdict,
+        a_cost_usd=a_cost,
+        b_cost_usd=b_cost,
+        cost_delta_usd=cost_delta,
+        cost_note=_cost_note(a_cost, b_cost),
     )
 
 
