@@ -135,14 +135,31 @@ def normalize_text(text: str) -> str:
 
 
 def _parse_evidence(raw: object) -> tuple[str, ...]:
-    """Gold turn ids. LoCoMo stores them as ``["D1:3", ...]``; a few rows carry a bare string."""
+    """Gold turn ids. LoCoMo stores them as ``["D1:3", ...]``; a few rows carry a bare string.
+
+    T3 (``TRACE-0923.md`` §7): at least one row (conv-26 qa[37]) carries a SINGLE evidence
+    STRING naming TWO turn ids joined by ``"; "`` (``"D8:6; D9:17"``) rather than two separate
+    list entries. Before this fix that joined string never matched a real ``dia_id`` (the ``;``
+    is part of the id string), so ``gold = {e for e in query.evidence if e in known}`` in
+    ``runner.py``/``answer_quality.py`` was always empty and the query was silently counted as
+    "no gold in corpus" even though both evidence turns were ingested and indexed. Splitting on
+    ``;`` here, once, at the loader, fixes every caller without duplicating the parsing.
+    """
     if raw is None:
         return ()
     if isinstance(raw, str):
-        return (raw,)
-    if isinstance(raw, list):
-        return tuple(str(e) for e in raw if isinstance(e, str | int))
-    return ()
+        raw = [raw]
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, str | int):
+            continue
+        for part in str(entry).split(";"):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return tuple(out)
 
 
 def load_locomo(path: str | Path, *, samples: int | None = None) -> list[Conversation]:

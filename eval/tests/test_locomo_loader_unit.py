@@ -73,3 +73,47 @@ def test_gold_evidence_and_adversarial_flag_are_parsed(tmp_path: Path) -> None:
 def test_missing_dataset_raises_rather_than_falling_back(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="never falls back to a synthetic corpus"):
         load_locomo(tmp_path / "absent.json")
+
+
+def test_semicolon_joined_evidence_string_splits_into_two_ids(tmp_path: Path) -> None:
+    """T3 (TRACE-0923.md §7): the real dataset carries at least one row (conv-26 qa[37]) whose
+    ``evidence`` is a single-element list holding ONE STRING naming TWO turn ids, joined by
+    ``"; "`` — ``["D8:6; D9:17"]`` — rather than two separate list entries. Before the fix this
+    joined string never equalled a real ``dia_id``, so `{e for e in query.evidence if e in known}`
+    downstream was always empty and the query was silently miscounted as having no gold in the
+    corpus even though both turns were ingested."""
+    payload = json.loads(json.dumps(_SAMPLE))
+    payload[0]["qa"].append(
+        {
+            "question": "What did they discuss?",
+            "answer": "Two things",
+            "evidence": ["D1:1; D2:1"],
+            "category": 4,
+        }
+    )
+    path = tmp_path / "semicolon.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    queries = load_locomo(path)[0].queries
+    joined = next(q for q in queries if q.question == "What did they discuss?")
+    assert joined.evidence == ("D1:1", "D2:1")
+
+
+def test_evidence_list_with_multiple_semicolon_joined_strings(tmp_path: Path) -> None:
+    """A bare (non-list) evidence string is also split — `_parse_evidence` normalizes it to a
+    one-element list before the semicolon split runs, so both shapes share one code path."""
+    payload = json.loads(json.dumps(_SAMPLE))
+    payload[0]["qa"].append(
+        {
+            "question": "Bare string evidence",
+            "answer": "x",
+            "evidence": "D1:1;D1:2 ",
+            "category": 4,
+        }
+    )
+    path = tmp_path / "bare_semicolon.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    queries = load_locomo(path)[0].queries
+    bare = next(q for q in queries if q.question == "Bare string evidence")
+    assert bare.evidence == ("D1:1", "D1:2")

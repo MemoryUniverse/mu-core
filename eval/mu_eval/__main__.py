@@ -91,6 +91,7 @@ def _print_baseline_report(report: Any) -> None:
     _print(
         f"importance={report.importance}  recall_limit={report.recall_limit}  "
         f"scored={arm.queries_scored}  skipped_adversarial={arm.queries_skipped_adversarial}  "
+        f"skipped_no_evidence={arm.queries_skipped_no_evidence}  "
         f"skipped_no_gold={arm.queries_skipped_no_gold_in_corpus}"
     )
     _table("OVERALL (macro-avg over queries)", arm.overall, arm.ks)
@@ -371,6 +372,7 @@ def _print_answer_quality_report(report: Any, *, elapsed: float) -> None:
     )
     _print(
         f"scored={report.queries_scored}  skipped_adversarial={report.skipped_adversarial}  "
+        f"skipped_no_evidence={report.skipped_no_evidence}  "
         f"skipped_no_gold={report.skipped_no_gold_in_corpus}"
     )
     o = report.overall

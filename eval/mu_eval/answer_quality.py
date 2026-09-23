@@ -175,6 +175,11 @@ class AnswerQualityReport(BaseModel):
     importance: float
     queries_scored: int
     skipped_adversarial: int
+    # T4 (`TRACE-0923.md` §7): see the identical field on `runner.ArmReport` — a
+    # non-adversarial row with empty `evidence` is a distinct reason from "adversarial", counted
+    # separately rather than folded into `skipped_adversarial`. Default 0 so an artifact written
+    # before this fix still loads through `AnswerQualityReport.model_validate_json`.
+    skipped_no_evidence: int = 0
     skipped_no_gold_in_corpus: int
     overall: CategoryStats
     by_category: dict[str, CategoryStats]
@@ -228,7 +233,7 @@ async def _complete_with_retry(
 
 def _eligible_queries(
     conversation: Conversation, max_queries: int | None
-) -> tuple[list[LabelledQuery], int, int]:
+) -> tuple[list[LabelledQuery], int, int, int]:
     """Same admission rule as ``runner.run_baseline``: drop adversarial/no-answer rows and rows
     whose gold evidence names no turn this harness actually ingested. Counted, never silently
     dropped."""
@@ -238,16 +243,22 @@ def _eligible_queries(
         queries = queries[:max_queries]
     eligible: list[LabelledQuery] = []
     skipped_adversarial = 0
+    skipped_no_evidence = 0
     skipped_no_gold = 0
     for query in queries:
-        if query.is_adversarial or not query.evidence or not query.answer:
+        if query.is_adversarial:
             skipped_adversarial += 1
+            continue
+        # T4: distinct from "adversarial" — a non-adversarial row with no evidence, or no gold
+        # answer text, cannot be scored but was never a category-5 row (TRACE-0923.md §7).
+        if not query.evidence or not query.answer:
+            skipped_no_evidence += 1
             continue
         if not any(e in known for e in query.evidence):
             skipped_no_gold += 1
             continue
         eligible.append(query)
-    return eligible, skipped_adversarial, skipped_no_gold
+    return eligible, skipped_adversarial, skipped_no_evidence, skipped_no_gold
 
 
 def eligible_query_count(
@@ -323,6 +334,7 @@ async def run_answer_quality(
     session = "evalsession"
     sem = asyncio.Semaphore(concurrency)
     skipped_adversarial = 0
+    skipped_no_evidence = 0
     skipped_no_gold = 0
     rows: list[QueryResult] = []
     total_eligible = eligible_query_count(conversations, max_queries_per_sample)
@@ -346,8 +358,11 @@ async def run_answer_quality(
                     memory, conversation.turns[0].text[:120], user=user, session=session
                 )
 
-            eligible, sk_adv, sk_gold = _eligible_queries(conversation, max_queries_per_sample)
+            eligible, sk_adv, sk_no_ev, sk_gold = _eligible_queries(
+                conversation, max_queries_per_sample
+            )
             skipped_adversarial += sk_adv
+            skipped_no_evidence += sk_no_ev
             skipped_no_gold += sk_gold
             turn_by_dia_id = conversation.turn_by_dia_id()
             known_dia_ids = set(turn_by_dia_id)
@@ -448,6 +463,7 @@ async def run_answer_quality(
         importance=importance,
         queries_scored=len(rows),
         skipped_adversarial=skipped_adversarial,
+        skipped_no_evidence=skipped_no_evidence,
         skipped_no_gold_in_corpus=skipped_no_gold,
         overall=overall,
         by_category=by_category,

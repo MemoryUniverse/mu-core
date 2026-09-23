@@ -376,7 +376,18 @@ class RecallSettings(BaseModel):
     # floor discounted to 0.1. A MiniLM bi-encoder over short conversational turns is weakest on
     # exactly the rare proper nouns, dates and numbers LoCoMo questions turn on, which is the
     # textbook sparse-retrieval strength.
-    sparse_enabled: bool = Field(default=False)
+    #
+    # TURNED ON 2026-09-23, on the owner's authorisation, because the A/B arm was measured and it
+    # is the single largest retrieval gain this project has recorded:
+    #     gold-in-context, conv-26, 149 queries, 3 repeats per arm, ZERO LLM calls
+    #       dense only   51.01%   spread 0.0000  (all 149 per-query verdicts identical, 3 reps)
+    #       hybrid       67.34%   spread 0.0067
+    #     +16.33 pt absolute, +32% relative, ~24x the larger arm's spread
+    #     paired on identical queries: 31 fixed, 7 regressed, McNemar p = 1.16e-4
+    # Corroborated independently on the full corpus, retrieval-only and therefore free:
+    # recall@10 0.4546 -> 0.6138. The dense-only default was the ceiling described above, so
+    # leaving it dark would have meant shipping the weaker arm on purpose.
+    sparse_enabled: bool = Field(default=True)
     # Registry key carried into `SparseQuery.encoder` as provenance (§1.5:
     # "bm25" | "splade" | "none"). Only "bm25" is implemented in-repo; "splade" is the design's
     # named optional upgrade and would be a new provider, not a new branch here.

@@ -27,6 +27,7 @@ __all__ = [
     "ArmReport",
     "RunReport",
     "ScoreProvenance",
+    "classify_query_admission",
     "gold_ids_present",
     "run_baseline",
 ]
@@ -54,6 +55,13 @@ class ArmReport(BaseModel):
     label: str
     queries_scored: int
     queries_skipped_adversarial: int
+    # T4 (`TRACE-0923.md` §7): non-adversarial rows with empty `evidence` (LoCoMo category 3
+    # rows carrying `evidence: []`) used to be folded into `queries_skipped_adversarial` — they
+    # are neither adversarial nor "gold named a turn we never ingested" (`queries_skipped_
+    # no_gold_in_corpus`), they are a distinct third reason with no counter of its own before this
+    # fix. Default 0 so an older artifact re-read with `AnswerQualityReport.model_validate_json`
+    # (`extra="forbid"`) still loads.
+    queries_skipped_no_evidence: int = 0
     queries_skipped_no_gold_in_corpus: int
     ks: tuple[int, ...]
     overall: dict[str, dict[int, float]]
@@ -73,6 +81,29 @@ class RunReport(BaseModel):
     ingest: list[IngestReport] = Field(default_factory=list)
     arms: list[ArmReport] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+
+def classify_query_admission(query: LabelledQuery, known: set[str]) -> str | None:
+    """Pure three-way admission classification for ONE query against the ingested turn-id set.
+
+    Split out of ``run_baseline``\'s loop (T4, ``TRACE-0923.md`` \u00a77) so the skip/no-skip
+    decision is unit-testable without a real store stack: before this fix, a non-adversarial row
+    with EMPTY ``evidence`` (LoCoMo category 3 rows such as conv-26 qa[30]/qa[46], which carry
+    ``evidence: []``) was folded into the SAME counter as truly adversarial rows
+    (``query.is_adversarial or not query.evidence`` at the old ``runner.py:246``), so a run's own
+    printed ``skipped_adversarial`` overcounted (49 reported vs 47 actually adversarial on
+    conv-26) and undercounted nothing distinct for "had no evidence at all".
+
+    Returns one of ``"adversarial"``, ``"no_evidence"``, ``"no_gold_in_corpus"``, or ``None``
+    (the query is eligible to be scored).
+    """
+    if query.is_adversarial:
+        return "adversarial"
+    if not query.evidence:
+        return "no_evidence"
+    if not any(e in known for e in query.evidence):
+        return "no_gold_in_corpus"
+    return None
 
 
 def _resolve_ranked_ids(items: Sequence[Any], index: TurnIndex, gold: set[str]) -> list[str]:
@@ -201,6 +232,7 @@ async def run_baseline(
 
     rows: list[QueryScores] = []
     skipped_adversarial = 0
+    skipped_no_evidence = 0
     skipped_no_gold = 0
     ingest_reports: list[IngestReport] = []
     provenance = _ProvenanceAccumulator()
@@ -243,16 +275,20 @@ async def run_baseline(
 
             known = {t.dia_id for t in conversation.turns}
             for query in queries:
-                if query.is_adversarial or not query.evidence:
+                reason = classify_query_admission(query, known)
+                if reason == "adversarial":
                     skipped_adversarial += 1
                     continue
-                gold = {e for e in query.evidence if e in known}
-                if not gold:
+                if reason == "no_evidence":
+                    skipped_no_evidence += 1
+                    continue
+                if reason == "no_gold_in_corpus":
                     # Evidence naming a turn this harness never ingested (image-only turns carry
                     # no body). Not a retrieval failure — an unretrievable label. Counted, never
                     # scored as a zero.
                     skipped_no_gold += 1
                     continue
+                gold = {e for e in query.evidence if e in known}
                 result = await memory.recall(
                     query.question, user=user, session=session, limit=limit, tier=tier_enum
                 )
@@ -291,6 +327,7 @@ async def run_baseline(
                 ),
                 queries_scored=len(rows),
                 queries_skipped_adversarial=skipped_adversarial,
+                queries_skipped_no_evidence=skipped_no_evidence,
                 queries_skipped_no_gold_in_corpus=skipped_no_gold,
                 ks=ks,
                 overall=aggregate(rows, ks),
