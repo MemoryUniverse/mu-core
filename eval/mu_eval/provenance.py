@@ -129,16 +129,30 @@ def build_provenance(
     dataset_path: str | Path,
     chats: dict[str, Any] | None = None,
     repo_dir: str | Path | None = None,
+    include_captions: bool | None = None,
 ) -> dict[str, Any]:
     """The one call site assembles: dataset hash, code revision, ranker config, and model
     provenance for every named chat client (``chats={"answer": answer_chat, "judge": judge_chat}``
     typically). Returns a plain dict (not a pydantic model) so it merges cleanly into whatever
     report dict is about to be written to ``--out`` (``__main__.py``'s own ``_write``), without
-    requiring every report schema in this package to carry an identical nested field."""
+    requiring every report schema in this package to carry an identical nested field.
+
+    ``include_captions`` (T7, ``TRACE-0923.md`` §7/§5.5): whether THIS run's ``load_locomo`` call
+    included ``blip_caption`` text. Recorded here — not as a new field on ``RunReport``/
+    ``AnswerQualityReport`` (both ``extra="forbid"``) — for the same reason ``recall_settings``
+    already lives in this free-form dict rather than a strict nested model: reading a caption-arm
+    artifact back with the OLDER pydantic schema must keep working, and a run's comparability to
+    published mem0/MemOS numbers is exactly the kind of fact a reader needs at the SAME place they
+    already look for "was this run reproducible", not a second place to remember to check.
+    ``None`` (the default) means "the caller did not say" — reported honestly as ``None``, never
+    silently defaulted to ``False``, so an artifact written before this fix cannot be misread as
+    having positively confirmed captions were excluded.
+    """
     commit, dirty = git_revision(repo_dir)
     provenance: dict[str, Any] = {
         "dataset_path": str(dataset_path),
         "dataset_sha256": dataset_sha256(dataset_path),
+        "dataset_include_captions": include_captions,
         "code_revision": commit,
         "code_dirty": dirty,
         "recall_settings": recall_settings_snapshot(),

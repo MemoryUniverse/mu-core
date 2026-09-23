@@ -97,6 +97,14 @@ def _print_baseline_report(report: Any) -> None:
     _table("OVERALL (macro-avg over queries)", arm.overall, arm.ks)
     for name, agg in sorted(arm.by_category.items()):
         _table(f"category {name}", agg, arm.ks)
+    if arm.queries_scored:
+        rate = arm.gold_in_context / arm.queries_scored
+        _print(
+            f"\ngold_in_context={arm.gold_in_context}/{arm.queries_scored} ({rate:.4f})  "
+            f"[free — no answer model, no judge]  "
+            f"via_neighbor_only={arm.gold_in_context_via_neighbor_only}  "
+            f"neighbor_items_seen={arm.neighbor_items_seen}"
+        )
     if arm.provenance is not None:
         p = arm.provenance
         _print("\nSCORE PROVENANCE (what fused_score actually contained)")
@@ -121,7 +129,9 @@ async def _cmd_baseline(args: argparse.Namespace) -> int:
     from mu_eval.repeats import run_n_times, summarize_repeats
     from mu_eval.runner import run_baseline
 
-    conversations = load_locomo(args.dataset, samples=args.samples)
+    conversations = load_locomo(
+        args.dataset, samples=args.samples, include_captions=args.include_captions
+    )
     run_id_base = args.run_id or uuid.uuid4().hex[:8]
 
     async def _once(run_id: str) -> Any:
@@ -136,7 +146,7 @@ async def _cmd_baseline(args: argparse.Namespace) -> int:
             consolidate=args.consolidate,
         )
 
-    provenance = build_provenance(dataset_path=args.dataset)
+    provenance = build_provenance(dataset_path=args.dataset, include_captions=args.include_captions)
 
     if args.num_runs <= 1:
         # UNCHANGED single-run path (byte-for-byte the pre-existing behaviour, minus the new
@@ -176,7 +186,9 @@ async def _cmd_baseline(args: argparse.Namespace) -> int:
 async def _cmd_fuse(args: argparse.Namespace) -> int:
     from mu_eval.arms import run_two_arm_fuse
 
-    conversations = load_locomo(args.dataset, samples=args.samples)
+    conversations = load_locomo(
+        args.dataset, samples=args.samples, include_captions=args.include_captions
+    )
     run_id = args.run_id or uuid.uuid4().hex[:8]
     results = []
     for conversation in conversations:
@@ -501,7 +513,9 @@ async def _cmd_answer_quality(args: argparse.Namespace) -> int:
     from mu_eval.repeats import run_n_times, summarize_repeats
     from mu_eval.usage import build_run_usage, load_rate_card
 
-    conversations = load_locomo(args.dataset, samples=args.samples)
+    conversations = load_locomo(
+        args.dataset, samples=args.samples, include_captions=args.include_captions
+    )
     run_id_base = args.run_id or uuid.uuid4().hex[:8]
     recall_limit = args.limit or max(args.k)
 
@@ -569,6 +583,7 @@ async def _cmd_answer_quality(args: argparse.Namespace) -> int:
             provenance = build_provenance(
                 dataset_path=args.dataset,
                 chats={"answer": answer_chat, "judge": judge_chat},
+                include_captions=args.include_captions,
             )
             usage = build_run_usage(
                 chats={"answer": answer_chat, "judge": judge_chat},
@@ -602,6 +617,7 @@ async def _cmd_answer_quality(args: argparse.Namespace) -> int:
         provenance = build_provenance(
             dataset_path=args.dataset,
             chats={"answer": answer_chat, "judge": judge_chat},
+            include_captions=args.include_captions,
         )
         # NOTE: `answer_chat`/`judge_chat` are shared across ALL `args.num_runs` repeats (same
         # instances threaded through every `_once` call above), so `usage_totals` here — like
@@ -713,6 +729,15 @@ def _parser() -> argparse.ArgumentParser:
         sp.add_argument("--max-queries", type=int, default=None)
         sp.add_argument("--run-id", default=None)
         sp.add_argument("--out", default=None)
+        sp.add_argument(
+            "--include-captions",
+            action="store_true",
+            help="T7 (TRACE-0923.md §7/§5.5): append each turn's blip_caption to its text before "
+            "ingest, instead of discarding it (the default, unchanged loader behaviour). Report "
+            "BOTH arms when this matters — the default stays comparable to every published "
+            "mem0/MemOS LoCoMo figure (they discard the caption too); this flag measures what "
+            "that shared benchmark gap is costing MU specifically.",
+        )
 
     bl = sub.add_parser("baseline", help="ranked-recall baseline over real stores")
     common(bl)

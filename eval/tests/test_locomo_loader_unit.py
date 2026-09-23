@@ -99,6 +99,52 @@ def test_semicolon_joined_evidence_string_splits_into_two_ids(tmp_path: Path) ->
     assert joined.evidence == ("D1:1", "D2:1")
 
 
+def test_captions_are_ignored_by_default(tmp_path: Path) -> None:
+    """T7 (TRACE-0923.md §7/§5.5): unchanged behaviour when `include_captions` is not passed —
+    the default MUST stay comparable to every published mem0/MemOS LoCoMo figure, which also
+    discard the caption."""
+    payload = json.loads(json.dumps(_SAMPLE))
+    payload[0]["conversation"]["session_1"][0]["blip_caption"] = "a photo of a sunset"
+    path = tmp_path / "captioned.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    turns = load_locomo(path)[0].turns
+    d1_1 = next(t for t in turns if t.dia_id == "D1:1")
+    assert d1_1.text == "Hey Mel!"
+    assert "sunset" not in d1_1.text
+
+
+def test_include_captions_true_appends_the_caption_to_the_turns_text(tmp_path: Path) -> None:
+    """T7: `include_captions=True` appends, it does not replace — the turn's own text stays
+    first so the flag can only ADD retrievable vocabulary."""
+    payload = json.loads(json.dumps(_SAMPLE))
+    payload[0]["conversation"]["session_1"][0]["blip_caption"] = "a photo of a sunset"
+    path = tmp_path / "captioned.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    turns = load_locomo(path, include_captions=True)[0].turns
+    d1_1 = next(t for t in turns if t.dia_id == "D1:1")
+    assert d1_1.text == "Hey Mel! a photo of a sunset"
+
+
+def test_include_captions_true_makes_an_image_only_turn_retrievable(tmp_path: Path) -> None:
+    """T7's strongest case (conv-26 q55 shape): a turn whose `text` is EMPTY is dropped by
+    default (`test_empty_bodied_turns_are_dropped`) — but if it carries a caption and
+    `include_captions=True`, the caption alone becomes the turn's retrievable body instead of
+    the turn silently vanishing from the corpus (and from `known`, so its gold evidence would
+    otherwise be misclassified as `no_gold_in_corpus` rather than a genuine retrieval question)."""
+    payload = json.loads(json.dumps(_SAMPLE))
+    payload[0]["conversation"]["session_1"][2]["blip_caption"] = "a painting of a sunset"
+    path = tmp_path / "image_only.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    default_ids = {t.dia_id for t in load_locomo(path)[0].turns}
+    assert "D1:3" not in default_ids  # unchanged: still dropped when captions are off
+
+    captioned_ids = {t.dia_id: t.text for t in load_locomo(path, include_captions=True)[0].turns}
+    assert captioned_ids["D1:3"] == "a painting of a sunset"
+
+
 def test_evidence_list_with_multiple_semicolon_joined_strings(tmp_path: Path) -> None:
     """A bare (non-list) evidence string is also split — `_parse_evidence` normalizes it to a
     one-element list before the semicolon split runs, so both shapes share one code path."""

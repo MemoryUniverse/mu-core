@@ -69,6 +69,11 @@ class IngestActivity(BaseModel):
     session_offset: str = Field(min_length=1)  # source offset — the M12 replay discriminator
     kind: str = "user_message"  # ActivityKind
     text: str = Field(min_length=1)  # salient content
+    # S1b (TRACE-0923.md §7/§6.2, ADR pending): the conversational-order key, forwarded verbatim
+    # onto `MemoryItem.turn_seq` below (see that field's own docstring for why `session_offset`
+    # above — deliberately RANDOM, "never a pure M12 replay" — cannot double as this). `None`
+    # (the default) when the caller assigns none; the read path degrades gracefully.
+    turn_seq: int | None = Field(default=None, ge=0)
 
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
     promote: bool = False
@@ -186,6 +191,7 @@ def _build_memory_item(
         updated_at=at,
         importance_score=activity.importance,
         source=activity.source,
+        turn_seq=activity.turn_seq,
         subject=activity.subject,
         predicate=activity.predicate,
         object=activity.object,

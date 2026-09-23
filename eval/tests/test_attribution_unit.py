@@ -14,7 +14,11 @@ import pytest
 from mu_eval.answer_quality import CategoryStats, QueryResult, _stats
 from mu_eval.corpus import TurnIndex
 from mu_eval.locomo import Turn
-from mu_eval.runner import gold_ids_present
+from mu_eval.runner import (
+    NEIGHBOR_EXPANSION_MARKER_ATTR,
+    gold_context_attribution,
+    gold_ids_present,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -24,6 +28,16 @@ class _StubItem:
 
     def __init__(self, content: str) -> None:
         self.content = content
+
+
+class _StubNeighborItem:
+    """Stand-in for a ``RecallItemView`` the neighbour-expansion arm (S1b) marked — carries the
+    proposed ``is_neighbor`` attribute (AD-228, ``ARCHITECTURE-DELTAS.md``) on top of ``.content``,
+    same shape ``RecallItemView.is_floor`` already uses for "how did this item get here"."""
+
+    def __init__(self, content: str, *, is_neighbor: bool = True) -> None:
+        self.content = content
+        setattr(self, NEIGHBOR_EXPANSION_MARKER_ATTR, is_neighbor)
 
 
 def _index_with(*turns: tuple[str, str]) -> TurnIndex:
@@ -72,6 +86,86 @@ def test_gold_ids_present_ignores_a_body_that_is_not_in_the_corpus_index_at_all(
     index = _index_with(("D1:1", "fact one"))
     items = [_StubItem("A: a paraphrase the harness never wrote verbatim")]
     assert gold_ids_present(items, index, {"D1:1"}) is False
+
+
+# ------------------------------------------------------------------- gold_context_attribution
+#
+# AD-228 (ARCHITECTURE-DELTAS.md): "the neighbour-expansion arm (S1b) must be measurable, or the
+# change will measure as zero and be thrown away." These pin the two halves of that guarantee:
+# (1) an expanded neighbour with real content is ALREADY counted as a gold hit today, with no
+# marker needed at all — content-join, not channel-aware; (2) the marker, when a surface DOES set
+# it, correctly attributes whether the hit needed expansion or would have happened anyway.
+
+
+def test_present_counts_an_unmarked_item_exactly_like_gold_ids_present_does() -> None:
+    """A plain `_StubItem` (no `is_neighbor` attribute at all — every recall surface in this repo
+    today) must resolve identically through `gold_context_attribution` and `gold_ids_present`;
+    they must never quietly disagree (`gold_ids_present`'s own docstring)."""
+    index = _index_with(("D1:1", "I adopted a greyhound named Pepper."))
+    items = [_StubItem("A: I adopted a greyhound named Pepper.")]
+    attribution = gold_context_attribution(items, index, {"D1:1"})
+    assert attribution.present is True
+    assert attribution.present == gold_ids_present(items, index, {"D1:1"})
+    assert attribution.via_neighbor_only is False  # no marker present -> never attributed to it
+    assert attribution.neighbor_items == 0
+
+
+def test_a_neighbor_marked_item_with_real_content_is_counted_as_a_gold_hit() -> None:
+    """The core S1b claim: an item the expansion arm added, carrying the NEIGHBOUR's own real
+    turn text, is resolved by the SAME content join a primary-channel item uses — no special
+    casing needed for `present` to be True."""
+    index = _index_with(("D1:1", "fact one"), ("D1:2", "fact two, the neighbour"))
+    items = [
+        _StubItem("A: fact one"),  # the primary hit, NOT gold
+        _StubNeighborItem("A: fact two, the neighbour"),  # expanded neighbour, IS gold
+    ]
+    attribution = gold_context_attribution(items, index, {"D1:2"})
+    assert attribution.present is True
+    assert attribution.neighbor_items == 1
+
+
+def test_via_neighbor_only_true_when_every_resolving_item_is_marked() -> None:
+    index = _index_with(("D1:1", "the neighbour fact"))
+    items = [_StubNeighborItem("A: the neighbour fact")]
+    attribution = gold_context_attribution(items, index, {"D1:1"})
+    assert attribution.present is True
+    assert attribution.via_neighbor_only is True
+    assert attribution.neighbor_items == 1
+
+
+def test_via_neighbor_only_false_when_a_primary_item_also_resolves_to_the_same_gold() -> None:
+    """The exact "measures as zero" risk AD-228 names, made concrete: if a primary channel ALSO
+    found the gold turn, the expansion arm contributed nothing NEW for this query — `present` is
+    (correctly) unaffected by expansion, and `via_neighbor_only` must say so explicitly rather
+    than let a reader assume the marked item was the one that mattered."""
+    index = _index_with(("D1:1", "the shared gold fact"))
+    items = [
+        _StubItem("A: the shared gold fact"),  # primary channel already found it
+        _StubNeighborItem("A: the shared gold fact"),  # expansion re-surfaced the SAME turn
+    ]
+    attribution = gold_context_attribution(items, index, {"D1:1"})
+    assert attribution.present is True
+    assert attribution.via_neighbor_only is False  # NOT solely due to expansion
+    assert attribution.neighbor_items == 1
+
+
+def test_neighbor_items_counted_even_when_none_of_them_are_gold() -> None:
+    """Lets a reader distinguish "the arm produced nothing" (0) from "the arm produced items but
+    none happened to be gold for this query" (nonzero here, `present` still False)."""
+    index = _index_with(("D1:1", "gold fact"), ("D1:2", "an irrelevant neighbour"))
+    items = [_StubNeighborItem("A: an irrelevant neighbour")]
+    attribution = gold_context_attribution(items, index, {"D1:1"})
+    assert attribution.present is False
+    assert attribution.via_neighbor_only is False
+    assert attribution.neighbor_items == 1
+
+
+def test_gold_context_attribution_on_empty_items_matches_gold_ids_present() -> None:
+    index = _index_with(("D1:1", "some fact"))
+    attribution = gold_context_attribution([], index, {"D1:1"})
+    assert attribution.present is False
+    assert attribution.via_neighbor_only is False
+    assert attribution.neighbor_items == 0
 
 
 # ---------------------------------------------------------------------------------- CategoryStats
@@ -145,3 +239,42 @@ def test_accuracy_is_zero_not_a_crash_when_nothing_was_scoreable() -> None:
 def test_scoreable_equals_n_when_every_row_reached_the_judge() -> None:
     stats = CategoryStats(n=10, correct=6, wrong=3, unparseable=1)
     assert stats.scoreable == stats.n == 10
+
+
+# ------------------------------------------------------- the marker contract, pinned for real
+#
+# VERIFY PASS 2026-09-23. AD-228 proposes `is_neighbor` as the attribute the recall surface will
+# carry, and `gold_context_attribution` reads it with `getattr(..., False)` so an un-adopting
+# surface reads as "nothing came from expansion". Two things that were NOT pinned, and both
+# matter, because the failure mode of this design is a counter that silently reads 0 forever:
+#
+#  1. Every existing test builds its stub with `setattr(self, NEIGHBOR_EXPANSION_MARKER_ATTR, ...)`
+#     — so renaming the constant renames BOTH sides and the suite stays green. VERIFIED: mutating
+#     the constant to "is_neighbour_XX" left all 19 tests passing.
+#  2. `mu_contracts.contracts.recall.RecallItemView` — the item type `LocalMemory.recall` actually
+#     returns, and therefore the one `run_baseline` reads — does not carry the field, and
+#     `mu_local.local_memory._to_recall_result` does not forward the engine-internal
+#     `RecallItemView.is_neighbor` onto it. So `neighbor_items_seen`/
+#     `gold_in_context_via_neighbor_only` are structurally 0 on every real run, whatever S1b does.
+
+
+def test_neighbor_marker_name_is_pinned_to_the_literal_the_engine_sets() -> None:
+    """A rename of the constant alone must not pass silently — every stub in this file derives its
+    attribute name FROM the constant, so only a literal pin catches a drift away from the name
+    `mu_engine.services.recall.dto.RecallItemView` actually sets."""
+    assert NEIGHBOR_EXPANSION_MARKER_ATTR == "is_neighbor"
+
+
+def test_the_recall_surface_does_not_yet_carry_the_neighbour_marker() -> None:
+    """TRIPWIRE, not an endorsement. While this passes, S1b's contribution is UNMEASURABLE through
+    the public surface and any report of `neighbor_items_seen=0` is evidence of nothing.
+
+    When this test goes RED the contract has landed — at which point: delete this test, and
+    re-read every conclusion that rested on a zero here (`ARCHITECTURE-DELTAS.md` AD-231 is the
+    first one)."""
+    from mu_contracts.contracts.recall import RecallItemView as SurfaceRecallItemView
+
+    assert NEIGHBOR_EXPANSION_MARKER_ATTR not in SurfaceRecallItemView.model_fields, (
+        "the canonical recall surface now carries the neighbour marker — good. Delete this "
+        "tripwire and confirm mu_local._to_recall_result actually forwards it."
+    )

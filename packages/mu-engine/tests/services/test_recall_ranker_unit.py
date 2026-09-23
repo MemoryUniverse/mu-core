@@ -29,7 +29,9 @@ from mu_engine.storage.domain.recall import RecallChannel, Scored
 _NS = Namespace(org="o", workspace="w", user="u1", session="s1", visibility=Visibility.PRIVATE)
 
 
-def _item(content: str, *, tier: MemoryTier, at: datetime) -> MemoryItem:
+def _item(
+    content: str, *, tier: MemoryTier, at: datetime, turn_seq: int | None = None
+) -> MemoryItem:
     return MemoryItem(
         content=content,
         kind=MemoryKind.PROPOSITION,
@@ -41,6 +43,7 @@ def _item(content: str, *, tier: MemoryTier, at: datetime) -> MemoryItem:
         session_id=_NS.session,
         created_at=at,
         updated_at=at,
+        turn_seq=turn_seq,
     )
 
 
@@ -541,6 +544,239 @@ async def test_most_recent_facts_are_still_unconditionally_protected() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
+# T1 option (c) — the STM floor guarantee made conditional on relevance (TRACE-0923.md §7/§7.1,
+# `ranker.py::_protected_floor_ids`). The SHIPPED default (`floor_protect_min_relevance=0.5`,
+# set on evidence — `dto.py`'s own docstring has the sweep) gates a genuinely irrelevant
+# just-said fact; `-1.0` (cosine similarity's true minimum) is the value that reproduces the
+# ORIGINAL, fully unconditional AD-195 guarantee the tests above pin.
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_t1c_shipped_default_gates_a_genuinely_irrelevant_just_said_fact() -> None:
+    """``floor_protect_min_relevance`` SHIPS at ``0.5`` (evidence-based — `dto.py`'s own sweep
+    table): a just-said fact with zero lexical overlap against the query must NOT be
+    unconditionally forced into the window at the shipped default — the whole point of T1c."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    stm_items = [
+        _item(f"session chatter #{n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n))
+        for n in range(10)
+    ]
+    just_said = stm_items[-1]
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={},
+        settings=RecallSettings(stm_scoring="lexical"),  # class default floor_protect_min_relevance
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "irrelevant this phase",
+        [0.1, 0.1],
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    floor_ids = {it.memory_id for it in result.items if it.is_floor}
+    assert just_said.id not in floor_ids, (
+        "the shipped default (0.5) did not gate a just-said fact with ZERO query overlap from "
+        "PROTECTED (is_floor) status — T1c's whole point (stop paying for an unconditional, "
+        "query-blind protection guarantee) is not reaching this default"
+    )
+
+
+@pytest.mark.asyncio
+async def test_t1c_legacy_value_reproduces_the_original_unconditional_guarantee() -> None:
+    """``floor_protect_min_relevance=-1.0`` (cosine similarity's true minimum) is the documented
+    escape hatch back to AD-195's ORIGINAL, fully unconditional guarantee — the exact behaviour
+    the shipped 0.5 default now narrows."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    stm_items = [
+        _item(f"session chatter #{n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n))
+        for n in range(10)
+    ]
+    just_said = stm_items[-1]
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={},
+        settings=RecallSettings(stm_scoring="lexical", floor_protect_min_relevance=-1.0),
+    )
+
+    ids = await _rank(ranker, [0.1, 0.1], limit=10)
+
+    assert just_said.id in ids, "floor_protect_min_relevance=-1.0 must reproduce AD-195 verbatim"
+
+
+@pytest.mark.asyncio
+async def test_t1c_rollback_value_protects_a_genuinely_negative_embed_score() -> None:
+    """Regression guard for the bug an earlier ``0.0`` default shipped with (caught live on
+    ``mu-dev-vm`` by ``test_persona_composition_int.py::
+    test_a_real_persona_reorders_a_real_recall_and_changes_nothing_else`` against real stores +
+    the real MiniLM embedder — see ``RecallSettings.floor_protect_min_relevance``'s own docstring
+    for the full account). ``stm_scoring="embed"``'s real range is cosine similarity, ``[-1.0,
+    1.0]``, NOT ``[0.0, 1.0]`` — a floor candidate whose embedding points AWAY from the query
+    scores genuinely negative, so ONLY ``-1.0`` (cosine's true minimum) is a genuinely inert
+    rollback value. Pins that: at ``-1.0`` the negative-scoring candidate is still PROTECTED
+    (``is_floor=True``), which a ``0.0`` "looks inert" value would silently break.
+
+    VERIFY PASS 2026-09-23: this test previously asserted ``just_said.id in ids`` at the SHIPPED
+    default and claimed "the shipped default must still protect it". Both halves were wrong —
+    at the shipped ``0.5`` bar a ``-1.0`` cosine is DELIBERATELY not protected (that is T1c), and
+    presence in ``ids`` is not protection when nothing else competes for the slot: the assertion
+    still passed with ``_protected_floor_ids`` mutated to return an empty set, i.e. it could not
+    fail for the reason it named."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    just_said = _item("completely unrelated aside", tier=MemoryTier.STM, at=base)
+    query_vec = [1.0, 0.0]
+    embedder = _FakeEmbedder({just_said.content: [-1.0, 0.0]})  # cosine == -1.0, the true minimum
+    ranker = _build_ranker(
+        stm_items=[just_said],
+        mtm_hits_by_query={},
+        settings=RecallSettings(stm_scoring="embed", floor_protect_min_relevance=-1.0),
+        embedder=embedder,
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "q",
+        query_vec,
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    assert just_said.id in {it.memory_id for it in result.items if it.is_floor}, (
+        "a floor candidate with a genuinely negative cosine score was not protected at the "
+        "documented rollback value -1.0 — the exact class of bug an earlier 0.0 default "
+        "shipped with (a bar that claims to be inert but is not)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_t1c_still_protects_a_just_said_fact_that_is_relevant() -> None:
+    """ADR 0052's live-agent-session promise, pinned: *"the most recent STM fact is never evicted
+    from the answer window PROVIDED it clears ``min_relevance`` against the asked query"*. A
+    conditional guarantee that never fires is not a guarantee — so this constructs the case the
+    ADR says is the typical one (a just-said fact that IS about the current question,
+    ``stm_scoring="embed"``, the SHIPPED scoring mode and the SHIPPED bar) against a strong,
+    competing MTM hit, and asserts the just-said fact is still PROTECTED (``is_floor=True``),
+    not merely present."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    just_said = _item("the flight to Denver is on Thursday", tier=MemoryTier.STM, at=base)
+    stale = [
+        _item(f"session chatter #{n}", tier=MemoryTier.STM, at=base - timedelta(minutes=n + 1))
+        for n in range(9)
+    ]
+    competing_mtm = _item("an unrelated but highly ranked MTM fact", tier=MemoryTier.MTM, at=base)
+    query_vec = (1.0, 0.0)
+    embedder = _FakeEmbedder({just_said.content: [1.0, 0.0]})  # cosine == 1.0, clears 0.5
+    ranker = _build_ranker(
+        stm_items=[*stale, just_said],
+        mtm_hits_by_query={query_vec: [competing_mtm]},
+        settings=RecallSettings(stm_scoring="embed"),  # class default bar: the SHIPPED 0.5
+        embedder=embedder,
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "when is the flight",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    assert just_said.id in {it.memory_id for it in result.items if it.is_floor}, (
+        "a just-said fact that IS relevant to the query lost AD-195's protection at the shipped "
+        "floor_protect_min_relevance=0.5 — T1c was supposed to narrow the guarantee to the "
+        "irrelevant case, not retire it"
+    )
+
+
+def test_protected_floor_ids_filters_by_relevance_within_the_eligibility_window() -> None:
+    """Direct unit test of ``_protected_floor_ids`` (the T1c mechanism itself), independent of
+    fusion/RRF arithmetic: ``protect_n`` still bounds ELIGIBILITY (recency-selected, unchanged
+    from pre-T1c) but a candidate below ``min_relevance`` is now excluded from the protected id
+    set, and a candidate outside the eligibility window is excluded regardless of its score."""
+    from mu_engine.services.recall.ranker import _protected_floor_ids
+
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    items = [
+        _item(f"item-{n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n)) for n in range(5)
+    ]
+    # `floor` — recency order, newest first (items[4], items[3], items[2], items[1], items[0]).
+    floor = [
+        Scored(item=it, score=1.0, channel=RecallChannel.STM_FLOOR, rank=rank, is_floor=True)
+        for rank, it in enumerate(reversed(items))
+    ]
+    # `floor_scored` — SAME items, relevance scores assigned deliberately out of recency order:
+    # items[4] (most recent) is IRRELEVANT (0.0); items[2] (3rd most recent, still inside the
+    # protect_n=3 eligibility window) is RELEVANT (0.8); items[0]/[1] are outside the window.
+    relevance = {
+        items[4].id: 0.0,
+        items[3].id: 0.2,
+        items[2].id: 0.8,
+        items[1].id: 0.9,
+        items[0].id: 1.0,
+    }
+    floor_scored = [
+        Scored(item=it, score=relevance[it.id], channel=RecallChannel.STM_FLOOR, rank=0)
+        for it in items
+    ]
+
+    protected = _protected_floor_ids(
+        floor=floor, floor_scored=floor_scored, protect_n=3, min_relevance=0.5
+    )
+
+    assert protected == {items[2].id}, (
+        "items[4]/[3] are eligible (top-3 recency) but score below the 0.5 bar — excluded; "
+        "items[2] is eligible AND clears the bar — included; items[1]/[0] score high but are "
+        "OUTSIDE the protect_n=3 eligibility window — excluded regardless of relevance"
+    )
+
+    # A bar at or below every candidate's score reproduces the pre-T1c "every eligible member
+    # protected" behaviour exactly. NOTE (verify pass 2026-09-23): 0.0 is NOT the shipped default
+    # (0.5 is) and is NOT the documented rollback value either (-1.0 is, because
+    # `stm_scoring="embed"` scores by cosine over [-1.0, 1.0]) — this line said "the shipped
+    # default" and was wrong on both counts.
+    assert _protected_floor_ids(
+        floor=floor, floor_scored=floor_scored, protect_n=3, min_relevance=0.0
+    ) == {items[4].id, items[3].id, items[2].id}
+
+
+@pytest.mark.asyncio
+async def test_t1c_recency_scoring_makes_the_bar_a_uniform_switch_not_a_filter() -> None:
+    """Documented degenerate case (``_protected_floor_ids`` docstring): ``stm_scoring="recency"``
+    gives every STM candidate the SAME constant score (1.0), so the bar can only switch
+    protection uniformly on (``<= 1.0``) or off (``> 1.0``) — never filter some candidates and
+    not others, because there is no per-candidate relevance signal to filter by."""
+
+    async def _floor_ids(min_relevance: float) -> set[str]:
+        base = datetime(2026, 7, 31, tzinfo=UTC)
+        stm_items = [_item("chatter", tier=MemoryTier.STM, at=base)]
+        ranker = _build_ranker(
+            stm_items=stm_items,
+            mtm_hits_by_query={},
+            settings=RecallSettings(
+                stm_scoring="recency", floor_protect_min_relevance=min_relevance
+            ),
+        )
+        result = await ranker.rank(
+            _NS,
+            "q",
+            [0.1, 0.1],
+            limit=10,
+            channels=RecallChannels(),
+            caller_identity_set=frozenset[str](),
+        )
+        return {it.memory_id for it in result.items if it.is_floor}
+
+    assert await _floor_ids(1.0) != set()
+    assert await _floor_ids(1.1) == set()
+
+
+# ---------------------------------------------------------------------------------------------
 # D1 — STM relevance scoring (DATA-QUALITY-ASSESSMENT.md §3.1, floor-fix follow-up to 02fbed9).
 # The tests above prove the STM channel no longer SWAMPS the fused result by count/insertion
 # order; these prove it now carries a REAL per-candidate relevance signal of its own, and that
@@ -663,7 +899,11 @@ async def test_protected_floor_is_reordered_by_relevance_not_recency() -> None:
     ranker = _build_ranker(
         stm_items=stm_items,
         mtm_hits_by_query={},
-        settings=RecallSettings(stm_scoring="embed"),
+        # T1c added a SECOND, INDEPENDENT gate on protection membership (this test's own module
+        # section below) — pin `floor_protect_min_relevance=-1.0` (AD-195's original, fully
+        # unconditional value) so this D1 test keeps isolating exactly what its own docstring
+        # says: membership stays recency-selected, only IN-BLOCK ORDER is relevance-driven.
+        settings=RecallSettings(stm_scoring="embed", floor_protect_min_relevance=-1.0),
         embedder=embedder,
     )
 
@@ -888,3 +1128,252 @@ async def test_reranker_dark_by_default_is_byte_identical_to_no_rerank() -> None
 
     assert [it.memory_id for it in result.items] == [only.id]
     assert result.items[0].rerank_score is None
+
+
+# ---------------------------------------------------------------------------------------------
+# S1b — read-time neighbour expansion (TRACE-0923.md §7/§6.2/§5.1, `ranker.py::_expand_neighbors`).
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_s1b_neighbor_expansion_off_by_default() -> None:
+    """``neighbor_expand_radius`` defaults to 0 — a candidate outside the returned window must
+    not appear just because it happens to be a turn_seq neighbour of something that made it."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    fillers = [
+        _item(f"filler #{n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n), turn_seq=100 + n)
+        for n in range(10)
+    ]
+    neighbor_item = _item(
+        "completely unrelated old aside",
+        tier=MemoryTier.STM,
+        at=base - timedelta(days=1),
+        turn_seq=6,
+    )
+    stm_items = [neighbor_item, *fillers]
+    strong_mtm = _item(
+        "Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base, turn_seq=5
+    )
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={query_vec: [strong_mtm]},
+        settings=RecallSettings(stm_scoring="recency", floor_protect_limit=0),
+    )
+
+    ids = await _rank(ranker, list(query_vec), limit=1)
+
+    assert ids == [strong_mtm.id]
+    assert neighbor_item.id not in ids
+
+
+@pytest.mark.asyncio
+async def test_s1b_legacy_rows_with_no_turn_seq_degrade_gracefully_when_expansion_is_on() -> None:
+    """TRACE-0923.md §7's explicit S1b requirement, and ``_expand_neighbors``'s own contract:
+    every row written before ``turn_seq`` existed (or by a write path that assigns none) carries
+    ``turn_seq=None`` and must be SKIPPED, never read as ``0`` and never raise — with expansion
+    switched ON. Added by the verify pass: no pure-unit test covered this path (mutating
+    ``_expand_neighbors`` to a hard no-op left the whole unit suite green)."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    # A row that WOULD be pulled in as a neighbour if a `turn_seq=None` anchor were read as 0 —
+    # `recency_floor_limit=0` keeps the STM channel from surfacing it on its own, so its presence
+    # in the result can only come from expansion.
+    trap = _item("a row at turn_seq 1", tier=MemoryTier.STM, at=base, turn_seq=1)
+    legacy_mtm = _item("a legacy MTM fact", tier=MemoryTier.MTM, at=base)  # turn_seq is None
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=[trap],
+        mtm_hits_by_query={query_vec: [legacy_mtm]},
+        settings=RecallSettings(
+            neighbor_expand_radius=2,
+            stm_scoring="recency",
+            floor_protect_limit=0,
+            recency_floor_limit=0,
+        ),
+    )
+
+    ids = await _rank(ranker, list(query_vec), limit=10)
+
+    assert ids == [legacy_mtm.id], (
+        "a turn_seq=None anchor was expanded anyway — it must be SKIPPED, never read as 0 "
+        f"(reading it as 0 pulls in the turn_seq=1 trap row): {ids!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_s1b_expansion_inserts_a_neighbour_that_no_channel_ranked() -> None:
+    """The POSITIVE half of S1b, deterministically and store-free. Added by the verify pass:
+    before it, every pure-unit S1b test asserted the neighbour's ABSENCE, so mutating
+    ``_expand_neighbors`` into an unconditional no-op left the unit suite entirely green and only
+    the real-Redis integration test caught it."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    # One anchor the MTM channel ranks, and one STM row that NOTHING ranks into the window on its
+    # own — it is only reachable as the anchor's turn_seq neighbour.
+    neighbor_item = _item(
+        "the reply that carries the answer", tier=MemoryTier.STM, at=base, turn_seq=6
+    )
+    anchor = _item(
+        "Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base, turn_seq=5
+    )
+    query_vec = (0.9, 0.1)
+
+    def _ids(radius: int) -> ThreeChannelRecallRanker:
+        return _build_ranker(
+            stm_items=[neighbor_item],
+            mtm_hits_by_query={query_vec: [anchor]},
+            settings=RecallSettings(
+                neighbor_expand_radius=radius,
+                stm_scoring="recency",
+                floor_protect_limit=0,
+                recency_floor_limit=0,  # the STM channel contributes NOTHING on its own
+            ),
+        )
+
+    off = await _rank(_ids(0), list(query_vec), limit=10)
+    on = await _rank(_ids(1), list(query_vec), limit=10)
+
+    assert off == [anchor.id], f"fixture broken — the neighbour is reachable without S1b: {off!r}"
+    assert neighbor_item.id in on, (
+        "neighbour expansion at radius=1 did not insert the anchor's ±1 turn_seq neighbour — the "
+        f"S1b read path is a no-op: {on!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_s1b_neighbor_never_borrows_a_higher_weighted_channels_scale() -> None:
+    """Regression guard for a scoring bug caught live on `mu-dev-vm` (measured account in
+    `_expand_neighbors`'s own docstring): a neighbour discovered via an MTM-sourced anchor must
+    compete at the STM channel's OWN ``weight_stm``-discounted scale, never at the anchor's
+    higher-weighted MTM scale — otherwise an irrelevant neighbour of a top MTM hit crowds out a
+    genuinely second-best MTM candidate purely because of which channel happened to find it."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    # 10 recent, irrelevant fillers fill the default `recency_floor_limit=10` window; the
+    # neighbour (turn_seq=6, oldest) is pushed OUTSIDE it — reachable only via
+    # `_expand_neighbors`'s own wider session scan, never the ordinary `floor` fetch, so this
+    # test exercises a GENUINE insertion, not a no-op skip of an already-present candidate.
+    fillers = [
+        _item(f"filler #{n}", tier=MemoryTier.STM, at=base + timedelta(minutes=n), turn_seq=100 + n)
+        for n in range(10)
+    ]
+    neighbor_item = _item(
+        "completely unrelated old aside",
+        tier=MemoryTier.STM,
+        at=base - timedelta(days=1),
+        turn_seq=6,
+    )
+    stm_items = [neighbor_item, *fillers]
+    strong_mtm = _item(
+        "Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base, turn_seq=5
+    )
+    second_mtm = _item("Ada's dentist appointment is on Friday", tier=MemoryTier.MTM, at=base)
+    query_vec = (0.9, 0.1)
+
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={query_vec: [strong_mtm, second_mtm]},
+        settings=RecallSettings(
+            neighbor_expand_radius=1, stm_scoring="recency", floor_protect_limit=0
+        ),
+    )
+
+    ids = await _rank(ranker, list(query_vec), limit=2)
+
+    assert ids == [strong_mtm.id, second_mtm.id], (
+        "an irrelevant neighbour of the top MTM anchor crowded out the genuinely second-best "
+        f"MTM candidate — the neighbour-scoring regression this test guards against: {ids!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_s1b_expansion_does_not_discard_the_rerank_gates_ordering() -> None:
+    """VERIFY PASS 2026-09-23 — regression test for a real interaction defect between the two
+    read-path stages. ``AdaptiveRerankGate.apply`` reorders the pool and records its verdict in
+    ``RecallItemView.rerank_score``; it deliberately does NOT rewrite ``fused_score`` (which
+    D2/``_to_view`` require to stay the RRF value). ``_expand_neighbors`` then ran
+    ``expanded.sort(key=fused_score)`` over the WHOLE list, which silently reverted the pool to
+    raw RRF order — so switching ``neighbor_expand_radius`` on turned the reranker off in effect.
+    Both knobs are operator-flippable, so the combination is reachable in production."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    # RRF ranks `first_by_rrf` ahead of `second_by_rrf` (MTM channel order); the reranker inverts
+    # that, and both clear the gate's cutoff so neither is pruned.
+    first_by_rrf = _item("chatter about the weather", tier=MemoryTier.MTM, at=base, turn_seq=5)
+    second_by_rrf = _item("Ada's flight to Denver is Thursday", tier=MemoryTier.MTM, at=base)
+    query_vec = [0.5, 0.5]
+    reranker = _ContentScoredReranker({second_by_rrf.content: 0.9, first_by_rrf.content: 0.8})
+
+    def _ranker(radius: int) -> ThreeChannelRecallRanker:
+        return ThreeChannelRecallRanker(
+            stm=_FakeStm([]),  # type: ignore[arg-type]
+            mtm=_FakeMtm({tuple(query_vec): [first_by_rrf, second_by_rrf]}),  # type: ignore[arg-type]
+            ltm=_EmptyLtm(),  # type: ignore[arg-type]
+            fusion=ReciprocalRankFusion(),
+            settings=RecallSettings(
+                stm_scoring="recency",
+                rerank_enabled=True,
+                rerank_min_score=0.5,
+                rerank_top_fraction=0.5,
+                neighbor_expand_radius=radius,
+            ),
+            clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+            reranker=reranker,
+        )
+
+    async def _ids(radius: int) -> list[str]:
+        result = await _ranker(radius).rank(
+            _NS,
+            "when is Ada's flight",
+            query_vec,
+            limit=10,
+            channels=RecallChannels(),
+            caller_identity_set=frozenset[str](),
+        )
+        return [it.memory_id for it in result.items]
+
+    off = await _ids(0)
+    assert off == [
+        second_by_rrf.id,
+        first_by_rrf.id,
+    ], f"fixture broken — rerank did not reorder: {off!r}"
+
+    on = await _ids(1)
+    assert on == off, (
+        "turning neighbour expansion on silently reverted the pool to raw RRF order and threw "
+        f"away the rerank gate's verdict: rerank-only {off!r} vs with-expansion {on!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_s1b_after_anchor_placement_puts_the_neighbour_inside_the_window() -> None:
+    """AD-232 / `RecallSettings.neighbor_expand_placement`. Under the shipped ``"tail"`` policy a
+    neighbour scores below every real candidate and is therefore truncated away whenever the pool
+    is already ``limit``-deep — which is why S1b measured as a no-op. ``"after_anchor"`` places it
+    directly behind the candidate that surfaced it, so it survives the same truncation."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    neighbor_item = _item(
+        "the reply that carries the answer", tier=MemoryTier.STM, at=base, turn_seq=6
+    )
+    anchor = _item("Ada's flight to Denver is Thursday", tier=MemoryTier.MTM, at=base, turn_seq=5)
+    filler = _item("an unrelated but well-ranked MTM row", tier=MemoryTier.MTM, at=base)
+    query_vec = (0.9, 0.1)
+
+    def _ranker(placement: str) -> ThreeChannelRecallRanker:
+        return _build_ranker(
+            stm_items=[neighbor_item],
+            mtm_hits_by_query={query_vec: [anchor, filler]},
+            settings=RecallSettings(
+                neighbor_expand_radius=1,
+                neighbor_expand_placement=placement,  # type: ignore[arg-type]
+                stm_scoring="recency",
+                floor_protect_limit=0,
+                recency_floor_limit=0,
+            ),
+        )
+
+    tail = await _rank(_ranker("tail"), list(query_vec), limit=2)
+    after = await _rank(_ranker("after_anchor"), list(query_vec), limit=2)
+
+    assert tail == [anchor.id, filler.id], f"'tail' should truncate the neighbour away: {tail!r}"
+    assert after == [
+        anchor.id,
+        neighbor_item.id,
+    ], f"'after_anchor' did not place the neighbour behind its anchor: {after!r}"

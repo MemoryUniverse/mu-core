@@ -22,7 +22,8 @@ import math
 import pytest
 
 from mu_contracts.domain.model.recall import SparseQuery
-from mu_engine.providers.sparse_encoder import Bm25SparseEncoder
+from mu_engine.providers.sparse_encoder import Bm25SparseEncoder, build_sparse_encoder
+from mu_engine.services.recall.dto import RecallSettings
 
 
 @pytest.fixture
@@ -169,3 +170,69 @@ def test_settings_are_injected_not_hardcoded() -> None:
 def test_values_are_finite_and_positive(enc: Bm25SparseEncoder) -> None:
     q = enc.encode("alpha beta gamma delta " * 50)
     assert all(math.isfinite(v) and v > 0.0 for v in q.values)
+
+
+# --------------------------------------------------------------------------------- S4 (TRACE-0923)
+
+
+def test_strip_leading_prefix_defaults_off_byte_identical_to_pre_s4_behaviour() -> None:
+    # The flag must be OPT-IN: every pre-existing caller of `Bm25SparseEncoder()` (no kwarg) keeps
+    # emitting the speaker term exactly as before until `RecallSettings.sparse_strip_leading_prefix`
+    # is explicitly turned on.
+    plain = Bm25SparseEncoder()
+    assert plain.strip_leading_prefix is False
+    assert plain.encode("Caroline: I painted this after I visited a center.").indices == (
+        plain.encode_query("Caroline: I painted this after I visited a center.").indices
+    )
+    assert (
+        plain.index_of("caroline")
+        in plain.encode("Caroline: I painted this after I visited a center.").indices
+    )
+
+
+def test_strip_leading_prefix_removes_the_speaker_term_from_the_write_side_only() -> None:
+    stripped = Bm25SparseEncoder(strip_leading_prefix=True)
+    doc = stripped.encode("Caroline: I painted this after I visited a center.")
+    assert stripped.index_of("caroline") not in doc.indices
+    assert stripped.index_of("painted") in doc.indices
+    # READ side is untouched — a query that happens to name the speaker still tokenises it; only
+    # the WRITE-side document drops the label (RecallSettings.sparse_strip_leading_prefix docstring
+    # — "encode_query ... UNCHANGED").
+    q = stripped.encode_query("What did Caroline paint?")
+    assert stripped.index_of("caroline") in q.indices
+
+
+def test_strip_leading_prefix_removes_at_most_one_leading_label_never_mid_document() -> None:
+    stripped = Bm25SparseEncoder(strip_leading_prefix=True)
+    # Two "Label:"-shaped spans: only the FIRST (at the very start) is a real speaker label: a
+    # colon appearing later, mid-sentence, must survive untouched.
+    doc = stripped.encode("Caroline: my plan: paint a mural this weekend.")
+    assert stripped.index_of("caroline") not in doc.indices
+    assert stripped.index_of("plan") in doc.indices  # the second "label:" is real content
+
+
+def test_strip_leading_prefix_never_strips_a_long_clause_before_a_colon() -> None:
+    # Length-capped: an ordinary sentence that merely contains a colon far from the start (not a
+    # short dialogue-turn label) must not lose its opening words.
+    stripped = Bm25SparseEncoder(strip_leading_prefix=True)
+    text = "According to the article the professor cited last week: the results were inconclusive."
+    doc = stripped.encode(text)
+    assert stripped.index_of("according") in doc.indices
+
+
+def test_strip_leading_prefix_degrades_to_empty_sparse_query_when_label_is_the_whole_text() -> None:
+    # A document that is NOTHING but a stripped label must land on the SAME empty-encode path a
+    # plain untokenizable document already takes (qdrant_mtm.py `_point_vector` -> dense-only
+    # point), never a crash or a malformed vector.
+    stripped = Bm25SparseEncoder(strip_leading_prefix=True)
+    q = stripped.encode("Caroline: ")
+    assert q.indices == ()
+    assert q.values == ()
+
+
+def test_build_sparse_encoder_wires_the_settings_flag_through() -> None:
+    off = build_sparse_encoder(RecallSettings())
+    assert off is not None and off.strip_leading_prefix is False
+
+    on = build_sparse_encoder(RecallSettings(sparse_strip_leading_prefix=True))
+    assert on is not None and on.strip_leading_prefix is True

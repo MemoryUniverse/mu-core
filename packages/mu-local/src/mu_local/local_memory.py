@@ -66,7 +66,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from mu_contracts.contracts.defaults import DEFAULT_CONSOLIDATE_LIMIT
 from mu_contracts.contracts.memory import MemoryResponse
@@ -125,6 +125,18 @@ _ASK_SYSTEM_PROMPT = "Answer the question using ONLY the given facts. Be concise
 # mypy-strict can verify the ``importance=`` kwarg below without an ``**dict`` unpack (which mypy
 # cannot type-check against a ``BaseModel``'s heterogeneous field types).
 _DEFAULT_IMPORTANCE: float = IngestActivity.model_fields["importance"].default
+# S1b (TRACE-0923.md §7/§6.2, `_next_turn_seq_base`'s own docstring): how far back `add()` scans
+# a session's STM window to find the highest already-assigned `turn_seq` before continuing the
+# sequence. Conv-41, the longest LoCoMo conversation this repo's own eval corpus carries, is 663
+# turns (TRACE-0923.md §0); this is set generously above that with headroom for a real deployment
+# session running longer than any benchmark conversation, NOT tuned to the benchmark. **Known,
+# documented limit** (DEV-STANDARDS: "record a tracked gap explicitly" rather than hide it): a
+# session whose STM window exceeds this width when `add()` is called will under-count and can
+# assign a `turn_seq` that collides with one already used earlier in that same session — the read
+# path's neighbour expansion (`services/recall/ranker.py`) is written to degrade gracefully on a
+# malformed/duplicate `turn_seq` rather than trust it blindly, but the fix for THIS limit is a
+# dedicated write-path sequence port (a follow-up, flagged in the T1/S1b ADR, not built here).
+_TURN_SEQ_SCAN_LIMIT: Final[int] = 4000
 
 
 class LocalMemory:
@@ -149,6 +161,16 @@ class LocalMemory:
         # where delegating changes no observable behaviour today: promote/demote (module
         # docstring "UNIFIED VERB SURFACE").
         self._facade = SurfaceFacade(self._container, workspace=workspace, namespace=namespace)
+        # S1b turn_seq continuation, cached per namespace prefix for THIS instance.
+        # `_next_turn_seq_base` reads STM to continue a sequence a PRIOR instance wrote, which is
+        # correct and must stay — but doing it on every `add()` made ingest 4.3-5.4x slower and
+        # superlinear (measured: 69.9/53.7/162.7 s against 16.4/13.8/30.1 s for the identical
+        # conversations dense-only), because the scan hydrates the whole session window each time
+        # and the window grows as the conversation does. The store is therefore read ONCE per
+        # namespace per instance; after that this instance owns the sequence it is writing and
+        # increments in memory. A new instance re-reads, so cross-instance continuation is
+        # unchanged.
+        self._turn_seq_next: dict[str, int] = {}
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> LocalMemory:
@@ -230,6 +252,14 @@ class LocalMemory:
         # ``None`` means "caller expressed no opinion" -> falls to IngestActivity's own field
         # default (module constant above), never a second hardcoded literal duplicating it here.
         importance = importance_score if importance_score is not None else _DEFAULT_IMPORTANCE
+        # S1b (TRACE-0923.md §7/§6.2): the FIRST turn_seq to assign this call — one past the
+        # highest turn_seq already resident in this session's STM window (`_next_turn_seq_base`'s
+        # own docstring has the full rationale + the read-from-store-not-a-counter reasoning).
+        # Read ONCE per `add()` call, then incremented locally per message below — a multi-message
+        # `content` list (`_normalize_messages`) gets consecutive values without a store
+        # round-trip per message, and a later, SEPARATE `add()` call on this SAME session (or a
+        # fresh `LocalMemory` instance) still continues the sequence rather than restarting it.
+        next_turn_seq = await self._next_turn_seq_cached(ns)
         last: IngestResult | None = None
         for message in _normalize_messages(content):
             activity = IngestActivity(
@@ -239,10 +269,16 @@ class LocalMemory:
                 kind="user_message",
                 text=message["content"],
                 importance=importance,
+                turn_seq=next_turn_seq,
             )
+            next_turn_seq += 1
             last = await self._container.ingest.remember(activity)
         if last is None:  # empty message list — fail loud, never a silent no-op
             raise ValueError("add() received no content to remember")
+        # Hand the consumed sequence back, so the next `add()` on this session continues from here
+        # without another STM scan. Written only after a successful write: a failed `add()` must
+        # not advance the counter past rows that were never stored.
+        self._remember_turn_seq(ns, next_turn_seq)
         return MemoryWriteResult(
             memory_id=last.memory_id,
             content_hash=last.content_hash,
@@ -587,6 +623,50 @@ class LocalMemory:
             agent_path=identity.agent_path,
         )
         return subagent_write_namespace(scope)
+
+    async def _next_turn_seq_cached(self, ns: Namespace) -> int:
+        """:meth:`_next_turn_seq_base`, read once per namespace per instance.
+
+        The store read exists so a sequence continues across instances; it does NOT need to
+        repeat once this instance is the one appending. Callers must write back the value they
+        consumed via :meth:`_remember_turn_seq`, so a later ``add()`` on the same session keeps
+        counting rather than re-scanning."""
+        key = ns.to_prefix()
+        cached = self._turn_seq_next.get(key)
+        if cached is not None:
+            return cached
+        base = await self._next_turn_seq_base(ns)
+        self._turn_seq_next[key] = base
+        return base
+
+    def _remember_turn_seq(self, ns: Namespace, next_value: int) -> None:
+        """Record the next unused ``turn_seq`` for ``ns`` after an ``add()`` has consumed some."""
+        self._turn_seq_next[ns.to_prefix()] = next_value
+
+    async def _next_turn_seq_base(self, ns: Namespace) -> int:
+        """S1b (TRACE-0923.md §7/§6.2): the next ``MemoryItem.turn_seq`` to assign in ``ns`` —
+        one past the highest ``turn_seq`` already resident in this session's STM window, or ``0``
+        for a session with none.
+
+        **Read from the store, not an in-process counter.** An in-process ``dict[session, int]``
+        would restart at 0 every time a NEW ``LocalMemory`` is constructed (a daemon restart, a
+        fresh object in the same process, or — the case this harness itself exercises — a test
+        or eval run that builds a fresh instance per conversation while re-using a session id
+        across runs), silently colliding new rows' ``turn_seq`` with rows a PRIOR instance already
+        wrote. Reading the current max off STM (the SAME port :meth:`consolidate` already calls
+        with a caller-supplied ``limit``, no new port method) makes the sequence continue
+        correctly across instances as long as those earlier rows are still resident — bounded by
+        :data:`_TURN_SEQ_SCAN_LIMIT`, a real, documented limit (that constant's own docstring).
+
+        **Graceful degradation (§7's own requirement — "existing rows carry random offsets, so
+        the read path must degrade gracefully").** A row written before ``turn_seq`` existed, or
+        by a write path that assigns none, carries ``turn_seq=None`` — filtered out here rather
+        than treated as ``0`` (which would collide with a genuine first turn). An EMPTY or
+        entirely-legacy session therefore starts a fresh sequence at ``0``, never raises, and
+        never returns a negative or nonsensical value."""
+        window = await self._container.stm.recent(ns, limit=_TURN_SEQ_SCAN_LIMIT)
+        seen = [scored.item.turn_seq for scored in window if scored.item.turn_seq is not None]
+        return (max(seen) + 1) if seen else 0
 
     def _scope(self, user: str, session: str | None) -> ClientScope:
         return ClientScope(

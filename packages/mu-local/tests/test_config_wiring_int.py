@@ -113,9 +113,14 @@ async def _teardown_stores(settings: Settings, uid: str) -> None:
 
 async def _seed_and_recall(settings: Settings, uid: str) -> list[str]:
     """Seed ``_TARGET`` (oldest — worst possible STM-recency rank) + 5 recency-favored fillers
-    (newest), then recall ``_QUERY`` with ``limit=5``. ``floor_protect_limit`` (default 3) always
-    force-includes the 3 MOST RECENT fillers regardless of relevance/weight (the "never evict a
-    just-said fact" guarantee, ``ranker.py:_merge_floor`` — untouched by this knob on purpose), so
+    (newest), then recall ``_QUERY`` with ``limit=5``. ``floor_protect_limit`` (default 3) bounds
+    how many of the MOST RECENT fillers are ELIGIBLE for the "never evict a just-said" guarantee
+    (``ranker.py:_merge_floor`` — untouched by this knob on purpose). NOTE (verify pass
+    2026-09-23): this used to read "always force-includes the 3 most recent fillers regardless of
+    relevance"; since T1 option (c) / ADR 0052 that is no longer true — an eligible filler is only
+    protected once it clears ``floor_protect_min_relevance`` (shipped 0.5), so fewer than 3 slots
+    may be spent on the floor. The claim this test actually makes (``MU_RECALL__WEIGHT_MTM``
+    reaches the composed ranker and changes result membership) is unaffected either way, since
     only the remaining 2 result slots are decided by the RRF-fused, ``weight_mtm``-sensitive tail:
     ``_TARGET`` (MTM rank 1, its ONLY edge) competing against the 2 oldest fillers (better STM
     rank, poor MTM rank)."""

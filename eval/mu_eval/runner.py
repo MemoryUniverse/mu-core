@@ -24,13 +24,28 @@ from mu_eval.locomo import CATEGORY_NAMES, Conversation, LabelledQuery
 from mu_eval.metrics import QueryScores, aggregate, score_query
 
 __all__ = [
+    "NEIGHBOR_EXPANSION_MARKER_ATTR",
     "ArmReport",
+    "GoldContextHit",
     "RunReport",
     "ScoreProvenance",
     "classify_query_admission",
+    "gold_context_attribution",
     "gold_ids_present",
     "run_baseline",
 ]
+
+# Coordination point for the neighbour-expansion arm (S1b, `TRACE-0923.md` §7 S1b; recorded as
+# AD-228 in `ARCHITECTURE-DELTAS.md`). This harness's own file ownership is `eval/` only
+# (CLAUDE.md rule 12 / this lane's brief) — it cannot add a field to `mu_contracts.contracts.
+# recall.RecallItemView` (that lives in `services/recall/`'s lane), so it names, here, the ONE
+# attribute the READ side has committed to looking for on a recalled item, mirroring the shape
+# `RecallItemView.is_floor` already uses for the same kind of "how did this item get here"
+# provenance. `getattr(item, NEIGHBOR_EXPANSION_MARKER_ATTR, False)` below means: a surface that
+# does not (yet) carry the field is read as "nothing came from expansion" — never a crash, and
+# never mistaken for "expansion produced nothing" once the field actually exists but reports
+# `False` for a real reason.
+NEIGHBOR_EXPANSION_MARKER_ATTR = "is_neighbor"
 
 
 class ScoreProvenance(BaseModel):
@@ -67,6 +82,28 @@ class ArmReport(BaseModel):
     overall: dict[str, dict[int, float]]
     by_category: dict[str, dict[str, dict[int, float]]]
     provenance: ScoreProvenance | None = None
+
+    # The FREE, no-LLM `gold_in_context` metric (TRACE-0923.md "COST DISCIPLINE": needs no answer
+    # model and no judge, so use it — with repeats, paired — for every arm). Distinct from
+    # `recall_at_k`: `gold_in_context` is the boolean "was ANY gold turn anywhere in what this
+    # query's recall actually returned", the same join `gold_ids_present` already gives
+    # `answer_quality.py` per-row, now also aggregated here so a retrieval-only run reports it
+    # without needing the paid answer-quality path at all. Default 0 so an artifact written before
+    # this fix still loads (`extra="forbid"` above).
+    gold_in_context: int = 0
+    # Of `gold_in_context` above, how many resolved ONLY through an item the recall surface marked
+    # `is_neighbor` (S1b) — i.e. no primary-channel item alone would have counted as a hit for
+    # that query. This is what makes the neighbour-expansion arm's OWN contribution visible: an
+    # expansion that only ever piggybacks on a hit a primary channel already found would leave
+    # `gold_in_context` unchanged (correctly — nothing new was retrieved) and this counter at 0;
+    # a nonzero value here is retrieval `gold_in_context` could not have reached without
+    # expansion. Unconditionally 0 until the recall surface actually sets `is_neighbor` on an
+    # item — an honest "not yet measurable", never a fabricated contribution.
+    gold_in_context_via_neighbor_only: int = 0
+    # Total items across all scored queries that the recall surface marked `is_neighbor`,
+    # regardless of whether they were a gold hit — lets a reader see the expansion arm is even
+    # switched on (nonzero) before asking whether it moved `gold_in_context` at all.
+    neighbor_items_seen: int = 0
 
 
 class RunReport(BaseModel):
@@ -129,6 +166,58 @@ def _resolve_ranked_ids(items: Sequence[Any], index: TurnIndex, gold: set[str]) 
     return ranked
 
 
+class GoldContextHit(BaseModel):
+    """Whether gold appears anywhere in a recall's ``items``, broken out by HOW it got there.
+
+    The join itself (``index.resolve(item.content)`` against ``gold``) is content-based and
+    therefore already channel-agnostic: an item the neighbour-expansion arm (S1b) adds to
+    ``result.items`` is resolved exactly the same way a primary-channel item is, AS LONG AS it
+    carries the neighbour's own real body text — which is the only sane way to implement S1b
+    (``TurnIndex`` joins ANY item's body back to its source turn, tier- and channel-agnostic by
+    design; see its own docstring). So ``present`` below needed no new logic to count an expanded
+    neighbour's hit. What ``present`` alone CANNOT show is whether the arm did anything: an
+    expansion that only ever re-surfaces a turn a primary channel already ranked in would leave
+    `present` looking identical to a run with the arm off. `via_neighbor_only` is the number that
+    would move even when `present` does not.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    present: bool
+    via_neighbor_only: bool
+    neighbor_items: int
+
+
+def gold_context_attribution(
+    items: Sequence[Any], index: TurnIndex, gold: set[str]
+) -> GoldContextHit:
+    """Per-query gold-in-context detail: presence, plus the neighbour-expansion attribution.
+
+    ``via_neighbor_only`` is true iff gold is present AND every item that resolved to a gold turn
+    id carries ``NEIGHBOR_EXPANSION_MARKER_ATTR`` (read via ``getattr(..., False)``, so an item
+    from a surface that has not adopted the marker — every surface in this repo today — is always
+    read as "not expansion", never crashes, and never inflates this count before the field is
+    real). ``neighbor_items`` counts every marked item seen, hit or not, so a reader can tell "the
+    arm produced nothing" (0) apart from "the arm produced items but none were gold" (nonzero here,
+    zero above).
+    """
+    resolved_hit_is_neighbor: list[bool] = []
+    neighbor_items = 0
+    for item in items:
+        if getattr(item, NEIGHBOR_EXPANSION_MARKER_ATTR, False):
+            neighbor_items += 1
+        if any(candidate in gold for candidate in index.resolve(item.content)):
+            resolved_hit_is_neighbor.append(
+                bool(getattr(item, NEIGHBOR_EXPANSION_MARKER_ATTR, False))
+            )
+    present = bool(resolved_hit_is_neighbor)
+    return GoldContextHit(
+        present=present,
+        via_neighbor_only=present and all(resolved_hit_is_neighbor),
+        neighbor_items=neighbor_items,
+    )
+
+
 def gold_ids_present(items: Sequence[Any], index: TurnIndex, gold: set[str]) -> bool:
     """True iff ANY item's body resolves (via ``TurnIndex``) to a turn id in ``gold``.
 
@@ -138,11 +227,13 @@ def gold_ids_present(items: Sequence[Any], index: TurnIndex, gold: set[str]) -> 
     model at all. Uses the SAME resolution ``_resolve_ranked_ids`` uses (candidates =
     ``index.resolve(item.content)``), so "was gold retrieved" and "what rank was gold retrieved
     at" are answered by literally the same join, never two joins that could quietly disagree.
+
+    Thin wrapper over ``gold_context_attribution`` (kept as its own function, unchanged signature
+    and return type, so every existing caller — ``answer_quality.py``'s per-row
+    ``QueryResult.gold_in_context`` — is untouched) so the two never drift apart into two joins
+    that could quietly disagree with each other.
     """
-    for item in items:
-        if any(candidate in gold for candidate in index.resolve(item.content)):
-            return True
-    return False
+    return gold_context_attribution(items, index, gold).present
 
 
 class _ProvenanceAccumulator:
@@ -238,6 +329,9 @@ async def run_baseline(
     provenance = _ProvenanceAccumulator()
     notes: list[str] = []
     corpus_turns = 0
+    gold_in_context = 0
+    gold_in_context_via_neighbor_only = 0
+    neighbor_items_seen = 0
 
     for conversation in conversations:
         async with local_memory_for(conversation, run_id=run_id, settings=settings) as opaque:
@@ -293,6 +387,12 @@ async def run_baseline(
                     query.question, user=user, session=session, limit=limit, tier=tier_enum
                 )
                 provenance.observe(result)
+                attribution = gold_context_attribution(result.items, index, gold)
+                if attribution.present:
+                    gold_in_context += 1
+                    if attribution.via_neighbor_only:
+                        gold_in_context_via_neighbor_only += 1
+                neighbor_items_seen += attribution.neighbor_items
                 ranked = _resolve_ranked_ids(result.items, index, gold)
                 rows.append(
                     score_query(
@@ -333,6 +433,9 @@ async def run_baseline(
                 overall=aggregate(rows, ks),
                 by_category=by_category,
                 provenance=provenance.finish(),
+                gold_in_context=gold_in_context,
+                gold_in_context_via_neighbor_only=gold_in_context_via_neighbor_only,
+                neighbor_items_seen=neighbor_items_seen,
             )
         ],
         notes=notes,

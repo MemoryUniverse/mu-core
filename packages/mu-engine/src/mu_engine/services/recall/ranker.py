@@ -10,9 +10,16 @@ Channel behaviour pinned to §1.3:
     excluded from the window; the floor protects a *valid* recent fact, never resurrects a retired
     one). BUG FIX (data-quality assessment §3.1/#1, 2026-07-31): the candidate pool now FUSES into
     the same RRF pass as MTM/LTM (``weight_stm``) instead of being force-prepended whole — only the
-    ``settings.floor_protect_limit`` most-recent candidates are UNCONDITIONALLY protected
-    (``is_floor=True``, never evicted); the rest compete on fused rank like any other channel.
-    Before this fix, ``recency_floor_limit`` defaulted to the SAME width as the result ``limit``
+    ``settings.floor_protect_limit`` most-recent candidates are ELIGIBLE for protection
+    (``is_floor=True``, never evicted); the rest compete on fused rank like any other channel. T1
+    option (c) (``TRACE-0923.md`` §7/§7.1, ``_protected_floor_ids`` below) added a SECOND gate on
+    top of that eligibility window: an eligible candidate is only actually protected once its own
+    relevance score clears ``settings.floor_protect_min_relevance`` — SHIPPED at ``0.5`` on
+    evidence (measured `gold_in_context` sweep, ``dto.py``'s own docstring has the numbers);
+    ``-1.0`` (cosine similarity's own true minimum) reproduces the pre-T1c "unconditional within
+    the window" behaviour exactly, still reachable via
+    ``MU_RECALL__FLOOR_PROTECT_MIN_RELEVANCE=-1``. Before the
+    original fix, ``recency_floor_limit`` defaulted to the SAME width as the result ``limit``
     (10==10), so a session with >= ``limit`` STM items consumed the ENTIRE result budget and the
     query-relevant MTM/LTM channels never surfaced a single item — every ``recall()`` in that
     session returned the identical, query-blind, insertion-order list (verbatim repro:
@@ -51,10 +58,15 @@ a nonsense query in the same session still returned near-identical, STM-dominate
 "embed": cosine-rank against the SAME query vector the MTM channel already uses; "lexical":
 token-overlap fallback needing no embedder; "recency": explicit pre-fix opt-out). The relevance-
 ordered list feeds BOTH the RRF fusion channel input (fused rank now reflects relevance, not just
-recency) AND the protected-floor DISPLAY order — protection membership (WHICH items can never be
-evicted) stays recency-selected (the "never evict a just-said fact" guarantee is unchanged), but the
-protected block is now reorderable BY RELEVANCE within itself so a just-said, irrelevant fact no
-longer sits at rank 1 ahead of the actual answer.
+recency) AND the protected-floor DISPLAY order — at the time of D1, protection membership (WHICH
+items can never be evicted) stayed purely recency-selected and the "never evict a just-said fact"
+guarantee was unchanged, with the protected block merely reorderable BY RELEVANCE within itself so
+a just-said, irrelevant fact no longer sat at rank 1 ahead of the actual answer. **T1 option (c)
+(2026-09-23, ADR 0052) SUPERSEDED the membership half of that sentence**: recency still bounds who
+is ELIGIBLE (``floor_protect_limit``), but an eligible candidate is now protected only once its own
+relevance score clears ``floor_protect_min_relevance`` — see ``_protected_floor_ids``. The D1
+statement above is kept as the record of what D1 itself decided; it is no longer the live
+behaviour.
 
 AD-204 channel rank-authority (RETRIEVAL-EVAL-0829.md §5.3 / STATE-AND-DEFECTS-0829.md D3,
 2026-08-30, the fix D3 itself named as still open): D1/D3 above fixed WHAT the STM channel's
@@ -160,6 +172,7 @@ def _to_view(
         fused_score=scored.score if fused_score is None else fused_score,
         is_floor=scored.is_floor,
         artifact_ref=item.artifact_ref,
+        turn_seq=item.turn_seq,  # S1b — None on any item written before it existed (dto.py)
     )
 
 
@@ -341,6 +354,19 @@ class ThreeChannelRecallRanker:
         # unchanged, so every pre-existing test of this method is unaffected.
         fused_views = await self._rerank_gate.apply(fused_views, query)
 
+        # S1b — read-time neighbour expansion (TRACE-0923.md §7/§6.2/§5.1; `_expand_neighbors`'s
+        # own docstring has the full rationale + graceful-degradation contract). Runs AFTER the
+        # rerank gate deliberately: an inserted neighbour is a NEW candidate no model has scored,
+        # and it competes for a `limit` slot on its anchor's already-decided position, not on a
+        # rerank verdict nobody computed for it. `settings.neighbor_expand_radius=0` (the default)
+        # returns `fused_views` unchanged — inert until an operator raises it.
+        fused_views = await self._expand_neighbors(
+            ns,
+            fused_views,
+            floor_pool_size=len(floor_scored),
+            caller_identity_set=caller_identity_set,
+        )
+
         # D1 (b): WHICH items are unconditionally protected stays RECENCY-selected — `floor` (not
         # `floor_scored`) picks the `floor_protect_limit` most-recent candidates, preserving the
         # "never evict a just-said fact" guarantee unchanged. But the block is now REORDERABLE
@@ -349,7 +375,12 @@ class ThreeChannelRecallRanker:
         # relevance order — a just-said, irrelevant fact no longer sits at rank 1 ahead of the
         # actual answer merely because it was said last.
         protect_n = self._settings.floor_protect_limit
-        protected_ids = {s.item.id for s in floor[:protect_n]}
+        protected_ids = _protected_floor_ids(
+            floor=floor,
+            floor_scored=floor_scored,
+            protect_n=protect_n,
+            min_relevance=self._settings.floor_protect_min_relevance,
+        )
         protected_floor_views = [
             _to_view(s, "stm") for s in floor_scored if s.item.id in protected_ids
         ]
@@ -498,6 +529,152 @@ class ThreeChannelRecallRanker:
         ranked = sorted(scored, key=lambda pair: pair[1], reverse=True)
         return [s.model_copy(update={"score": relevance}) for s, relevance in ranked]
 
+    async def _expand_neighbors(
+        self,
+        ns: Namespace,
+        fused_views: list[RecallItemView],
+        *,
+        floor_pool_size: int,
+        caller_identity_set: CallerIdentitySet | None,
+    ) -> list[RecallItemView]:
+        """S1b — read-time neighbour expansion (``docs/tracking/TRACE-0923.md`` §7/§6.2/§5.1; ADR
+        pending in ``docs/decisions/``; ``RecallSettings.neighbor_expand_radius``'s own docstring
+        has the config-level rationale). §5.1's finding: 32.5% of this repo's own measured
+        failures returned a turn within ±1 of the gold and NEVER the gold — the retriever finds
+        the right conversational moment and returns the wrong turn of it, because the
+        answer-bearing turn is usually a *reply* and the question's vocabulary lives one turn
+        earlier. This inserts each fused candidate's ``turn_seq`` neighbours (``MemoryItem.
+        turn_seq``, S1b's write-side field, ``local_memory.py::_next_turn_seq_base``) into the
+        SAME pool ``_merge_floor`` truncates to ``limit`` — a neighbour competes for a slot
+        exactly like the candidate that surfaced it (see the module-level ADR reference for why
+        "costs a slot" was chosen over a free-riding wire-contract field this phase does not own).
+
+        **Placement in the ranked list — and the bug an earlier version of this method shipped
+        with.** A neighbour is fetched via a RAW STM lookup (this method's own session-window
+        fetch below), so it is fundamentally an STM-CHANNEL candidate regardless of which channel
+        surfaced its anchor. The first version of this method scored it as ``anchor_score -
+        epsilon`` — which, for an MTM-sourced anchor (``weight_mtm=1.0``), put the neighbour at
+        very nearly the MTM channel's score SCALE, entirely bypassing the ``weight_stm=0.1``
+        discount AD-204 measured and shipped specifically to stop the STM channel from swamping
+        MTM (``dto.py``'s own ``weight_stm`` docstring). MEASURED on `mu-dev-vm` real LoCoMo
+        (3 conversations, 383 queries): this dropped `gold_in_context` from 257/383 (0.6710) to
+        223/383 (0.5822), a net 34-query regression, and inverted the STM/MTM slot share from
+        2638/1192 (MTM-dominant, the shipped
+        baseline) to 1213/2617 (STM-dominant) — an MTM anchor's high-ranked neighbour was
+        crowding out GENUINELY better-ranked MTM candidates the anchor's own channel had earned.
+
+        **The fix: every neighbour scores on the STM channel's OWN weight family, never the
+        anchor's.** A neighbour is treated as an UN-RANKED STM candidate entering just past the
+        end of the real, already-ranked STM floor pool (``floor_pool_size``, the caller's
+        ``len(floor_scored)`` for this query) — ``weight_stm / (rrf_k + floor_pool_size + offset)``,
+        ``offset`` the conversational distance from its anchor (so a ±1 neighbour outranks a ±2
+        neighbour of the same anchor, both still strictly below every genuinely STM-ranked
+        candidate, since ``floor_pool_size + offset > floor_pool_size - 1``, the worst REAL rank
+        in the pool). This can never exceed a real STM channel member's score and can never
+        approach MTM's scale (bounded by ``weight_stm``, not by whatever channel found the
+        anchor) — it restores AD-204's discount instead of routing around it, while still
+        entering the SAME RRF competition every other candidate is in (re-sorted below), so a
+        neighbour with nothing else competing for its slot still gets a fair look.
+
+        **Graceful degradation (§7's explicit requirement).** An anchor with ``turn_seq=None``
+        (any row written before S1b, or by a write path that assigns none) is simply not
+        expanded — never treated as ``turn_seq=0``. A ``turn_seq`` COLLISION (two items sharing
+        one value — the documented gap in ``local_memory.py::_TURN_SEQ_SCAN_LIMIT``/
+        ``RecallSettings.neighbor_expand_session_scan_limit``) resolves to "the first one this
+        method's own session-window fetch happens to see", never a raise. A store outage on that
+        fetch degrades to NO expansion for this call (returns ``fused_views`` unchanged) — this is
+        an enhancement, not one of the channels this ranker's own named degrade contract (§5)
+        covers, so it fails OPEN to the pre-S1b result rather than failing the whole recall.
+        """
+        radius = self._settings.neighbor_expand_radius
+        if radius <= 0:
+            return fused_views
+        anchors = [v for v in fused_views if v.turn_seq is not None]
+        if not anchors:
+            return fused_views
+        try:
+            window = await self._stm.recent(
+                ns,
+                limit=self._settings.neighbor_expand_session_scan_limit,
+                caller_identity_set=caller_identity_set,
+            )
+        except StoreUnavailableError:
+            return fused_views  # enhancement, not a named channel — degrade to no expansion.
+        by_turn_seq: dict[int, Scored[MemoryItem]] = {}
+        for scored in window:
+            seq = scored.item.turn_seq
+            if seq is not None and seq not in by_turn_seq:  # first-found wins a collision
+                by_turn_seq[seq] = scored
+
+        present_ids = {v.memory_id for v in fused_views}
+        neighbors: list[RecallItemView] = []
+        by_anchor: dict[str, list[RecallItemView]] = {}
+        for anchor in anchors:
+            anchor_turn_seq = anchor.turn_seq
+            if anchor_turn_seq is None:  # pragma: no cover - excluded by `anchors` filter above
+                continue
+            for offset in range(1, radius + 1):
+                for seq in (anchor_turn_seq - offset, anchor_turn_seq + offset):
+                    if seq < 0:
+                        continue
+                    neighbor = by_turn_seq.get(seq)
+                    if neighbor is None or neighbor.item.id in present_ids:
+                        continue
+                    present_ids.add(neighbor.item.id)
+                    # STM-channel-family score (this docstring's "the fix" section) — NEVER
+                    # derived from `anchor.fused_score`, so a neighbour can never borrow a
+                    # higher-weighted channel's scale.
+                    neighbor_score = self._settings.weight_stm / (
+                        self._settings.rrf_k + floor_pool_size + offset
+                    )
+                    # `is_floor=False`: the STM adapter's own `recent()` stamps EVERY returned
+                    # candidate `is_floor=True` unconditionally (module docstring, "`is_floor`
+                    # from the adapter marks EVERY STM candidate") — the SAME reason the main
+                    # `fused_views` comprehension above forces it False. A neighbour earns
+                    # `is_floor=True` only if `_merge_floor` independently re-stamps it because it
+                    # ALSO happens to be a protected floor member, exactly like any other fused
+                    # candidate — never because of how this method fetched it.
+                    view = _to_view(neighbor, "stm", fused_score=neighbor_score).model_copy(
+                        update={"is_neighbor": True, "is_floor": False}
+                    )
+                    neighbors.append(view)
+                    by_anchor.setdefault(anchor.memory_id, []).append(view)
+        # PLACEMENT. `fused_views` order is NEVER re-sorted here — VERIFY PASS 2026-09-23: this
+        # method used to end with `expanded.sort(key=fused_score)` over the whole merged list,
+        # which silently discarded `AdaptiveRerankGate.apply`'s ordering, because the gate records
+        # its verdict in `rerank_score` and deliberately leaves `fused_score` at the RRF value
+        # (D2/`_to_view`). Switching `neighbor_expand_radius` on therefore switched the reranker
+        # off in effect (`test_s1b_expansion_does_not_discard_the_rerank_gates_ordering`).
+        #
+        # It is NOT enough to append instead: MEASURED (the real-store
+        # `test_s1b_neighbor_expansion_int.py` went red), a neighbour's
+        # `weight_stm / (rrf_k + floor_pool_size + offset)` score does sometimes exceed a real,
+        # weakly-ranked STM candidate's, and appending would silently demote it below one — so the
+        # old sort was load-bearing for the mechanism, just too broad. STABLE INSERTION keeps both
+        # properties: each neighbour goes before the FIRST existing item scoring strictly lower
+        # than it, and the relative order of everything already in the pool is untouched. When the
+        # pool is score-ordered (the shipped config — the rerank gate is dark by default) that is
+        # byte-identical to the old whole-list sort; when the gate HAS reordered, the gate wins.
+        if self._settings.neighbor_expand_placement == "after_anchor":
+            # Measured and REJECTED as a default (ARCHITECTURE-DELTAS.md AD-232's own arm H:
+            # 246/383 against 281 shipped, with the STM/MTM slot share inverting) — kept as a
+            # config-gated arm, not deleted, so the next reader does not re-derive it. Each
+            # neighbour sits immediately behind the candidate that surfaced it.
+            placed: list[RecallItemView] = []
+            for view in fused_views:
+                placed.append(view)
+                placed.extend(by_anchor.get(view.memory_id, ()))
+            return placed
+        neighbors.sort(key=lambda v: v.fused_score, reverse=True)
+        merged = list(fused_views)
+        for view in neighbors:
+            at = next(
+                (i for i, existing in enumerate(merged) if existing.fused_score < view.fused_score),
+                len(merged),
+            )
+            merged.insert(at, view)
+        return merged
+
 
 def _lexical_overlap(query: str, content: str) -> float:
     """D1 "lexical" STM relevance score: ``|query_tokens ∩ content_tokens| / |query_tokens|``,
@@ -537,6 +714,68 @@ def _channel_label(scored: Scored[MemoryItem]) -> str:
     if scored.channel is RecallChannel.STM_FLOOR:
         return "stm"
     return "mtm"
+
+
+def _protected_floor_ids(
+    *,
+    floor: list[Scored[MemoryItem]],
+    floor_scored: list[Scored[MemoryItem]],
+    protect_n: int,
+    min_relevance: float,
+) -> set[str]:
+    """T1 option (c) (``docs/tracking/TRACE-0923.md`` §7/§7.1; ADR pending in
+    ``docs/decisions/``): the "never evict a just-said fact" guarantee (AD-195) stays intent-true
+    — a just-said fact IS still protected — but it must now also clear a relevance bar, so it no
+    longer spends a result slot on a recent item the query has nothing to do with.
+
+    **Why this, and not lowering ``floor_protect_limit``.** §7.1 laid out the honest options: (a)
+    keep 3 and pay the cost, (b) lower the default and weaken the guarantee everywhere including
+    the live-agent session it was built for, or (c) keep the guarantee's SHAPE (bounded by the
+    SAME ``floor_protect_limit`` membership window this always used) and make membership
+    CONDITIONAL. This is (c): ``floor`` is still the recency-ordered candidate pool and
+    ``protect_n`` still bounds HOW MANY of its most-recent members are even eligible — identical
+    to the pre-T1c selection — but a member only clears the gate when its OWN relevance score (in
+    ``floor_scored``, the SAME per-candidate score :meth:`ThreeChannelRecallRanker._score_stm`
+    already computes for floor re-ordering and for the RRF channel input) is ``>= min_relevance``.
+    A member that misses the bar is not specially penalised either — it simply re-enters the
+    ordinary fused competition like any other STM candidate that was never protected (§ranker.py
+    module docstring, "the rest of the STM candidate pool ... competes in the SAME RRF fusion").
+
+    **What the guarantee now promises** (the ADR's own words, recorded here so the code and the
+    decision record cannot drift): *"the most recent STM fact is never evicted from the answer
+    window PROVIDED it clears ``min_relevance`` against the asked query — an irrelevant just-said
+    aside is no longer owed a slot."* This is a real, deliberate narrowing of AD-195, not a bug —
+    AD-195's original promise (protect every one of the top ``floor_protect_limit`` regardless of
+    relevance) is what §7's own measurement (3 fixed slots on EVERY query, 30% of the window) says
+    is expensive specifically on adversarial benchmarks like LoCoMo where the last few turns are
+    rarely the answer; a live agent session's last turns are usually genuinely relevant, so the
+    gate is expected to pass them through unchanged there.
+
+    **Default is 0.5, shipped on evidence.** A real `gold_in_context` sweep on `mu-dev-vm`
+    recovered essentially all of the measured unconditional-guarantee cost at this bar
+    (``RecallSettings.floor_protect_min_relevance``'s own docstring has the full sweep table).
+    ``-1.0`` — cosine similarity's own true theoretical minimum (``stm_scoring="embed"``'s real
+    range is ``[-1.0, 1.0]``, NOT ``[0.0, 1.0]`` — an earlier ``0.0`` default was live-caught as
+    wrong exactly because of this, see that same docstring for the regression) — is the value
+    that reproduces the ORIGINAL, fully unconditional AD-195 guarantee, still reachable via
+    ``MU_RECALL__FLOOR_PROTECT_MIN_RELEVANCE=-1``.
+
+    **``stm_scoring="recency"`` makes the bar UNIFORM, not conditional.** Under "recency" (D1's
+    documented pre-fix opt-out), ``_score_stm`` is a no-op and every candidate in ``floor_scored``
+    carries the SAME constant channel-native score (``1.0``) — so ``min_relevance`` degrades to a
+    single global on/off switch (protect the top ``protect_n`` unconditionally when
+    ``min_relevance <= 1.0``, protect none when it is higher), never a per-candidate filter. This
+    is documented rather than special-cased or refused: a deployment that pins ``stm_scoring=
+    "recency"`` has already opted out of per-candidate relevance everywhere else in this ranker
+    (the floor's own reorder-by-relevance, the RRF channel input), and T1c does not invent a
+    relevance signal recency mode deliberately has none of.
+    """
+    relevance_by_id = {s.item.id: s.score for s in floor_scored}
+    return {
+        s.item.id
+        for s in floor[:protect_n]
+        if relevance_by_id.get(s.item.id, s.score) >= min_relevance
+    }
 
 
 def _merge_floor(

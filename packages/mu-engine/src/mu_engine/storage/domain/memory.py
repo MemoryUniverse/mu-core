@@ -164,6 +164,26 @@ class MemoryItem(BaseModel):
     workspace_id: str
     session_id: str
 
+    # S1b (``docs/tracking/TRACE-0923.md`` §7 "S1b"/§6.2, ADR pending in ``docs/decisions/``): the
+    # CONVERSATIONAL-order key the read path's neighbour expansion needs and, until now, nothing
+    # persisted. ``created_at`` alone was the only candidate (§6.2's own wording: "no conversational
+    # -order key is persisted — only created_at ordering") and is NOT sufficient as a stand-in: two
+    # writes landing in the same clock tick (a real risk under a fast bulk-ingest harness, or a
+    # `Clock` port whose resolution is coarser than the write rate) tie on the STM recency ZSET
+    # score with no defined tie-break, and `created_at` measures ARRIVAL time, not the position a
+    # turn actually occupies in its own conversation — a distinction `session_offset`
+    # (`IngestActivity`) can't fill either, because it is deliberately RANDOM (mu-local's own
+    # ``local_memory.py`` comment: "unique ⇒ never a pure M12 replay") and never reaches this
+    # record at all. `turn_seq` is a SEPARATE, additive, per-session, monotonically increasing
+    # integer a write path may assign (mu-local's `LocalMemory.add`, ADR pending) — `None` for
+    # every row written before this field existed or by any write path that does not assign one
+    # (`services/recall/ranker.py`'s neighbour expansion degrades gracefully in that case: no
+    # crash, no neighbours, exactly the graceful-degradation requirement §7 names). NOT part of
+    # `compute_content_hash`'s basis below — two occurrences of identical content at different
+    # conversational positions are still the SAME fact for dedup purposes; only WHERE it sits in
+    # the turn sequence changes, not WHAT it is.
+    turn_seq: int | None = Field(default=None, ge=0)
+
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
     valid_at: datetime | None = None

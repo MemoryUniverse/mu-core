@@ -162,11 +162,32 @@ def _parse_evidence(raw: object) -> tuple[str, ...]:
     return tuple(out)
 
 
-def load_locomo(path: str | Path, *, samples: int | None = None) -> list[Conversation]:
+def load_locomo(
+    path: str | Path, *, samples: int | None = None, include_captions: bool = False
+) -> list[Conversation]:
     """Load LoCoMo conversations. ``samples`` caps how many of the 10 are returned (in file order).
 
     Raises ``FileNotFoundError`` rather than falling back to anything synthetic — a harness that
     quietly evaluates on a toy corpus is worse than one that refuses to run.
+
+    ``include_captions`` (T7, ``TRACE-0923.md`` §7/§5.5): every LoCoMo turn carries an optional
+    ``img_url`` + BLIP-generated ``blip_caption`` alongside ``text``. This loader read ``text``
+    only, and 37-43% of scoreable queries across the three traced conversations have gold on a
+    turn that also carries a caption (measured exposure: conv-26 42.7%, conv-30 37.0%,
+    conv-41 39.5%); at least three rows are PROVABLY unanswerable without it — for conv-26 q55
+    ("What subject have Caroline and Melanie both painted?", gold "Sunsets") the word "sunset"
+    appears ONLY in the two gold turns' captions, never in their ``text``. Default ``False``
+    (unchanged loader behaviour) because including the caption makes MU's LoCoMo numbers
+    NON-COMPARABLE to every published mem0/MemOS figure — both of those harnesses discard it too
+    (verified: ``grep -rn blip_caption --include=*.py`` over the cloned ``MemOS/`` and ``mem0/``
+    trees returns nothing; MemOS's own LoCoMo ingestion builds each message as
+    ``speaker + ": " + text``, ``other_repos/MemOS/.../locomo_ingestion.py:39``, and never touches
+    the caption). ``True`` is a diagnostic arm: it measures what the benchmark's own image-caption
+    gap is costing MU, not a change to what ships. Every captioned turn in the real dataset also
+    carries non-empty ``text`` (verified over the full corpus, 1,226/1,226 captioned turns), so the
+    caption is appended to it rather than replacing it — no turn changes from "included" to
+    "filtered" by this flag alone; a turn whose ``text`` is empty and has no caption is still
+    dropped exactly as before (``not text`` below never fires from turning this flag on).
     """
     data_path = Path(path)
     if not data_path.exists():
@@ -189,8 +210,15 @@ def load_locomo(path: str | Path, *, samples: int | None = None) -> list[Convers
             date = str(conv.get(f"session_{idx}_date_time", ""))
             for turn in conv[f"session_{idx}"]:
                 text = str(turn.get("text", "")).strip()
+                if include_captions:
+                    # T7: append, never replace — a turn's own text stays first so the flag can
+                    # never make an otherwise-answerable turn LESS answerable, only add the
+                    # caption's vocabulary on top of it.
+                    caption = str(turn.get("blip_caption", "") or "").strip()
+                    if caption:
+                        text = f"{text} {caption}".strip() if text else caption
                 if not text:
-                    continue  # image-only turns carry no retrievable body
+                    continue  # image-only turns carry no retrievable body (text nor caption)
                 turns.append(
                     Turn(
                         dia_id=str(turn["dia_id"]),

@@ -78,6 +78,19 @@ def test_recall_settings_snapshot_carries_the_ranker_knobs_the_brief_named() -> 
     assert snapshot["ambient"] is True
 
 
+def test_recall_settings_snapshot_dumps_the_whole_model_not_a_hand_picked_subset() -> None:
+    """AD-228 (ARCHITECTURE-DELTAS.md) leans on this: the reason a FUTURE recall knob (e.g. an
+    S1b neighbour-expansion setting `services/recall/` has not written yet) will show up in every
+    run's provenance with NO matching change needed here is that `recall_settings_snapshot`
+    dumps `engine_settings.recall.model_dump(...)` WHOLE, never a hand-picked list of field names.
+    Proved directly against `RecallSettings.model_fields` rather than merely asserted — a future
+    edit that narrows the dump to a curated subset turns this test RED before it ships."""
+    from mu_engine.services.recall.dto import RecallSettings
+
+    snapshot = recall_settings_snapshot()
+    assert set(snapshot["recall"]) == set(RecallSettings.model_fields)
+
+
 class _StubChat:
     def __init__(self, *, requested: str, served: set[str]) -> None:
         self.requested_model = requested
@@ -122,3 +135,24 @@ def test_build_provenance_with_no_chats_reports_an_empty_models_list(tmp_path: P
     f.write_bytes(b"[]")
     provenance = build_provenance(dataset_path=f)
     assert provenance["models"] == []
+
+
+def test_build_provenance_records_include_captions_when_the_caller_says(tmp_path: Path) -> None:
+    """T7 (ARCHITECTURE-DELTAS.md AD-227): a run's caption-arm must be readable from the SAME
+    artifact a reader already checks for reproducibility, not a second place to remember."""
+    f = tmp_path / "locomo10.json"
+    f.write_bytes(b"[]")
+    on = build_provenance(dataset_path=f, include_captions=True)
+    off = build_provenance(dataset_path=f, include_captions=False)
+    assert on["dataset_include_captions"] is True
+    assert off["dataset_include_captions"] is False
+
+
+def test_build_provenance_include_captions_defaults_to_none_not_false(tmp_path: Path) -> None:
+    """`None` means "the caller did not say" — never silently defaulted to False, so an artifact
+    from before this fix (or a caller that forgot to pass it) cannot be misread as having
+    positively confirmed captions were excluded."""
+    f = tmp_path / "locomo10.json"
+    f.write_bytes(b"[]")
+    provenance = build_provenance(dataset_path=f)
+    assert provenance["dataset_include_captions"] is None

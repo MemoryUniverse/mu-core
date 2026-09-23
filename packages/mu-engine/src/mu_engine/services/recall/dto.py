@@ -116,6 +116,17 @@ class RecallItemView(BaseModel):
     rerank_score: float | None = None
     is_floor: bool = False  # STM recency-floor member — reorderable, NEVER evicted (§1.3)
     artifact_ref: str | None = None  # CANONICAL §3/§7.10 (G5): the linked ContextArtifact id
+    # S1b (TRACE-0923.md §7/§6.2/§5.1, ADR pending): the SAME conversational-order key as
+    # `MemoryItem.turn_seq` — `None` for any hit whose underlying item was written before S1b or
+    # by a write path that assigns none (this field, like that one, degrades gracefully rather
+    # than assuming `0`). Provenance/debugging only — `ranker.py::_expand_neighbors` reads it to
+    # find an anchor's neighbours; nothing downstream is REQUIRED to consult it.
+    turn_seq: int | None = None
+    # True on a `RecallItemView` this ranker added via neighbour expansion rather than because
+    # any channel ranked it — provenance only, never consulted by `_merge_floor`'s own logic
+    # (a neighbour competes for its `limit` slot exactly like any other candidate once inserted,
+    # `_expand_neighbors`'s own docstring: "a neighbour COSTS a slot").
+    is_neighbor: bool = False
 
 
 class RecallResult(BaseModel):
@@ -165,6 +176,55 @@ class RecallSettings(BaseModel):
     # `floor_protect_limit` most-recent facts are always recallable) without letting the STM channel
     # swamp every other channel's relevance signal.
     floor_protect_limit: int = Field(default=3, ge=0)
+    # T1 option (c) (TRACE-0923.md §7/§7.1, ADR pending): `floor_protect_limit` above still bounds
+    # WHICH recency-ranked candidates are even ELIGIBLE for protection — this field adds a SECOND,
+    # independent gate: an eligible candidate is only actually protected (never-evicted) when its
+    # own relevance score (`ranker.py::_score_stm`'s per-candidate score, the SAME one that already
+    # reorders the floor and feeds the RRF channel) is >= this bar. See `ranker.py::
+    # _protected_floor_ids` for the full rationale, what the AD-195 guarantee now promises, and why
+    # `stm_scoring="recency"` makes this a uniform on/off rather than a per-candidate filter.
+    # Measured cost this narrows (§7, pooled over 382 LoCoMo queries, real stores): the
+    # UNCONDITIONAL guarantee (this field at its default) costs 6.28 pt of `gold_in_context` (9.59
+    # on multi-hop) for 24 fixed / 0 regressed — i.e. it is a real, priced trade-off, not free; the
+    # whole point of a conditional gate is to keep most of that 24-fixed benefit on a query the
+    # protected fact is actually relevant to, while stopping paying the 6.28 pt cost on the queries
+    # it is not.
+    #
+    # DEFAULT SHIPPED AT `0.5`, on evidence (T1 ADR, `docs/tracking/ARCHITECTURE-DELTAS.md`
+    # AD-230): a real `gold_in_context` sweep on `mu-dev-vm` (3 LoCoMo conversations, 383 queries,
+    # `stm_scoring="embed"`, the shipped default) —
+    #     bar        gold_in_context   vs unconditional (257/383, 0.6710)
+    #     0.3        272/383  0.7102   +15 queries
+    #     0.5        281/383  0.7337   +24 queries  <- SHIPPED
+    #     0.7        282/383  0.7363   +25 queries  (within noise of 0.5 — one run, no repeats)
+    #     disabled   281/383  0.7337   (floor_protect_min_relevance=1.1, i.e. no candidate ever
+    #                                  clears the bar — the "(b) lower floor_protect_limit to 0"
+    #                                  option §7.1 named and the owner explicitly did NOT want)
+    # `0.5` recovers ESSENTIALLY ALL of the measured gain from disabling the guarantee outright,
+    # while — unlike full disable — still protecting a just-said fact whenever it clears a real
+    # relevance bar, which is what keeps AD-195's live-agent-session intent alive (§7.1: "probably
+    # worth keeping ... LoCoMo is the adversarial case for it, not the typical one"). One run per
+    # arm, no repeats (`gic_hybrid.json`'s own measured 3-repeat spread for THIS metric shape was
+    # 0.0067 on a similar sample, so 0.5 vs 0.7's 1-query difference is not distinguishable from
+    # that noise floor — 0.5 is picked as the more conservative of the two statistically
+    # indistinguishable options, not because 0.7 was ruled out).
+    #
+    # `-1.0` (cosine similarity's own true theoretical minimum — below it no real score, under any
+    # `stm_scoring` mode this repo ships, can ever fall) is the value that reproduces AD-195's
+    # ORIGINAL, fully unconditional guarantee — set `MU_RECALL__FLOOR_PROTECT_MIN_RELEVANCE=-1` to
+    # get it back exactly. **This was not the first default this field shipped with.** `0.0`
+    # looked equally inert on the reasoning "a real relevance score is virtually always
+    # non-negative" and was WRONG — caught live by `test_persona_composition_int.py::
+    # test_a_real_persona_reorders_a_real_recall_and_changes_nothing_else` going red on
+    # `mu-dev-vm` against real stores + the real MiniLM embedder: `stm_scoring="embed"` scores by
+    # COSINE SIMILARITY (`ranker.py::_cosine`), whose real range is `[-1.0, 1.0]`, not `[0.0,
+    # 1.0]` — a floor candidate genuinely orthogonal-to-hostile to the query scores negative, and
+    # a `0.0` bar silently un-protected it even though the field's OWN claim at the time was "this
+    # default is a no-op". Recorded rather than quietly fixed, because it is the concrete proof
+    # that "looks inert" and "is inert" are different claims for a bound whose true range was not
+    # checked carefully enough the first time. Env override:
+    # `MU_RECALL__FLOOR_PROTECT_MIN_RELEVANCE`.
+    floor_protect_min_relevance: float = Field(default=0.5, ge=-1.0)
     channel_pool_size: int = Field(default=20, ge=1)  # per-channel fetch width > limit (ADR 0010)
 
     # POOL-TRAP FIX (ACCURACY-PLAN-0831.md §1.4, "channel_pool_size does not scale with limit, so
@@ -290,6 +350,50 @@ class RecallSettings(BaseModel):
     # allowed through) for A/B comparison (DEV-STANDARDS rule 3).
     cross_tier_dedup: bool = Field(default=True)
 
+    # S1b — read-time neighbour expansion (TRACE-0923.md §7/§6.2/§5.1, ADR pending in
+    # `docs/decisions/`). §5.1's own finding: 32.5% of failures return a turn within ±1 of the
+    # gold and never the gold (48.4% within ±2), because the answer-bearing turn is usually a
+    # REPLY and the question's vocabulary lives in the turn BEFORE it — the retriever finds the
+    # right conversational moment and returns the wrong turn of it. `ranker.py::_expand_neighbors`
+    # inserts each fused candidate's ±`neighbor_expand_radius` conversational neighbours (by
+    # `MemoryItem.turn_seq`, S1b's write-side field — `local_memory.py::_next_turn_seq_base`)
+    # into the SAME fused pool `_merge_floor` truncates to `limit`, so a neighbour COMPETES for a
+    # result slot exactly like any other candidate (the "does a neighbour cost a slot or ride
+    # along with its parent" decision this ADR records: THIS phase chose "costs a slot" — the
+    # measurable-today choice, since a free-riding neighbour would need a new field on the
+    # WIRE-versioned `mu_contracts` `RecallItemView`, out of this phase's lane; see the ADR).
+    # Default 0 = OFF — every existing caller/test is byte-identical until an operator raises it;
+    # ±1 is the width §5.1 measured as the single largest gain (41 of 382 queries), ±2 the next
+    # (61 of 382) — SET FROM EVIDENCE once the paired gold_in_context sweep is recorded. Env
+    # override: `MU_RECALL__NEIGHBOR_EXPAND_RADIUS`.
+    neighbor_expand_radius: int = Field(default=0, ge=0)
+    # How far back the read-time expansion's OWN STM session-window fetch scans to build the
+    # `turn_seq -> item` lookup — mirrors `local_memory.py::_TURN_SEQ_SCAN_LIMIT`'s own documented
+    # basis (conv-41, the longest LoCoMo conversation this repo's corpus carries, is 663 turns;
+    # set generously above that, NOT tuned to the benchmark) and the SAME documented limit: a
+    # session whose STM window exceeds this width will not have every neighbour resolvable, which
+    # degrades to "no expansion for that anchor" (graceful, never a crash — see
+    # `_expand_neighbors`'s own docstring), not a wrong answer.
+    neighbor_expand_session_scan_limit: int = Field(default=4000, ge=1)
+    # WHERE an inserted neighbour is placed in the ranked pool. VERIFY PASS 2026-09-23 (AD-232):
+    # `"tail"` is the SHIPPED policy S1b was first measured with — a neighbour is scored on the STM
+    # channel's own `weight_stm`-discounted family and therefore lands strictly below every real
+    # candidate, i.e. at the END of the pool `_merge_floor` then truncates to `limit`. On a corpus
+    # where the pool is already `limit`-deep (this eval harness ingests at `importance=0.9`, so
+    # nearly every turn is promoted to MTM) that makes the whole mechanism a measured no-op, which
+    # is exactly what AD-231 recorded. `"after_anchor"` places each neighbour immediately BEHIND
+    # the candidate that surfaced it, so a neighbour of a top-ranked anchor is inside the window
+    # whenever its anchor is — still costing a slot (the anchor's tail neighbours push the pool's
+    # own tail out), still never re-sorting the pool (so `AdaptiveRerankGate`'s verdict survives),
+    # but no longer guaranteed to be truncated away before it can be judged.
+    # The ceiling this is aimed at, recomputed independently from
+    # `docs/tracking/eval-runs/2026-09-23/trace_*.json` + the raw corpus: of 126 pooled read-path
+    # failures over conv-26/30/41, **41 (32.5%) returned a turn within ±1 of the gold and never the
+    # gold** (61, 48.4%, within ±2) — i.e. a working ±1 expansion is worth up to +10.7 pt of
+    # `gold_in_context` on this sample. Default stays `"tail"` so every number already recorded
+    # against S1b keeps its meaning; `MU_RECALL__NEIGHBOR_EXPAND_PLACEMENT=after_anchor`.
+    neighbor_expand_placement: Literal["tail", "after_anchor"] = "tail"
+
     # D1 STM relevance scoring (DATA-QUALITY-ASSESSMENT.md §3.1, floor-fix follow-up to 02fbed9):
     # ``recency_floor_limit``/``floor_protect_limit`` bound HOW MANY STM candidates enter the fuse
     # and HOW MANY are unconditionally protected — but the candidates themselves still carried NO
@@ -400,6 +504,29 @@ class RecallSettings(BaseModel):
     sparse_bm25_b: float = Field(default=0.75, ge=0.0, le=1.0)
     sparse_bm25_avg_len: float = Field(default=256.0, gt=0.0)
     sparse_min_token_len: int = Field(default=2, ge=1)
+    # S4 (TRACE-0923.md §5.4/§7): the caller-supplied document text for a dialogue turn carries a
+    # leading "Speaker: " label (the eval harness's own `Turn.ingest_text`, and this is the SAME
+    # shape MemOS's own LoCoMo ingestion builds, `locomo_ingestion.py:39` — a convention this
+    # engine does not control but must not be naive about). Measured on conv-26 (419 turns): the
+    # label token `caroline` has document frequency 80.9%, and on the queries where BM25 fails,
+    # the speaker name is the ONLY term the query shares with the gold turn at all — the sparse
+    # arm is not mis-weighted there, it is empty-handed, weakly favoring every turn the named
+    # speaker ever said over turns that actually share content vocabulary. Qdrant's server-side
+    # `Modifier.IDF` already down-weights a high-df term correctly (§5.4: `caroline` IDF 0.213 <
+    # `the` IDF 0.925), so this is not an IDF defect — it is that the label token is the only
+    # match candidate on the failing rows, and it is not informative.
+    # `sparse_strip_leading_prefix=True` strips ONE detected "Label: " prefix
+    # (`_LEADING_LABEL_PREFIX_RE` in `providers/sparse_encoder.py`) from the text handed to
+    # `Bm25SparseEncoder.encode` — the WRITE-side sparse document only. It does NOT touch
+    # `MemoryItem.content` (still stored verbatim), the dense embedding text (unchanged — a
+    # bi-encoder is not confused by a short label the way a sparse lexical match is; the trace's
+    # own §7 S4 entry: "The dense arm may still want it, so treat the sparse document and the
+    # dense document as separate concerns"), or `encode_query` (queries are not turn-labelled).
+    # A document that tokenises to nothing once its label is stripped degrades to the SAME
+    # dense-only-point path `_point_vector` already handles for an empty encode — never a write
+    # failure. Default False pending the paired gold_in_context measurement this ADR's evidence
+    # promised (`docs/decisions/` S4 ADR) — flip once recorded.
+    sparse_strip_leading_prefix: bool = Field(default=False)
     # ADR 0023 final combined value (recall-service-design.md:576, `rerank.py`'s own
     # `adaptive_rerank_gate` floor rule): the top-scored candidate in the pool must clear this
     # before ANY candidate in the pool is trusted — below it, the whole gate is empty and the

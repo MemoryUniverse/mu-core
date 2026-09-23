@@ -37,6 +37,18 @@ DEV-STANDARDS rule-3 magic constant and silently wrong for every other language.
 Adding either means a dependency or a hand-rolled Porter stemmer; §1.2's SPLADE producer is the
 design's own answer for paraphrase recall, and it is explicitly the optional upgrade, not this
 baseline. Recorded rather than hidden.
+
+**S4 (``docs/tracking/TRACE-0923.md`` §5.4/§7, ADR pending in ``docs/decisions/``).** Callers on
+this codebase's own read/write path format a dialogue turn as ``f"{speaker}: {text}"`` before it
+ever reaches this encoder (``eval/mu_eval/locomo.py:90``; the SAME convention MemOS's own LoCoMo
+harness uses, ``locomo_ingestion.py:39`` — this engine neither invented nor controls the
+convention, only how it feeds the sparse index). Measured: the label token is present in 80.9% of
+one conversation's documents, and on the rows where BM25 fails to retrieve the gold turn, that
+label is the ONLY term the query and the gold document share at all. ``encode`` (write side) can
+optionally strip one leading ``"Label: "``-shaped prefix before tokenizing — ``encode_query`` and
+every other caller of this text are UNCHANGED, so the label still reaches the dense embedding and
+``MemoryItem.content`` untouched (see ``RecallSettings.sparse_strip_leading_prefix``'s own
+docstring for why the two documents are treated as separate concerns).
 """
 
 from __future__ import annotations
@@ -60,6 +72,17 @@ _TOKEN_RE: Final = re.compile(r"\w+", re.UNICODE)
 
 # Qdrant sparse-vector indices are u32; blake2b digest_size=4 lands exactly in that range.
 _INDEX_DIGEST_BYTES: Final = 4
+
+# S4: a leading "Label: " shape at the very start of a document — one non-whitespace, non-colon
+# character, then up to 39 more non-newline/non-colon characters (40 chars total: generous for a
+# real name/role label, e.g. "Assistant to the Regional Manager" at 34), then a colon and >=1
+# whitespace. Length-capped so a real sentence that merely contains an early colon (e.g. "Note:
+# remember...") can still match if short, but a long clause ending in a colon cannot ("According
+# to the article the professor cited last week: the results were inconclusive" is 56 chars before
+# its colon and is left alone — measured, not guessed: the test for this pins the exact string).
+# Anchored to the START ONLY — a colon anywhere else in the document is untouched — and it strips
+# AT MOST ONE such prefix, never every "Label:" run in the text.
+_LEADING_LABEL_PREFIX_RE: Final = re.compile(r"^[^\s:][^:\n]{0,39}:[ \t]+")
 
 # BM25 defaults. k1/b are the textbook Robertson/Sparck-Jones values that every reference
 # implementation ships (Lucene, rank_bm25, FastEmbed `Qdrant/bm25`) — cited, not invented.
@@ -92,6 +115,7 @@ class Bm25SparseEncoder:
         b: float = _DEFAULT_B,
         avg_len: float = _DEFAULT_AVG_LEN,
         min_token_len: int = _DEFAULT_MIN_TOKEN_LEN,
+        strip_leading_prefix: bool = False,
     ) -> None:
         if k1 < 0.0:
             raise ValueError("Bm25SparseEncoder: k1 must be >= 0")
@@ -105,6 +129,9 @@ class Bm25SparseEncoder:
         self.b = b
         self.avg_len = avg_len
         self.min_token_len = min_token_len
+        # S4 (`RecallSettings.sparse_strip_leading_prefix`'s own docstring has the full evidence
+        # and the write-side-only scope). WRITE side (`encode`) only — never `encode_query`.
+        self.strip_leading_prefix = strip_leading_prefix
 
     @property
     def name(self) -> str:
@@ -132,7 +159,18 @@ class Bm25SparseEncoder:
         astronomically unlikely at these document lengths, which is exactly why it would
         otherwise surface as a rare, unreproducible write failure rather than as anything a test
         would catch.
+
+        S4: when ``self.strip_leading_prefix``, one leading ``"Label: "``-shaped prefix
+        (:data:`_LEADING_LABEL_PREFIX_RE`) is removed from ``text`` BEFORE tokenizing — the
+        SPARSE document only; the caller's own ``text``/``content`` object is never mutated (this
+        method returns a new value, it does not touch its argument), so the dense embedding and
+        the stored record are unaffected. A document that tokenises to nothing once its label is
+        removed (e.g. the label WAS the entire text) returns the same empty ``SparseQuery`` an
+        untokenizable document already returns — the caller's existing empty-encode handling
+        (``qdrant_mtm.py::_point_vector`` falls back to a dense-only point) needs no new case.
         """
+        if self.strip_leading_prefix:
+            text = _LEADING_LABEL_PREFIX_RE.sub("", text, count=1)
         tokens = self._tokenize(text)
         if not tokens:
             return SparseQuery(indices=(), values=(), encoder=_ENCODER_KEY)
@@ -189,4 +227,5 @@ def build_sparse_encoder(settings: RecallSettings) -> Bm25SparseEncoder | None:
         b=settings.sparse_bm25_b,
         avg_len=settings.sparse_bm25_avg_len,
         min_token_len=settings.sparse_min_token_len,
+        strip_leading_prefix=settings.sparse_strip_leading_prefix,
     )
