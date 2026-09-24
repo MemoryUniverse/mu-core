@@ -615,17 +615,28 @@ class ThreeChannelRecallRanker:
         concurrency, not a new dependency edge the group doesn't already have (if MTM raises
         ``StoreUnavailableError`` the group's own hard-deny contract fires exactly as it does
         today; this method adds no new except-clause for that, deliberately, so it is never
-        swallowed as an LTM-only degrade). See :meth:`_resolve_seed_entity_uids`."""
-        try:
-            # `session_scope` is left at its DEFAULT (`None` = federate every one of the user's
-            # sessions), exactly as this ranker already leaves `MtmTierRepository.recall`'s
-            # identical parameter at its default. Until `graph_recall` GREW that parameter, the
-            # LTM arm had no way to express it and filtered the full session-included namespace —
-            # so the MTM arm federated across sessions while the LTM arm, the durable user-scoped
-            # tier, stayed locked to the asking session. Same default, same semantics, one fabric.
-            hits = await self._ltm.graph_recall(ns, limit=pool, caller_identity_set=caller)
-        except StoreUnavailableError:
-            return [], True
+        swallowed as an LTM-only degrade). See :meth:`_resolve_seed_entity_uids`.
+
+        AD-279 selective seed: ``settings.ltm_flat_seed=False`` SKIPS the unconditional flat
+        ``graph_recall`` seed entirely, so this channel contributes candidates ONLY when the
+        query-conditional traversal arm found some — i.e. the channel goes SILENT on a query it
+        has no entity-grounded answer to, which is the one property no ranking lever can
+        synthesise (see that field's docstring and ADR 0072 for why the four previously-tried
+        levers could not). Default ``True`` = byte-identical to every prior release."""
+        flat_seed = self._settings.ltm_flat_seed
+        hits: list[Scored[MemoryItem]] = []
+        if flat_seed:
+            try:
+                # `session_scope` is left at its DEFAULT (`None` = federate every one of the
+                # user's sessions), exactly as this ranker already leaves
+                # `MtmTierRepository.recall`'s identical parameter at its default. Until
+                # `graph_recall` GREW that parameter, the LTM arm had no way to express it and
+                # filtered the full session-included namespace — so the MTM arm federated across
+                # sessions while the LTM arm, the durable user-scoped tier, stayed locked to the
+                # asking session. Same default, same semantics, one fabric.
+                hits = await self._ltm.graph_recall(ns, limit=pool, caller_identity_set=caller)
+            except StoreUnavailableError:
+                return [], True
         if self._settings.ltm_max_hops <= 0:
             return hits, False
         seed_entity_uids = await self._resolve_seed_entity_uids(mtm_seed)
@@ -647,7 +658,11 @@ class ThreeChannelRecallRanker:
             # the flat seed already succeeded above — a traversal-only outage degrades to
             # flat-only LTM results rather than dropping the WHOLE arm (narrower than the
             # named LTM_UNAVAILABLE degrade, which is reserved for the flat seed itself).
-            return hits, False
+            # AD-279: with the flat seed OFF there is no such "already succeeded" half — the
+            # traversal IS the whole arm, so its outage is the named LTM_UNAVAILABLE degrade,
+            # exactly as the flat seed's own outage is above. Reporting `False` here would
+            # silently claim a complete recall while the only LTM arm was down.
+            return hits, not flat_seed
         seen = {s.item.id for s in hits}
         extra = [s for s in traversal_hits if s.item.id not in seen]
         # BUG2 FIX (data-quality re-assessment §3, "fix the ranker LTM arm so traversal hits

@@ -16,6 +16,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from mu_contracts.domain.errors import StoreUnavailableError
+from mu_contracts.domain.events import DegradeReason
 from mu_contracts.domain.model.recall import Vector
 from mu_engine.platform.clock import FrozenClock
 from mu_engine.providers._contracts import RerankHit
@@ -2333,3 +2335,230 @@ async def test_rrf_k_ltm_lets_the_ltm_seed_take_a_slot_the_shared_k_denies_it() 
         "rrf_k_ltm=5 did NOT change the ranking — the per-channel k never reached fusion, so "
         "ADR 0069's six eval arms were varying a setting with no effect"
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# AD-279 — the SELECTIVE seed (`RecallSettings.ltm_flat_seed`).
+#
+# Four prior levers (weight, protect floor, content-aware traversal seed, per-channel `rrf_k_ltm`)
+# all failed identically because each is DOWNSTREAM of `graph_recall`'s unconditional flat seed and
+# RRF fuses by rank, never by content — so any lever strong enough to let LTM place at all lets it
+# place on EVERY query. These tests hold the fifth lever: make the CHANNEL ITSELF conditional.
+# ---------------------------------------------------------------------------------------------
+
+
+class _TraversalOnlyLtm(_EmptyLtm):
+    """Stands in for the REAL adapter's asymmetry, which `_FakeLtm` does not model: the flat
+    ``graph_recall`` seed is query-BLIND and unconditional, while ``traverse_entities`` is
+    query-CONDITIONAL — it returns ``[]`` outright when nothing in the query matches the entity
+    sub-graph (``falkor_ltm.py``'s ``if not memory_hop: return []``). ``flat`` is returned always;
+    ``traversal`` only when ``query`` contains ``trigger``."""
+
+    def __init__(
+        self, *, flat: list[MemoryItem], traversal: list[MemoryItem], trigger: str
+    ) -> None:
+        self._flat = flat
+        self._traversal = traversal
+        self._trigger = trigger
+        self.traverse_calls = 0
+
+    async def graph_recall(
+        self,
+        ns: Namespace,
+        *,
+        subject: str | None = None,
+        predicate: str | None = None,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        return [
+            Scored(item=i, score=1.0 / (rank + 1), channel=RecallChannel.LTM_GRAPH, rank=rank)
+            for rank, i in enumerate(self._flat[:limit])
+        ]
+
+    async def traverse_entities(
+        self,
+        ns: Namespace,
+        *,
+        query: str,
+        max_hops: int,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+        seed_entity_uids: object = None,
+    ) -> list[Scored[MemoryItem]]:
+        self.traverse_calls += 1
+        if self._trigger not in query:
+            return []
+        # `(1.0 / hop) + relevance_bonus` == 2.0 for a 1-hop predicate-matching hit — the real
+        # adapter's own top of range (`falkor_ltm.py::_traverse_entities_impl`).
+        return [
+            Scored(item=i, score=2.0, channel=RecallChannel.LTM_GRAPH, rank=rank)
+            for rank, i in enumerate(self._traversal[:limit])
+        ]
+
+
+class _TraversalDownLtm(_EmptyLtm):
+    """Flat seed healthy, traversal arm store-down — the asymmetric outage `_ltm_channel`'s
+    except-clause exists for."""
+
+    async def traverse_entities(self, *a: object, **k: object) -> list[Scored[MemoryItem]]:
+        raise StoreUnavailableError("falkordb traversal down")
+
+
+def _ranker_with_ltm(ltm: object, *, settings: RecallSettings) -> ThreeChannelRecallRanker:
+    return ThreeChannelRecallRanker(
+        stm=_FakeStm([]),
+        mtm=_FakeMtm({}),
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=settings,
+        clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+    )
+
+
+def test_ltm_flat_seed_ships_on() -> None:
+    """The shipped default must be the pre-AD-279 behaviour. `ltm_flat_seed=False` is an A/B
+    lever (DEV-STANDARDS rule 3), not a behaviour change landed by stealth."""
+    assert RecallSettings().ltm_flat_seed is True
+
+
+@pytest.mark.asyncio
+async def test_the_selective_seed_silences_the_channel_on_a_query_it_cannot_answer() -> None:
+    """THE POINT OF AD-279, and the half no earlier lever could reach.
+
+    Same scenario as ``test_rrf_k_ltm_lets_the_ltm_seed_take_a_slot_the_shared_k_denies_it``: at
+    ``rrf_k_ltm=5`` — ADR 0069 arm E, the arm that won 383/383 slots and cost 4 `gold_in_context`
+    queries — the query-BLIND flat seed beats the genuinely relevant MTM hit. With
+    ``ltm_flat_seed=False`` at the IDENTICAL ``rrf_k_ltm=5``, the traversal arm finds nothing for
+    this query, so the channel contributes NOTHING and the relevant MTM hit is back on top.
+
+    The rank authority is unchanged between the two halves — only whether the channel had a
+    candidate at all. That is the property `weight_ltm`, `ltm_protect_limit`, the content-aware
+    seed and `rrf_k_ltm` all structurally cannot express, because all four act on a candidate the
+    seed has already produced unconditionally.
+
+    MUTATION CHECK (run, red): drop `ranker.py`'s ``if flat_seed:`` guard so ``graph_recall`` is
+    called unconditionally again, and the second half fails — the query-blind seed takes the slot
+    exactly as it does at the shipped default."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = (0.9, 0.1)
+    decoys = [_item(f"unrelated MTM decoy #{n}", tier=MemoryTier.MTM, at=base) for n in range(3)]
+    target = _item("Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base)
+    noise = _item("Let me know if you need anything", tier=MemoryTier.LTM, at=base)
+
+    async def _order(settings: RecallSettings) -> list[str]:
+        ranker = ThreeChannelRecallRanker(
+            stm=_FakeStm([]),
+            mtm=_FakeMtm({query_vec: [*decoys, target]}),
+            ltm=_TraversalOnlyLtm(flat=[noise], traversal=[], trigger="never-in-this-query"),  # type: ignore[arg-type]
+            fusion=ReciprocalRankFusion(),
+            settings=settings,
+            clock=FrozenClock(base),
+        )
+        result = await ranker.rank(
+            _NS,
+            "who is Bo's manager?",
+            list(query_vec),
+            limit=10,
+            channels=RecallChannels(),
+            caller_identity_set=frozenset[str](),
+        )
+        return [it.memory_id for it in result.items]
+
+    forced = await _order(RecallSettings(stm_scoring="recency", rrf_k_ltm=5))
+    assert forced.index(noise.id) < forced.index(target.id), (
+        "precondition: at rrf_k_ltm=5 the unconditional flat seed must beat the relevant MTM hit "
+        "— this is ADR 0069 arm E, the -4-query arm this lever is measured against"
+    )
+
+    selective = await _order(
+        RecallSettings(stm_scoring="recency", rrf_k_ltm=5, ltm_flat_seed=False)
+    )
+    assert noise.id not in selective, (
+        "ltm_flat_seed=False still surfaced the query-blind flat seed — the channel is not "
+        "conditional, so AD-279's eval arms would be varying a setting with no effect"
+    )
+    assert target.id in selective
+
+
+@pytest.mark.asyncio
+async def test_the_selective_seed_still_places_a_traversal_hit_that_actually_matched() -> None:
+    """NEGATIVE CONTROL: `ltm_flat_seed=False` must not be a disguised "turn the channel off".
+
+    The SAME store and the SAME settings as the test above, on a query the traversal arm CAN
+    answer: the entity-grounded hit still reaches the result, and at ``rrf_k_ltm=5`` it still
+    places ahead of the MTM decoys. Without this half, a green test above would be satisfied by
+    a change that simply deleted the LTM channel — and the owner's option (a) and option (b) would
+    be indistinguishable in test."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = (0.9, 0.1)
+    decoys = [_item(f"unrelated MTM decoy #{n}", tier=MemoryTier.MTM, at=base) for n in range(3)]
+    noise = _item("Let me know if you need anything", tier=MemoryTier.LTM, at=base)
+    answer = _item("Ada manages Bo", tier=MemoryTier.LTM, at=base)
+
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),
+        mtm=_FakeMtm({query_vec: decoys}),
+        ltm=_TraversalOnlyLtm(flat=[noise], traversal=[answer], trigger="manager"),  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency", rrf_k_ltm=5, ltm_flat_seed=False),
+        clock=FrozenClock(base),
+    )
+    result = await ranker.rank(
+        _NS,
+        "who is Bo's manager?",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+    ids = [it.memory_id for it in result.items]
+
+    assert answer.id in ids, (
+        "the entity-grounded traversal hit vanished — ltm_flat_seed=False silenced the WHOLE "
+        "channel, not just its unconditional half"
+    )
+    assert noise.id not in ids, "the flat seed must still be skipped on the query it does answer"
+    assert ids[0] == answer.id
+
+
+@pytest.mark.asyncio
+async def test_a_traversal_outage_with_no_flat_seed_is_the_named_ltm_degrade() -> None:
+    """With the flat seed ON, a traversal-only outage is NOT a degrade — the flat half succeeded,
+    and `_ltm_channel`'s except-clause says so in its own comment. With the flat seed OFF the
+    traversal IS the whole arm, so the same outage must raise the named ``LTM_UNAVAILABLE``
+    degrade; reporting a clean recall there would claim a complete answer while the only LTM arm
+    was down.
+
+    MUTATION CHECK (run, red): change `ranker.py`'s ``return hits, not flat_seed`` back to
+    ``return hits, False`` and the second half fails."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = (0.9, 0.1)
+
+    async def _degrade(settings: RecallSettings) -> object:
+        ranker = ThreeChannelRecallRanker(
+            stm=_FakeStm([]),
+            mtm=_FakeMtm({query_vec: []}),
+            ltm=_TraversalDownLtm(),  # type: ignore[arg-type]
+            fusion=ReciprocalRankFusion(),
+            settings=settings,
+            clock=FrozenClock(base),
+        )
+        result = await ranker.rank(
+            _NS,
+            "who is Bo's manager?",
+            list(query_vec),
+            limit=10,
+            channels=RecallChannels(),
+            caller_identity_set=frozenset[str](),
+        )
+        return result.degraded
+
+    assert await _degrade(RecallSettings(stm_scoring="recency")) is None, (
+        "flat seed ON: a traversal-only outage must stay the NARROWER non-degrade it has always "
+        "been"
+    )
+    assert (
+        await _degrade(RecallSettings(stm_scoring="recency", ltm_flat_seed=False))
+        is DegradeReason.LTM_UNAVAILABLE
+    ), "flat seed OFF: the traversal is the whole arm, so its outage is the named degrade"

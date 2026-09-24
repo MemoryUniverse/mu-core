@@ -649,6 +649,39 @@ class RecallSettings(BaseModel):
     # ``MU_RECALL__LTM_ENTITY_SEED_POOL``.
     ltm_entity_seed_pool: int = Field(default=0, ge=0)
 
+    # AD-279 — the SELECTIVE seed, and the one lever four prior passes could not pull.
+    #
+    # `graph_recall` (`falkor_ltm.py::_graph_recall_impl`) is, read literally, `MATCH (m:Memory)
+    # WHERE <namespace> AND m.state=active AND still-valid RETURN … ORDER BY m.valid_at DESC
+    # LIMIT $limit` with `score = 1/(rank+1)`. There is NO query term in that Cypher at all: the
+    # "seed" is the N most RECENTLY-VALID facts in the partition, and it returns them whenever the
+    # partition holds any fact — which, on any populated namespace, is every query. So the LTM
+    # channel is never empty and its rank-0 slot carries ZERO relevance signal.
+    #
+    # That is why four independent levers all failed the same way (ADR 0072 has the table):
+    # `weight_ltm` (2026-08-31), `ltm_protect_limit` (ADR 0060/0066), the content-aware traversal
+    # seed (ADR 0065/AD-262) and per-channel `rrf_k_ltm` (ADR 0069/AD-273) are all DOWNSTREAM of
+    # the seed, and RRF fuses by RANK POSITION, never by content — so any lever strong enough to
+    # make LTM's rank-0 place at all makes it place on EVERY query, relevant or not, reproducing
+    # the identical 4-to-7-query `gold_in_context` cost each time. No arithmetic can make a
+    # placement conditional on relevance when the candidate handed to it is unconditional.
+    #
+    # `False` skips the flat seed entirely, leaving `ThreeChannelRecallRanker._ltm_channel` with
+    # only `traverse_entities` — which IS query-conditional: it returns `[]` when no entity in the
+    # query (or in the `ltm_entity_seed_pool` MTM seed) matches the entity sub-graph at all
+    # (`falkor_ltm.py`'s `if not memory_hop: return []`). The channel then goes SILENT on queries
+    # it has no entity-grounded answer to, which is the property every ranking lever was missing.
+    # Pair it with `rrf_k_ltm` (the rank authority those silent-when-irrelevant hits need in order
+    # to place when they DO fire) — alone it changes nothing, for exactly the structural reason
+    # `weight_ltm`'s own docstring proves.
+    #
+    # DEFAULT `True` — byte-identical to every prior release; this is an A/B lever
+    # (DEV-STANDARDS rule 3), not a behaviour change. `ltm_flat_seed=False` together with
+    # `ltm_max_hops=0` disables the LTM recall channel outright (both arms off) — a legitimate
+    # way to express option (b) of `docs/tracking/GRAPH-TIER-DECISION.md`, and the reason neither
+    # value is validated against the other. Env override: `MU_RECALL__LTM_FLAT_SEED=false`.
+    ltm_flat_seed: bool = True
+
     # Rerank gate (ACCURACY-PLAN-0831.md item 6 / recall-service-design.md §1.5, ADR 0010/0023):
     # `ModelRouter.rerank` (`providers/model_router.py:265`) was fully built — a local
     # `BAAI/bge-reranker-v2-m3` configured, a `Task.RERANK` route registered — and had NO caller
