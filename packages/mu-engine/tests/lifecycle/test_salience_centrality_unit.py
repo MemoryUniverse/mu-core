@@ -193,7 +193,10 @@ def test_the_renormalising_four_weight_form_this_replaced_really_did_flip_gates(
     The rejected shape was four declared weights (0.45/0.18/0.27/0.10) divided by the sum of the
     PRESENT weights — mathematically identical, numerically not. This asserts the measured
     witnesses: points where the two forms straddle one of the three ABSOLUTE gates
-    (``demote_mtm=0.3``, ``promote_stm_mtm=0.7``, ``promote_mtm_ltm=0.9``). ``use`` values of k/10
+    (``demote_mtm=0.3``, ``promote_stm_mtm=0.7`` at the time this was written, since lowered to
+    0.45 by ADR 0054; ``promote_mtm_ltm=0.9`` at the time this was written, since recalibrated to
+    0.6 by ADR 0058 — this test's own witnesses below exercise ``demote_mtm=0.3`` only, so neither
+    rename changes what is actually asserted here). ``use`` values of k/10
     are the normal case (``access_count``/``usage_cap=10``) and these ``imp`` values are ordinary
     extractor outputs, so none of this is a synthetic corner.
     """

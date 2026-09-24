@@ -225,7 +225,41 @@ class LifecycleSettings(BaseModel):
     # quietly violate that for this one gate. 0.45 leaves a 0.15 margin above `demote_mtm`
     # (> 0.10) while staying under the 0.5 rescue ceiling.
     promote_stm_mtm: float = Field(default=0.45, ge=0.0, le=1.0)
-    promote_mtm_ltm: float = Field(default=0.9, ge=0.0, le=1.0)
+
+    # ADR 0058 verify pass (2026-09-24): 0.9 survived ADR 0054's F2 fix (`score_for_ltm_gate`
+    # drops recency) arithmetically reachable in theory but empirically DEAD for the corpus the
+    # product actually writes. Exhaustive grid over `score_for_ltm_gate = (w_usage*use +
+    # w_importance*imp)/(w_usage+w_importance)` = `0.4*use + 0.6*imp` at shipped `w_usage=0.2`/
+    # `w_importance=0.3` (importance 0..1 step 0.01 x access_count 0..60, `usage_cap=10`):
+    #     max score over the whole grid = 1.0 (imp=1.0, access_count>=10)
+    #     lowest importance EVER admitted at 0.9 = 0.84, and only at access_count >= 10
+    # Every importance the shipped capture path actually writes is below that floor:
+    # `IngestSettings.importance_promote` default 0.5 (`mu_contracts.../memory.py:277`),
+    # `mu-client` `thinking_finding_importance` 0.55, `thinking_decision_importance` 0.70
+    # (`mu_client/config.py:184-185`) — UNREACHABLE at ANY access_count. Measured end to end
+    # (`docs/tracking/eval-runs/2026-09-24-verify-graph-tier-contribution.md`): 1,051 facts
+    # extracted from three real conversations, 0 ever admitted through the periodic gate. A gate
+    # sitting above the entire distribution the product writes is not a gate, it is an off switch
+    # (ADR 0058's own words) — recalibrated here against that distribution, not picked to feel
+    # right.
+    #
+    # Recalibrated to 0.6 — the SAME bar `importance_promote` already uses for the STM->MTM ingest
+    # gate (`services/settings.py:24`), so "worth consolidating to the durable graph" is pinned to
+    # "at least as validated as a fact that reached MTM on importance alone, PLUS demonstrated
+    # re-use," not a number chosen in isolation. Re-solving the grid at 0.6:
+    #     imp=1.00 (explicit max/pinned importance): admitted at access_count=0 (immediately)
+    #     imp=0.90:                                  admitted at access_count>=2   (use>=0.15)
+    #     imp=0.70 (thinking_decision_importance):    admitted at access_count>=5   (use>=0.45)
+    #     imp=0.55 (thinking_finding_importance):     admitted at access_count>=7   (use>=0.675)
+    #     imp=0.50 (ingest/importance_promote floor):  admitted at access_count>=8   (use>=0.75)
+    # Every stamp the shipped capture path writes is now reachable through real re-engagement
+    # (access_count in single digits, well under `usage_cap=10`) rather than "never, at any
+    # access_count" — while still requiring genuine, repeated recall for anything below the
+    # `importance_promote` floor, so this is a recalibration of an off switch into a gate, not a
+    # removal of the gate. See `tests/lifecycle/test_promotion_int.py` and
+    # `tests/lifecycle/test_salience_ltm_gate_calibration_unit.py` for the grid re-run against the
+    # SHIPPED default (no half-life/usage_cap override) and the mutation check.
+    promote_mtm_ltm: float = Field(default=0.6, ge=0.0, le=1.0)
     promote_min_age_h: float = Field(default=24.0, ge=0.0)
     pre_ttl_window_s: int = Field(default=300, ge=1)  # last-chance salience rescue before STM TTL
 

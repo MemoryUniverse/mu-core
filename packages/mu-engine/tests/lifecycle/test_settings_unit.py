@@ -49,7 +49,12 @@ def test_lifecycle_settings_constructs_with_spec_defaults() -> None:
     # not 0.5, to stay above `demote_mtm + w_centrality` so the A4 blend term alone still cannot
     # cross this gate — see test_salience_centrality_unit.py's own check of that invariant).
     assert settings.promote_stm_mtm == pytest.approx(0.45)
-    assert settings.promote_mtm_ltm == pytest.approx(0.9)
+    # ADR 0058 recalibration: 0.6, not the old 0.9 — see settings.py's field docstring for the
+    # exhaustive grid (0.9 admitted no importance the product's capture path ever writes; 0.6
+    # pins the durable-graph bar to the SAME bar IngestSettings.importance_promote already uses
+    # for STM->MTM, reachable at single-digit access_count for every real capture-path stamp —
+    # see test_salience_ltm_gate_calibration_unit.py for the mutation-checked grid proof).
+    assert settings.promote_mtm_ltm == pytest.approx(0.6)
     assert settings.promote_min_age_h == pytest.approx(24.0)
     assert settings.pre_ttl_window_s == 300
 

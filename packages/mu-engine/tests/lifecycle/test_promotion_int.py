@@ -172,7 +172,10 @@ async def test_periodic_mtm_to_ltm_gate_respects_score_and_age(
     now = _T0 + timedelta(hours=200)
     clock = FrozenClock(now)
     salience = SalienceStrategy(SalienceSettings())  # SHIPPED defaults: half_life=24h, cap=10
-    settings = LifecycleSettings()  # SHIPPED: promote_mtm_ltm=0.9, promote_min_age_h=24h
+    # SHIPPED: promote_mtm_ltm=0.6 (ADR 0058 recalibration — was 0.9 when this test was
+    # written; the assertions below use `settings` dynamically, so they hold at either value,
+    # but the inline arithmetic comments below are written against the CURRENT shipped 0.6).
+    settings = LifecycleSettings()
     svc = PromotionService(
         mtm=mtm,
         distill=DistillPipeline(ltm=ltm, mtm=mtm, clock=clock),
