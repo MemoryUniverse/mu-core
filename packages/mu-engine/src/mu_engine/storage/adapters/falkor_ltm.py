@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
@@ -1116,6 +1116,7 @@ class FalkorLtmAdapter:
         max_hops: int,
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
+        seed_entity_uids: Sequence[str] | None = None,
     ) -> list[Scored[MemoryItem]]:
         """D-4 (ARCHITECTURE-CONFORMANCE.md "LTM graph arm thin"): the multi-hop traversal arm —
         answers a relational query ("who is Bo's manager?") by seeding on entity NAMES found in
@@ -1137,6 +1138,18 @@ class FalkorLtmAdapter:
         :meth:`_invalidate_entity_edge`) is excluded from every hop, so a stale relation never
         resurfaces via traversal.
 
+        AD-258 (content-aware seed, `docs/tracking/FAULT-HUNT-0924.md`): the token match above is
+        EXACT — a query that never spells an entity's name verbatim ("what does she do for a
+        living?", or any paraphrase) seeds nothing, and every measured attempt to give this
+        channel a guaranteed result slot while it stayed token-only made `gold_in_context` worse
+        (ADR 0060). ``seed_entity_uids`` is a SECOND, non-lexical seed the caller derives from the
+        query's own top MTM dense-vector hits — see the port docstring for the full derivation.
+        It UNIONS into hop 1's frontier match alongside the token match (never replaces it,
+        `traverse_entities` module docstring "ADDS, never REPLACES" precedent); hop 2+ frontiers
+        are unaffected (they are already derived from graph edges discovered at hop 1, which is
+        the correct generalization — a uid-seeded entity's OWN neighbours are walked exactly like
+        a token-seeded entity's are).
+
         AUTHZ (C2 fix): the ids this arm derives come from the WORKSPACE-wide ``:Entity``
         sub-graph (``_user_scope_prefix``, user slot ``*`` on SHARED), so the ``:Memory``
         hydration below MUST re-impose both walls ``graph_recall`` already imposes — the
@@ -1154,6 +1167,7 @@ class FalkorLtmAdapter:
             max_hops=max_hops,
             limit=limit,
             caller_identity_set=caller_identity_set,
+            seed_entity_uids=seed_entity_uids,
         )
 
     async def _traverse_entities_impl(
@@ -1164,6 +1178,7 @@ class FalkorLtmAdapter:
         max_hops: int,
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
+        seed_entity_uids: Sequence[str] | None = None,
     ) -> list[Scored[MemoryItem]]:
         # AD-179 fix-impl: fail CLOSED on `SHARED + None` (a wiring bug), never silently omit the
         # authorized_ids clause the hydration step below compiles.
@@ -1173,7 +1188,12 @@ class FalkorLtmAdapter:
             operation="falkor_ltm.traverse_entities",
         )
         tokens = {t.casefold() for t in re.findall(r"[A-Za-z0-9]+", query) if len(t) > 1}
-        if not tokens:
+        # AD-258: de-duplicated, order-preserving — `seed_entity_uids` is the caller's own
+        # rank-ordered MTM top-K, and a stable order here is harmless (frontier order never
+        # affects which memories are found, only Cypher's internal row order) but keeps the
+        # query params reproducible for logging/debugging.
+        uid_seeds = list(dict.fromkeys(u for u in (seed_entity_uids or ()) if u))
+        if not tokens and not uid_seeds:
             return []
         g = await self._graph(ns)
         # BUG2 FIX (scoping): the entity/edge frontier walk scopes on the USER-level prefix (see
@@ -1193,16 +1213,27 @@ class FalkorLtmAdapter:
         # attribute (e.g. Ada's own favorite-coffee edge), which pure hop-distance alone cannot.
         memory_hop: dict[str, int] = {}
         for depth in range(1, hops + 1):
-            if not frontier:
+            # AD-258: `uid_seeds` only ever widens hop 1's frontier match — hop 2+ already walks
+            # forward from `other.canonical_name` entities discovered by hop 1's own edges, which
+            # subsumes anything a uid seed could add at later depths.
+            depth_uid_seeds = uid_seeds if depth == 1 else []
+            if not frontier and not depth_uid_seeds:
                 break
             cypher = (
                 "MATCH (seed:Entity {namespace: $ns})-[r]-(other:Entity {namespace: $ns}) "
-                "WHERE seed.canonical_name IN $frontier "
+                "WHERE (seed.canonical_name IN $frontier OR seed.entity_uid IN $uid_frontier) "
                 "AND (r.invalid_at = '' OR r.invalid_at > $now) AND r.memory_id IS NOT NULL "
                 "RETURN DISTINCT r.memory_id AS mid, other.canonical_name AS ocn"
             )
             rows = await g_query(
-                g, cypher, {"ns": user_ns_prefix, "frontier": frontier, "now": now_iso}
+                g,
+                cypher,
+                {
+                    "ns": user_ns_prefix,
+                    "frontier": frontier,
+                    "uid_frontier": depth_uid_seeds,
+                    "now": now_iso,
+                },
             )
             next_frontier: list[str] = []
             for mid, ocn in rows:

@@ -27,9 +27,11 @@ verbs DIRECTLY, with no ``get`` pre-gate, which is exactly the new-caller / drop
 the fix has to survive.
 
 Every test asserts on the RAW Qdrant payload rather than on ``mtm.get``: ``get`` applies its own
-namespace refusal, and two of the four written keys (``superseded_by``, ``entity_uids``) are not
-``MemoryItem`` fields at all and are dropped by ``QdrantMapper.from_store``. The raw point is the
-real store state.
+namespace refusal, and one of the four written keys (``superseded_by``) is not a ``MemoryItem``
+field at all and is dropped by ``QdrantMapper.from_store``. The raw point is the real store state.
+(``entity_uids`` was the SAME shape until AD-258 fixed it: it round-trips into
+``MemoryItem.metadata['entity_uids']`` now — see ``test_set_entity_uids_round_trips_through_get``
+below, which reads it back through ``mtm.get`` deliberately, as the regression proof.)
 
 Each verb is covered TWICE — refused across a namespace boundary AND still working within its own.
 Without the second half, an implementation that turned all four verbs into no-ops would pass every
@@ -271,6 +273,32 @@ async def test_set_entity_uids_in_its_own_namespace_still_writes(
     after = await _raw(qdrant_client, ns, item.id)
     assert after is not None
     assert after["entity_uids"] == ["ent_subject", "ent_object"]
+
+
+async def test_set_entity_uids_round_trips_through_get(
+    mtm: QdrantMtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """AD-258 fix-impl, real Qdrant: the ONE thing the prior two tests deliberately did NOT
+    check, because before this fix it was FALSE — the module docstring even documented it as
+    dropped. `_backfill_mtm_entity_uids` (``falkor_ltm.py``) patches this key onto an
+    already-promoted MTM point specifically so a LATER recall can read the entity resolution the
+    graph tier already computed; a write nothing ever reads back is dead code with a working
+    write half. Mutation-checked: reverting ``QdrantMapper.from_store``'s ``entity_uids`` restore
+    turns this red with ``KeyError``/``assert {} == {...}`` (the field silently absent from
+    ``metadata``, not merely wrong)."""
+    ns = make_ns()
+    item = make_item(ns, "backfill my entity uids, then read it back")
+    await mtm.upsert(item)
+    await mtm.set_entity_uids(ns, item.id, ["ent_subject", "ent_object"])
+
+    got = await mtm.get(ns, item.id)
+
+    assert got is not None
+    assert got.metadata["entity_uids"] == ["ent_subject", "ent_object"], (
+        f"entity_uids did not round-trip through MemoryItem.metadata: {got.metadata!r}"
+    )
 
 
 # --------------------------------------------------------------------------------------

@@ -96,6 +96,7 @@ class _EmptyLtm:
         max_hops: int,
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
+        seed_entity_uids: object = None,
     ) -> list[Scored[MemoryItem]]:
         return []
 

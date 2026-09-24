@@ -145,6 +145,22 @@ class QdrantMapper:
             payload["namespace"] = parts
         for k in ("current_tier", "authorized_ids"):
             payload.pop(k, None)
+        # AD-258 fix-impl (verified by running, `test_qdrant_mtm_write_scoping_int.py`'s own
+        # module docstring named this as known-dropped): `set_entity_uids` (D-5) PATCHes a
+        # top-level ``entity_uids`` payload key onto an already-written point — it is not a
+        # ``MemoryItem`` field, so ``MemoryItem.model_validate`` (default Pydantic ``extra=
+        # "ignore"``) silently discarded it on every read, making the LTM entity resolution
+        # write-only: never reachable through ``semantic()``/``get()`` despite the write
+        # succeeding every time. Mirrors ``to_store``'s own ``authorized_ids`` precedent (a
+        # payload-only indexed key gets moved to/from ``MemoryItem.metadata`` at the mapper
+        # seam) — restored into ``metadata['entity_uids']`` here so the ranker's content-aware
+        # LTM seed (AD-258, `ranker.py::_ltm_channel`) can actually read the entity uids the
+        # graph tier already resolved for this fact instead of always seeing an empty list.
+        entity_uids = payload.pop("entity_uids", None)
+        if entity_uids is not None:
+            metadata = dict(payload.get("metadata") or {})
+            metadata["entity_uids"] = entity_uids
+            payload["metadata"] = metadata
         item = MemoryItem.from_dict(payload)
         if row.vector and any(v != 0.0 for v in row.vector):
             item.embedding = list(row.vector)

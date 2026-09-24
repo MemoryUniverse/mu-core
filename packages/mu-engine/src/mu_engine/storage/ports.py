@@ -21,6 +21,7 @@ pins storage-vocabulary DTOs there — pure wire shapes both planes must agree o
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Protocol, TypeVar
 
@@ -437,6 +438,7 @@ class GraphStorePort(Protocol):
         max_hops: int,
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
+        seed_entity_uids: Sequence[str] | None = None,
     ) -> list[Scored[MemoryItem]]:
         """Multi-hop entity-edge traversal (D-4, ARCHITECTURE-CONFORMANCE.md "LTM graph arm
         thin"): seeds on entity names found in ``query`` and walks the entity-entity edges
@@ -451,7 +453,20 @@ class GraphStorePort(Protocol):
         nothing to filter ``m.authorized_ids`` against and returns ``:Memory`` rows from any room
         and any ACL in the workspace. The parameter exists because the PORT must be able to
         express the caller set — an implementation that ignores it on SHARED is an authorization
-        bypass, not an optimization."""
+        bypass, not an optimization.
+
+        ``seed_entity_uids`` (AD-258, content-aware seed) ADDS a second, non-lexical seed source
+        to the frontier's FIRST hop, alongside the casefolded-token match against
+        ``canonical_name`` this arm has always done — it never replaces the token match (a query
+        that does name its entity in plain text keeps matching exactly as before). The caller
+        (``ThreeChannelRecallRanker._ltm_channel``) resolves this list from the query's OWN
+        top-ranked MTM dense-vector hits' ``entity_uids`` payload (the entities the MTM channel's
+        fact-embedding — ``"{subject} {predicate} {object}"``, ``pipelines/concrete/ingest.py``'s
+        own docstring — already resolved as semantically relevant to the query), so an entity the
+        query never names verbatim (a paraphrase, a pronoun, a follow-up question) can still seed
+        the frontier — the exact gap named in ``docs/tracking/FAULT-HUNT-0924.md``/ADR 0060's own
+        "entity-resolved seeding behind ``resolve_entity``" future-work note. ``None`` or empty
+        reproduces the pre-fix, token-only seed exactly (A/B comparison, DEV-STANDARDS rule 3)."""
         ...
 
     async def by_artifact(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]:
