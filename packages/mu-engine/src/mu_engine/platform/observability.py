@@ -70,21 +70,87 @@ _LABEL_KEY = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9_.:*/\-]{1,256}$")
 _HEX_HASH = re.compile(r"^[0-9a-f]{8,64}$")
 
+# ── credential guard (AD-267 / ADR 0067 D4) ─────────────────────────────────────────────────
+# `_credential_shaped` (prototype `observability/tracing.py:26,255-256`, cited by
+# observability-design.md:50 + observability-metering-spec.md:70,330 as one of four ported guards)
+# was never ported — `sanitize_labels`/`SafeTraceFields` accepted a key named `api_key`, `token`,
+# `password`, `secret` or `credential` carrying its real value verbatim (RUN-verified, ADR
+# 0067/0070). Ported here, and hardened past the prototype's key-name-only check per the AD-267
+# task: a credential in a field called `note` is still a credential, and a key named `token`
+# holding the word "token" is not — so a VALUE-SHAPE check (below) runs alongside the key-name
+# one. Fails CLOSED (raises, never drops-and-continues) and never logs the rejected value itself
+# (rule 3) — only the key name (an identifier, not payload) and, for a shape match, a fixed label
+# drawn from `_CREDENTIAL_VALUE_PATTERNS` below (our own catalog, never derived from the value).
+_CREDENTIAL_TOKENS = (
+    "credential",
+    "secret",
+    "api_key",
+    "apikey",
+    "password",
+    "passwd",
+    "token",
+)
+
+# Value-shape patterns for the credential formats a developer terminal session actually contains:
+# provider keys, JWTs, cloud access keys, personal access tokens, private key blocks, connection
+# strings with an inline password, bearer/basic auth headers. Matched with `.search` (the value may
+# be embedded in a longer string, e.g. a `Bearer <token>` header or a `scheme://user:pass@host` URL).
+_CREDENTIAL_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
+    ("openai_key", re.compile(r"sk-[A-Za-z0-9]{20,}")),
+    ("github_token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
+    ("gitlab_token", re.compile(r"glpat-[A-Za-z0-9_-]{15,}")),
+    ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("jwt", re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
+    ("aws_access_key_id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("google_api_key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("google_oauth_token", re.compile(r"ya29\.[0-9A-Za-z_-]{20,}")),
+    ("private_key_block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("bearer_header", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}")),
+    ("basic_auth_header", re.compile(r"(?i)\bbasic\s+[A-Za-z0-9+/=]{8,}")),
+    ("connection_string_password", re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://[^:/\s@]+:[^@/\s]+@")),
+)
+
+
+def _credential_shaped_key(key: str) -> bool:
+    """True when the KEY NAME alone marks this a credential field — the prototype's check
+    (`_credential_shaped`), by substring so `api_key`/`apikey` and any `*_token`/`*_secret`
+    variant match, never the value."""
+    lowered = key.lower()
+    return any(token in lowered for token in _CREDENTIAL_TOKENS)
+
+
+def _credential_shape_match(value: str) -> str | None:
+    """Return the matched shape's name (from our fixed catalog — never the value) when ``value``
+    looks like a real credential, else ``None``."""
+    for shape, pattern in _CREDENTIAL_VALUE_PATTERNS:
+        if pattern.search(value):
+            return shape
+    return None
+
 
 def sanitize_label_value(value: str) -> str:
-    """Assert ``value`` is a safe scalar (id / enum / ns-prefix); raise otherwise (fail-loud,
-    spec §11). Never mutates/truncates — a bad value is a call-site bug, not something to scrub."""
+    """Assert ``value`` is a safe scalar (id / enum / ns-prefix) and not credential-SHAPED; raise
+    otherwise (fail-loud, spec §11; AD-267 fails closed on ambiguity). Never mutates/truncates —
+    a bad value is a call-site bug, not something to scrub — and the raised message never repeats
+    the value (rule 3), only the shape name that matched."""
+    shape = _credential_shape_match(value)
+    if shape is not None:
+        raise ValueError(f"credential-shaped value rejected (matched: {shape})")
     if not _SAFE_VALUE.match(value):
         raise ValueError("non-content-free label value rejected")
     return value
 
 
 def sanitize_labels(labels: Mapping[str, str]) -> dict[str, str]:
-    """Validate every key + value of a metric/span label map (spec §11). Raises on any violation."""
+    """Validate every key + value of a metric/span label map (spec §11). Raises on any violation,
+    including a credential-shaped key name or value (AD-267)."""
     out: dict[str, str] = {}
     for key, value in labels.items():
         if not _LABEL_KEY.match(key):
             raise ValueError(f"illegal label key: {key!r}")
+        if _credential_shaped_key(key):
+            raise ValueError(f"credential-shaped key rejected: {key!r}")
         out[key] = sanitize_label_value(value)
     return out
 
@@ -114,6 +180,8 @@ class SafeTraceFields(BaseModel):
         for key, value in v.items():
             if not _LABEL_KEY.match(key):
                 raise ValueError(f"illegal hash key: {key!r}")
+            if _credential_shaped_key(key):
+                raise ValueError(f"credential-shaped hash key rejected: {key!r}")
             if not _HEX_HASH.match(value):
                 raise ValueError("hash must be lowercase hex (8-64 chars, e.g. sha256)")
         return dict(v)
@@ -124,6 +192,8 @@ class SafeTraceFields(BaseModel):
         for key, value in v.items():
             if not _LABEL_KEY.match(key):
                 raise ValueError(f"illegal count key: {key!r}")
+            if _credential_shaped_key(key):
+                raise ValueError(f"credential-shaped count key rejected: {key!r}")
             if value < 0:
                 raise ValueError("counts must be non-negative")
         return dict(v)
