@@ -894,8 +894,7 @@ class ThreeChannelRecallRanker:
 
         Fires :meth:`~mu_engine.storage.ports.StmTierRepository.reinforce` once per DISTINCT id
         in the FINAL result, de-duped so a row occupying two slots is reinforced exactly once per
-        call. Concurrent (``asyncio.gather``), never serialised — a bounded, small number of
-        independent writes, not a chain.
+        call.
 
         **Every id, not just the ``channel == "stm"`` ones (AD-259 correction).** ADR 0061
         filtered on the channel label, which is the label of the FUSED winner: a memory that
@@ -910,6 +909,20 @@ class ThreeChannelRecallRanker:
         and safe by contract: ``reinforce`` on a store that does not hold the id is a documented
         no-op returning ``None`` (``ports.py``), never a raise.
 
+        **AD-260 — batched, not one-``asyncio.gather``-of-N-round-trips-per-id.** MEASURED (real
+        Valkey + real Qdrant, `mu-dev-vm`): a 10-item recall with this fan-out unbatched cost
+        p95 **+114ms** over the same recall with ``reinforce_on_recall=False`` — 95% of
+        ``storage-indexing-design.md`` §5.2's entire 120ms no-rerank budget, spent on a
+        best-effort stat write. Concurrency (``asyncio.gather`` over per-id tasks) did NOT buy
+        parallelism against these stores' connection handling, so the fix is fewer round trips.
+        When the bound adapter exposes the batched
+        :meth:`~mu_engine.storage.adapters.redis_stm.RedisStmAdapter.reinforce_many` (a pipelined
+        GET-all + pipelined SET-all — O(1) round trips instead of O(2N)), it is used; any other
+        ``StmTierRepository`` implementation (an in-memory/memcached test double) falls back to
+        the original per-id ``asyncio.gather`` unchanged — duck-typed, not a Protocol-widening
+        change, mirroring the existing ``hasattr(self._mtm, "reinforce")`` capability check below
+        rather than inventing a new idiom.
+
         Best-effort by design (this docstring's own contract, ``ports.py``'s ``reinforce``
         docstring): a store outage here degrades to NO reinforcement for this call, exactly like
         every other enhancement in this module (``_expand_neighbors``'s own graceful-degradation
@@ -921,6 +934,19 @@ class ThreeChannelRecallRanker:
         if not ids:
             return
         at = self._clock.now()
+
+        reinforce_many = getattr(self._stm, "reinforce_many", None)
+        if callable(reinforce_many):
+            try:
+                await reinforce_many(ns, ids, at=at)
+            except StoreUnavailableError as exc:
+                _log.warning(
+                    "recall.reinforce_unavailable",
+                    ns=ns.to_prefix(),
+                    n_ids=len(ids),
+                    error=str(exc),
+                )
+            return
 
         async def _one(memory_id: str) -> None:
             try:
@@ -937,8 +963,8 @@ class ThreeChannelRecallRanker:
 
     async def _reinforce_mtm_hits(self, ns: Namespace, items: list[RecallItemView]) -> None:
         """AD-259: the MTM twin of :meth:`_reinforce_stm_hits` — same contract, same de-dupe,
-        same concurrency, same best-effort degrade, same "every returned id" rule (that method's
-        docstring has the reasoning), a different port and one extra guard.
+        same best-effort degrade, same "every returned id" rule (that method's docstring has the
+        reasoning), same AD-260 batching preference, a different port and one extra guard.
 
         Kept as a second method rather than folded into one generic helper: the two ports are
         structurally unrelated Protocols and only this one needs the capability check below, so a
@@ -962,6 +988,24 @@ class ThreeChannelRecallRanker:
         if not hasattr(self._mtm, "reinforce"):
             return
         at = self._clock.now()
+
+        # AD-260 — same batching preference as `_reinforce_stm_hits` (that method's own docstring
+        # has the measurement): `QdrantMtmAdapter.reinforce_many` collapses the per-id `retrieve`
+        # + `set_payload` fan-out into one batched `retrieve` and one `batch_update_points` call.
+        # `WeaviateMtmAdapter` (and any other `reinforce`-capable but not `reinforce_many`-capable
+        # adapter) falls back to the original per-id `asyncio.gather` unchanged.
+        reinforce_many = getattr(self._mtm, "reinforce_many", None)
+        if callable(reinforce_many):
+            try:
+                await reinforce_many(ns, ids, at=at)
+            except StoreUnavailableError as exc:
+                _log.warning(
+                    "recall.reinforce_mtm_unavailable",
+                    ns=ns.to_prefix(),
+                    n_ids=len(ids),
+                    error=str(exc),
+                )
+            return
 
         async def _one(memory_id: str) -> None:
             try:

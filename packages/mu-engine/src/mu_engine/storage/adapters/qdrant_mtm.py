@@ -26,6 +26,7 @@ truncated in storage. SHARED and any session-narrowed PRIVATE recall keep the ex
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Final
 
@@ -546,6 +547,84 @@ class QdrantMtmAdapter:
             points=_scoped_point_selector(ns, memory_id),
         )
         return reinforced
+
+    async def reinforce_many(
+        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+    ) -> None:
+        """AD-260 — the batched twin of :meth:`reinforce`. MEASURED
+        (``docs/tracking/ARCHITECTURE-DELTAS.md`` AD-260): ``ThreeChannelRecallRanker`` firing one
+        ``retrieve`` + one ``set_payload`` PER id via ``asyncio.gather`` cost recall p95
+        **+114ms on a 10-item recall** (real Valkey + real Qdrant, `mu-dev-vm`) — almost the
+        entire ``storage-indexing-design.md`` §5.2 120ms no-rerank budget, spent on a best-effort
+        stat write nothing downstream of the response reads synchronously. Concurrency did not
+        buy parallelism here, so the fix is fewer round trips, not more concurrency: ONE batched
+        ``retrieve`` (a single ``ids=[...]`` list, exactly like :meth:`_get_impl`'s single-id
+        form) instead of N, and ONE ``batch_update_points`` call carrying N independent
+        ``SetPayloadOperation`` entries (Qdrant's own multi-op primitive, ``AsyncQdrantClient.
+        batch_update_points``) instead of N separate ``set_payload`` round trips.
+
+        Same isolation and same contract as :meth:`reinforce`, per id: each write is still
+        addressed through :func:`_scoped_point_selector` (the namespace-scoped Filter, never a
+        bare point id — a foreign/absent id simply matches zero points, exactly as one
+        ``set_payload`` call already tolerates), the vector/``state``/bi-temporal fields are
+        untouched by construction (payload-only PATCH), and an id absent from this partition is
+        silently skipped rather than raised — the batched equivalent of :meth:`reinforce`'s own
+        ``None`` return, best-effort by the same contract (``ports.py``'s
+        ``MtmTierRepository.reinforce`` docstring)."""
+        if not memory_ids:
+            return
+        await self._retry(self._reinforce_many_impl)(ns, memory_ids, at=at)
+
+    async def _reinforce_many_impl(
+        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+    ) -> None:
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return
+        # ONE retrieve for every id — same reconstruct-then-compare namespace check `_get_impl`
+        # makes for a single id (that function's own docstring has the "why post-read, not a
+        # filter" rationale), just batched. Vectors are NOT needed for a payload-only stat bump,
+        # unlike `_get_impl`'s own general-purpose form.
+        records = await self._qdrant.retrieve(
+            collection_name=name,
+            ids=[point_id(memory_id) for memory_id in memory_ids],
+            with_payload=True,
+            with_vectors=False,
+        )
+        current_by_point: dict[str, MemoryItem] = {}
+        for rec in records:
+            item = self._mapper.from_store(
+                QdrantPoint(
+                    point_id=str(rec.id),
+                    vector=[],
+                    sparse=None,
+                    payload=rec.payload or {},
+                    collection=name,
+                )
+            )
+            if item.namespace == ns:
+                current_by_point[str(rec.id)] = item
+
+        operations: list[models.SetPayloadOperation] = []
+        for memory_id in memory_ids:
+            current = current_by_point.get(str(point_id(memory_id)))
+            if current is None:
+                continue  # absent, or in another partition — a no-op, never a raise (see above)
+            operations.append(
+                models.SetPayloadOperation(
+                    set_payload=models.SetPayload(
+                        payload={
+                            "access_count": current.access_count + 1,
+                            "updated_at": at.isoformat(),
+                        },
+                        filter=_scoped_point_selector(ns, memory_id),
+                    )
+                )
+            )
+        if operations:
+            await self._qdrant.batch_update_points(
+                collection_name=name, update_operations=operations
+            )
 
     def _recall_filter(
         self,

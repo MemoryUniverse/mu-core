@@ -32,7 +32,7 @@ docstring).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from datetime import datetime
 from typing import cast
 
@@ -456,6 +456,53 @@ class RedisStmAdapter:
         # docstring), so there is nothing here that needs re-scoring.
         await self._redis.set(key, reinforced.model_dump_json(), keepttl=True)
         return reinforced
+
+    async def reinforce_many(
+        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+    ) -> None:
+        """AD-260 — the batched twin of :meth:`reinforce`. MEASURED
+        (``docs/tracking/ARCHITECTURE-DELTAS.md`` AD-260): ``ThreeChannelRecallRanker`` firing one
+        GET+SET pair per id via ``asyncio.gather`` cost recall p95 **+114ms on a 10-item recall**
+        (real Valkey + real Qdrant, `mu-dev-vm`) — almost the entire ``storage-indexing-design.md``
+        §5.2 120ms no-rerank budget, spent on a best-effort stat write nothing downstream of the
+        response reads synchronously. Concurrency did not buy parallelism here (redis-py's
+        connection pool serializes commands issued faster than it can open new connections), so
+        the fix is fewer round trips, not more concurrency: ONE pipelined round trip for every
+        GET, then ONE pipelined round trip for every SET, regardless of how many ids are passed —
+        O(1) round trips instead of O(2N).
+
+        Same contract as :meth:`reinforce`, applied per id: KEEPTTL (never resets a demoted item's
+        retention clock), ``created_at`` untouched, an id that raced away between the read and the
+        write (already expired/evicted) is silently skipped in the write pipeline — the pipelined
+        equivalent of :meth:`reinforce`'s own ``None`` return, best-effort by the same contract
+        (``ports.py``'s ``StmTierRepository.reinforce`` docstring)."""
+        if not memory_ids:
+            return
+        await self._retry(self._reinforce_many_impl)(ns, memory_ids, at=at)
+
+    async def _reinforce_many_impl(
+        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+    ) -> None:
+        keys = [RedisMapper.memory_key(ns, memory_id) for memory_id in memory_ids]
+
+        read_pipe = self._redis.pipeline(transaction=False)
+        for key in keys:
+            read_pipe.get(key)
+        blobs = await read_pipe.execute()
+
+        write_pipe = self._redis.pipeline(transaction=False)
+        queued = False
+        for key, blob in zip(keys, blobs, strict=True):
+            if blob is None:
+                continue  # expired/evicted in the window between the caller's read and this call
+            current = self._mapper.from_store(RedisRecord(key=key, ttl_s=None, blob=_as_str(blob)))
+            reinforced = current.model_copy(
+                update={"access_count": current.access_count + 1, "updated_at": at}
+            )
+            write_pipe.set(key, reinforced.model_dump_json(), keepttl=True)
+            queued = True
+        if queued:
+            await write_pipe.execute()
 
 
 def _as_str(value: str | bytes) -> str:
