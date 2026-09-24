@@ -10,7 +10,7 @@ invalidate-don't-delete, edge_operations.py:406-441). Every write goes through t
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from qdrant_client import AsyncQdrantClient
@@ -250,17 +250,21 @@ async def test_distill_noop_reinforces_identical_fact(
 ) -> None:
     ns = make_ns()
     t1 = datetime(2020, 1, 1, tzinfo=UTC)
+    # D2's own assertion below needs a deterministic `created_at` to compare against — `make_item`
+    # defaults it to real wall-clock construction time, which this fixed-clock pipeline never sees.
     item = make_item(
         ns, "Ada lives in Paris", subject="Ada", predicate="lives_in", obj="Paris", valid_at=t1
-    )
+    ).model_copy(update={"created_at": t1})
     await _pipeline(ltm, now=t1).distill(ns, [item])
 
-    # a DISTINCT capture (new id) asserting the identical triple -> NOOP (reinforce, not dup).
+    # a DISTINCT capture (new id) asserting the identical triple -> NOOP (reinforce, not dup),
+    # at a LATER instant — so a stamped `last_seen` is distinguishable from a static default.
+    t2 = t1 + timedelta(days=1)
     again = make_item(
         ns, "Ada lives in Paris", subject="Ada", predicate="lives_in", obj="Paris", valid_at=t1
     )
     assert again.id != item.id
-    report = await _pipeline(ltm, now=t1).distill(ns, [again])
+    report = await _pipeline(ltm, now=t2).distill(ns, [again])
 
     assert report.actions[0].kind is DistillActionKind.NOOP
     # still exactly one active fact (the original, reinforced) — the duplicate did not land.
@@ -276,7 +280,10 @@ async def test_distill_noop_reinforces_identical_fact(
         "an identical-active-fact NOOP must bump mention_count — the 'said it again' signal — "
         "not just access_count"
     )
-    # D2 fix (AD-266a): last_seen must advance too, distinctly from created_at.
+    # D2 fix (AD-266a): last_seen must advance to the REINFORCEMENT instant (t2), distinctly
+    # from created_at (t1) — a static/never-moving last_seen would fail this the same way a
+    # missing bump would.
+    assert hits[0].item.last_seen == t2
     assert hits[0].item.last_seen > item.created_at
 
 
