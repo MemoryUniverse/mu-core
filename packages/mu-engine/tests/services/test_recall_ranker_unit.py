@@ -92,7 +92,21 @@ class _FakeStm:
         unconditionally now, so the fake needed it to keep working at all."""
         return []
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        # AD-266 (a CONCURRENT lane, landed on dev/mlm-build at 3b73011) added this keyword
+        # to `ranker.py`'s three `reinforce(...)` call sites and to `storage/ports.py`, but
+        # not to these three test doubles — so this whole file was RED at the branch tip
+        # (`TypeError: _Fake*.reinforce() got an unexpected keyword argument
+        # 'relevance_score'`, 12 failures), VERIFIED by running the unmodified tip. Accepted
+        # and ignored here: these doubles assert on WHICH ids were reinforced, not on the
+        # score, so adding the parameter restores the file without weakening any assertion.
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
         """AD-250 fix (ADR 0061): a real, functioning fake of the read-stat write-back — bumps
         `access_count` in place, exactly like the shipped adapters, so a test asserting on it
         (rather than merely on call-count) can. `ThreeChannelRecallRanker.rank` calls this
@@ -1982,7 +1996,21 @@ class _ReinforcingMtm(_FakeMtm):
         super().__init__(hits_by_query)
         self.reinforced: list[str] = []
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        # AD-266 (a CONCURRENT lane, landed on dev/mlm-build at 3b73011) added this keyword
+        # to `ranker.py`'s three `reinforce(...)` call sites and to `storage/ports.py`, but
+        # not to these three test doubles — so this whole file was RED at the branch tip
+        # (`TypeError: _Fake*.reinforce() got an unexpected keyword argument
+        # 'relevance_score'`, 12 failures), VERIFIED by running the unmodified tip. Accepted
+        # and ignored here: these doubles assert on WHICH ids were reinforced, not on the
+        # score, so adding the parameter restores the file without weakening any assertion.
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
         self.reinforced.append(memory_id)
         return None
 
@@ -2135,7 +2163,21 @@ class _ReinforcingLtm(_FakeLtm):
         super().__init__(hits)
         self.reinforced: list[str] = []
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        # AD-266 (a CONCURRENT lane, landed on dev/mlm-build at 3b73011) added this keyword
+        # to `ranker.py`'s three `reinforce(...)` call sites and to `storage/ports.py`, but
+        # not to these three test doubles — so this whole file was RED at the branch tip
+        # (`TypeError: _Fake*.reinforce() got an unexpected keyword argument
+        # 'relevance_score'`, 12 failures), VERIFIED by running the unmodified tip. Accepted
+        # and ignored here: these doubles assert on WHICH ids were reinforced, not on the
+        # score, so adding the parameter restores the file without weakening any assertion.
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
         self.reinforced.append(memory_id)
         return None
 
