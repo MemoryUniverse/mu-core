@@ -916,7 +916,15 @@ def to_memory_response(item: MemoryItem) -> MemoryResponse:
     plain chat/activity text, so
     ``"text"`` is the honest default here, never a guess at a richer type the item does not carry.
     Every other field below is a direct 1:1 read off ``MemoryItem`` (module docstring's own field
-    list, ``mu_engine/storage/domain/memory.py:150-198``) — no field is fabricated."""
+    list, ``mu_engine/storage/domain/memory.py:150-198``) — no field is fabricated.
+
+    AD-281a: ``last_seen``/``mention_count`` are read off the item here, having previously been
+    omitted from BOTH read-path mappers (this one and ``mu_local.local_memory._to_memory_response``,
+    which mirrors it field-for-field and was fixed in the same pass). AD-266/AD-266b made them real
+    stored columns on ``MemoryItem`` and routed them across ``to_contract_item``; the two mappers
+    that serve ``get`` were never updated, so the fields existed everywhere except where a caller
+    could see them. Field-level loss like this is invisible to a name-level check — the function
+    existed and was tested; it simply did not WRITE these two slots. See ADR 0076."""
     return MemoryResponse(
         id=item.id,
         content=item.content,
@@ -938,6 +946,8 @@ def to_memory_response(item: MemoryItem) -> MemoryResponse:
         polarity=item.polarity.value,
         valid_at=item.valid_at,
         invalid_at=item.invalid_at,
+        last_seen=item.last_seen,
+        mention_count=item.mention_count,
         relevance_score=item.relevance_score,
         content_hash=item.content_hash,
     )

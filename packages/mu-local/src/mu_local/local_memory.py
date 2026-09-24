@@ -754,13 +754,23 @@ def _to_memory_response(item: MemoryItem) -> MemoryResponse:
     so ``"text"`` is the honest default, never a guess at a richer type the item does not carry
     (same rationale as the facade's own mapping).
 
+    AD-281a: ``last_seen`` and ``mention_count`` are NO LONGER on the unavailable list. They were
+    listed here as "an LTM-graph-only aggregate" and left at their schema default, which was true
+    when this docstring was written and stopped being true when AD-266/AD-266b gave ``MemoryItem``
+    both fields as real stored columns (``mu_engine/storage/domain/memory.py:202,218``) and wired
+    the recall-time and dedup-time writers that keep them current. The engine record carried the
+    value and this mapper dropped it on the floor, so a ``get()`` caller read ``last_seen=None``
+    and ``mention_count=1`` for a memory recalled nine times and asserted five — the same
+    "user-visible field that lies" shape AD-266 (D1) was opened to fix, one layer further out.
+    RUN-verified before and after; see ADR 0076.
+
     UNAVAILABLE from an STM point-get, left at ``MemoryResponse``'s own field default (documented,
     never faked with a guessed value) because ``MemoryItem`` (``mu_engine/storage/domain/
     memory.py:145-201``) carries no correlate for them today: ``speaker_kind``, ``speaker_id``,
     ``source_id``, ``turn_id``, ``entity_id``, ``asserted_state``, ``gds_pagerank`` (an LTM-graph-
     only aggregate), ``object_type``, ``object_value``, ``predicate_cardinality``, ``expires_at``,
-    ``last_seen``, ``mention_count`` (an LTM-graph-only aggregate), ``parent_ids``/``child_ids``
-    (LTM-graph-only lineage). Every other field below is a direct 1:1 read off ``MemoryItem``."""
+    ``parent_ids``/``child_ids`` (LTM-graph-only lineage). Every other field below is a direct 1:1
+    read off ``MemoryItem``."""
     return MemoryResponse(
         id=item.id,
         content=item.content,
@@ -782,6 +792,8 @@ def _to_memory_response(item: MemoryItem) -> MemoryResponse:
         polarity=item.polarity.value,
         valid_at=item.valid_at,
         invalid_at=item.invalid_at,
+        last_seen=item.last_seen,
+        mention_count=item.mention_count,
         relevance_score=item.relevance_score,
         content_hash=item.content_hash,
     )
