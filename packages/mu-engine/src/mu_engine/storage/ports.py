@@ -335,6 +335,39 @@ class GraphStorePort(Protocol):
 
     async def upsert_fact(self, item: MemoryItem) -> None: ...
 
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        """The LTM twin of :meth:`MtmTierRepository.reinforce` (ADR 0062 / AD-259 named this the
+        one still-missing half: ``recall-service-design.md`` §5.1 describes a ``COLD -> ACTIVE``
+        reactivate-on-recall edge (spec §9) built on "the existing access_count/last_seen
+        write-back" — but until this method existed, ``LtmTierRepository`` had no ``reinforce``
+        at all, so ``RetentionService`` had nothing to read and the edge had no trigger. NAMED,
+        not fixed, is what ADR 0062 left this as; this closes it.
+
+        Same contract as :meth:`MtmTierRepository.reinforce`: increments ``access_count`` by 1
+        and refreshes ``updated_at`` to ``at``. MUST leave ``created_at``, the stored
+        ``content``/``subject``/``predicate``/``object`` triple, ``state``, ``cold`` and every
+        bi-temporal field untouched by this call itself — it is a read-STAT write-back, not a
+        re-capture and not the COLD flip (see below). ``None`` if ``memory_id`` is absent from
+        ``ns``'s graph partition — a no-op, never a raise, for the same reason
+        :meth:`StmTierRepository.reinforce` gives: the caller passes only ids its own prior read
+        just returned. Best-effort by contract — a caller MUST NOT let a failure here fail the
+        read it is reinforcing.
+
+        **Reactivation is deliberately NOT folded into this write.** ``reinforce`` only bumps the
+        stat; :meth:`~mu_engine.lifecycle.retention.RetentionService.reactivate_on_recall` is the
+        method that actually flips a COLD fact back to non-COLD (``upsert_fact``-based, gated on
+        ``LifecycleSettings.retention.reactivate_on_recall``), and it already existed — unwired —
+        before this method did. ``RetentionService._sweep`` reads the freshly-bumped
+        ``updated_at`` on its NEXT pass over a COLD fact (the same "no longer long-inactive"
+        test the cold-slide itself uses, mirrored) and calls that method — exactly the
+        recall-writes-a-stat / lifecycle-sweep-reads-it split every other tier's reinforcement
+        already follows (STM's write-back rescues a DEMOTED item only on the NEXT
+        ``promote_stm_mtm`` sweep, never inline; MTM's rescues only on the NEXT
+        ``scan_for_demotion`` sweep). Keeping this port method a pure stat bump — no
+        ``LifecycleSettings`` import here, no ``cold`` mutation here — keeps the storage layer
+        from depending downward on the lifecycle layer that owns the policy over it."""
+        ...
+
     async def get_fact(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         """Point-get ONE ``:Memory`` LTM node by id from ``ns``'s graph partition (``None`` if
         absent) — the graph-tier twin of :meth:`StmTierRepository.get`/:meth:`MtmTierRepository.

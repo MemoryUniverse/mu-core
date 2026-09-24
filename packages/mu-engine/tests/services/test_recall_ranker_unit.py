@@ -2005,3 +2005,107 @@ async def test_a_memory_in_both_tiers_is_reinforced_in_both_stores() -> None:
     stm_row = await stm.get(_NS, both.id)
     assert stm_row is not None
     assert stm_row.access_count == 1, "the STM row was not reinforced either"
+
+
+# =================================================================================================
+# ADR 0062 / AD-259's named-open item — the LTM read-stat write-back (`_reinforce_ltm_hits`)
+# =================================================================================================
+class _ReinforcingLtm(_FakeLtm):
+    """``_FakeLtm`` plus a real, functioning ``reinforce`` — the SHIPPED shape
+    (``FalkorLtmAdapter``).
+
+    Deliberately a SUBCLASS rather than an edit to ``_FakeLtm``/``_EmptyLtm``: those staying
+    WITHOUT ``reinforce`` is what keeps every OTHER test in this module an ongoing regression
+    test for the capability guard in ``_reinforce_ltm_hits`` (see
+    ``test_a_graph_backend_without_reinforce_does_not_break_recall`` below).
+    """
+
+    def __init__(self, hits: list[MemoryItem]) -> None:
+        super().__init__(hits)
+        self.reinforced: list[str] = []
+
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        self.reinforced.append(memory_id)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_a_recalled_ltm_hit_is_reinforced_exactly_once() -> None:
+    """ADR 0062 / AD-259's still-open half, closed: ``LtmTierRepository`` had no ``reinforce`` at
+    all, so a COLD LTM fact's ``COLD -> ACTIVE`` reactivate-on-recall edge (spec §9,
+    ``recall-service-design.md`` §5.1) had no trigger and ``RetentionService`` had nothing to
+    read on its next sweep. This pins the ranker-side contract (once per DISTINCT surviving LTM
+    id, never per channel candidate) — the storage-layer stat bump and the
+    ``RetentionService._sweep`` reactivation this write-back feeds are proved separately, against
+    real FalkorDB, in ``tests/storage/test_graph_falkor_int.py`` and
+    ``tests/lifecycle/test_retention_int.py``.
+
+    MUTATION CHECK (run, red): remove ``self._reinforce_ltm_hits(ns, items)`` from the
+    ``asyncio.gather`` in ``rank`` — ``ltm.reinforced`` stays empty.
+    """
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    target = _item("Ada uses Postgres", tier=MemoryTier.LTM, at=base)
+    query_vec = (0.9, 0.1)
+    ltm = _ReinforcingLtm([target])
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),
+        mtm=_FakeMtm({}),  # type: ignore[arg-type]
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency"),
+        clock=FrozenClock(base),
+    )
+
+    ids = await _rank(ranker, list(query_vec))
+
+    assert target.id in ids
+    assert ltm.reinforced == [
+        target.id
+    ], f"expected exactly one reinforcement of the surviving LTM hit, got {ltm.reinforced}"
+
+
+@pytest.mark.asyncio
+async def test_reinforce_on_recall_off_reinforces_no_ltm_hit() -> None:
+    """The A/B off-switch covers ALL THREE channels, not just STM/MTM — an operator who turns the
+    write-back off must get a genuinely read-only recall."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    target = _item("Ada uses Postgres", tier=MemoryTier.LTM, at=base)
+    query_vec = (0.9, 0.1)
+    ltm = _ReinforcingLtm([target])
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),
+        mtm=_FakeMtm({}),  # type: ignore[arg-type]
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency", reinforce_on_recall=False),
+        clock=FrozenClock(base),
+    )
+
+    ids = await _rank(ranker, list(query_vec))
+
+    assert target.id in ids
+    assert ltm.reinforced == []
+
+
+@pytest.mark.asyncio
+async def test_a_graph_backend_without_reinforce_does_not_break_recall() -> None:
+    """The LTM twin of ``test_a_vector_backend_without_reinforce_does_not_break_recall``.
+    ``FalkorLtmAdapter`` is the only shipped ``GraphStorePort`` implementation today and it DOES
+    implement ``reinforce`` — but the port is a ``Protocol`` (``STORE_REGISTRY.build`` is typed
+    ``-> Any``, exactly like the vector role), so an alternate/future graph backend or a test
+    double built against the pre-AD-259 port shape must degrade, not crash, the read path.
+    ``_FakeLtm``/``_EmptyLtm`` (no ``reinforce``) stand in for exactly that.
+
+    MUTATION CHECK (run, red): delete the ``if not hasattr(self._ltm, "reinforce"): return``
+    guard in ``_reinforce_ltm_hits`` — this test fails with
+    ``AttributeError: '_FakeLtm' object has no attribute 'reinforce'``, and so do every other
+    test in this module that ever populates the LTM channel.
+    """
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    target = _item("Ada uses Postgres", tier=MemoryTier.LTM, at=base)
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(stm_items=[], mtm_hits_by_query={}, ltm_hits=[target])
+
+    ids = await _rank(ranker, list(query_vec))  # must not raise
+
+    assert target.id in ids

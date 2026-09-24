@@ -108,7 +108,7 @@ _ERROR_METRIC = "mu_operation_errors_total"
 # Archival/GC candidates (spec §9): "acts only on SUPERSEDED/EXPIRED" — never ACTIVE.
 _DEAD_STATES = frozenset({MemoryState.SUPERSEDED, MemoryState.EXPIRED})
 
-RetentionAction = Literal["self_expire", "cold_slide", "gc"]
+RetentionAction = Literal["self_expire", "cold_slide", "gc", "reactivate"]
 
 
 @runtime_checkable
@@ -294,6 +294,35 @@ class RetentionService:
                             reason="low_importance_inactive",
                         )
                     )
+            elif item.cold:
+                # AD-259 / ADR 0062's still-open half, closed here: spec §9's
+                # `COLD -> ACTIVE : recall hit` edge (recall-service-design.md §5.1).
+                # `GraphStorePort.reinforce` (the new read-stat write-back a genuine LTM recall
+                # hit performs — `ranker.py`'s `_reinforce_ltm_hits`) bumps `updated_at` to the
+                # moment of the hit, and nothing else in this engine touches a COLD fact's
+                # `updated_at` (the sweep never writes to a fact it does not act on, and
+                # `upsert_fact` is not on any other read path) — so a COLD fact that is no
+                # longer "long-inactive" by the SAME `durable_cold_after_d` test the slide above
+                # uses was, by construction, genuinely recalled since it went cold.
+                # `reactivate_on_recall` does the actual flip (and honors
+                # `LifecycleSettings.retention.reactivate_on_recall`'s own off-switch); this
+                # sweep only decides WHEN to call it — exactly the integration point that
+                # method's own docstring names ("the integrate phase wires this call at
+                # whichever call site assembles a recall result set"): the call site is this
+                # sweep reading the reinforcement back, not the read path itself, because
+                # `RecallService`'s write-back has no visibility into `cold` and recall must
+                # stay a pure reader (§5.1's CQRS rule) of everything BUT this one stat.
+                inactive_for = now - item.updated_at
+                if inactive_for < timedelta(days=retention.durable_cold_after_d):
+                    reactivated = await self.reactivate_on_recall(item)
+                    if reactivated is not None:
+                        outcomes.append(
+                            RetentionOutcome(
+                                memory_id=item.id,
+                                action="reactivate",
+                                reason="recalled_since_cold_slide",
+                            )
+                        )
 
         # ---- pass 2: dead (SUPERSEDED/EXPIRED) facts — GC, chain-head-dead + window gated --
         dead = await self._ltm_retention.facts_by_state(ns, _DEAD_STATES)
@@ -356,12 +385,18 @@ class RetentionService:
         return report
 
     async def reactivate_on_recall(self, item: MemoryItem) -> MemoryItem | None:
-        """Reactivate-on-recall (ADR 0035; spec §9's ``COLD -> ACTIVE : recall hit`` edge): the
-        recall path — owned by another task; the integrate phase wires this call at whichever
-        call site assembles a recall result set — calls this whenever a COLD item (``item.cold
-        is True``) surfaces in a hit, flipping ``cold`` back to ``False`` via the existing
-        ``upsert_fact`` (never a new port method: this is a plain field mutation + re-MERGE,
-        exactly like the EXPIRE/COLD-slide flips above).
+        """Reactivate-on-recall (ADR 0035; spec §9's ``COLD -> ACTIVE : recall hit`` edge).
+
+        WIRED (ADR 0062 / AD-259, was previously built-but-unwired — this method existed,
+        tested, with zero production callers, the exact shape of defect ADR 0058 went hunting
+        for): called from THIS class's own :meth:`_sweep`, pass 1's ``elif item.cold`` branch,
+        for a COLD fact whose ``updated_at`` shows a genuine recall since it went cold — which
+        the recall path can now produce, because :meth:`~mu_engine.storage.ports.GraphStorePort.
+        reinforce` (``ranker.py``'s ``_reinforce_ltm_hits``) finally exists and bumps it. See
+        that ``elif`` branch's own comment for why the SWEEP reads the reinforcement rather than
+        recall calling this method inline: recall has no visibility into ``cold`` and must stay a
+        pure reader of it (§5.1's CQRS rule) — this mirrors the STM/MTM rescues, which also only
+        fire on the tier's OWN next sweep, never inline with the recall that earned them.
 
         No-op (returns ``None``, zero writes) if the item is not actually COLD or
         ``LifecycleSettings.retention.reactivate_on_recall`` is disabled — mirrors

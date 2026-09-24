@@ -120,6 +120,58 @@ async def test_find_conflicts(
     assert {c.id for c in conflicts} == {f1.id, f2.id}
 
 
+# =================================================================================================
+# ADR 0062 / AD-259's still-open half, closed: `GraphStorePort.reinforce`
+# =================================================================================================
+async def test_reinforce_bumps_access_count_and_updated_at_only(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """Real FalkorDB — payload-only stat write, everything else on the node untouched: the same
+    contract `qdrant_mtm.py`'s `_reinforce_impl` docstring pins for MTM, proved here for the
+    graph tier's fetch-then-`upsert_fact` shape instead of a Qdrant `set_payload`."""
+    ns = make_ns()
+    now = datetime.now(UTC)
+    item = make_item(ns, "Ada uses Postgres", subject="Ada", predicate="uses", obj="Postgres")
+    item.valid_at = now
+    await ltm.upsert_fact(item)
+
+    at = now + timedelta(hours=1)
+    reinforced = await ltm.reinforce(ns, item.id, at=at)
+
+    assert reinforced is not None
+    assert reinforced.access_count == item.access_count + 1
+    assert reinforced.updated_at == at
+    # untouched by construction: created_at, content, state, the triple, cold.
+    assert reinforced.created_at == item.created_at
+    assert reinforced.content == item.content
+    assert reinforced.state == item.state
+    assert (reinforced.subject, reinforced.predicate, reinforced.object) == (
+        item.subject,
+        item.predicate,
+        item.object,
+    )
+
+    # persisted, not just returned — a fresh read sees the same bump.
+    refetched = await ltm.get_fact(ns, item.id)
+    assert refetched is not None
+    assert refetched.access_count == item.access_count + 1
+    assert refetched.updated_at == at
+
+
+async def test_reinforce_on_absent_memory_is_a_documented_noop(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+) -> None:
+    """The caller passes only ids its own prior read just returned (`ports.py`'s
+    `GraphStorePort.reinforce` docstring) — an id absent from this namespace's partition is a
+    silent no-op, never a raise, exactly like every other tier's `reinforce`."""
+    ns = make_ns()
+    result = await ltm.reinforce(ns, "never-existed", at=datetime.now(UTC))
+    assert result is None
+
+
 async def test_bitemporal_invalidate_dont_delete(
     ltm: FalkorLtmAdapter,
     make_ns: Callable[..., Namespace],

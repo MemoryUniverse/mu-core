@@ -434,6 +434,40 @@ class FalkorLtmAdapter:
             )
         await self._materialize_entity_edge(g, item, props)
 
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+
+    async def _reinforce_impl(
+        self, ns: Namespace, memory_id: str, *, at: datetime
+    ) -> MemoryItem | None:
+        """AD-259 / ADR 0062's named-open LTM half — the recall-time read-stat write-back for a
+        ``:Memory`` node (``ports.py``'s ``GraphStorePort.reinforce`` docstring has the full
+        rationale, including why the ``cold`` flip is deliberately NOT done here).
+
+        Fetch-then-``upsert_fact``, the SAME shape ``RetentionService`` already uses for its own
+        stat-affecting flips (``_expire_impl``/the COLD-slide branch, ``retention.py``) — not the
+        lean single-property Cypher ``SET`` :meth:`_expire_impl` on THIS adapter uses, because
+        that shortcut leaves ``m.memory_json`` stale (the property write and the JSON carrier
+        diverge) and :meth:`_get_fact_impl`/``graph_recall``/``facts_at`` all read the fact back
+        OUT of ``m.memory_json``, never the individual properties. Going through
+        :meth:`_upsert_fact_impl` keeps the JSON carrier and the node properties in the ONE
+        consistent state every other mutator in this file already relies on, at the cost of a
+        full MERGE + entity-edge re-materialization per recall hit — an established, already-paid
+        cost on this tier (``RetentionService``'s own sweep pays it for every COLD-slide/
+        self-expire flip today), not a new one this method introduces.
+        """
+        current = await self._get_fact_impl(ns, memory_id)
+        if current is None:
+            # Absent (never existed, in another partition, or already GC'd) — a no-op by
+            # contract, never a raise: the caller passes only ids its own prior read just
+            # returned.
+            return None
+        reinforced = current.model_copy(
+            update={"access_count": current.access_count + 1, "updated_at": at}
+        )
+        await self._upsert_fact_impl(reinforced)
+        return reinforced
+
     async def _materialize_entity_edge(
         self, g: Any, item: MemoryItem, props: dict[str, Any]
     ) -> None:

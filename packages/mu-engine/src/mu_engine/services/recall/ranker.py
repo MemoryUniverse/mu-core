@@ -516,10 +516,16 @@ class ThreeChannelRecallRanker:
         # recalled every single day still demotes on the identical schedule as one nobody has
         # touched, because `access_count` is the ONLY salience term a recall can move and nothing
         # moved it (`ports.py`'s `MtmTierRepository.reinforce` docstring has the measurement).
-        # One gather over both channels, not two round trips: they are independent writes.
+        # ADR 0062 / AD-259 named this the still-missing third leg: `LtmTierRepository` had no
+        # `reinforce` at all, so a COLD LTM fact (spec §9's `COLD -> ACTIVE : recall hit` edge,
+        # `recall-service-design.md` §5.1) had no trigger and `RetentionService` had nothing to
+        # read on its next sweep. Same contract, same guard shape as the MTM leg.
+        # One gather over all three channels, not three round trips: independent writes.
         if self._settings.reinforce_on_recall:
             await asyncio.gather(
-                self._reinforce_stm_hits(ns, items), self._reinforce_mtm_hits(ns, items)
+                self._reinforce_stm_hits(ns, items),
+                self._reinforce_mtm_hits(ns, items),
+                self._reinforce_ltm_hits(ns, items),
             )
 
         ran = RecallChannels(
@@ -1013,6 +1019,48 @@ class ThreeChannelRecallRanker:
             except StoreUnavailableError as exc:
                 _log.warning(
                     "recall.reinforce_mtm_unavailable",
+                    ns=ns.to_prefix(),
+                    memory_id=memory_id,
+                    error=str(exc),
+                )
+
+        await asyncio.gather(*(_one(mid) for mid in ids))
+
+    async def _reinforce_ltm_hits(self, ns: Namespace, items: list[RecallItemView]) -> None:
+        """ADR 0062 / AD-259's named-open item: the LTM twin of :meth:`_reinforce_mtm_hits` —
+        same contract, same de-dupe, same concurrency, same best-effort degrade, same "every
+        returned id" rule, same capability guard (:meth:`_reinforce_mtm_hits`'s docstring has
+        the reasoning for all five).
+
+        This is the write-back `recall-service-design.md` §5.1 describes as what lets
+        ``RetentionService`` flip a COLD LTM fact back to non-COLD on its NEXT sweep
+        (``reactivate_on_recall`` — a lifecycle-layer decision this read-side method
+        deliberately does not make itself; ``ports.py``'s ``GraphStorePort.reinforce`` docstring
+        has the split). Bumping ``access_count``/``updated_at`` on a fact that is not COLD is
+        simply the same ordinary usage-stat write-back the MTM/STM legs already perform — never
+        a no-op special case, and never gated on ``item.cold`` here, because this method has no
+        visibility into that field (``RecallItemView`` carries no ``cold`` flag) and needs none:
+        the sweep is the one place that reads it.
+        """
+        ids = list({v.memory_id for v in items})
+        if not ids:
+            return
+        # CAPABILITY CHECK, not a type check — mirrors `_reinforce_mtm_hits`'s guard. Today
+        # `FalkorLtmAdapter` is the only shipped `GraphStorePort` implementation and it DOES
+        # implement `reinforce`, so this guard is defensive rather than live — but the port is a
+        # `Protocol`, `STORE_REGISTRY.build` is typed `-> Any` exactly like the vector role, and a
+        # future/alternate graph backend or a test double built against the pre-AD-259 port shape
+        # would otherwise turn every recall against it into an `AttributeError` on the read path.
+        if not hasattr(self._ltm, "reinforce"):
+            return
+        at = self._clock.now()
+
+        async def _one(memory_id: str) -> None:
+            try:
+                await self._ltm.reinforce(ns, memory_id, at=at)
+            except StoreUnavailableError as exc:
+                _log.warning(
+                    "recall.reinforce_ltm_unavailable",
                     ns=ns.to_prefix(),
                     memory_id=memory_id,
                     error=str(exc),

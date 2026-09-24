@@ -522,6 +522,102 @@ async def test_durable_cold_slide_then_reactivate_on_recall(
     assert noop is None
 
 
+async def test_a_genuine_recall_hit_reactivates_a_cold_fact_on_the_next_sweep(
+    ltm: FalkorLtmAdapter,
+    ltm_retention: LtmRetentionStorePort,
+    make_ns: Callable[..., Namespace],
+) -> None:
+    """ADR 0062 / AD-259's still-open half, PROVED END TO END, by running it — never by reading.
+
+    ``recall-service-design.md`` §5.1 / spec §9 describe a ``COLD -> ACTIVE`` reactivate-on-
+    recall edge; ``reactivate_on_recall`` (above) existed, tested, with ZERO production callers
+    (the exact shape ADR 0058 went hunting for), because ``LtmTierRepository`` had no
+    ``reinforce`` at all and ``RetentionService`` had nothing to read. This test calls NEITHER
+    ``reactivate_on_recall`` NOR any private helper directly — it drives only the two PUBLIC
+    verbs a real recall hit and a real sweep actually call in production
+    (``GraphStorePort.reinforce`` — ``ranker.py``'s ``_reinforce_ltm_hits`` — and
+    ``RetentionService.sweep``), exactly the "one memory walked across real time" standard
+    ADR 0058/0062 set.
+
+    MUTATION CHECK (run, red):
+      (a) delete the ``elif item.cold: ... await self.reactivate_on_recall(item)`` branch in
+          ``RetentionService._sweep`` -> ``reinforced.id`` stays ``cold is True`` forever, no
+          matter how many more sweeps run.
+      (b) revert ``FalkorLtmAdapter.reinforce`` to raise/absent -> this test fails at the
+          ``await ltm.reinforce(...)`` call itself (``AttributeError``), never silently.
+    """
+    ns = make_ns()
+    long_ago = _T0
+    cold_since = _T0 + timedelta(days=200)  # after the first sweep below, both facts are COLD
+
+    reinforced_fact = _fact(
+        ns,
+        "trivial low-importance fact the user still actually uses",
+        retention_class=RetentionClass.DURABLE,
+        valid_at=long_ago,
+        updated_at=long_ago,
+        importance=0.05,
+        subject="Ada",
+        predicate="likes",
+    )
+    never_recalled_fact = _fact(
+        ns,
+        "trivial low-importance fact nobody ever asks about again",
+        retention_class=RetentionClass.DURABLE,
+        valid_at=long_ago,
+        updated_at=long_ago,
+        importance=0.05,
+        subject="Ada",
+        predicate="dislikes",
+    )
+    await ltm.upsert_fact(reinforced_fact)
+    await ltm.upsert_fact(never_recalled_fact)
+
+    settings = LifecycleSettings(
+        retention=RetentionSettings(durable_cold_after_d=180, durable_cold_importance_max=0.2)
+    )
+
+    # ---- sweep 1 (T0+200d): both facts are long-inactive + low-importance -> both COLD-slide.
+    clock1 = FrozenClock(cold_since)
+    service = RetentionService(
+        ltm=ltm, ltm_retention=ltm_retention, settings=settings, clock=clock1
+    )
+    acted_1 = await service.sweep(ns, clock=clock1)
+    assert acted_1 == 2
+
+    before = {
+        m.id: m for m in await ltm_retention.facts_by_state(ns, frozenset({MemoryState.ACTIVE}))
+    }
+    assert before[reinforced_fact.id].cold is True
+    assert before[never_recalled_fact.id].cold is True
+
+    # ---- a GENUINE recall hit, one day later — the production call `_reinforce_ltm_hits` makes,
+    # not a hand-mutated MemoryItem. `never_recalled_fact` is never touched, the control arm.
+    recall_at = cold_since + timedelta(days=1)
+    reinforced = await ltm.reinforce(ns, reinforced_fact.id, at=recall_at)
+    assert reinforced is not None
+    assert reinforced.access_count == reinforced_fact.access_count + 1
+    assert reinforced.cold is True, "reinforce() itself must not flip cold — the sweep does"
+
+    # ---- sweep 2, shortly after the recall — this is the "next sweep" ADR 0062 named as the
+    # trigger. Nothing else touched either fact between the two sweeps.
+    now2 = recall_at + timedelta(minutes=5)
+    clock2 = FrozenClock(now2)
+    acted_2 = await service.sweep(ns, clock=clock2)
+    assert acted_2 == 1, f"expected exactly one reactivation, sweep reported {acted_2} actions"
+
+    after = {
+        m.id: m for m in await ltm_retention.facts_by_state(ns, frozenset({MemoryState.ACTIVE}))
+    }
+    assert after[reinforced_fact.id].cold is False, (
+        "the RECALLED fact was not reactivated — this is the AD-259 LTM defect: the "
+        "COLD -> ACTIVE reactivate-on-recall edge had no trigger"
+    )
+    assert (
+        after[never_recalled_fact.id].cold is True
+    ), "the fact nobody recalled must stay COLD — reactivation is not a blanket un-cold sweep"
+
+
 # =================================================================================================
 # wiring: manager.py's sweep_namespace_now really calls RetentionService.sweep — ZERO diff to
 # manager.py (S1-03 already carries the `if self._retention is not None: await self._retention.
