@@ -401,6 +401,57 @@ class RecallSettings(BaseModel):
     # `2026-09-24-verify-graph-tier-contribution.md`'s own closing line named. Env override:
     # `MU_RECALL__LTM_PROTECT_LIMIT`.
     ltm_protect_limit: int = Field(default=0, ge=0)
+
+    # AD-273 (ADR 0066's own "try (a) first" instruction, 2026-09-24) — TRIED, MEASURED, and
+    # SETTLED NEGATIVE. This was the one alternative to a protect floor that could still let the
+    # graph tier win a slot ON MERIT rather than by guaranteed presence: `weight_ltm`'s docstring
+    # above proves the structural exclusion is a SHARED `rrf_k` problem, not (only) a seed-quality
+    # problem — `weight/(k+rank+1)` caps a heavily-discounted channel's best-possible (rank 0)
+    # contribution below a heavily-weighted channel's worst-pool-item contribution, no matter how
+    # relevant that top candidate is. This field is a SEPARATE, smaller RRF constant for the LTM
+    # channel only (`fusion.py::reciprocal_rank_fusion`'s `ks` parameter), tried at
+    # `ltm_protect_limit=0` — no forced presence, the channel's top candidate simply gets a fair
+    # shot at the SAME rank-0 score scale every other channel's top candidate gets, and has to WIN
+    # its slot by out-scoring a real MTM/STM candidate.
+    #
+    # MEASURED (matched-width by construction — every arm returns exactly 3,830 items over the
+    # same conv-26/30/41, 383 queries, `ltm_protect_limit=0` throughout — `docs/tracking/
+    # eval-runs/2026-09-24-ad273-ltm-fusion-arithmetic.md`):
+    #     k_ltm=None (shipped, shared k=60):        ltm=0,   gold_in_context=279/383 (0.7285)
+    #     k_ltm=10:                                 ltm=0,   gold_in_context=280/383 (0.7311)
+    #     k_ltm=7:                                  ltm=0,   gold_in_context=279/383 (0.7285)
+    #     k_ltm=6:                                  ltm=304, gold_in_context=272/383 (0.7102)  -7
+    #     k_ltm=5, flat seed (seed_pool=0):         ltm=383, gold_in_context=275/383 (0.7180)  -4
+    #     k_ltm=5, content-aware seed (seed_pool=5): ltm=383, gold_in_context=272/383 (0.7102)  -7
+    #
+    # **The finding, and why it rules the lever out rather than merely under-tuning it.** The
+    # transition from "wins nothing" to "wins everything" happens between `k_ltm=7` and `k_ltm=6`
+    # — there is no smooth, query-dependent middle where the channel wins ONLY the queries its top
+    # candidate is actually relevant to. The root cause is structural, not a tuning miss:
+    # `_ltm_channel`'s flat `graph_recall` seed is UNCONDITIONAL — it returns a recency-ordered
+    # candidate whenever the namespace holds ANY LTM fact at all, so the channel's rank-0 slot is
+    # (almost) never genuinely empty. RRF fuses by RANK POSITION, not by the underlying candidate's
+    # actual relevance, so a `k_ltm` small enough to make rank-0's score competitive makes it
+    # EQUALLY competitive on every query, relevant or not — the exact "guaranteed one slot
+    # regardless of quality" shape `ltm_protect_limit` already produces, just reached through
+    # score inflation instead of explicit reservation, and it costs the SAME 4-7 queries either
+    # way (compare this table to `ltm_protect_limit`'s own: -6/-7 queries at "forced, one slot").
+    # A `k_ltm` weak enough to avoid always-winning (>=7) is, measured, indistinguishable from
+    # `None` — it structurally can never place, for the same proof `weight_ltm`'s docstring gives.
+    # **There is no value of this field that both wins slots and helps `gold_in_context`.**
+    #
+    # This settles ADR 0066's open question: the graph tier's problem is not the fusion arithmetic
+    # (this field), not the protect floor (`ltm_protect_limit`, tried first), and not the seed
+    # (content-aware vs flat — the SAME two points, within noise of each other, at every k tried).
+    # It is that `graph_recall`'s unconditional flat seed makes the channel's "does it have a
+    # candidate at all" carry no relevance signal, so nothing downstream of it — not weight, not
+    # per-channel k, not a floor — can express "only when genuinely relevant" without the seed
+    # itself learning to return NOTHING on a query it has no good answer to. `ARCHITECTURE-
+    # DELTAS.md` AD-273/AD-274 has the full writeup and the recommendation left to the owner.
+    #
+    # Left at `None` (the shared `rrf_k`, i.e. the structural exclusion unchanged) — every measured
+    # non-default value is a net cost. Env override: `MU_RECALL__RRF_K_LTM` (unset/absent = `None`).
+    rrf_k_ltm: int | None = Field(default=None, ge=1)
     weight_shared: float = Field(default=1.0, ge=0.0)  # federation: shared-arm weight (§1.6)
 
     # D4 read-time cross-tier dedup (CONFIG-AND-DATA-FIX-PLAN.md PART 2 D4; conformance D-8):

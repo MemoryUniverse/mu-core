@@ -468,6 +468,84 @@ class FalkorLtmAdapter:
         await self._upsert_fact_impl(reinforced)
         return reinforced
 
+    async def reinforce_many(
+        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+    ) -> None:
+        """AD-263 (ADR 0066 §1/§6) — the batched twin of :meth:`reinforce`, preferred by the SAME
+        ``getattr(self._ltm, "reinforce_many", None)`` capability check
+        ``ThreeChannelRecallRanker._reinforce_ltm_hits`` already uses for the STM/MTM legs
+        (AD-260) — a graph backend without this method falls back to the per-id
+        :meth:`reinforce` loop unchanged, exactly as ``_reinforce_stm_hits``/``_reinforce_mtm_hits``
+        already do for a store that lacks their own batched verb.
+
+        MEASURED (ADR 0066 §1, real Valkey/Qdrant/FalkorDB, `mu-dev-vm`): on a NORMAL recall,
+        every id handed to this leg is an STM/MTM memory id with NO ``:Memory`` node in this tier
+        at all — :meth:`_reinforce_impl` paid a full round trip (:meth:`_get_fact_impl`) PER id
+        just to discover that and return ``None``, 20% of the whole reinforce write-back cost
+        (+8.74ms p95 of the measured +42.87ms) for zero useful work. This method pays exactly
+        ONE round trip for that case: a single ``UNWIND`` existence+fetch returns only the ids
+        that ARE facts, and when that result is empty — the common case — there is nothing
+        further to do. AD-263(b), the absent-id fast path.
+
+        For the (rare) ids that DO resolve to a ``:Memory`` node, AD-263(a): the write is batched
+        too, in a SECOND single ``UNWIND`` query, not a :meth:`_upsert_fact_impl` call per hit.
+        This deliberately does NOT redo :meth:`_upsert_fact_impl`'s full MERGE +
+        :meth:`_materialize_entity_edge` re-run: that re-materialization exists for when
+        subject/predicate/object change (a genuine ``upsert_fact``), and a reinforce never
+        touches them — the fact's existing entity-entity edge stays exactly as valid as it was
+        before the stat bump. ``m.access_count``/``m.updated_at`` are NOT separate node
+        properties on this tier (``GraphMapper.to_store``'s ``props`` dict has no such keys —
+        only ``m.memory_json`` carries them, same as every other field the mapper's own
+        docstring calls "lossless"), so the batched write only needs to touch ``memory_json``,
+        which is what keeps this fast path correct without reaching for the full upsert.
+
+        Same contract as :meth:`reinforce`, applied per id: ``created_at`` untouched, every
+        bi-temporal/entity field untouched, an id absent from ``ns``'s graph partition is
+        silently skipped (never a raise) — the batched equivalent of :meth:`reinforce`'s own
+        ``None`` return, best-effort by the same contract (``ports.py``'s
+        ``GraphStorePort.reinforce`` docstring).
+        """
+        if not memory_ids:
+            return
+        await self._retry(self._reinforce_many_impl)(ns, memory_ids, at=at)
+
+    async def _reinforce_many_impl(
+        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+    ) -> None:
+        g = await self._graph(ns)
+        ns_prefix = ns.to_prefix()
+        # ONE batched existence+fetch (AD-263(b)) — filters on the SAME exact
+        # ``{namespace, id}`` match :meth:`_get_fact_impl` uses (session-scoped, not
+        # federated): an id belonging to a DIFFERENT namespace that happens to share this
+        # namespace's PHYSICAL graph (two sessions of the same user, see
+        # :meth:`graph_name_for`) is correctly treated as absent here, never reinforced.
+        res = await g_query(
+            g,
+            "UNWIND $ids AS mid MATCH (m:Memory {namespace: $ns, id: mid}) "
+            "RETURN m.id AS id, m.memory_json AS mj",
+            {"ns": ns_prefix, "ids": list(memory_ids)},
+        )
+        if not res:
+            # The common case on a normal recall (AD-263(b)) — one round trip total, not one
+            # per id.
+            return
+        # AD-263(a): recompute each matched fact's bumped access_count/updated_at in Python
+        # (mirrors `_reinforce_impl`'s `model_copy`) and write all of them back in ONE more
+        # UNWIND — not N.
+        rows: list[dict[str, Any]] = []
+        for memory_id, memory_json in res:
+            current = MemoryItem.model_validate_json(memory_json)
+            reinforced = current.model_copy(
+                update={"access_count": current.access_count + 1, "updated_at": at}
+            )
+            rows.append({"id": memory_id, "memory_json": reinforced.model_dump_json()})
+        await g.query(
+            "UNWIND $rows AS row "
+            "MATCH (m:Memory {namespace: $ns, id: row.id}) "
+            "SET m.memory_json = row.memory_json",
+            params={"ns": ns_prefix, "rows": rows},
+        )
+
     async def _materialize_entity_edge(
         self, g: Any, item: MemoryItem, props: dict[str, Any]
     ) -> None:

@@ -35,6 +35,7 @@ def reciprocal_rank_fusion(
     key: Callable[[T], str],
     weights: Sequence[float],
     k: int = 60,
+    ks: Sequence[int] | None = None,
 ) -> list[tuple[T, float]]:
     """Fuse ranked lists into one weighted RRF ranking (ported fusion.py:17, generalised).
 
@@ -45,9 +46,28 @@ def reciprocal_rank_fusion(
     returned ``(element, fused_score)`` sorted by fused score DESC; an element in only one channel
     still scores (fusion never requires multi-channel agreement). The FIRST occurrence of a key
     (by channel order) is the representative element kept.
+
+    ``ks`` — OPTIONAL, one RRF constant PER CHANNEL instead of the single shared ``k`` (AD-273,
+    the fusion-arithmetic lane of ADR 0066's graph-tier settlement — `RecallSettings.rrf_k_ltm`'s
+    docstring has the full derivation and the measurement). Every channel's contribution is
+    ``weight/(k_channel+rank+1)``: a SHARED ``k`` across channels with very different weights
+    structurally caps a heavily-discounted channel's best-POSSIBLE rank-0 contribution below a
+    heavily-weighted channel's WORST-pool-item contribution, no matter how genuinely relevant
+    that channel's top candidate is (`RecallSettings.weight_ltm`'s field docstring has the
+    exhaustive proof for the shipped LTM channel, PROVED exhaustively and reproduced end to end
+    four times). A per-channel ``k`` lets one channel's decay curve be steeper than another's —
+    its best candidate gets a fair shot at the SAME rank-0 score scale as every other channel's
+    best candidate, while its weight discount still governs how quickly it falls off past the
+    top few (a small ``weight`` over a small ``k`` decays MUCH faster per rank than a large
+    ``weight`` over a large ``k``) — without touching any OTHER channel's already-tuned decay.
+    Defaults to ``None``: every channel uses the shared ``k`` — BYTE-IDENTICAL to every call site
+    that predates this parameter. When given, must be the same length as
+    ``channel_results``/``weights``.
     """
     if len(channel_results) != len(weights):
         raise ValueError("channel_results and weights must have the same length")
+    if ks is not None and len(ks) != len(channel_results):
+        raise ValueError("ks must be the same length as channel_results")
     if not channel_results:
         return []
 
@@ -56,10 +76,11 @@ def reciprocal_rank_fusion(
 
     scores: dict[str, float] = {}
     elements: dict[str, T] = {}
-    for weight, results in zip(normalized, channel_results, strict=True):
+    for idx, (weight, results) in enumerate(zip(normalized, channel_results, strict=True)):
+        channel_k = ks[idx] if ks is not None else k
         for rank, element in enumerate(results):
             eid = key(element)
-            scores[eid] = scores.get(eid, 0.0) + weight * (1.0 / (k + rank + 1))
+            scores[eid] = scores.get(eid, 0.0) + weight * (1.0 / (channel_k + rank + 1))
             elements.setdefault(eid, element)
 
     ordered = sorted(scores, key=lambda eid: scores[eid], reverse=True)
@@ -95,6 +116,7 @@ class FusionStrategy(Protocol):
         id_of: Callable[[T], str],
         weights: Sequence[float],
         k: int,
+        ks: Sequence[int] | None = None,
     ) -> list[tuple[T, float]]: ...
 
 
@@ -110,5 +132,6 @@ class ReciprocalRankFusion:
         id_of: Callable[[T], str],
         weights: Sequence[float],
         k: int,
+        ks: Sequence[int] | None = None,
     ) -> list[tuple[T, float]]:
-        return reciprocal_rank_fusion(channel_results, key=id_of, weights=weights, k=k)
+        return reciprocal_rank_fusion(channel_results, key=id_of, weights=weights, k=k, ks=ks)

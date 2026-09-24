@@ -379,14 +379,28 @@ class ThreeChannelRecallRanker:
         # for the overwhelming majority of recalls that touch no demoted item at all.
         channel_results: list[Sequence[Scored[MemoryItem]]] = [floor_scored, mtm_hits, ltm_hits]
         channel_weights = [settings.weight_stm, settings.weight_mtm, settings.weight_ltm]
+        # AD-273 — every channel uses the shared `rrf_k` EXCEPT the LTM slot, which uses
+        # `rrf_k_ltm` when an operator has set it (`None`, the shipped default, falls back to the
+        # shared `rrf_k` here too — so this list is BYTE-IDENTICAL to `[settings.rrf_k] * len(...)`
+        # until that field is set, and `_fusion.fuse`'s own `ks=None` fast path is what every
+        # OTHER call site — `RecallService`'s private/shared federation fuse — still takes,
+        # unaffected by this parameter's existence). See `RecallSettings.rrf_k_ltm`'s docstring
+        # for the derivation and the measurement this lever exists to let the owner re-run.
+        channel_ks = [
+            settings.rrf_k,
+            settings.rrf_k,
+            settings.rrf_k_ltm if settings.rrf_k_ltm is not None else settings.rrf_k,
+        ]
         if demoted_scored:
             channel_results.append(demoted_scored)
             channel_weights.append(settings.weight_stm)
+            channel_ks.append(settings.rrf_k)
         fused_pairs = self._fusion.fuse(
             channel_results,
             id_of=lambda s: s.item.id,
             weights=channel_weights,
             k=settings.rrf_k,
+            ks=channel_ks,
         )
         # `is_floor` from the adapter marks EVERY STM candidate (Scored.is_floor=True on the whole
         # recency pool, redis_stm.py `recent()`) — force it False here so ONLY the explicitly
@@ -1110,6 +1124,15 @@ class ThreeChannelRecallRanker:
         a no-op special case, and never gated on ``item.cold`` here, because this method has no
         visibility into that field (``RecallItemView`` carries no ``cold`` flag) and needs none:
         the sweep is the one place that reads it.
+
+        **AD-263 — same batching preference as `_reinforce_stm_hits`/`_reinforce_mtm_hits`
+        (AD-260).** MEASURED (ADR 0066 §1): on a normal recall every id here is an STM/MTM id
+        with no `:Memory` node at all, so the per-id `reinforce` fallback below paid a full
+        round trip PER id just to learn that — 20% of the whole reinforce write-back cost for
+        zero useful work. `FalkorLtmAdapter.reinforce_many` collapses that into one batched
+        existence check (plus, only for actual graph hits, one batched write); any other
+        `GraphStorePort` implementation without a `reinforce_many` falls back to the unbatched
+        per-id loop unchanged.
         """
         ids = list({v.memory_id for v in items})
         if not ids:
@@ -1123,6 +1146,24 @@ class ThreeChannelRecallRanker:
         if not hasattr(self._ltm, "reinforce"):
             return
         at = self._clock.now()
+
+        # AD-263 — same batching preference as `_reinforce_stm_hits`/`_reinforce_mtm_hits`:
+        # `FalkorLtmAdapter.reinforce_many` collapses the per-id fetch-then-upsert fan-out into
+        # one batched existence check and (only for actual hits) one batched write. Any other
+        # `reinforce`-capable-but-not-`reinforce_many`-capable `GraphStorePort` falls back to the
+        # original per-id `asyncio.gather` unchanged.
+        reinforce_many = getattr(self._ltm, "reinforce_many", None)
+        if callable(reinforce_many):
+            try:
+                await reinforce_many(ns, ids, at=at)
+            except StoreUnavailableError as exc:
+                _log.warning(
+                    "recall.reinforce_ltm_unavailable",
+                    ns=ns.to_prefix(),
+                    n_ids=len(ids),
+                    error=str(exc),
+                )
+            return
 
         async def _one(memory_id: str) -> None:
             try:
