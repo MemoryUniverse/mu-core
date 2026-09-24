@@ -101,7 +101,16 @@ COPY packages/mu-engine-server/docker/serve.py /app/serve.py
 # Leaving SENTENCE_TRANSFORMERS_HOME unset keeps both stages resolving the identical path.
 COPY --from=builder /opt/hf-cache /opt/hf-cache
 
-RUN chown -R mu-engine-server:mu-engine-server /app /home/mu-engine-server /opt/hf-cache
+# The raw-artifact blob root (docker-compose.yml's MU_STORAGE__ARTIFACT__CONTENT_ROOT, and the
+# mount point of the `mu-engine-server-artifacts` named volume). Created HERE, owned by the app
+# user, on purpose: docker seeds a FRESH named volume from the image's content AND ownership at
+# the mount point, but only when that path exists in the image — mount a volume at a path the
+# image does not have and docker creates it root:root, which a `USER mu-engine-server` process
+# cannot write. Without this line the compose fix for ADR 0070 would trade `Errno 30 Read-only
+# file system` for `Errno 13 Permission denied` on the very first ingest.
+RUN mkdir -p /var/lib/mu-engine-server/artifacts
+RUN chown -R mu-engine-server:mu-engine-server /app /home/mu-engine-server /opt/hf-cache \
+    /var/lib/mu-engine-server
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \

@@ -69,6 +69,25 @@ services:
       MU_ENGINE_SERVER_TOKEN_PATH: /home/mu-engine-server/.memory-universe/engine-server.token
       MU_ENGINE_SERVER_WORKSPACE: local
       MU_ENGINE_SERVER_NAMESPACE: default
+      # ---------------------------------------------------------------------------------------
+      # The raw-artifact blob root. MANDATORY here, not a nicety.
+      #
+      # `PersistRawArtifactStage` is a MANDATORY ingest stage, and `ArtifactFsSettings.
+      # content_root`'s default (`mu_contracts.config.settings`) is `~/.memory-universe/artifacts`
+      # — which, inside this container, lands under the `:ro` token mount below. MEASURED
+      # 2026-09-24 (ADR 0070, on a real `make up` stack): EVERY write to this server returned
+      # HTTP 500, `StageExecutionError: stage 'persist_raw_artifact' failed: [Errno 30]
+      # Read-only file system: '/home/mu-engine-server/.memory-universe/artifacts/...'`, so the
+      # containerized `mode="local_server"` product could not store a single memory. Stage F's
+      # four writing acceptance criteria (F1/F2a/F2b/F3's 201) all failed on it; only the
+      # never-writing auth/404 criteria passed, which is why a targeted run looked fine.
+      #
+      # Note the prefix: this is the CENTRAL `Settings` tree (`MU_`), not this package's own
+      # `MU_ENGINE_SERVER_` one — `storage/factories.py::_build_artifact_fs` reads
+      # `get_settings().storage.artifact.content_root`, never the server's own settings object.
+      # Pointed at a dedicated WRITABLE named volume so blobs also survive `make down`/`up`, the
+      # same durability every other store in this stack already has.
+      MU_STORAGE__ARTIFACT__CONTENT_ROOT: /var/lib/mu-engine-server/artifacts
     volumes:
       # `make up` mints this file on the HOST at ~/.memory-universe/engine-server.token, 0600,
       # before bringing this stack up. Read-only: the container only ever verifies, never mints.
@@ -77,6 +96,11 @@ services:
       # EngineContainer._build_embedder() runs eagerly at construction (composition.py step 1),
       # not lazily on first request, so an empty cache costs one real download on first `make up`.
       - mu-engine-server-hf-cache:/home/mu-engine-server/.cache/huggingface
+      # The raw-artifact blob tree (see MU_STORAGE__ARTIFACT__CONTENT_ROOT above). A named volume
+      # rather than a path inside the `:ro` mount above: the token mount is read-only ON PURPOSE
+      # ("the container only ever verifies, never mints"), and that is the right posture — it is
+      # the artifact root that had no business defaulting inside it.
+      - mu-engine-server-artifacts:/var/lib/mu-engine-server/artifacts
     depends_on:
       valkey:
         condition: service_healthy
@@ -142,6 +166,7 @@ services:
 
 volumes:
   mu-engine-server-hf-cache:
+  mu-engine-server-artifacts:
   mu-engine-server-valkey-data:
   mu-engine-server-qdrant-data:
   mu-engine-server-falkordb-data:
