@@ -171,7 +171,15 @@ def test_gold_context_attribution_on_empty_items_matches_gold_ids_present() -> N
 # ---------------------------------------------------------------------------------- CategoryStats
 
 
-def _row(query_id: str, verdict: bool | None, *, gold_in_context: bool) -> QueryResult:
+def _row(
+    query_id: str,
+    verdict: bool | None,
+    *,
+    gold_in_context: bool,
+    judge_raw: str | None = None,
+    answer_budget_retried: bool = False,
+    judge_budget_retried: bool = False,
+) -> QueryResult:
     return QueryResult(
         query_id=query_id,
         category=4,
@@ -181,6 +189,9 @@ def _row(query_id: str, verdict: bool | None, *, gold_in_context: bool) -> Query
         context_items=5,
         verdict=verdict,
         gold_in_context=gold_in_context,
+        judge_raw=judge_raw,
+        answer_budget_retried=answer_budget_retried,
+        judge_budget_retried=judge_budget_retried,
     )
 
 
@@ -241,6 +252,49 @@ def test_scoreable_equals_n_when_every_row_reached_the_judge() -> None:
     assert stats.scoreable == stats.n == 10
 
 
+# ------------------------------------------------------- TRUSTWORTHY-MEASUREMENT-0924: honestly
+# splitting WHY a row is unparseable, from the actual raw judge output, not the bare counter.
+
+
+def test_stats_splits_unparseable_by_the_budget_exhaustion_wire_signature() -> None:
+    rows = [
+        _row("q1", None, gold_in_context=True, judge_raw=""),  # budget exhausted
+        _row("q2", None, gold_in_context=True, judge_raw="   "),  # whitespace-only: also blank
+        _row("q3", None, gold_in_context=True, judge_raw="not a label at all"),  # a DIFFERENT
+        # failure (real content, just no CORRECT/WRONG) — must NOT be counted as budget-shaped.
+        _row("q4", True, gold_in_context=True, judge_raw="CORRECT"),
+    ]
+    stats = _stats(rows)
+    assert stats.unparseable == 3
+    assert stats.unparseable_budget_exhausted == 2
+    assert stats.unparseable_other == 1
+
+
+def test_stats_does_not_guess_budget_exhaustion_for_a_row_predating_judge_raw() -> None:
+    """An older artifact's row carries `judge_raw=None` (the field did not exist yet) — it must
+    fall into `unparseable_other`, never a guessed `unparseable_budget_exhausted`, so an old
+    artifact never silently claims a characterisation it has no evidence for."""
+    rows = [_row("q1", None, gold_in_context=True, judge_raw=None)]
+    stats = _stats(rows)
+    assert stats.unparseable == 1
+    assert stats.unparseable_budget_exhausted == 0
+    assert stats.unparseable_other == 1
+
+
+def test_stats_counts_budget_retries_even_on_rows_that_ended_up_parsed() -> None:
+    """The retry can SUCCEED (the row ends up correctly parsed) — `answer_budget_retried`/
+    `judge_budget_retried` must still count it, so a report can show how often the safety net
+    fired, not only its effect on the unparseable count."""
+    rows = [
+        _row("q1", True, gold_in_context=True, judge_budget_retried=True),
+        _row("q2", True, gold_in_context=True, answer_budget_retried=True),
+        _row("q3", True, gold_in_context=True),
+    ]
+    stats = _stats(rows)
+    assert stats.judge_budget_retried == 1
+    assert stats.answer_budget_retried == 1
+
+
 # ------------------------------------------------------- the marker contract, pinned for real
 #
 # VERIFY PASS 2026-09-23. AD-228 proposes `is_neighbor` as the attribute the recall surface will
@@ -265,16 +319,25 @@ def test_neighbor_marker_name_is_pinned_to_the_literal_the_engine_sets() -> None
     assert NEIGHBOR_EXPANSION_MARKER_ATTR == "is_neighbor"
 
 
-def test_the_recall_surface_does_not_yet_carry_the_neighbour_marker() -> None:
-    """TRIPWIRE, not an endorsement. While this passes, S1b's contribution is UNMEASURABLE through
-    the public surface and any report of `neighbor_items_seen=0` is evidence of nothing.
+def test_the_recall_surface_carries_the_neighbour_marker() -> None:
+    """AD-233's TRIPWIRE, fired and now inverted (VERIFY 2026-09-24).
 
-    When this test goes RED the contract has landed — at which point: delete this test, and
-    re-read every conclusion that rested on a zero here (`ARCHITECTURE-DELTAS.md` AD-231 is the
-    first one)."""
+    This test used to assert the OPPOSITE — that the canonical surface did NOT yet carry
+    `is_neighbor` — as a deliberate tripwire whose failure would mean "the contract landed, delete
+    this test and re-read every conclusion that rested on a `neighbor_items_seen=0`". AD-236 landed
+    that contract and the tripwire went red exactly as designed. It was then reported as *"a
+    pre-existing tripwire tripped by a different concurrent lane's uncommitted engine change —
+    unrelated to this pass"*, which is the one reading it cannot have: a tripwire firing is not
+    noise from someone else's lane, it is the signal, and the instruction attached to it ("re-read
+    every conclusion that rested on a zero here") is exactly what this verify pass then did — see
+    AD-238, where the zero turned out to be a second truncation nobody had looked for.
+
+    Kept rather than deleted, inverted: the field is part of the wire-versioned contract now, and a
+    regression that removed it would otherwise silently restore the structural zero AD-233 exists
+    to have caught once already."""
     from mu_contracts.contracts.recall import RecallItemView as SurfaceRecallItemView
 
-    assert NEIGHBOR_EXPANSION_MARKER_ATTR not in SurfaceRecallItemView.model_fields, (
-        "the canonical recall surface now carries the neighbour marker — good. Delete this "
-        "tripwire and confirm mu_local._to_recall_result actually forwards it."
+    assert NEIGHBOR_EXPANSION_MARKER_ATTR in SurfaceRecallItemView.model_fields, (
+        "the canonical recall surface lost the neighbour marker — every downstream "
+        "`getattr(item, 'is_neighbor', False)` attribution is a structural zero again (AD-233)"
     )

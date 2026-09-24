@@ -285,11 +285,27 @@ def _protect_floor(items: list[RecallItemView], *, limit: int) -> list[RecallIte
     rescued at the END, not the front, exactly mirroring ``ranker.py``'s in-arm
     :func:`~mu_engine.services.recall.ranker._merge_floor` fix (never edit one without the
     other — the SAME shape, DEV-STANDARDS rule 6)."""
-    head = items[:limit]
+    # S1b Shape A (`RecallSettings.neighbor_free_ride`, ADR 0053) — VERIFY 2026-09-24. A
+    # free-riding neighbour is APPENDED past `limit` by `ranker._attach_free_riding_neighbors`, on
+    # the explicit premise (that setting's own docstring) that it "never displaces anything already
+    # selected" and that "RecallResult.items can carry MORE than `limit` entries". This slice is
+    # one federation layer ABOVE that ranker and cut every one of them back off again, so the
+    # shape was structurally unreachable through the public recall surface and its measured
+    # `neighbor_items_seen=0` was a measurement of nothing — the same class of mistake AD-233
+    # already recorded once for the `is_neighbor` field itself. MEASURED before this fix, real
+    # stores, conv-30, 30 queries, radius=1 + free_ride: the ranker emitted 527 `is_neighbor` rows,
+    # ALL of them past `limit`, and `LocalMemory.recall` returned 300 items with ZERO of them.
+    # Riders are therefore separated out here and re-appended AFTER the ranked slice, never
+    # competing for one of its slots. INERT AT THE SHIPPED DEFAULT: `neighbor_free_ride=false`
+    # means no item ever carries `is_neighbor=True`, so `riders` is empty and this function is
+    # byte-identical to what it was.
+    riders = [v for v in items if v.is_neighbor]
+    ranked = [v for v in items if not v.is_neighbor] if riders else items
+    head = ranked[:limit]
     head_ids = {v.memory_id for v in head}
-    rescued = [v for v in items if v.is_floor and v.memory_id not in head_ids]
+    rescued = [v for v in ranked if v.is_floor and v.memory_id not in head_ids]
     room = max(0, limit - len(rescued))
-    return [*items[:room], *rescued]
+    return [*ranked[:room], *rescued, *riders]
 
 
 def _union_channels(a: RecallChannels, b: RecallChannels) -> RecallChannels:

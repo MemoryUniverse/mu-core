@@ -81,6 +81,21 @@ class CompareResult(BaseModel):
     mcnemar_p_value: float
     significant_at_p05: bool
 
+    #: VERIFY 2026-09-24. `significant_at_p05` above is McNemar's answer to ONE question — "is the
+    #: fixed/regressed split larger than chance" — computed over the rows that were parseable in
+    #: BOTH runs. It says nothing about whether that parseable subset is itself stable, and on this
+    #: harness it demonstrably is not: TRUSTWORTHY-MEASUREMENT-0924 measured 9 rows of parseability
+    #: churn against 7 of verdict churn between two runs of the SAME configuration. Until that
+    #: number comes down, a delta drawn from a smaller number of rows than the judge infrastructure
+    #: moves on its own is not a finding, and a MACHINE reader had no way to tell: the caveat this
+    #: pass's predecessor added lives only inside the human-readable `verdict` string, so any
+    #: consumer that branches on `significant_at_p05` (or reads `delta` straight out of the
+    #: artifact) still sees a clean "significant" on a noise-limited comparison. This flag is that
+    #: missing machine-readable refusal — True when parseability churn is at least as large as the
+    #: verdict churn `delta` was computed from. Callers must treat `significant_at_p05 and not
+    #: noise_limited` as the reportable condition, never `significant_at_p05` alone.
+    noise_limited: bool = False
+
     verdict: str  # a human-readable one-line summary of the above
 
     # COST DELTA (CLAUDE.md eval lane: "the delta in accuracy alongside the delta in cost, because
@@ -160,6 +175,12 @@ def compare_runs(a: AnswerQualityReport, b: AnswerQualityReport) -> CompareResul
 
     delta = b.overall.accuracy - a.overall.accuracy
     significant = p_value < 0.05
+    noise_limited = _is_noise_limited(
+        fixed=len(fixed),
+        regressed=len(regressed),
+        became_unparseable=len(became_unparseable),
+        recovered_from_unparseable=len(recovered_from_unparseable),
+    )
 
     verdict = _summarize(
         delta=delta,
@@ -167,6 +188,8 @@ def compare_runs(a: AnswerQualityReport, b: AnswerQualityReport) -> CompareResul
         significant=significant,
         fixed=len(fixed),
         regressed=len(regressed),
+        became_unparseable=len(became_unparseable),
+        recovered_from_unparseable=len(recovered_from_unparseable),
     )
 
     a_cost = _total_cost(a)
@@ -195,6 +218,7 @@ def compare_runs(a: AnswerQualityReport, b: AnswerQualityReport) -> CompareResul
         mcnemar_n_a_wrong_b_correct=n_a_wrong_b_correct,
         mcnemar_p_value=p_value,
         significant_at_p05=significant,
+        noise_limited=noise_limited,
         verdict=verdict,
         a_cost_usd=a_cost,
         b_cost_usd=b_cost,
@@ -203,14 +227,67 @@ def compare_runs(a: AnswerQualityReport, b: AnswerQualityReport) -> CompareResul
     )
 
 
+def _is_noise_limited(
+    *,
+    fixed: int,
+    regressed: int,
+    became_unparseable: int,
+    recovered_from_unparseable: int,
+) -> bool:
+    """Is judge-infrastructure churn at least as large as the effect being measured?
+
+    ONE definition, read by both :class:`CompareResult.noise_limited` (the machine-readable
+    refusal) and :func:`_summarize`'s human-readable CAVEAT, so the two can never disagree about
+    the same comparison — they were two separate expressions of the same rule before this, which
+    is how a caveat ends up printed next to a `significant_at_p05: true`."""
+    parseability_churn = became_unparseable + recovered_from_unparseable
+    verdict_churn = fixed + regressed
+    return parseability_churn > 0 and parseability_churn >= max(verdict_churn, 1)
+
+
 def _summarize(
-    *, delta: float, p_value: float, significant: bool, fixed: int, regressed: int
+    *,
+    delta: float,
+    p_value: float,
+    significant: bool,
+    fixed: int,
+    regressed: int,
+    became_unparseable: int,
+    recovered_from_unparseable: int,
 ) -> str:
     direction = "improved" if delta > 0 else "regressed" if delta < 0 else "unchanged"
+    parseability_churn = became_unparseable + recovered_from_unparseable
+    verdict_churn = fixed + regressed
+    # JUDGE-NOISE CAVEAT (TRUSTWORTHY-MEASUREMENT-0924). This is the exact gap a real paired run
+    # exposed: two arms differing ONLY in retrieval moved accuracy by +0.03pt (4 fixed, 1
+    # regressed) while 13 rows became unparseable and 7 recovered — parseability churn an order of
+    # magnitude larger than the verdict churn the delta was computed from. McNemar's own p-value
+    # already answers "is the fixed/regressed split real"; it says NOTHING about whether the
+    # PARSEABLE SUBSET those rows were drawn from is itself stable, and a reader comparing two
+    # printed accuracy numbers has no way to notice that unless the tool says so. Always computed
+    # (never opt-in), because a reader should not have to remember to ask for it.
+    noise_caveat = (
+        (
+            f" CAVEAT: judge-parseability churn ({became_unparseable} became unparseable, "
+            f"{recovered_from_unparseable} recovered = {parseability_churn} rows) is >= the "
+            f"verdict churn this delta is computed from ({fixed} fixed + {regressed} regressed = "
+            f"{verdict_churn} rows) — judge-infra noise is at least as large as the measured "
+            "effect. Do not report this delta as a finding until parseability churn is reduced "
+            "(see the budget-exhaustion retry in answer_quality._complete_with_retry) or shown, "
+            "by running the SAME configuration twice, to be smaller than this."
+        )
+        if _is_noise_limited(
+            fixed=fixed,
+            regressed=regressed,
+            became_unparseable=became_unparseable,
+            recovered_from_unparseable=recovered_from_unparseable,
+        )
+        else ""
+    )
     if fixed == 0 and regressed == 0:
         return (
             "No row flipped verdict in either direction — the aggregate delta, if any, "
-            "comes only from unparseable-count changes."
+            "comes only from unparseable-count changes." + noise_caveat
         )
     significance = (
         f"significant at p<0.05 (McNemar p={p_value:.4f})"
@@ -222,7 +299,7 @@ def _summarize(
     )
     return (
         f"B {direction} vs A by {delta * 100:+.2f}pt (parseable-subset accuracy): "
-        f"{fixed} row(s) fixed, {regressed} row(s) regressed — {significance}."
+        f"{fixed} row(s) fixed, {regressed} row(s) regressed — {significance}." + noise_caveat
     )
 
 

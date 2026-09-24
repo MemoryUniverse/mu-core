@@ -649,6 +649,46 @@ async def test_facade_write_is_readable_through_local_memory(
 
 
 @pytest.mark.integration
+async def test_facade_add_assigns_turn_seq_via_the_centralised_ingest_fallback(
+    container: LocalContainer, uid: str
+) -> None:
+    """AD-234 blocker 2 (TRACE-0923.md §7/§6.2): ``SurfaceFacade.add`` was one of the two ingest
+    paths that left ``MemoryItem.turn_seq`` permanently ``None`` — it never assigned one itself
+    (unlike ``LocalMemory.add``'s own pre-assignment). Fixed by centralising the fallback in
+    ``IngestService._ensure_turn_seq``, the ONE place every ingest path in this tree funnels
+    through — this proves it end to end over REAL Redis, mirroring ``mu-local/tests/
+    test_s1b_neighbor_expansion_int.py::test_turn_seq_is_persisted_and_increases_across_
+    successive_add_calls`` exactly, for the surface that pass could not cover.
+
+    ``turn_seq`` is engine-internal (not on the wire-versioned ``MemoryResponse`` — this facade's
+    own ``get()`` docstring), so this reaches into ``container.stm`` directly, the same way that
+    mu-local test reaches into ``memory._container.stm``."""
+    ns = Namespace(
+        org=f"{_ORG}{uid}",
+        workspace=f"{_WORKSPACE}{uid}",
+        user=_USER,
+        session=_SESSION,
+        visibility=Visibility.PRIVATE,
+    )
+    facade = SurfaceFacade(container, workspace=f"{_WORKSPACE}{uid}", namespace=f"{_ORG}{uid}")
+
+    r0 = await facade.add("Ada lives in Paris", user=_USER, session=_SESSION)
+    r1 = await facade.add("Ada works at Acme", user=_USER, session=_SESSION)
+
+    item0 = await container.stm.get(ns, r0.memory_id)
+    item1 = await container.stm.get(ns, r1.memory_id)
+    assert item0 is not None and item1 is not None
+    assert (
+        item0.turn_seq is not None
+    ), "SurfaceFacade.add left turn_seq unset — the centralised IngestService fallback regressed"
+    assert item1.turn_seq is not None
+    assert item1.turn_seq == item0.turn_seq + 1, (
+        f"turn_seq did not increase by one across successive SurfaceFacade.add() calls on the "
+        f"same session: {item0.turn_seq!r} -> {item1.turn_seq!r}"
+    )
+
+
+@pytest.mark.integration
 async def test_local_memory_write_is_readable_through_facade(
     container: LocalContainer, mem: LocalMemory, uid: str
 ) -> None:

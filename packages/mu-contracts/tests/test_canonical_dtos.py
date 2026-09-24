@@ -145,6 +145,32 @@ def test_recall_item_view_has_no_engine_internal_federate_dedup_fields() -> None
     assert "namespace" not in RecallItemView.model_fields
 
 
+def test_recall_item_view_carries_turn_seq_and_is_neighbor() -> None:
+    """AD-233 fix: S1b's ``turn_seq``/``is_neighbor`` pair reached the ENGINE-internal
+    ``RecallItemView`` (ADR 0053) but never this wire-versioned, ``extra="forbid"`` canonical
+    surface — so every downstream reader of the canonical DTO (the eval harness's ``is_neighbor``
+    attribution included) measured a structural zero no matter what the ranker did. Both are now
+    real fields here, additive and backward compatible (defaults match what every existing caller
+    already observed)."""
+    default_item = RecallItemView(
+        memory_id="m1", content="hi", tier=Tier.STM, channel="stm", fused_score=1.0
+    )
+    assert default_item.turn_seq is None
+    assert default_item.is_neighbor is False
+
+    neighbor_item = RecallItemView(
+        memory_id="m2",
+        content="the reply",
+        tier=Tier.STM,
+        channel="stm",
+        fused_score=0.01,
+        turn_seq=7,
+        is_neighbor=True,
+    )
+    assert neighbor_item.turn_seq == 7
+    assert neighbor_item.is_neighbor is True
+
+
 def test_recall_result_memory_ids_projection() -> None:
     item = RecallItemView(
         memory_id="m1", content="hi", tier=Tier.MTM, channel="mtm", fused_score=0.9

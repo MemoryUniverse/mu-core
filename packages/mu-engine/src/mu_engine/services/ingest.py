@@ -52,6 +52,7 @@ from mu_engine.platform.observability import (
 )
 from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.services.settings import IngestSettings
+from mu_engine.storage.domain.namespace import Visibility
 from mu_engine.storage.ports import ContextRepository, MtmTierRepository, StmTierRepository
 
 __all__ = ["IngestResult", "IngestService"]
@@ -60,6 +61,14 @@ _PIPELINE_NAME = "ingest"
 _OP = "ingest.remember"
 _LATENCY_METRIC = "mu_operation_latency_seconds"
 _ERROR_METRIC = "mu_operation_errors_total"
+
+# S1b write-side blocker (TRACE-0923.md §7/§6.2, AD-234, `IngestService._ensure_turn_seq`'s own
+# docstring): mirrors `mu_local.local_memory._TURN_SEQ_SCAN_LIMIT` 1:1 — the current longest
+# LoCoMo conversation this repo's own corpus carries is 663 turns (conv-41); set generously above
+# that, NOT tuned to the benchmark. A session whose STM window exceeds this can under-count and
+# assign a colliding `turn_seq` — the SAME documented, bounded gap `local_memory.py` already
+# carries, not a new one this centralisation introduces.
+_TURN_SEQ_SCAN_LIMIT = 4000
 
 
 class IngestResult(BaseModel):
@@ -99,6 +108,31 @@ class IngestService:
         self._bus = bus
         self._clock = clock
         self._settings = settings or IngestSettings()
+        # S1b write-side blocker fix (TRACE-0923.md §7/§6.2, AD-234; `_ensure_turn_seq`'s own
+        # docstring has the full rationale). Kept ONLY for the turn_seq auto-assign fallback below
+        # — every stage that actually writes/reads STM already has its own `stm` reference.
+        self._stm = stm
+        # Per-namespace `turn_seq` continuation cache + lock, the SAME shape as `mu_local.
+        # local_memory.LocalMemory._turn_seq_next` (that class's own `_next_turn_seq_cached`
+        # docstring has the "read from the store once per instance, not once per add" rationale
+        # this mirrors) — an `asyncio.Lock` per namespace additionally guards the read-then-write
+        # race a single-tenant `LocalMemory` never has to worry about but a multi-tenant
+        # `IngestService` (this class, shared across every SHARED-plane request on mu-server) does:
+        # two concurrent `remember()` calls on the SAME namespace, both missing the cache, must not
+        # both compute the same base and hand out a colliding `turn_seq`.
+        # KNOWN, DOCUMENTED LIMIT (not hidden — this project's own established discipline for a
+        # tracked gap, e.g. AD-234's own `_TURN_SEQ_SCAN_LIMIT` account): both dicts grow by one
+        # entry per DISTINCT namespace this instance ever sees and are never evicted. `LocalMemory`
+        # carries the identical shape today and it is bounded there by one process's own session
+        # count; on mu-server's long-lived, multi-tenant `IngestService` the namespace set is every
+        # session of every tenant the process ever serves, so this is unbounded per-process growth
+        # over a long uptime — real, but small (one int + one near-empty `asyncio.Lock` per
+        # namespace, not per row), and a process restart clears it (the values are re-derived from
+        # the store on first touch, never authoritative on their own). Named here as a follow-up
+        # (a bounded/LRU cache) rather than built — out of this fix's scope, which is closing the
+        # "3 ingest paths, 1 remembers `turn_seq`" gap, not redesigning this cache's eviction.
+        self._turn_seq_next: dict[str, int] = {}
+        self._turn_seq_locks: dict[str, asyncio.Lock] = {}
         # Central observability (DEV-STANDARDS rule 4): span + latency/error metrics + content-free
         # audit on the meaningful op. Sinks default to no-op so the service is testable unwired.
         self._tracer: Tracer = tracer or NoopTracer()
@@ -143,6 +177,7 @@ class IngestService:
         Wrapped in central observability (DEV-STANDARDS rule 4): a content-free span, a latency
         histogram (always) + an error counter (on failure), and a content-free audit row on
         success. ``CancelledError`` propagates and is NOT counted as a failure (it is not one)."""
+        activity = await self._ensure_turn_seq(activity)
         correlation_id = activity_id_for(activity)
         started = time.perf_counter()
         with self._tracer.span(_OP, attributes={"pipeline": self._pipeline.name}):
@@ -167,6 +202,72 @@ class IngestService:
             counts={"tiers_written": len(result.tiers_written)},
         )
         return result
+
+    async def _ensure_turn_seq(self, activity: IngestActivity) -> IngestActivity:
+        """S1b write-side blocker (``docs/tracking/TRACE-0923.md`` §7/§6.2, AD-234): auto-assign
+        ``turn_seq`` for any caller that leaves it unset, so an ingest path can no longer forget
+        it by omission. AD-234 found that only ONE of three ``IngestActivity`` construction sites
+        assigned ``turn_seq`` at all — ``mu_local.local_memory.LocalMemory.add`` did (its own
+        ``_next_turn_seq_cached``/``_next_turn_seq_base``), ``mu_engine.surface.facade.
+        SurfaceFacade.add`` and mu-server's ``SharedMemoryService.add`` did not, and — the delta's
+        own words — a row written through either of those two is "permanently unexpandable" by
+        S1b's read-time neighbour expansion. That is a call-site convention (every NEW surface has
+        to remember to replicate the caching dance), which is exactly the failure shape this
+        project's own CLAUDE.md names as the recurring defect pattern (relying on every caller to
+        remember one thing). Moving the assignment HERE — the one method every ingest path in this
+        tree already funnels through, ``LocalMemory``/``SurfaceFacade``/mu-server's
+        ``SharedMemoryService`` alike — makes it structural instead of conventional: a FOURTH
+        surface gets a real ``turn_seq`` for free, without knowing this field exists.
+
+        **An explicit caller-supplied ``turn_seq`` always wins and is never recomputed or
+        overridden** — this only fills the gap for a caller that expressed no opinion (``None``,
+        ``IngestActivity``'s own field default). ``LocalMemory.add`` keeps its own pre-assignment
+        exactly as ADR 0053 shipped it (needed there: a multi-message ``add()`` call assigns
+        CONSECUTIVE values across one call without a store round-trip per message — see that
+        method's own docstring); this fallback exists for every caller that does not do that,
+        which today is every other one.
+
+        **Design mirrors ``LocalMemory._next_turn_seq_cached``/``_next_turn_seq_base`` exactly**
+        (that pair's own docstrings have the full "read from the store, not an in-process counter,
+        because a fresh instance must continue a prior instance's sequence" rationale, and the
+        documented ``_TURN_SEQ_SCAN_LIMIT`` gap this inherits verbatim) — read the current STM
+        session max ONCE per namespace per ``IngestService`` instance, then increment in memory;
+        this is also the AD-234 PERFORMANCE fix applied at the one place every path funnels
+        through, not a second unoptimised copy of the pre-fix O(n)-per-add cost.
+
+        **One addition ``LocalMemory`` does not need**: an ``asyncio.Lock`` per namespace. A
+        single-tenant ``LocalMemory`` never serves two concurrent ``add()`` calls on the SAME
+        session from two different callers; this class is shared across every request on the
+        multi-tenant SHARED plane (mu-server), where that IS reachable — without the lock, two
+        concurrent ``remember()`` calls on a namespace neither has cached yet could both compute
+        the same base and hand out a colliding ``turn_seq``."""
+        if activity.turn_seq is not None:
+            return activity
+        ns = activity.namespace
+        key = ns.to_prefix()
+        lock = self._turn_seq_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            next_seq = self._turn_seq_next.get(key)
+            if next_seq is None:
+                # Model-A (CANONICAL §7.4): PRIVATE authorizes by partition (`None` is correct
+                # there — `IngestActivity`'s own validator forbids `authorized_ids` on PRIVATE);
+                # SHARED needs a real set, and an unstamped SHARED write (`authorized_ids=None`,
+                # a legal but content-free-to-everyone row, `IngestActivity.authorized_ids`'s own
+                # docstring) still must not crash this scan — coerce to the empty set, the SAME
+                # "authorize nothing, never over-broad" direction `RecallService`/`ranker.py`
+                # already use for exactly this case.
+                caller_identity_set = activity.authorized_ids
+                if ns.visibility is Visibility.SHARED and caller_identity_set is None:
+                    caller_identity_set = frozenset()
+                window = await self._stm.recent(
+                    ns,
+                    limit=_TURN_SEQ_SCAN_LIMIT,
+                    caller_identity_set=caller_identity_set,
+                )
+                seen = [s.item.turn_seq for s in window if s.item.turn_seq is not None]
+                next_seq = (max(seen) + 1) if seen else 0
+            self._turn_seq_next[key] = next_seq + 1
+        return activity.model_copy(update={"turn_seq": next_seq})
 
     async def _remember(self, activity: IngestActivity, correlation_id: str) -> IngestResult:
         ctx = PipelineContext(

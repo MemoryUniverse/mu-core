@@ -73,6 +73,7 @@ __all__ = [
     "CategoryStats",
     "QueryResult",
     "RepeatedAnswerQualityReport",
+    "compute_pairwise_noise",
     "eligible_query_count",
     "run_answer_quality",
     "run_answer_quality_repeated",
@@ -118,6 +119,23 @@ class QueryResult(BaseModel):
     answer_usage: CallUsage | None = None
     judge_usage: CallUsage | None = None
 
+    # NOISE-FLOOR / CHARACTERISATION FIELDS (TRUSTWORTHY-MEASUREMENT-0924). Defaults keep an
+    # older artifact loading unchanged (same discipline `gold_in_context` and `*_usage` already
+    # established for this model).
+    #
+    # The RAW judge completion, kept regardless of whether it parsed — this is what let this pass
+    # characterise "unparseable" from actual outputs instead of the bare counter: before this
+    # field existed, an unparseable row's own artifact carried no way to tell "empty because the
+    # budget ran out", "a refusal", or "both CORRECT and WRONG present" apart after the fact
+    # without re-running the whole row. `None` only for a row written before this fix.
+    judge_raw: str | None = None
+    # Did `_complete_with_retry`'s budget-exhaustion policy have to intervene on this row's answer
+    # / judge call? Recorded even when the row ended up correctly parsed anyway (the retry
+    # SUCCEEDED) — so a report can show how often the safety net fired, not only its effect on the
+    # unparseable count. See `_complete_with_retry`/`_is_budget_exhausted` for the exact policy.
+    answer_budget_retried: bool = False
+    judge_budget_retried: bool = False
+
 
 class CategoryStats(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -132,6 +150,17 @@ class CategoryStats(BaseModel):
     gold_retrieved: int = 0  # rows (any verdict) whose gold evidence was in the context
     wrong_retrieved: int = 0  # verdict=WRONG AND gold was retrieved -> a GENERATION failure
     wrong_not_retrieved: int = 0  # verdict=WRONG AND gold was NOT retrieved -> a RETRIEVAL failure
+
+    # How often the budget-exhaustion retry (`_complete_with_retry`) fired on this bucket's rows,
+    # and how many of the STILL-unparseable rows show the exact budget-exhaustion wire signature
+    # even after that retry (`finish_reason == "length"` and blank content on the LAST attempt) —
+    # i.e. genuinely exhausted the RETRIED budget too, as opposed to unparseable for some other
+    # reason (a non-empty judge output that names neither/both labels). Both default 0 so an
+    # artifact from before this fix still loads.
+    answer_budget_retried: int = 0
+    judge_budget_retried: int = 0
+    unparseable_budget_exhausted: int = 0  # subset of `unparseable`, see docstring above
+    unparseable_other: int = 0  # `unparseable` minus `unparseable_budget_exhausted`
 
     @property
     def scoreable(self) -> int:
@@ -212,23 +241,102 @@ class AnswerQualityReport(BaseModel):
     usage: dict[str, Any] | None = None
 
 
+# BUDGET-EXHAUSTION RETRY POLICY (TRUSTWORTHY-MEASUREMENT-0924: "characterise it, then handle it
+# deterministically"). Read the real failing rows first (`STATE-AND-DEFECTS-0829.md` D4 update,
+# item 3; `ARCHITECTURE-DELTAS.md` AD-232's paired 150-row run): every unparseable row inspected
+# so far shares ONE exact wire signature — `finish_reason: "length"` with `content: ""` and
+# `reasoning_tokens` at or near the requested cap (e.g. `reasoning_tokens: 300` on a 300-token
+# budget). gpt-5 spent the ENTIRE completion budget on hidden reasoning tokens before emitting a
+# single visible token. That is not a refusal (`finish_reason` would be `"content_filter"`), not a
+# parse that is too strict (there is no content to parse — `parse_judgement`'s bare-label regex
+# and JSON path both correctly return `None` on an empty string), and not "something else" — it is
+# budget exhaustion, characterised from the actual wire response, not inferred from the unparseable
+# counter. A genuinely malformed-but-NON-EMPTY completion (a real format miss, or the "both CORRECT
+# and WRONG present" case `parse_judgement` already refuses) is a DIFFERENT failure that a bigger
+# budget cannot fix, so it is deliberately NOT retried here — retrying on content alone would
+# silently paper over an actual parser gap instead of surfacing it.
+#
+# The fix is ONE deterministic, bounded retry, doubling the completion budget, only on that exact
+# signature. `BUDGET_RETRY_MULTIPLIER=2` and `BUDGET_RETRY_MAX_TOKENS` are stated here, not
+# invented at the call site, so the policy is the same for every caller of `_complete_with_retry`
+# (answer and judge calls alike) and is auditable in one place.
+BUDGET_RETRY_MULTIPLIER = 2
+# Hard ceiling on the RETRIED budget (never on the caller's original ask) — bounds the worst-case
+# extra cost of the safety net to at most this many completion tokens on any one call, instead of
+# an unbounded doubling if a caller ever passes a very large `max_tokens`.
+BUDGET_RETRY_MAX_TOKENS = 3000
+# MEASURED, not guessed (TRUSTWORTHY-MEASUREMENT-0924's own real run, gpt-5, conv-26, 300 judge
+# rows): a SINGLE doubling (300 -> 600) was NOT always enough. Every one of the 11 unparseable
+# rows across both repeats showed the identical wire signature (`content=""`,
+# `finish_reason="length"`, `reasoning_tokens=600`) at the FIRST retry's 600-token budget too —
+# i.e. this project's own real evidence, not a hypothetical, shows one retry level is
+# insufficient for a real (if small, ~2-5%) share of rows. `BUDGET_RETRY_MAX_ATTEMPTS` bounds how
+# many ADDITIONAL doublings `_complete_with_retry` will make beyond the first attempt (2 => at
+# most 300 -> 600 -> 1200 for the judge's default budget) before accepting an exhausted result and
+# reporting it honestly rather than looping further. Kept well under `BUDGET_RETRY_MAX_TOKENS` so
+# the ceiling, not this count, is normally what stops the loop for a caller with a larger
+# `max_tokens`.
+BUDGET_RETRY_MAX_ATTEMPTS = 2
+
+
+def _is_budget_exhausted(result: CompletionResult) -> bool:
+    """The exact, wire-verified signature of hidden-reasoning budget exhaustion — see the policy
+    note above. Both conditions are required: `finish_reason` alone is not enough (a model can
+    legitimately finish at the cap with SOME visible content already written), and blank content
+    alone is not enough (a `"stop"`/`"content_filter"` finish with empty content is a different,
+    NOT budget-shaped, failure that this policy must not paper over)."""
+    return result.finish_reason == "length" and result.content.strip() == ""
+
+
 async def _complete_with_retry(
     chat: OpenAICompatChat, *, system: str, user: str, max_tokens: int
 ) -> CompletionResult:
-    """ONE reactive retry on 429 — same backoff contract as ``PacedOpenAICompatChat`` (sleep the
-    server's own ``Retry-After``/reset header, never retry instantly), minus the proactive
-    per-request floor gpt-5's quota does not need. Concurrency is gated by the CALLER (the whole
-    per-query pipeline, recall included — see ``run_answer_quality``'s ``sem``), not here.
+    """ONE reactive retry on 429 (same backoff contract as ``PacedOpenAICompatChat``: sleep the
+    server's own ``Retry-After``/reset header, never retry instantly, minus the proactive
+    per-request floor gpt-5's quota does not need), PLUS a separate, deterministic, BOUNDED-LOOP
+    retry on hidden-reasoning budget exhaustion: up to ``BUDGET_RETRY_MAX_ATTEMPTS`` further
+    attempts, each doubling the previous attempt's budget (``BUDGET_RETRY_MULTIPLIER``), capped at
+    ``BUDGET_RETRY_MAX_TOKENS`` — see the policy note above those constants, including the REAL
+    measured evidence for why a single retry level was not enough to make this loop, not a single
+    `if`. Concurrency is gated by the CALLER (the whole per-query pipeline, recall included — see
+    ``run_answer_quality``'s ``sem``), not here.
 
     Returns ``CompletionResult`` (content + usage IN-BAND), not a bare string: this coroutine runs
     concurrently, up to ``concurrency`` at a time, against ONE shared chat client per role — see
     ``CompletionResult``'s own docstring for why reading ``chat.last_usage`` after the fact would
-    be a race under that concurrency, and why returning it bundled with the content is not."""
-    try:
-        return await chat.complete_with_usage(system=system, user=user, max_tokens=max_tokens)
-    except RateLimitError as exc:
-        await asyncio.sleep(exc.retry_after_s if exc.retry_after_s is not None else 5.0)
-        return await chat.complete_with_usage(system=system, user=user, max_tokens=max_tokens)
+    be a race under that concurrency, and why returning it bundled with the content is not.
+
+    The RETURNED ``CompletionResult`` always reflects the LAST attempt made (the final retried one,
+    when any budget retry fired) — never a silently discarded earlier attempt — and
+    ``result.budget_retried`` records whether AT LEAST one retry happened, so a caller can count
+    how often the safety net was needed rather than only seeing its effect on the parse. A row that
+    is STILL exhausted after every attempt this policy allows is returned as-is (still exhausted,
+    `budget_retried=True`) — reported honestly as budget-shaped rather than looped forever.
+    """
+
+    async def _attempt(tokens: int) -> CompletionResult:
+        try:
+            return await chat.complete_with_usage(system=system, user=user, max_tokens=tokens)
+        except RateLimitError as exc:
+            await asyncio.sleep(exc.retry_after_s if exc.retry_after_s is not None else 5.0)
+            return await chat.complete_with_usage(system=system, user=user, max_tokens=tokens)
+
+    result = await _attempt(max_tokens)
+    tokens = max_tokens
+    retried = False
+    for _ in range(BUDGET_RETRY_MAX_ATTEMPTS):
+        if not _is_budget_exhausted(result):
+            break
+        next_tokens = min(tokens * BUDGET_RETRY_MULTIPLIER, BUDGET_RETRY_MAX_TOKENS)
+        if next_tokens <= tokens:
+            # Already at (or the multiplier rounds to) the ceiling — a further identical-or-
+            # smaller call would not be a genuine retry, so stop rather than spend another call
+            # that cannot possibly change the outcome.
+            break
+        result = await _attempt(next_tokens)
+        tokens = next_tokens
+        retried = True
+    return result.model_copy(update={"budget_retried": True}) if retried else result
 
 
 def _eligible_queries(
@@ -272,6 +380,17 @@ def eligible_query_count(
     return sum(len(_eligible_queries(c, max_queries_per_sample)[0]) for c in conversations)
 
 
+def _is_budget_exhausted_row(row: QueryResult) -> bool:
+    """Same wire signature `_is_budget_exhausted` checks live (blank content), applied
+    RETROSPECTIVELY to a row's stored `judge_raw` — the honest split between "still unparseable
+    because the (possibly retried) budget was exhausted" and "unparseable for some other reason"
+    (non-empty content that names neither/both labels). `judge_raw is None` (an artifact written
+    before this fix carries no raw text to check) is conservatively NOT counted as budget-shaped —
+    an older artifact's unparseable rows fall entirely into `unparseable_other` rather than a
+    guess."""
+    return row.verdict is None and row.judge_raw is not None and row.judge_raw.strip() == ""
+
+
 def _stats(rows: Sequence[QueryResult]) -> CategoryStats:
     correct = sum(1 for r in rows if r.verdict is True)
     wrong = sum(1 for r in rows if r.verdict is False)
@@ -279,6 +398,9 @@ def _stats(rows: Sequence[QueryResult]) -> CategoryStats:
     gold_retrieved = sum(1 for r in rows if r.gold_in_context)
     wrong_retrieved = sum(1 for r in rows if r.verdict is False and r.gold_in_context)
     wrong_not_retrieved = sum(1 for r in rows if r.verdict is False and not r.gold_in_context)
+    answer_budget_retried = sum(1 for r in rows if r.answer_budget_retried)
+    judge_budget_retried = sum(1 for r in rows if r.judge_budget_retried)
+    unparseable_budget_exhausted = sum(1 for r in rows if _is_budget_exhausted_row(r))
     return CategoryStats(
         n=len(rows),
         correct=correct,
@@ -287,6 +409,10 @@ def _stats(rows: Sequence[QueryResult]) -> CategoryStats:
         gold_retrieved=gold_retrieved,
         wrong_retrieved=wrong_retrieved,
         wrong_not_retrieved=wrong_not_retrieved,
+        answer_budget_retried=answer_budget_retried,
+        judge_budget_retried=judge_budget_retried,
+        unparseable_budget_exhausted=unparseable_budget_exhausted,
+        unparseable_other=unparseable - unparseable_budget_exhausted,
     )
 
 
@@ -438,6 +564,9 @@ async def run_answer_quality(
                     gold_in_context=gold_ids_present(result.items, index, gold),
                     answer_usage=answer_result.usage,
                     judge_usage=judge_result.usage,
+                    judge_raw=verdict_raw,
+                    answer_budget_retried=answer_result.budget_retried,
+                    judge_budget_retried=judge_result.budget_retried,
                 )
                 done += 1
                 if progress is not None:
@@ -484,6 +613,21 @@ class RepeatedAnswerQualityReport(BaseModel):
     overall_accuracy: RepeatSummary  # parseable-subset accuracy, one value per run
     overall_accuracy_all_scoreable: RepeatSummary
     by_category_accuracy: dict[str, RepeatSummary]
+    # THE NOISE FLOOR (TRUSTWORTHY-MEASUREMENT-0924), measured directly rather than assumed: a
+    # paired `compare.compare_runs` between each pair of CONSECUTIVE repeats of this SAME,
+    # unchanged config. Unlike `overall_accuracy.spread` (which only says how far the two AGGREGATE
+    # numbers moved), this names WHICH rows moved and in which direction — including the
+    # `became_unparseable`/`recovered_from_unparseable` churn that a bare accuracy spread cannot
+    # see at all (two runs can tie on accuracy while churning a dozen rows' parseability in
+    # opposite directions). Empty when `num_runs < 2` or any run was written with `keep_rows=False`
+    # (a comparison needs per-row verdicts — see `compare.compare_runs`'s own guard).
+    #
+    # `dict[str, Any]` rather than `compare.CompareResult` directly, same reason and same
+    # precedent as `AnswerQualityReport.provenance`/`.usage` above (`compare.py` imports FROM this
+    # module, so importing its model back here would be circular) — each entry is
+    # `CompareResult.model_dump(mode="json")`, so a caller who wants the typed object back can
+    # `CompareResult.model_validate(entry)`.
+    pairwise_noise: list[dict[str, Any]] = Field(default_factory=list)
 
 
 async def run_answer_quality_repeated(
@@ -538,9 +682,35 @@ async def run_answer_quality_repeated(
             run_ids=run_ids,
         )
 
+    pairwise_noise = compute_pairwise_noise(reports)
+
     return RepeatedAnswerQualityReport(
         runs=reports,
         overall_accuracy=overall_accuracy,
         overall_accuracy_all_scoreable=overall_accuracy_all_scoreable,
         by_category_accuracy=by_category_accuracy,
+        pairwise_noise=pairwise_noise,
     )
+
+
+def compute_pairwise_noise(reports: Sequence[AnswerQualityReport]) -> list[dict[str, Any]]:
+    """`compare.compare_runs` between each pair of CONSECUTIVE repeats — see
+    `RepeatedAnswerQualityReport.pairwise_noise`'s own docstring for why this, not just the
+    accuracy spread, is the honest noise-floor measurement. Lazy import: `compare.py` imports
+    `AnswerQualityReport`/`QueryResult` FROM this module, so a module-level import here would be
+    circular (the same reason `run_answer_quality` lazy-imports `runner._await_index`)."""
+    if len(reports) < 2:
+        return []
+    import itertools
+
+    from mu_eval.compare import compare_runs
+
+    results: list[dict[str, Any]] = []
+    for a, b in itertools.pairwise(reports):
+        if not a.rows or not b.rows:
+            # `compare_runs` requires per-row data (`keep_rows=True`, the default) to pair on —
+            # silently skip rather than raise, so an aggregate-only repeated run still returns its
+            # accuracy spread even though it cannot also return row-level churn.
+            continue
+        results.append(compare_runs(a, b).model_dump(mode="json"))
+    return results

@@ -207,6 +207,38 @@ async def test_neighbor_expansion_surfaces_the_reply_neighbor_when_enabled(
             "raising MU_RECALL__NEIGHBOR_EXPAND_RADIUS did not surface the anchor's turn_seq "
             f"neighbour — the S1b read path did not reach the composed ranker: {contents!r}"
         )
+
+        # AD-233's OWN blocker, closed end to end and guarded HERE for the first time (VERIFY
+        # 2026-09-24). The pass that fixed AD-233 added `turn_seq`/`is_neighbor` to the canonical
+        # `mu_contracts.contracts.recall.RecallItemView` and routed all three hand-duplicated
+        # projections through one shared mapping — but every test it shipped for that fix was a
+        # UNIT test of the DTO or of the mapping function in isolation. Nothing asserted the two
+        # fields on what `LocalMemory.recall` actually RETURNS, which is the only surface the eval
+        # harness's `getattr(item, "is_neighbor", False)` attribution (AD-228) ever reads. That is
+        # precisely the gap AD-233 was: the mechanism worked, the wire dropped it, and a suite full
+        # of green unit tests said nothing. Assert it on the real, composed, real-Redis result.
+        by_content = {it.content: it for it in result}
+        anchor_view = by_content[_ANCHOR]
+        neighbor_view = by_content[_GOLD_NEIGHBOR]
+        assert neighbor_view.is_neighbor is True, (
+            "the expanded neighbour reached LocalMemory.recall's canonical RecallItemView with "
+            "is_neighbor=False — the engine->canonical projection is dropping the flag again "
+            "(AD-233), so every downstream neighbour attribution is a structural zero"
+        )
+        assert (
+            neighbor_view.turn_seq is not None
+        ), "the expanded neighbour's turn_seq did not survive the canonical projection"
+        assert (
+            anchor_view.is_neighbor is False
+        ), "the ANCHOR was marked is_neighbor — the flag is being stamped on the wrong rows"
+        assert anchor_view.turn_seq is not None, (
+            "the anchor carried no turn_seq on the canonical surface, so nothing downstream can "
+            "tell which conversational turn a returned row came from"
+        )
+        assert neighbor_view.turn_seq == anchor_view.turn_seq - 1, (
+            f"the neighbour's turn_seq is not the anchor's -1: {neighbor_view.turn_seq!r} vs "
+            f"{anchor_view.turn_seq!r}"
+        )
     finally:
         await _teardown(settings, uid)
         await memory.aclose()

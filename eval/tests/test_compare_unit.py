@@ -146,3 +146,111 @@ def test_significant_at_p05_flag_matches_the_computed_p_value() -> None:
     result = compare_runs(_report("run-a", rows_a), _report("run-b", rows_b))
     assert result.mcnemar_p_value < 0.05
     assert result.significant_at_p05 is True
+
+
+# ------------------------------------------------------------ TRUSTWORTHY-MEASUREMENT-0924: the
+# judge-noise caveat. Real evidence (AD-232's paired 150-row run): +0.03pt accuracy from 4 fixed /
+# 1 regressed, while 13 rows became unparseable and 7 recovered — parseability churn an order of
+# magnitude larger than the verdict churn the delta was computed from. `compare_runs`'s own
+# verdict string must say so, unprompted, whenever that shape recurs.
+
+
+def test_verdict_warns_when_parseability_churn_dwarfs_the_verdict_churn() -> None:
+    # Reproduces AD-232's own shape at small scale: 1 fixed / 0 regressed (verdict churn = 1),
+    # but 3 became unparseable / 2 recovered (parseability churn = 5) — churn far exceeds signal.
+    a_rows = (
+        [_row("fixed", False)]
+        + [_row(f"bu{i}", True) for i in range(3)]  # -> None in B: became_unparseable
+        + [_row(f"rec{i}", None) for i in range(2)]  # -> parsed in B: recovered_from_unparseable
+    )
+    b_rows = (
+        [_row("fixed", True)]
+        + [_row(f"bu{i}", None) for i in range(3)]
+        + [_row(f"rec{i}", True) for i in range(2)]
+    )
+    result = compare_runs(_report("run-a", a_rows), _report("run-b", b_rows))
+    assert len(result.fixed) == 1
+    assert len(result.regressed) == 0
+    assert len(result.became_unparseable) == 3
+    assert len(result.recovered_from_unparseable) == 2
+    assert "CAVEAT" in result.verdict
+    assert "judge-parseability churn" in result.verdict
+    assert "do not report this delta as a finding" in result.verdict.lower()
+
+
+def test_verdict_carries_no_caveat_when_parseability_is_stable() -> None:
+    """The common, healthy case — no unparseable churn at all — must not carry the caveat text,
+    so the caveat's presence is actually informative rather than boilerplate on every run."""
+    a_rows = [_row("q1", False), _row("q2", True)]
+    b_rows = [_row("q1", True), _row("q2", True)]
+    result = compare_runs(_report("run-a", a_rows), _report("run-b", b_rows))
+    assert len(result.fixed) == 1
+    assert result.became_unparseable == []
+    assert result.recovered_from_unparseable == []
+    assert "CAVEAT" not in result.verdict
+
+
+def test_verdict_caveat_fires_even_with_zero_verdict_churn() -> None:
+    """The exact AD-232 edge: fixed=regressed=0 (the pre-existing 'no row flipped' branch) but
+    unparseable churn is non-zero — must still warn, not silently fall into the "no row flipped"
+    sentence with nothing said about the churn that DID happen."""
+    a_rows = [_row("bu", True)]
+    b_rows = [_row("bu", None)]
+    result = compare_runs(_report("run-a", a_rows), _report("run-b", b_rows))
+    assert result.fixed == []
+    assert result.regressed == []
+    assert result.became_unparseable == ["bu"]
+    assert "CAVEAT" in result.verdict
+
+
+def test_a_noise_limited_comparison_is_flagged_machine_readably_not_only_in_prose() -> None:
+    """VERIFY 2026-09-24. The predecessor pass added a CAVEAT to `CompareResult.verdict` when
+    judge-parseability churn is at least as large as the verdict churn a delta is computed from.
+    That caveat is prose: `__main__._cmd_compare`'s own docstring tells a caller scripting a gate
+    to read `significant_at_p05`/`delta` out of the artifact, and both of those stay clean on a
+    comparison the harness has just declared unreportable. `noise_limited` is the machine-readable
+    half — this pins BOTH halves on the same result, so a future refactor cannot fix one and leave
+    the other lying.
+
+    The shape below is the one TRUSTWORTHY-MEASUREMENT-0924 measured live (parseability churn >=
+    verdict churn) with the verdict churn made significant on purpose, so the test also proves the
+    two flags are INDEPENDENT: McNemar says "significant", the noise gate says "do not report".
+    """
+    rows_a = (
+        [_row(f"f{i}", False) for i in range(6)]  # 6 rows A-wrong -> B-correct  (fixed)
+        + [_row(f"u{i}", True) for i in range(4)]  # 4 rows A-parseable -> B-unparseable
+        + [_row(f"r{i}", None) for i in range(4)]  # 4 rows A-unparseable -> B-parseable
+    )
+    rows_b = (
+        [_row(f"f{i}", True) for i in range(6)]
+        + [_row(f"u{i}", None) for i in range(4)]
+        + [_row(f"r{i}", True) for i in range(4)]
+    )
+    result = compare_runs(_report("A", rows_a), _report("B", rows_b))
+
+    assert len(result.fixed) == 6 and len(result.regressed) == 0
+    assert len(result.became_unparseable) == 4
+    assert len(result.recovered_from_unparseable) == 4
+    assert result.significant_at_p05 is True, (
+        "fixture broken: this test needs McNemar to say 'significant' so that it can prove the "
+        "noise gate is a SEPARATE refusal, not a restatement of the p-value"
+    )
+    assert result.noise_limited is True, (
+        "8 rows of parseability churn against 6 of verdict churn is the exact shape "
+        "TRUSTWORTHY-MEASUREMENT-0924 measured, and it must set the machine-readable flag — not "
+        "only the human-readable verdict string"
+    )
+    assert "CAVEAT" in result.verdict, "the prose caveat and the flag must agree on one comparison"
+
+
+def test_a_clean_comparison_is_not_flagged_noise_limited() -> None:
+    """The negative control the flag needs: churn well below the effect leaves it False, so
+    `noise_limited` cannot be an always-True refusal that silences every real finding."""
+    rows_a = [_row(f"f{i}", False) for i in range(20)] + [_row("u0", True)]
+    rows_b = [_row(f"f{i}", True) for i in range(20)] + [_row("u0", None)]
+    result = compare_runs(_report("A", rows_a), _report("B", rows_b))
+
+    assert len(result.fixed) == 20
+    assert len(result.became_unparseable) == 1
+    assert result.noise_limited is False
+    assert "CAVEAT" not in result.verdict

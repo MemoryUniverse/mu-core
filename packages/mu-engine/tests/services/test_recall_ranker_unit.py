@@ -19,9 +19,9 @@ import pytest
 from mu_contracts.domain.model.recall import Vector
 from mu_engine.platform.clock import FrozenClock
 from mu_engine.providers._contracts import RerankHit
-from mu_engine.services.recall.dto import RecallChannels, RecallSettings
+from mu_engine.services.recall.dto import RecallChannels, RecallItemView, RecallSettings
 from mu_engine.services.recall.fusion import ReciprocalRankFusion
-from mu_engine.services.recall.ranker import ThreeChannelRecallRanker
+from mu_engine.services.recall.ranker import ThreeChannelRecallRanker, _narrow_after_expansion
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, MemoryState, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored
@@ -1377,3 +1377,306 @@ async def test_s1b_after_anchor_placement_puts_the_neighbour_inside_the_window()
         anchor.id,
         neighbor_item.id,
     ], f"'after_anchor' did not place the neighbour behind its anchor: {after!r}"
+
+
+# ---------------------------------------------------------------------------------------------
+# Shape A / Shape B — TRACE-0923.md follow-up, ARCHITECTURE-DELTAS.md AD-233's own amendment:
+# "the two live options are the free-riding insertion ... or a wider fetch narrowed after
+# expansion. Nothing else is left." `neighbor_free_ride` / `neighbor_expand_widen`.
+# ---------------------------------------------------------------------------------------------
+
+
+async def _full_rank(
+    ranker: ThreeChannelRecallRanker, query_vec: Vector, *, limit: int = 10
+) -> list[RecallItemView]:
+    result = await ranker.rank(
+        _NS,
+        "irrelevant-this-phase",
+        query_vec,
+        limit=limit,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+    return list(result.items)
+
+
+def _two_mtm_one_neighbor_fixture() -> tuple[list[MemoryItem], MemoryItem, MemoryItem, MemoryItem]:
+    """One anchor (turn_seq=5) reachable via MTM, a second MTM hit nothing links to a neighbour,
+    and one STM row (turn_seq=6) reachable ONLY as the anchor's turn_seq neighbour — the SAME
+    shape ``test_s1b_expansion_inserts_a_neighbour_that_no_channel_ranked`` uses, with a second
+    MTM candidate added so a "does this displace a real candidate" question is answerable.
+    Returns ``(stm_items, anchor, second_mtm, neighbor_item)``."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    neighbor_item = _item(
+        "the reply that carries the answer", tier=MemoryTier.STM, at=base, turn_seq=6
+    )
+    anchor = _item(
+        "Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base, turn_seq=5
+    )
+    second_mtm = _item("Ada's dentist appointment is on Friday", tier=MemoryTier.MTM, at=base)
+    return [neighbor_item], anchor, second_mtm, neighbor_item
+
+
+@pytest.mark.asyncio
+async def test_shipped_default_never_shows_the_neighbour_and_never_exceeds_limit() -> None:
+    """Baseline pin — neither Shape A nor Shape B enabled: the costs-a-slot mechanism truncates
+    the neighbour away exactly as AD-231/AD-232 measured, and the result is always exactly
+    `limit` items."""
+    stm_items, anchor, second_mtm, neighbor_item = _two_mtm_one_neighbor_fixture()
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={query_vec: [anchor, second_mtm]},
+        settings=RecallSettings(
+            neighbor_expand_radius=1,
+            stm_scoring="recency",
+            floor_protect_limit=0,
+            recency_floor_limit=0,  # isolate: the neighbour must be reachable ONLY via expansion
+        ),
+    )
+
+    items = await _full_rank(ranker, list(query_vec), limit=2)
+
+    assert [it.memory_id for it in items] == [anchor.id, second_mtm.id]
+    assert len(items) == 2
+    assert neighbor_item.id not in [it.memory_id for it in items]
+
+
+@pytest.mark.asyncio
+async def test_neighbor_free_ride_adds_the_neighbour_without_displacing_anything() -> None:
+    """Shape A. The neighbour is APPENDED past `limit` — nothing already selected is displaced,
+    and the result is allowed to exceed `limit` (the ADR's own "bounded to prompt length, never
+    to precision" trade)."""
+    stm_items, anchor, second_mtm, neighbor_item = _two_mtm_one_neighbor_fixture()
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={query_vec: [anchor, second_mtm]},
+        settings=RecallSettings(
+            neighbor_expand_radius=1,
+            neighbor_free_ride=True,
+            stm_scoring="recency",
+            floor_protect_limit=0,
+            recency_floor_limit=0,
+        ),
+    )
+
+    items = await _full_rank(ranker, list(query_vec), limit=2)
+    ids = [it.memory_id for it in items]
+
+    assert ids == [
+        anchor.id,
+        second_mtm.id,
+        neighbor_item.id,
+    ], f"free-riding must keep both real winners AND append the neighbour: {ids!r}"
+    assert len(items) == 3, "free-riding must be allowed to exceed the caller's limit"
+    neighbor_view = next(it for it in items if it.memory_id == neighbor_item.id)
+    assert neighbor_view.is_neighbor is True
+
+
+@pytest.mark.asyncio
+async def test_neighbor_free_ride_only_attaches_to_anchors_that_actually_survived() -> None:
+    """A neighbour of an anchor that did NOT make the final `limit` window must not appear either
+    — free-riding rides with a WINNER, it does not independently resurrect a loser's context."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    # `winner` carries a turn_seq far from anything else in the fixture, so it IS a valid anchor
+    # (the free-ride mechanism inspects every surviving item's `turn_seq`) but has no neighbour of
+    # its own to find — isolating "did the LOSER's neighbour leak through" from "does a winner
+    # with no real neighbour break anything".
+    winner = _item(
+        "Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base, turn_seq=50
+    )
+    loser = _item(
+        "Ada's dentist appointment is on Friday", tier=MemoryTier.MTM, at=base, turn_seq=5
+    )
+    losers_neighbor = _item("the reply nobody should see", tier=MemoryTier.STM, at=base, turn_seq=6)
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=[losers_neighbor],
+        mtm_hits_by_query={query_vec: [winner, loser]},
+        settings=RecallSettings(
+            neighbor_expand_radius=1,
+            neighbor_free_ride=True,
+            stm_scoring="recency",
+            floor_protect_limit=0,
+            recency_floor_limit=0,
+        ),
+    )
+
+    items = await _full_rank(ranker, list(query_vec), limit=1)
+    ids = [it.memory_id for it in items]
+
+    assert ids == [winner.id], f"only the surviving winner may free-ride a neighbour: {ids!r}"
+
+
+@pytest.mark.asyncio
+async def test_neighbor_expand_widen_lets_the_neighbour_displace_the_weakest_real_candidate() -> (
+    None
+):
+    """Shape B. Unlike free-riding, this DOES cost something — the result stays exactly `limit`
+    items, and the weakest ordinary candidate (`second_mtm`) is displaced to make room for the
+    neighbour, which is the priced trade `neighbor_expand_widen`'s own docstring names."""
+    stm_items, anchor, second_mtm, neighbor_item = _two_mtm_one_neighbor_fixture()
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={query_vec: [anchor, second_mtm]},
+        settings=RecallSettings(
+            neighbor_expand_radius=1,
+            neighbor_expand_widen=1,
+            stm_scoring="recency",
+            floor_protect_limit=0,
+            recency_floor_limit=0,
+        ),
+    )
+
+    items = await _full_rank(ranker, list(query_vec), limit=2)
+    ids = [it.memory_id for it in items]
+
+    assert ids == [
+        anchor.id,
+        neighbor_item.id,
+    ], f"widen=1 should displace the weakest real candidate for the neighbour: {ids!r}"
+    assert len(items) == 2, "unlike free-riding, Shape B must never exceed the caller's limit"
+    assert second_mtm.id not in ids, "the displaced candidate is the priced cost of this shape"
+
+
+@pytest.mark.asyncio
+async def test_neighbor_expand_widen_zero_is_byte_identical_to_the_shipped_default() -> None:
+    stm_items, anchor, second_mtm, _neighbor_item = _two_mtm_one_neighbor_fixture()
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=stm_items,
+        mtm_hits_by_query={query_vec: [anchor, second_mtm]},
+        settings=RecallSettings(
+            neighbor_expand_radius=1,
+            neighbor_expand_widen=0,
+            stm_scoring="recency",
+            floor_protect_limit=0,
+            recency_floor_limit=0,
+        ),
+    )
+
+    items = await _full_rank(ranker, list(query_vec), limit=2)
+
+    assert [it.memory_id for it in items] == [anchor.id, second_mtm.id]
+
+
+@pytest.mark.asyncio
+async def test_neighbor_expand_widen_never_evicts_a_protected_floor_member() -> None:
+    """The correctness property `_narrow_after_expansion` exists for: widening the working limit
+    must not let a rescued, unconditionally-protected floor member (AD-195/ADR 0052) get cut back
+    out by the narrow step. `recency_floor_limit`/`floor_protect_limit` are left at shipped
+    defaults here specifically so a real protected member is in play."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    # A lone, very stale STM item — protected by `floor_protect_limit` regardless of relevance
+    # under `stm_scoring="recency"` (D1's documented uniform on/off — see `_protected_floor_ids`'s
+    # own docstring).
+    protected = _item("a just-said aside", tier=MemoryTier.STM, at=base, turn_seq=1)
+    # `anchor` carries a turn_seq with NO row at ±1 in the STM fixture (`protected` sits at 1,
+    # far below 100) — `neighbor_expand_radius` must be > 0 for `neighbor_expand_widen` to be
+    # live at all (dto.py's own docstring: "ignored when neighbor_expand_radius == 0"), but this
+    # keeps the fixture from actually INSERTING a neighbour, isolating the floor-rescue
+    # interaction this test is about from the neighbour-insertion mechanism the other tests cover.
+    anchor = _item(
+        "Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base, turn_seq=100
+    )
+    second_mtm = _item("Ada's dentist appointment is on Friday", tier=MemoryTier.MTM, at=base)
+    third_mtm = _item("Ada's dry cleaning is ready", tier=MemoryTier.MTM, at=base)
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=[protected],
+        mtm_hits_by_query={query_vec: [anchor, second_mtm, third_mtm]},
+        settings=RecallSettings(
+            neighbor_expand_radius=1,
+            neighbor_expand_widen=1,
+            stm_scoring="recency",
+        ),
+    )
+
+    items = await _full_rank(ranker, list(query_vec), limit=2)
+    ids = [it.memory_id for it in items]
+
+    assert (
+        protected.id in ids
+    ), f"a protected floor member was evicted by the widen/narrow round-trip: {ids!r}"
+    assert len(items) == 2
+
+
+def _nv(mid: str, score: float, *, is_floor: bool = False, is_neighbor: bool = False):
+    """A bare `RecallItemView` for the direct `_narrow_after_expansion` tests below — this helper
+    exercises the pure function on an order the caller controls exactly, instead of trying to coax
+    the whole composed ranker into producing one (which, under any weighting reachable from
+    `RecallSettings`, keeps every STM-family row at the tail anyway — see the docstring below)."""
+    return RecallItemView(
+        memory_id=mid,
+        content=f"content {mid}",
+        content_hash=f"h-{mid}",
+        tier=MemoryTier.STM if (is_floor or is_neighbor) else MemoryTier.MTM,
+        channel="stm" if (is_floor or is_neighbor) else "mtm",
+        namespace=_NS,
+        fused_score=score,
+        is_floor=is_floor,
+        is_neighbor=is_neighbor,
+    )
+
+
+def test_narrow_after_expansion_filters_the_pool_it_never_reorders_it() -> None:
+    """VERIFY 2026-09-24 — Shape B's narrow step rebuilt the pool in a NEW order.
+
+    `_narrow_after_expansion` chose its survivors by partitioning the merged pool into three
+    buckets and CONCATENATING them — `[*rest[:room], *rescued_neighbors, *protected]`. That is a
+    RE-ORDER of a list every stage upstream and downstream treats as a RANKING, and it is the same
+    class of defect AD-232 already found one stage earlier: `_expand_neighbors` used to end with
+    `expanded.sort(...)`, silently discarding `AdaptiveRerankGate.apply`'s ordering. The rule that
+    fix established is the one applied here — **decide membership, never position**.
+
+    Two things the concatenation broke, both visible in the assertion below. `_merge_floor`'s own
+    D3 contract (STATE-AND-DEFECTS-0829.md) is that "a protected member keeps whatever position
+    fusion actually earned it" — the concatenation moved every protected member to the END
+    regardless. And the injector's token budgeter trims from the TAIL, so a protected just-said
+    fact that fusion had ranked FIRST became the first thing a tight budget dropped, behind a
+    bottom-scored speculative neighbour.
+
+    Tested directly on the pure helper rather than through `rank()`: under every weighting
+    `RecallSettings` can express, an STM-family row (a floor member or a neighbour) lands at the
+    tail of the fused pool anyway, so the composed ranker cannot be made to produce the input
+    order that discriminates the two implementations. That is also why this reorder was never
+    noticed — it is unobservable end-to-end today and would surface the moment the fuse's ordering
+    changed. Mutation check: restore the concatenation and this goes red.
+    """
+    floor_first = _nv("F", 0.9, is_floor=True)  # fusion ranked the protected member FIRST
+    strong = _nv("A", 0.8)
+    weak = _nv("B", 0.7)
+    neighbour = _nv("N", 0.001, is_neighbor=True)  # appended last, by construction
+
+    out = _narrow_after_expansion(
+        [floor_first, strong, weak, neighbour], limit=3, neighbor_rescue_budget=1
+    )
+    ids = [v.memory_id for v in out]
+
+    assert ids == ["F", "A", "N"], (
+        "the narrow step must FILTER the pool, keeping the incoming order: the protected member "
+        "keeps the first position fusion gave it (D3), the weakest ordinary candidate `B` is what "
+        "the rescued neighbour displaces, and the neighbour stays where it was appended. The "
+        f"pre-fix concatenation returned ['A', 'N', 'F'] instead: {ids!r}"
+    )
+
+
+def test_narrow_after_expansion_still_keeps_every_protected_member() -> None:
+    """The guarantee the rewrite must not lose: `_merge_floor`'s protected members survive the
+    narrow unconditionally (AD-195/ADR 0052), even when the neighbour budget would otherwise want
+    their slot."""
+    out = _narrow_after_expansion(
+        [
+            _nv("A", 0.9),
+            _nv("F1", 0.5, is_floor=True),
+            _nv("F2", 0.4, is_floor=True),
+            _nv("N", 0.001, is_neighbor=True),
+        ],
+        limit=2,
+        neighbor_rescue_budget=1,
+    )
+    ids = [v.memory_id for v in out]
+
+    assert ids == ["F1", "F2"], f"a protected member lost its slot to the neighbour budget: {ids!r}"

@@ -385,12 +385,35 @@ class ThreeChannelRecallRanker:
             _to_view(s, "stm") for s in floor_scored if s.item.id in protected_ids
         ]
 
+        # Shape B — "fetch wider, narrow after expansion" (dto.py's own `neighbor_expand_widen`
+        # docstring has the full rationale): widen `_merge_floor`'s working limit so an inserted
+        # neighbour (and a protected-floor rescue) has more room to survive the rescue/cross-tier-
+        # dedup pass BEFORE the pool is cut back to what the caller actually asked for.
+        widen = (
+            self._settings.neighbor_expand_widen
+            if (self._settings.neighbor_expand_radius > 0 and not self._settings.neighbor_free_ride)
+            else 0
+        )
         items = _merge_floor(
             floor_views=protected_floor_views,
             fused=fused_views,
-            limit=limit,
+            limit=limit + widen,
             cross_tier_dedup=self._settings.cross_tier_dedup,
         )
+        if widen:
+            items = _narrow_after_expansion(items, limit=limit, neighbor_rescue_budget=widen)
+
+        # Shape A — "free-riding insertion" (dto.py's own `neighbor_free_ride` docstring): a
+        # neighbour rides along with the anchor that already earned its slot instead of competing
+        # for one of its own. Runs AFTER `_merge_floor`/the widen-narrow step above have already
+        # picked the `limit` winners — nothing already selected is ever displaced by this.
+        if self._settings.neighbor_expand_radius > 0 and self._settings.neighbor_free_ride:
+            items = await self._attach_free_riding_neighbors(
+                ns,
+                items,
+                floor_pool_size=len(floor_scored),
+                caller_identity_set=caller_identity_set,
+            )
 
         ran = RecallChannels(
             stm=channels.stm,
@@ -589,22 +612,18 @@ class ThreeChannelRecallRanker:
         radius = self._settings.neighbor_expand_radius
         if radius <= 0:
             return fused_views
+        # Shape A (dto.py's own `neighbor_free_ride` docstring): free-riding insertion is a
+        # SEPARATE mechanism, applied by `rank()` AFTER `_merge_floor` has already picked the
+        # winners (`_attach_free_riding_neighbors`) — this "costs a slot" path must not ALSO run,
+        # or the same neighbour could both compete here and free-ride there.
+        if self._settings.neighbor_free_ride:
+            return fused_views
         anchors = [v for v in fused_views if v.turn_seq is not None]
         if not anchors:
             return fused_views
-        try:
-            window = await self._stm.recent(
-                ns,
-                limit=self._settings.neighbor_expand_session_scan_limit,
-                caller_identity_set=caller_identity_set,
-            )
-        except StoreUnavailableError:
+        by_turn_seq = await self._turn_seq_window(ns, caller_identity_set)
+        if by_turn_seq is None:
             return fused_views  # enhancement, not a named channel — degrade to no expansion.
-        by_turn_seq: dict[int, Scored[MemoryItem]] = {}
-        for scored in window:
-            seq = scored.item.turn_seq
-            if seq is not None and seq not in by_turn_seq:  # first-found wins a collision
-                by_turn_seq[seq] = scored
 
         present_ids = {v.memory_id for v in fused_views}
         neighbors: list[RecallItemView] = []
@@ -613,32 +632,15 @@ class ThreeChannelRecallRanker:
             anchor_turn_seq = anchor.turn_seq
             if anchor_turn_seq is None:  # pragma: no cover - excluded by `anchors` filter above
                 continue
-            for offset in range(1, radius + 1):
-                for seq in (anchor_turn_seq - offset, anchor_turn_seq + offset):
-                    if seq < 0:
-                        continue
-                    neighbor = by_turn_seq.get(seq)
-                    if neighbor is None or neighbor.item.id in present_ids:
-                        continue
-                    present_ids.add(neighbor.item.id)
-                    # STM-channel-family score (this docstring's "the fix" section) — NEVER
-                    # derived from `anchor.fused_score`, so a neighbour can never borrow a
-                    # higher-weighted channel's scale.
-                    neighbor_score = self._settings.weight_stm / (
-                        self._settings.rrf_k + floor_pool_size + offset
-                    )
-                    # `is_floor=False`: the STM adapter's own `recent()` stamps EVERY returned
-                    # candidate `is_floor=True` unconditionally (module docstring, "`is_floor`
-                    # from the adapter marks EVERY STM candidate") — the SAME reason the main
-                    # `fused_views` comprehension above forces it False. A neighbour earns
-                    # `is_floor=True` only if `_merge_floor` independently re-stamps it because it
-                    # ALSO happens to be a protected floor member, exactly like any other fused
-                    # candidate — never because of how this method fetched it.
-                    view = _to_view(neighbor, "stm", fused_score=neighbor_score).model_copy(
-                        update={"is_neighbor": True, "is_floor": False}
-                    )
-                    neighbors.append(view)
-                    by_anchor.setdefault(anchor.memory_id, []).append(view)
+            for view in self._neighbors_of(
+                anchor_turn_seq,
+                by_turn_seq,
+                radius=radius,
+                present_ids=present_ids,
+                floor_pool_size=floor_pool_size,
+            ):
+                neighbors.append(view)
+                by_anchor.setdefault(anchor.memory_id, []).append(view)
         # PLACEMENT. `fused_views` order is NEVER re-sorted here — VERIFY PASS 2026-09-23: this
         # method used to end with `expanded.sort(key=fused_score)` over the whole merged list,
         # which silently discarded `AdaptiveRerankGate.apply`'s ordering, because the gate records
@@ -674,6 +676,176 @@ class ThreeChannelRecallRanker:
             )
             merged.insert(at, view)
         return merged
+
+    async def _turn_seq_window(
+        self, ns: Namespace, caller_identity_set: CallerIdentitySet | None
+    ) -> dict[int, Scored[MemoryItem]] | None:
+        """The ``turn_seq -> item`` lookup S1b's two expansion mechanisms (costs-a-slot and
+        free-riding, both below) share — one session-window fetch, never duplicated per mechanism.
+        ``None`` on a store outage (the SAME graceful-degrade contract ``_expand_neighbors``'s own
+        docstring documents: an enhancement, not a named channel, so both callers fail OPEN to
+        "no expansion" rather than failing the recall)."""
+        try:
+            window = await self._stm.recent(
+                ns,
+                limit=self._settings.neighbor_expand_session_scan_limit,
+                caller_identity_set=caller_identity_set,
+            )
+        except StoreUnavailableError:
+            return None
+        by_turn_seq: dict[int, Scored[MemoryItem]] = {}
+        for scored in window:
+            seq = scored.item.turn_seq
+            if seq is not None and seq not in by_turn_seq:  # first-found wins a collision
+                by_turn_seq[seq] = scored
+        return by_turn_seq
+
+    def _neighbors_of(
+        self,
+        anchor_turn_seq: int,
+        by_turn_seq: dict[int, Scored[MemoryItem]],
+        *,
+        radius: int,
+        present_ids: set[str],
+        floor_pool_size: int,
+    ) -> list[RecallItemView]:
+        """The ``±radius`` neighbour views for one anchor, scored on the STM channel's OWN weight
+        family (``_expand_neighbors``'s own docstring, "the fix" — NEVER derived from the anchor's
+        score, so a neighbour can never borrow a higher-weighted channel's scale). ``present_ids``
+        is mutated in place (both call sites need a single ACCUMULATING de-dup set across every
+        anchor they process, not a per-anchor-local one, so the same physical neighbour is never
+        attached twice to two different anchors)."""
+        found: list[RecallItemView] = []
+        for offset in range(1, radius + 1):
+            for seq in (anchor_turn_seq - offset, anchor_turn_seq + offset):
+                if seq < 0:
+                    continue
+                neighbor = by_turn_seq.get(seq)
+                if neighbor is None or neighbor.item.id in present_ids:
+                    continue
+                present_ids.add(neighbor.item.id)
+                neighbor_score = self._settings.weight_stm / (
+                    self._settings.rrf_k + floor_pool_size + offset
+                )
+                # `is_floor=False`: the STM adapter's own `recent()` stamps EVERY returned
+                # candidate `is_floor=True` unconditionally — a neighbour earns `is_floor=True`
+                # only if a later `_merge_floor` pass independently re-stamps it because it ALSO
+                # happens to be a protected floor member, never because of how it was fetched.
+                view = _to_view(neighbor, "stm", fused_score=neighbor_score).model_copy(
+                    update={"is_neighbor": True, "is_floor": False}
+                )
+                found.append(view)
+        return found
+
+    async def _attach_free_riding_neighbors(
+        self,
+        ns: Namespace,
+        items: list[RecallItemView],
+        *,
+        floor_pool_size: int,
+        caller_identity_set: CallerIdentitySet | None,
+    ) -> list[RecallItemView]:
+        """Shape A — free-riding insertion (``dto.py``'s own ``neighbor_free_ride`` docstring has
+        the full design rationale; ADR 0053 "what would need to change before this ships ON" §1).
+        Runs AFTER ``_merge_floor`` (and the Shape-B widen/narrow step, when that is also
+        configured — the two are mutually exclusive by construction, see ``rank()``) has already
+        picked the ``limit`` winners: a neighbour of a SURVIVING item is appended to the returned
+        list, never displacing anything already in it. Nothing here can shrink ``items`` or change
+        the order/content of what is already present — the only observable effect is a LONGER
+        list, exactly the trade `neighbor_free_ride`'s own docstring names ("the downside is
+        bounded to prompt length").
+
+        Uses the SAME session-window lookup and STM-family neighbour score as the costs-a-slot
+        mechanism (``_turn_seq_window``/``_neighbors_of``) — a free-riding neighbour is not a
+        different KIND of candidate, only a differently-PLACED one."""
+        anchors = [v for v in items if v.turn_seq is not None]
+        if not anchors:
+            return items
+        by_turn_seq = await self._turn_seq_window(ns, caller_identity_set)
+        if by_turn_seq is None:
+            return items  # store outage on the expansion-only fetch — degrade to no attachment.
+        present_ids = {v.memory_id for v in items}
+        radius = self._settings.neighbor_expand_radius
+        extras: list[RecallItemView] = []
+        for anchor in anchors:
+            anchor_turn_seq = anchor.turn_seq
+            if anchor_turn_seq is None:  # pragma: no cover - excluded by `anchors` filter above
+                continue
+            extras.extend(
+                self._neighbors_of(
+                    anchor_turn_seq,
+                    by_turn_seq,
+                    radius=radius,
+                    present_ids=present_ids,
+                    floor_pool_size=floor_pool_size,
+                )
+            )
+        return [*items, *extras]
+
+
+def _narrow_after_expansion(
+    items: list[RecallItemView], *, limit: int, neighbor_rescue_budget: int
+) -> list[RecallItemView]:
+    """Shape B's second half — "fetch wider, narrow after expansion" (``dto.py``'s own
+    ``neighbor_expand_widen`` docstring). ``items`` was produced by ``_merge_floor`` at a WIDENED
+    working limit (``limit + neighbor_expand_widen``); this cuts it back down to the caller's real
+    ``limit``, in two stages:
+
+    1. **Never break ``_merge_floor``'s own "a protected floor member is never evicted"
+       invariant.** A blind ``items[:limit]`` slice could otherwise push a rescued protected item
+       (which ``_merge_floor`` deliberately appends at the END, past the naturally-ranked head)
+       back out past the real limit — exactly the guarantee AD-195/ADR 0052 exist to keep.
+       ``is_floor`` members are therefore kept unconditionally, regardless of budget.
+
+    2. **The actual "expansion informs ranking" mechanism**: up to ``neighbor_rescue_budget`` of
+       the neighbours that survived the WIDENED first cut (``is_neighbor``, not also
+       ``is_floor`` — a rescued floor member is already covered by stage 1) are guaranteed a
+       final slot too, in their already-established order (best-scored first — ``_expand_
+       neighbors``'s stable insertion, never re-sorted here). Unlike Shape A (``neighbor_free_
+       ride``, which NEVER displaces anything), this stage DOES displace the weakest ordinary
+       (non-floor, non-neighbour) candidates to make room when neither this method nor
+       ``_merge_floor``'s own natural ranking gave the neighbour a slot on merit alone — the
+       priced trade this shape commits to, capped at ``neighbor_rescue_budget`` displacements so
+       the cost is bounded, not unlimited the way an uncapped rescue would be."""
+    if len(items) <= limit:
+        return items
+    # SELECT, then EMIT IN THE INCOMING ORDER. VERIFY 2026-09-24: this used to partition the pool
+    # into three buckets and CONCATENATE them (`rest`, then rescued neighbours, then floor
+    # members), which is a RE-ORDER of a list every stage upstream treats as a ranking. It is the
+    # same defect class AD-232 found one stage earlier (`_expand_neighbors` ending with
+    # `expanded.sort(...)`, silently discarding the rerank gate's ordering) and fixed with the same
+    # rule: decide membership here, never position. Two concrete inversions it produced: a
+    # neighbour is scored at the very BOTTOM of the pool by construction (`weight_stm / (rrf_k +
+    # floor_pool_size + offset)`, AD-231) and `_expand_neighbors` appends it LAST, yet it was
+    # emitted ahead of the protected just-said fact ADR 0052 exists to keep — and the injector's
+    # token budgeter trims from the TAIL, so a tight budget dropped the protected row and kept the
+    # speculative one; and `_merge_floor`'s own D3 contract ("a protected member keeps whatever
+    # position fusion actually earned it", STATE-AND-DEFECTS-0829.md) was discarded for every
+    # protected member on every widened call.
+    keep: set[int] = set()
+    # (1) every protected floor member, unconditionally — `_merge_floor`'s "never evicted"
+    #     guarantee (AD-195/ADR 0052) survives the narrow, exactly as before.
+    for i, view in enumerate(items):
+        if view.is_floor:
+            keep.add(i)
+    # (2) up to `neighbor_rescue_budget` neighbours, in their already-established order — and only
+    #     while doing so does not push the count past `limit`, so a neighbour can never be the
+    #     reason a protected member is evicted (the ordering between (1) and (2) is the priority,
+    #     not a position).
+    rescued = 0
+    for i, view in enumerate(items):
+        if rescued >= neighbor_rescue_budget or len(keep) >= limit:
+            break
+        if view.is_neighbor and not view.is_floor:
+            keep.add(i)
+            rescued += 1
+    # (3) fill the remaining slots with the best-ranked ordinary candidates — the weakest ones are
+    #     what a rescued neighbour displaces, capped at `neighbor_rescue_budget` displacements.
+    for i, _view in enumerate(items):
+        if len(keep) >= limit:
+            break
+        keep.add(i)
+    return [view for i, view in enumerate(items) if i in keep][:limit]
 
 
 def _lexical_overlap(query: str, content: str) -> float:

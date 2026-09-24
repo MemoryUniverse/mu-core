@@ -334,3 +334,71 @@ async def test_a_member_point_gets_only_the_rows_the_room_stamped_for_them(
         assert await stm.get(room, memory_id, caller_identity_set=frozenset({CAROL})) is None
         with pytest.raises(CallerIdentitySetRequiredError):
             await stm.get(room, memory_id)
+
+
+async def test_the_shared_plane_write_path_assigns_a_real_turn_seq(
+    room: Namespace,
+    redis_client: Redis,
+    qdrant_client: AsyncQdrantClient,
+    embedder: SentenceTransformerEmbedder,
+) -> None:
+    """VERIFY 2026-09-24 — the THIRD ingest path's half of AD-234, proved rather than argued.
+
+    AD-234 found that only ``LocalMemory.add`` assigned ``turn_seq``; ``SurfaceFacade.add`` and
+    mu-server's ``SharedMemoryService.add`` left every row they wrote permanently ``None``, i.e.
+    permanently unexpandable by S1b. AD-236 closed that by centralising the fallback in
+    ``IngestService.remember`` (``_ensure_turn_seq``) and shipped a real-store proof for the
+    facade — but mu-server's own path was recorded as needing "zero code changes" on the strength
+    of READING one line (``service.py``: ``await self._c.ingest.remember(activity)``). Reading is
+    how AD-233 got missed. This is that path's missing real-store proof, exercised where mu-core
+    can reach it: the SHARED-η branch of ``_ensure_turn_seq`` — the branch mu-server is the only
+    caller of, and the one carrying the ``authorized_ids -> caller_identity_set`` coercion that a
+    PRIVATE-η test can never touch — against real Valkey and real Qdrant.
+
+    Mutation check: delete ``activity = await self._ensure_turn_seq(activity)`` from
+    ``IngestService.remember`` and this goes red on the first assertion.
+    """
+    stm = RedisStmAdapter(redis_client)
+    service = IngestService(
+        stm=stm,
+        mtm=QdrantMtmAdapter(qdrant_client, dim=embedder.dimension),
+        embedder=embedder,
+        bus=InprocBus(),
+        ledger=RedisStageLedger(redis_client, key_prefix=f"mu:test-ledger:{room.workspace}"),
+        clock=SystemClock(),
+    )
+    try:
+        # Constructed exactly as `SharedMemoryService.add` constructs it (mu-server
+        # `service.py`): no `turn_seq`, a real roster stamp, `kind="user_message"`.
+        results = [
+            await service.remember(
+                IngestActivity(
+                    namespace=room,
+                    host="mu-server",
+                    session_offset=f"off-seq-{n}",
+                    kind="user_message",
+                    text=f"a room message number {n}",
+                    authorized_ids=ROSTER,
+                )
+            )
+            for n in range(2)
+        ]
+
+        items = [await stm.get(room, r.memory_id, caller_identity_set=ROSTER) for r in results]
+        assert all(i is not None for i in items), "the shared write did not land in real STM"
+        seqs = [i.turn_seq for i in items if i is not None]
+        assert all(s is not None for s in seqs), (
+            "a row written through the SHARED-plane ingest path carries turn_seq=None — the "
+            f"centralised IngestService fallback did not fire for a SHARED η: {seqs!r}"
+        )
+        assert seqs[1] == seqs[0] + 1, (  # type: ignore[operator]
+            f"successive shared-plane writes did not get consecutive turn_seq: {seqs!r}"
+        )
+    finally:
+        coll = collection_name(room, embedder.dimension)
+        if await qdrant_client.collection_exists(coll):
+            await qdrant_client.delete_collection(coll)
+        for pattern in (f"mu/{room.to_prefix()}*", f"mu:test-ledger:{room.workspace}*"):
+            keys = [k async for k in redis_client.scan_iter(match=pattern.encode())]
+            if keys:
+                await redis_client.delete(*keys)

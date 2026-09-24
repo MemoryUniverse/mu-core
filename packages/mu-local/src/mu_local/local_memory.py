@@ -70,7 +70,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from mu_contracts.contracts.defaults import DEFAULT_CONSOLIDATE_LIMIT
 from mu_contracts.contracts.memory import MemoryResponse
-from mu_contracts.contracts.recall import RecallChannels, RecallItemView, RecallResult
+from mu_contracts.contracts.recall import RecallItemView, RecallResult
 from mu_contracts.contracts.views import (
     ConsolidateView,
     ContextView,
@@ -82,7 +82,6 @@ from mu_contracts.domain.model.agent import (
     resolve_subagent_identity,
     subagent_write_namespace,
 )
-from mu_contracts.domain.model.memory import Tier
 from mu_contracts.domain.model.scope import AgentKind, ClientScope
 from mu_contracts.ports.bus import EventBusPort
 from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
@@ -98,6 +97,9 @@ from mu_engine.services.ingest import IngestResult
 from mu_engine.services.recall.dto import RecallChannels as _EngineRecallChannels
 from mu_engine.services.recall.dto import RecallQuery
 from mu_engine.services.recall.dto import RecallResult as _EngineRecallResult
+from mu_engine.services.recall.mapping import (
+    to_canonical_recall_result as _to_canonical_recall_result,
+)
 from mu_engine.storage.domain.memory import MemoryItem, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.surface.facade import SurfaceFacade
@@ -706,36 +708,17 @@ def _channels_for_tier(tier: MemoryTier | None) -> _EngineRecallChannels:
 def _to_recall_result(result: _EngineRecallResult) -> RecallResult:
     """Map the engine-native :class:`~mu_engine.services.recall.dto.RecallResult` onto the
     canonical :class:`~mu_contracts.contracts.recall.RecallResult` (Decision B) — REPLACES the
-    deleted ``_to_list_view``/``mu_local.views.MemoryListView`` collapse. ``namespace`` and
-    ``DegradeReason`` are the SAME type on both sides (``mu_engine.storage.domain.namespace`` /
-    ``mu_engine.services.recall.dto`` re-export ``mu_contracts``'s own classes, module docstrings)
-    so they pass straight through; only the per-item ``Tier``/``RecallChannels`` shapes need an
-    explicit re-wrap since the engine's internal item additionally carries a federate-dedup
-    ``content_hash``/per-item ``namespace`` this surface deliberately drops (Decision B cross-
-    cutting section, ``mu_contracts.contracts.recall`` module docstring)."""
-    return RecallResult(
-        namespace=result.namespace,
-        items=[
-            RecallItemView(
-                memory_id=item.memory_id,
-                content=item.content,
-                tier=Tier(item.tier.value),
-                channel=item.channel,
-                fused_score=item.fused_score,
-                rerank_score=item.rerank_score,
-                is_floor=item.is_floor,
-                artifact_ref=item.artifact_ref,
-            )
-            for item in result.items
-        ],
-        channels_run=RecallChannels(
-            stm=result.channels_run.stm,
-            mtm=result.channels_run.mtm,
-            ltm=result.channels_run.ltm,
-        ),
-        degraded=result.degraded,
-        generated_at=result.generated_at,
-    )
+    deleted ``_to_list_view``/``mu_local.views.MemoryListView`` collapse.
+
+    AD-233/AD-236 (``docs/tracking/ARCHITECTURE-DELTAS.md``): this used to hand-roll the
+    field-by-field projection inline, and when S1b (ADR 0053) added ``turn_seq``/``is_neighbor``
+    to the engine-internal item, THIS copy was the one that got updated while ``mu_engine.
+    surface.facade._to_canonical_recall_result`` and mu-server's own inline mapping both silently
+    kept dropping both fields — three independent copies of one projection, only one remembered.
+    Now a thin call-through to the ONE shared mapping
+    (:func:`mu_engine.services.recall.mapping.to_canonical_recall_result`) every caller imports
+    instead of re-deriving; see that module's own docstring for the fuller account."""
+    return _to_canonical_recall_result(result)
 
 
 def _to_memory_response(item: MemoryItem) -> MemoryResponse:

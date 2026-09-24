@@ -394,6 +394,63 @@ class RecallSettings(BaseModel):
     # against S1b keeps its meaning; `MU_RECALL__NEIGHBOR_EXPAND_PLACEMENT=after_anchor`.
     neighbor_expand_placement: Literal["tail", "after_anchor"] = "tail"
 
+    # S1b — TWO FURTHER SHAPES (TRACE-0923.md follow-up, ADR 0053 "what would need to change
+    # before this ships ON" §1/§2; ARCHITECTURE-DELTAS.md AD-233's own amendment: "the two live
+    # options are the free-riding insertion ... or a wider fetch narrowed after expansion. Nothing
+    # else is left"). Both are OFF by default and, unlike `neighbor_expand_placement`, are not
+    # alternate values of one knob — a deployment can run neither, either, or (nonsensically) both;
+    # `rank()` checks `neighbor_free_ride` first and short-circuits the "costs a slot" mechanism
+    # entirely when it is set, so the two never actually compete for the same neighbour.
+    #
+    # **`neighbor_free_ride`** — a neighbour rides along WITH the anchor that earned its slot
+    # instead of consuming one of its own. `_expand_neighbors`'s ordinary "costs a slot" insertion
+    # (AD-231/AD-232's own mechanism, above) is SKIPPED entirely when this is `True` — inserting a
+    # neighbour into the SAME RRF-competed pool `_merge_floor` truncates was the thing AD-233's own
+    # amendment names as unable to pay ("only ~1 in 3 neighbours is gold"), so free-riding runs a
+    # SEPARATE step, `_attach_free_riding_neighbors`, strictly AFTER `_merge_floor` has already
+    # picked the `limit` winners: for every surviving item carrying a `turn_seq`, its real
+    # `±neighbor_expand_radius` neighbours (the SAME session-window lookup and STM-family score as
+    # the costs-a-slot mechanism, `weight_stm / (rrf_k + floor_pool_size + offset)` — never derived
+    # from the anchor's own score, same AD-231 regression guard) are APPENDED to the returned list,
+    # never displacing anything already selected. This means `RecallResult.items` can carry MORE
+    # than `limit` entries whenever this is on and at least one surviving item has a real
+    # neighbour — the deliberate trade the ADR's own "what would need to change" section names:
+    # "the downside is bounded to prompt length" rather than to precision, since nothing already
+    # ranked in ever loses its slot to make room for one. A caller that renders a strict `limit`
+    # window (e.g. `build_context`'s token budget) is expected to either accept the extra
+    # provenance-only context or filter `is_neighbor` rows itself — this field does not change
+    # what `limit` MEANS, only whether extras may ride past it.
+    # Env override: `MU_RECALL__NEIGHBOR_FREE_RIDE`.
+    neighbor_free_ride: bool = False
+    # **`neighbor_expand_widen`** — "fetch wider, narrow after expansion": how many EXTRA
+    # candidates beyond the caller's real `limit` this shape fetches/considers before cutting back
+    # down to `limit`, AND (the same number — one knob, two effects that share a rationale) how
+    # many of the neighbours that survive that wider look are then GUARANTEED a final slot. `0`
+    # (the default) is byte-identical to the shipped "costs a slot at the real limit" behaviour.
+    # At `>0`:
+    #   1. `_merge_floor` runs at `limit + neighbor_expand_widen` — giving an inserted neighbour,
+    #      and a protected-floor RESCUE, more room to survive the FIRST truncation and the
+    #      cross-tier dedup pass inside it, instead of being squeezed out before either ever
+    #      considers it.
+    #   2. `_narrow_after_expansion` then cuts back to `limit` in two tiers: every `is_floor`
+    #      member survives unconditionally (never breaks AD-195/ADR 0052's own guarantee — a
+    #      blind `items[:limit]` re-slice of the widened pool could otherwise push a RESCUED
+    #      protected item, which `_merge_floor` deliberately appends past the naturally-ranked
+    #      head, back out past the real limit); THEN up to `neighbor_expand_widen` of the
+    #      neighbours that made the widened cut are ALSO guaranteed a slot, in their
+    #      already-established (best-scored-first) order — displacing the WEAKEST ordinary
+    #      (non-floor, non-neighbour) candidates if there is not already room. **This is the
+    #      priced trade that makes Shape B a distinct mechanism from Shape A
+    #      (`neighbor_free_ride`, above), not a second copy of it**: free-riding NEVER displaces
+    #      anything (bounded to prompt length); this shape DOES displace up to
+    #      `neighbor_expand_widen` of the weakest real candidates to let a neighbour compete for a
+    #      genuine slot, capped so the cost stays bounded rather than unlimited.
+    # Ignored when `neighbor_expand_radius == 0` (nothing to widen for) or when
+    # `neighbor_free_ride` is set (the two mechanisms are alternatives, not composable — free-
+    # riding already never costs a slot, so there is nothing for a rescue budget to buy it).
+    # Env override: `MU_RECALL__NEIGHBOR_EXPAND_WIDEN`.
+    neighbor_expand_widen: int = Field(default=0, ge=0)
+
     # D1 STM relevance scoring (DATA-QUALITY-ASSESSMENT.md §3.1, floor-fix follow-up to 02fbed9):
     # ``recency_floor_limit``/``floor_protect_limit`` bound HOW MANY STM candidates enter the fuse
     # and HOW MANY are unconditionally protected — but the candidates themselves still carried NO

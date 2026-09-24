@@ -73,7 +73,6 @@ import uuid
 from typing import Any, NoReturn, Protocol
 
 from mu_contracts.contracts.memory import MemoryResponse
-from mu_contracts.contracts.recall import RecallChannels as CanonicalRecallChannels
 from mu_contracts.contracts.recall import RecallItemView as CanonicalRecallItemView
 from mu_contracts.contracts.recall import RecallResult as CanonicalRecallResult
 from mu_contracts.contracts.views import (
@@ -109,6 +108,9 @@ from mu_engine.services.ingest import IngestResult, IngestService
 from mu_engine.services.recall.dto import RecallChannels as _EngineRecallChannels
 from mu_engine.services.recall.dto import RecallQuery
 from mu_engine.services.recall.dto import RecallResult as _EngineRecallResult
+from mu_engine.services.recall.mapping import (
+    to_canonical_recall_result as _to_canonical_recall_result_shared,
+)
 from mu_engine.services.recall.service import RecallService
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -773,37 +775,17 @@ def _channels_for_tier(tier: MemoryTier | None) -> _EngineRecallChannels:
 
 def _to_canonical_recall_result(result: _EngineRecallResult) -> CanonicalRecallResult:
     """Map the engine-native :class:`~mu_engine.services.recall.dto.RecallResult` onto the
-    canonical :class:`~mu_contracts.contracts.recall.RecallResult` (Decision B) — a PORT of
-    ``mu_local.local_memory._to_recall_result`` (``mu-local/local_memory.py:468-497``), re-derived
-    here since that helper is private to a package this module cannot import. ``namespace`` and
-    ``DegradeReason`` are the SAME type on both sides (``mu_engine.storage.domain.namespace`` /
-    ``mu_engine.services.recall.dto`` re-export ``mu_contracts``'s own classes) so they pass
-    straight through; only the per-item ``Tier``/``RecallChannels`` shapes need an explicit re-wrap
-    since the engine's internal item additionally carries a federate-dedup ``content_hash``/
-    per-item ``namespace`` the canonical surface item deliberately drops."""
-    return CanonicalRecallResult(
-        namespace=result.namespace,
-        items=[
-            CanonicalRecallItemView(
-                memory_id=item.memory_id,
-                content=item.content,
-                tier=CanonicalTier(item.tier.value),
-                channel=item.channel,
-                fused_score=item.fused_score,
-                rerank_score=item.rerank_score,
-                is_floor=item.is_floor,
-                artifact_ref=item.artifact_ref,
-            )
-            for item in result.items
-        ],
-        channels_run=CanonicalRecallChannels(
-            stm=result.channels_run.stm,
-            mtm=result.channels_run.mtm,
-            ltm=result.channels_run.ltm,
-        ),
-        degraded=result.degraded,
-        generated_at=result.generated_at,
-    )
+    canonical :class:`~mu_contracts.contracts.recall.RecallResult` (Decision B).
+
+    AD-233/AD-236: this used to be a hand-duplicated PORT of ``mu_local.local_memory.
+    _to_recall_result`` ("re-derived here since that helper is private to a package this module
+    cannot import") — now a thin call-through to the ONE shared mapping
+    (:func:`mu_engine.services.recall.mapping.to_canonical_recall_result`), which lives in THIS
+    package precisely so every caller (this module included) can import it instead of
+    re-deriving it. See that module's own docstring for why the duplication was a real defect,
+    not a style nit — it is how ``turn_seq``/``is_neighbor`` went unforwarded at two of three
+    call sites the first time they were added."""
+    return _to_canonical_recall_result_shared(result)
 
 
 def to_memory_response(item: MemoryItem) -> MemoryResponse:

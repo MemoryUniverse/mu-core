@@ -97,6 +97,20 @@ class RecallItemView(BaseModel):
     rerank_score: float | None = None
     is_floor: bool = False
     artifact_ref: str | None = None
+    # S1b (TRACE-0923.md §7/§6.2/§5.1, ADR 0053, AD-233): the wire-contract half of the engine's
+    # own `mu_engine.services.recall.dto.RecallItemView.turn_seq`/`is_neighbor` pair. AD-233 found
+    # that neither field ever reached this canonical surface (`extra="forbid"` here refused them
+    # silently) — `LocalMemory.recall`/`_to_recall_result` built this DTO from the engine's answer
+    # but had nothing to forward the two fields INTO, so every `is_neighbor` attribution the eval
+    # harness read via `getattr(item, "is_neighbor", False)` (AD-228) was structurally `False`
+    # forever, whatever the ranker actually did — S1b's own `neighbor_items_seen=0` measurement
+    # was therefore evidence of nothing (AD-231's causal claim built on it was retracted by
+    # AD-233). Added here, additive and backward-compatible (both default to the pre-existing
+    # values every caller already observed: `None`/`False`), so a neighbour that wins a result
+    # slot is finally attributable end to end — see `_to_recall_result` (`mu-local/local_memory.
+    # py`) for the forwarding half.
+    turn_seq: int | None = None
+    is_neighbor: bool = False
 
 
 class RecallResult(BaseModel):

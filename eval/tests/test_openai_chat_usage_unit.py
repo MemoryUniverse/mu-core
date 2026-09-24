@@ -91,6 +91,47 @@ async def test_complete_with_usage_returns_content_and_parsed_usage_together() -
         await chat.aclose()
 
 
+async def test_complete_with_usage_captures_finish_reason_from_the_wire_response() -> None:
+    """`finish_reason` is what turns an empty completion into an ANSWERABLE question (budget
+    exhaustion vs refusal vs something else) instead of a guess — see
+    `answer_quality._is_budget_exhausted`. Pinned here at the source: the client must read it off
+    `choices[0]`, not synthesize it."""
+
+    class _FinishReasonTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "model": "gpt-5-2025-08-07",
+                    "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 300},
+                },
+                request=request,
+            )
+
+    chat = _chat(_FinishReasonTransport())
+    try:
+        result = await chat.complete_with_usage(system="s", user="u", max_tokens=300)
+        assert result.content == ""
+        assert result.finish_reason == "length"
+        assert result.budget_retried is False  # this client never retries anything but 429
+    finally:
+        await chat.aclose()
+
+
+async def test_complete_with_usage_finish_reason_is_none_when_the_wire_omits_it() -> None:
+    """A response with no `finish_reason` at all (a non-conforming deployment) must read back as
+    `None`, not crash and not silently default to `"stop"` — a caller must be able to tell "we
+    don't know" apart from "it really did stop normally"."""
+    transport = _ScriptedUsageTransport([({"total_tokens": 7}, 0.0)])
+    chat = _chat(transport)
+    try:
+        result = await chat.complete_with_usage(system="s", user="u", max_tokens=16)
+        assert result.finish_reason is None
+    finally:
+        await chat.aclose()
+
+
 async def test_complete_still_returns_a_bare_string_unchanged() -> None:
     """Backward compatibility: every pre-existing caller of `.complete()` (judge_control_set,
     judge-probe, PacedOpenAICompatChat) expects a plain string return, not a CompletionResult."""

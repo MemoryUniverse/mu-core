@@ -507,7 +507,11 @@ def _print_usage_summary(usage: dict[str, Any]) -> None:
 async def _cmd_answer_quality(args: argparse.Namespace) -> int:
     import time
 
-    from mu_eval.answer_quality import eligible_query_count, run_answer_quality
+    from mu_eval.answer_quality import (
+        compute_pairwise_noise,
+        eligible_query_count,
+        run_answer_quality,
+    )
     from mu_eval.openai_chat import OpenAICompatChat
     from mu_eval.provenance import build_provenance
     from mu_eval.repeats import run_n_times, summarize_repeats
@@ -520,14 +524,27 @@ async def _cmd_answer_quality(args: argparse.Namespace) -> int:
     recall_limit = args.limit or max(args.k)
 
     n_eligible = eligible_query_count(conversations, args.max_queries)
+    # TRUSTWORTHY-MEASUREMENT-0924: `--num-runs N` (N>=2, e.g. a noise-floor measurement) fires
+    # the WHOLE pipeline N times — `run_n_times`'s own docstring: "fresh ingest ... every time".
+    # The projection must say so too: printing only ONE run's worth of eligible queries when N
+    # calls are actually about to happen understates the projection by exactly a factor of N,
+    # which is precisely the number CLAUDE.md's "abandon now if this is not worth it" line exists
+    # to make trustworthy BEFORE anything is spent.
+    n_projected = n_eligible * max(args.num_runs, 1)
     means = _resolve_projection_means(projection_source=args.projection_source)
     _print_projected_cost(
-        n_queries=n_eligible,
+        n_queries=n_projected,
         answer_model=args.answer_model,
         judge_model=args.judge_model,
         rate_card_path=args.rate_card,
         means=means,
     )
+    if args.num_runs > 1:
+        _print(
+            f"  ({n_eligible} eligible queries x {args.num_runs} runs = {n_projected} — "
+            "--num-runs repeats the WHOLE pipeline, this is not a typo)"
+        )
+        sys.stdout.flush()
 
     api_key = _resolve_api_key(args, subcommand="answer-quality")
     answer_chat = OpenAICompatChat(
@@ -550,6 +567,17 @@ async def _cmd_answer_quality(args: argparse.Namespace) -> int:
         if done == 1 or done == total or done % 25 == 0:
             elapsed = time.monotonic() - started
             _print(f"  ... {done}/{total} graded ({elapsed:.0f}s elapsed)")
+            # TRUSTWORTHY-MEASUREMENT-0924: same fix `_print_projected_cost` already had to make
+            # (that function's own docstring measures it directly) — CPython block-buffers stdout
+            # (8 KB) whenever it is not a TTY, and every real invocation of this harness is
+            # exactly that (`vm_eval.sh` over ssh, redirected to a log). MEASURED live during this
+            # pass: without this flush, a real answer-quality run against conv-26 (149 rows)
+            # produced ZERO visible heartbeat lines for its full multi-minute duration — the first
+            # "... N/150 graded" line only reached the log once the 8 KB buffer finally filled
+            # from unrelated `structlog` output, long after those rows were actually graded. A
+            # caller watching the log to decide whether a run is progressing or hung sees nothing
+            # for minutes at a time, which is indistinguishable from the run actually being hung.
+            sys.stdout.flush()
 
     async def _once(run_id: str) -> Any:
         return await run_answer_quality(
@@ -614,6 +642,32 @@ async def _cmd_answer_quality(args: argparse.Namespace) -> int:
             f"min={summary.minimum:.4f}  max={summary.maximum:.4f}  spread={summary.spread:.4f}"
         )
         _print(f"values: {[round(v, 4) for v in summary.values]}")
+
+        # THE NOISE FLOOR (TRUSTWORTHY-MEASUREMENT-0924): a paired `compare_runs` between each
+        # pair of consecutive repeats of this SAME, unchanged config — names which rows moved and
+        # how much judge-parseability churned, which `summary.spread` (an aggregate delta) cannot
+        # show. Always computed when `--num-runs >= 2` and rows were kept; never left for a
+        # separate `compare` invocation the caller has to remember to run.
+        pairwise_noise = compute_pairwise_noise(reports)
+        if pairwise_noise:
+            total_fixed = sum(len(p["fixed"]) for p in pairwise_noise)
+            total_regressed = sum(len(p["regressed"]) for p in pairwise_noise)
+            total_became_unparseable = sum(len(p["became_unparseable"]) for p in pairwise_noise)
+            total_recovered = sum(len(p["recovered_from_unparseable"]) for p in pairwise_noise)
+            _print(
+                f"\nNOISE FLOOR ({len(pairwise_noise)} consecutive-repeat pair(s), SAME config): "
+                f"verdict churn (fixed+regressed)={total_fixed + total_regressed}  "
+                f"parseability churn (became+recovered unparseable)="
+                f"{total_became_unparseable + total_recovered}"
+            )
+            for p in pairwise_noise:
+                _print(f"  {p['run_a']} vs {p['run_b']}: {p['verdict']}")
+        elif args.no_rows:
+            _print(
+                "\nNOISE FLOOR: not computed (--no-rows was set — pass rows through to measure "
+                "run-to-run churn)."
+            )
+
         provenance = build_provenance(
             dataset_path=args.dataset,
             chats={"answer": answer_chat, "judge": judge_chat},
@@ -634,6 +688,7 @@ async def _cmd_answer_quality(args: argparse.Namespace) -> int:
             {
                 "runs": [r.model_dump(mode="json") for r in reports],
                 "repeat_summary": summary.model_dump(mode="json"),
+                "pairwise_noise": pairwise_noise,
                 "provenance": provenance,
                 "usage": usage,
             },
@@ -650,7 +705,10 @@ async def _cmd_compare(args: argparse.Namespace) -> int:
     WITHOUT ``--no-rows``, since the pairing needs per-row verdicts) and reports flips in both
     directions, McNemar's p-value, and names the query ids that regressed. Exit code is 0
     regardless of the verdict (this is a report, not a gate) — a caller scripting a gate on top
-    reads ``significant_at_p05``/``delta`` from ``--out``.
+    reads ``significant_at_p05``/``delta`` from ``--out``, **and must read ``noise_limited``
+    alongside them** (VERIFY 2026-09-24): a delta drawn from fewer rows than judge parseability
+    moves on its own is not a finding, and `significant_at_p05` alone cannot say so. The
+    reportable condition is ``significant_at_p05 and not noise_limited``.
     """
     from mu_eval.answer_quality import AnswerQualityReport
     from mu_eval.compare import compare_runs
@@ -689,6 +747,13 @@ async def _cmd_compare(args: argparse.Namespace) -> int:
         f"McNemar: n(A correct,B wrong)={result.mcnemar_n_a_correct_b_wrong}  "
         f"n(A wrong,B correct)={result.mcnemar_n_a_wrong_b_correct}  "
         f"p={result.mcnemar_p_value:.4f}  significant_at_p05={result.significant_at_p05}"
+    )
+    # VERIFY 2026-09-24: printed on the SAME line-group as `significant_at_p05`, because that flag
+    # read alone is the exact misreading this measures against — see `CompareResult.noise_limited`.
+    _print(
+        f"noise_limited={result.noise_limited}  "
+        f"(reportable = significant_at_p05 AND NOT noise_limited -> "
+        f"{result.significant_at_p05 and not result.noise_limited})"
     )
     if result.regressed:
         _print(f"REGRESSED query ids: {result.regressed}")
@@ -847,6 +912,18 @@ def _parser() -> argparse.ArgumentParser:
     # nothing while charging full price is worse than one that costs slightly more, so the default
     # is the budget that works. `K10-VS-K30-RECONCILED-0903.md` §2 already traced a past
     # contradiction to exactly this, and the default was never moved.
+    #
+    # TRUSTWORTHY-MEASUREMENT-0924: these two defaults no longer need to be a hand-tuned upper
+    # bound on their own. `answer_quality._complete_with_retry` now runs a BOUNDED RETRY LOOP —
+    # up to `BUDGET_RETRY_MAX_ATTEMPTS` further attempts, each multiplying the previous attempt's
+    # budget by `BUDGET_RETRY_MULTIPLIER` and capped at `BUDGET_RETRY_MAX_TOKENS` — whenever a
+    # call comes back with `finish_reason: "length"` and blank content, the exact wire signature
+    # of hidden reasoning eating the whole budget (see that function's own docstring). VERIFY
+    # 2026-09-24: this comment said "retries ONE time" when it landed, which was true of an
+    # earlier draft and false of the shipped loop the same pass wrote — corrected here rather than
+    # left to mislead the next reader about how much a single row can cost. These flags still set
+    # the FIRST attempt's budget (a smaller first try costs less when it is enough, which is most
+    # rows), not a hard ceiling on what a row can cost.
     aq.add_argument("--answer-max-tokens", type=int, default=1500)
     aq.add_argument("--judge-max-tokens", type=int, default=300)
     aq.add_argument("--concurrency", type=int, default=12)

@@ -76,6 +76,23 @@ class CompletionResult(BaseModel):
     content: str
     usage: CallUsage | None = None
     served_model: str | None = None
+    # The wire response's own `choices[0].finish_reason` (e.g. "stop", "length",
+    # "content_filter") — captured because it is what turns "the content was empty" into an
+    # ANSWERABLE question instead of a guess. `finish_reason == "length"` with blank `content` on
+    # a reasoning model is the exact, unambiguous signature of hidden-reasoning budget exhaustion
+    # (all of `max_completion_tokens` was spent on invisible reasoning before a single visible
+    # token; measured live, `docs/tracking/STATE-AND-DEFECTS-0829.md`: `content: ""`,
+    # `finish_reason: "length"`, `reasoning_tokens: 300` on a 300-token cap) — distinct from a
+    # `"stop"`/`"content_filter"` finish with non-parseable content, which is a DIFFERENT failure
+    # (a genuine format miss or refusal) that more budget will not fix. `None` when the response
+    # carries no `finish_reason` at all (a non-conforming deployment).
+    finish_reason: str | None = None
+    # Set by `answer_quality._complete_with_retry`'s budget-exhaustion policy (this client itself
+    # never retries anything but a 429 — see this class's own callers) — True when THIS result is
+    # the retried attempt, not the caller's original ask. Kept here, not on `CallUsage`, because it
+    # describes the CALL'S OUTCOME (did the harness's own policy have to intervene), not the
+    # provider's billed usage.
+    budget_retried: bool = False
 
 
 class OpenAICompatChat:
@@ -200,8 +217,16 @@ class OpenAICompatChat:
         if served_model_str is not None:
             self.last_model = served_model_str
             self.served_models.add(served_model_str)
-        content = str(body["choices"][0]["message"]["content"])
-        return CompletionResult(content=content, usage=call_usage, served_model=served_model_str)
+        choice0 = body["choices"][0]
+        content = str(choice0["message"]["content"])
+        finish_reason_raw = choice0.get("finish_reason")
+        finish_reason = finish_reason_raw if isinstance(finish_reason_raw, str) else None
+        return CompletionResult(
+            content=content,
+            usage=call_usage,
+            served_model=served_model_str,
+            finish_reason=finish_reason,
+        )
 
     @property
     def usage_totals(self) -> UsageTotals:
