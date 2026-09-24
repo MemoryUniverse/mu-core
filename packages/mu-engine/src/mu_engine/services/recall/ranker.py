@@ -42,11 +42,17 @@ Channel behaviour pinned to §1.3:
   * **LTM graph (bi-temporal)** — ``graph_recall`` returns only ``m.state='active'`` facts whose
     ``[valid_at, invalid_at)`` interval contains *now* (adapter §4.3), so a conflict-resolved query
     returns the WINNING fact, not the stale one. DETERMINISTIC seed (recorded deviation, no LLM this
-    phase — CODE-ADOPTION rule 4): with no entity-extraction pipeline wired yet, the graph arm seeds
-    on the whole partition's currently-valid facts (``subject=None``, valid-now, recency-ordered)
-    rather than LLM-resolved query entities; RRF lets the query-relevant MTM arm dominate while the
-    graph arm contributes still-valid facts. Query-entity seeding folds in behind ``resolve_entity``
-    when the extraction pipeline lands — a wiring change, not a shape change.
+    phase — CODE-ADOPTION rule 4): with no entity-extraction pipeline wired yet, the flat
+    ``graph_recall`` half of this arm still seeds on the whole partition's currently-valid facts
+    (``subject=None``, valid-now, recency-ordered) rather than LLM-resolved query entities. The
+    ``traverse_entities`` half (D-4) no longer shares that limitation as of AD-258: its frontier is
+    seeded from the query's own casefolded tokens (D-4, exact-match against ``canonical_name``,
+    unchanged) UNIONED with entity uids the ranker resolves — without any LLM, without any new
+    index — from the query's own top-ranked MTM dense-vector hits' already-resolved
+    ``entity_uids`` (``_resolve_seed_entity_uids``/``dto.py``'s ``ltm_entity_seed_pool``
+    docstring have the full derivation and the measured effect). RRF still lets the query-relevant
+    MTM arm dominate the fused rank either way; this only changes what the graph arm has to offer
+    when it does place.
 
 LTM-store-down is the ONE named in-arm degrade (``DegradeReason.LTM_UNAVAILABLE`` /
 ``recall_mtm_only``, degradation §_RULES): the graph arm drops, MTM+floor return, the result is
@@ -319,7 +325,15 @@ class ThreeChannelRecallRanker:
                     else _empty_scored()
                 )
                 ltm_t = tg.create_task(
-                    self._ltm_channel(ns, pool, caller_identity_set, query)
+                    # AD-258: `mtm_t` is passed in (not yet awaited — it is the SAME task object
+                    # this TaskGroup already created above, still running) so `_ltm_channel` can
+                    # harvest the content-aware entity seed off the MTM channel's OWN result
+                    # without this ranker issuing a second embedding call or a second store round
+                    # trip. Passed unconditionally: when `channels.mtm` is False `mtm_t` already
+                    # resolves to `_empty_scored()`, which yields no entity uids — the same
+                    # no-op-when-disabled shape every other cross-channel input in this method
+                    # already has.
+                    self._ltm_channel(ns, pool, caller_identity_set, query, mtm_seed=mtm_t)
                     if channels.ltm
                     else _ltm_ok([])
                 )
@@ -557,7 +571,13 @@ class ThreeChannelRecallRanker:
         return max(self._settings.channel_pool_size, scaled)
 
     async def _ltm_channel(
-        self, ns: Namespace, pool: int, caller: CallerIdentitySet | None, query: str
+        self,
+        ns: Namespace,
+        pool: int,
+        caller: CallerIdentitySet | None,
+        query: str,
+        *,
+        mtm_seed: asyncio.Task[list[Scored[MemoryItem]]] | None = None,
     ) -> tuple[list[Scored[MemoryItem]], bool]:
         """LTM graph arm with the ONE named in-arm degrade (LTM_UNAVAILABLE, §5). Returns
         ``(hits, degraded)``; a store-down drops the arm rather than failing the whole recall.
@@ -572,7 +592,16 @@ class ThreeChannelRecallRanker:
         traversal-only hit ("who is Bo's manager?" -> "Ada manages Bo", never surfaced by the
         flat seed if Ada/Bo aren't already in the recency-ordered whole-partition window)
         competes on equal footing with every other LTM hit. ``settings.ltm_max_hops == 0``
-        disables the traversal call entirely (flat-only, pre-D6 behavior)."""
+        disables the traversal call entirely (flat-only, pre-D6 behavior).
+
+        AD-258 content-aware seed: ``mtm_seed`` is the SAME ``asyncio.Task`` :meth:`rank` already
+        created for the MTM channel's own ``semantic()`` call, handed down un-awaited so this
+        method can harvest its result WITHOUT a second embedding call or a second store round
+        trip — awaiting a sibling task from the same ``TaskGroup`` is ordinary structured
+        concurrency, not a new dependency edge the group doesn't already have (if MTM raises
+        ``StoreUnavailableError`` the group's own hard-deny contract fires exactly as it does
+        today; this method adds no new except-clause for that, deliberately, so it is never
+        swallowed as an LTM-only degrade). See :meth:`_resolve_seed_entity_uids`."""
         try:
             # `session_scope` is left at its DEFAULT (`None` = federate every one of the user's
             # sessions), exactly as this ranker already leaves `MtmTierRepository.recall`'s
@@ -585,6 +614,7 @@ class ThreeChannelRecallRanker:
             return [], True
         if self._settings.ltm_max_hops <= 0:
             return hits, False
+        seed_entity_uids = await self._resolve_seed_entity_uids(mtm_seed)
         try:
             # C2 FIX: the caller identity set goes to the traversal arm too — it is the SAME
             # `caller` the flat `graph_recall` seed above already receives. The traversal arm
@@ -597,6 +627,7 @@ class ThreeChannelRecallRanker:
                 max_hops=self._settings.ltm_max_hops,
                 limit=pool,
                 caller_identity_set=caller,
+                seed_entity_uids=seed_entity_uids,
             )
         except StoreUnavailableError:
             # the flat seed already succeeded above — a traversal-only outage degrades to
@@ -618,6 +649,44 @@ class ThreeChannelRecallRanker:
         # the rank its relevance deserves instead of being structurally buried.
         merged = sorted([*hits, *extra], key=lambda s: -s.score)
         return merged, False
+
+    async def _resolve_seed_entity_uids(
+        self, mtm_seed: asyncio.Task[list[Scored[MemoryItem]]] | None
+    ) -> list[str] | None:
+        """AD-258: derive ``traverse_entities``'s content-aware seed from the MTM channel's OWN
+        top-ranked hits, rather than re-deriving entities from the raw query text a second way.
+
+        ``mtm_seed`` arrives un-awaited (:meth:`_ltm_channel`'s docstring) so awaiting it here
+        costs nothing extra when the MTM task has already finished by the time this runs (the
+        common case: MTM's ANN search is typically the fastest of the three channels) and, when
+        it hasn't, simply lets this arm's traversal start the moment MTM's own result is ready —
+        no second `semantic()` call, no second embedding.
+
+        Reads ``Scored.item.metadata['entity_uids']`` — the ``(subject_uid, object_uid)`` pair
+        `FalkorLtmAdapter._materialize_entity_edge` resolved for whichever prior graph fact this
+        SAME MTM point was the source ingest of, backfilled via `set_entity_uids` (D-5) and now
+        actually reachable after `QdrantMapper.from_store`'s own AD-258 fix (that fix's docstring
+        has the full "write-only, never read" defect this closes). An MTM hit with no backfilled
+        entities (never distilled to the graph, or distilled before this fix existed) simply
+        contributes nothing — never an error, never a gap in the returned list.
+
+        ``ltm_entity_seed_pool<=0`` (the shipped default) or ``mtm_seed is None`` (LTM ran without
+        an MTM channel at all, e.g. a caller that disabled `channels.mtm`) short-circuits to
+        `None` WITHOUT awaiting anything — `traverse_entities` reads that as "no content-aware
+        seed, token-match only", byte-identical to pre-AD-258 behavior."""
+        pool_n = self._settings.ltm_entity_seed_pool
+        if mtm_seed is None or pool_n <= 0:
+            return None
+        mtm_hits = await mtm_seed
+        uids: list[str] = []
+        seen: set[str] = set()
+        for scored in mtm_hits[:pool_n]:
+            for uid in scored.item.metadata.get("entity_uids") or ():
+                uid_s = str(uid)
+                if uid_s not in seen:
+                    seen.add(uid_s)
+                    uids.append(uid_s)
+        return uids or None
 
     async def _score_stm(
         self, floor: list[Scored[MemoryItem]], query: str, query_vec: Vector

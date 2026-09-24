@@ -175,6 +175,7 @@ class _EmptyLtm:
         max_hops: int,
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
+        seed_entity_uids: object = None,
     ) -> list[Scored[MemoryItem]]:
         return []  # D-4: no entity edges wired for this test — isolates STM/MTM interaction
 
@@ -1133,6 +1134,7 @@ class _RecordingLtm(_EmptyLtm):
         max_hops: int,
         limit: int,
         caller_identity_set: frozenset[str] | None = None,
+        seed_entity_uids: object = None,
     ) -> list[Scored[MemoryItem]]:
         self.traverse_caller = caller_identity_set
         return []
@@ -1170,6 +1172,113 @@ async def test_ranker_threads_the_caller_identity_set_to_the_traversal_arm() -> 
         "traverse_entities — the adapter's SHARED ACL clause is then skipped entirely"
     )
     assert ltm.graph_recall_caller == caller, "the flat seed's caller threading regressed"
+
+
+class _SeedRecordingLtm(_EmptyLtm):
+    """AD-258: records the ``seed_entity_uids`` list ``_ltm_channel`` actually passed into
+    ``traverse_entities`` — the call-site regression proof for the content-aware seed, the same
+    role ``_RecordingLtm`` plays for ``caller_identity_set`` above."""
+
+    def __init__(self) -> None:
+        self.seed_entity_uids_seen: object = "<never called>"
+
+    async def traverse_entities(
+        self,
+        ns: Namespace,
+        *,
+        query: str,
+        max_hops: int,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+        seed_entity_uids: object = None,
+    ) -> list[Scored[MemoryItem]]:
+        self.seed_entity_uids_seen = seed_entity_uids
+        return []
+
+
+@pytest.mark.asyncio
+async def test_ltm_channel_seeds_traversal_from_the_mtm_channels_own_entity_uids() -> None:
+    """AD-258 call-site regression: ``_ltm_channel`` must harvest ``entity_uids`` off the SAME
+    MTM semantic-search task the MTM channel itself ran — no second embedding call, no query-text
+    re-derivation — and pass them to ``traverse_entities`` as ``seed_entity_uids``, ordered by MTM
+    rank, deduplicated, and bounded to ``settings.ltm_entity_seed_pool``. Mutation-checked: with
+    ``ltm_entity_seed_pool`` reverted to not being read (or ``_resolve_seed_entity_uids`` deleted)
+    this fails with ``seed_entity_uids_seen is None``."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = [1.0, 0.0]
+
+    def _mtm_item(name: str, entity_uids: list[str] | None) -> MemoryItem:
+        item = _item(name, tier=MemoryTier.MTM, at=base)
+        if entity_uids is not None:
+            item.metadata = {"entity_uids": entity_uids}
+        return item
+
+    # Rank order matters: top-2 (pool=2 below) contribute uids, the 3rd (in-pool but beyond the
+    # seed pool) must NOT, and the 4th carries no backfilled uids at all (never distilled) —
+    # exercising "contributes nothing, never an error" in the same test.
+    hits = [
+        _mtm_item("Ada manages the Denver team", ["ent_ada", "ent_denver_team"]),
+        _mtm_item("Ada's flight is Thursday", ["ent_ada", "ent_thursday"]),  # dup ent_ada
+        _mtm_item("outside the seed pool", ["ent_outside_pool"]),
+        _mtm_item("never distilled to the graph", None),
+    ]
+    ltm = _SeedRecordingLtm()
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({tuple(query_vec): hits}),  # type: ignore[arg-type]
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency", ltm_entity_seed_pool=2),
+        clock=FrozenClock(base),
+    )
+
+    await ranker.rank(
+        _NS,
+        "who does Ada manage?",
+        query_vec,
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=None,
+    )
+
+    assert ltm.seed_entity_uids_seen == ["ent_ada", "ent_denver_team", "ent_thursday"], (
+        "expected rank-ordered, deduplicated entity uids from the top-2 MTM hits only "
+        f"(pool=2); got {ltm.seed_entity_uids_seen!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ltm_entity_seed_pool_zero_reproduces_token_only_seed_exactly() -> None:
+    """The shipped default (``ltm_entity_seed_pool=0``): AD-258's seed must be fully inert unless
+    explicitly enabled — ``None`` reaches ``traverse_entities`` (token-match-only, byte-identical
+    to pre-AD-258 behavior), never an empty list (a caller-observable difference some adapters
+    could treat differently) and never anything derived from the MTM hits below despite them
+    carrying real ``entity_uids``."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = [1.0, 0.0]
+    hits = [_item("Ada manages the Denver team", tier=MemoryTier.MTM, at=base)]
+    hits[0].metadata = {"entity_uids": ["ent_ada", "ent_denver_team"]}
+    ltm = _SeedRecordingLtm()
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({tuple(query_vec): hits}),  # type: ignore[arg-type]
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency"),  # ltm_entity_seed_pool default (0)
+        clock=FrozenClock(base),
+    )
+    assert RecallSettings().ltm_entity_seed_pool == 0, "precondition: shipped default is off"
+
+    await ranker.rank(
+        _NS,
+        "who does Ada manage?",
+        query_vec,
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=None,
+    )
+
+    assert ltm.seed_entity_uids_seen is None
 
 
 class _ContentScoredReranker:

@@ -570,6 +570,34 @@ class RecallSettings(BaseModel):
     # ``MU_RECALL__LTM_MAX_HOPS=0`` (or any int).
     ltm_max_hops: int = Field(default=2, ge=0)
 
+    # AD-258 fix (content-aware seed, `docs/tracking/FAULT-HUNT-0924.md`; ADR pending): how many
+    # of the query's OWN top-ranked MTM dense-vector hits contribute their resolved
+    # ``entity_uids`` (D-5 payload backfill, now round-tripping through ``QdrantMapper.from_store``
+    # — see that fix's own docstring) into ``traverse_entities``'s hop-1 frontier, ALONGSIDE the
+    # pre-existing casefolded-token match (never replacing it). This is the fix ADR 0060's own
+    # closing line named as the only lever not yet tried: the graph tier's flat/token seeds are
+    # both query-blind or exact-lexical, and every measured attempt to give the channel a
+    # guaranteed slot on TOP of that seed made `gold_in_context` worse, never better (ADR 0060,
+    # `2026-09-24-ltm-channel-zero-slots.md`). ``ThreeChannelRecallRanker._ltm_channel`` awaits
+    # the SAME MTM semantic-search task the MTM channel itself runs (no second embedding call,
+    # no second store round trip beyond the traversal it already makes) and harvests
+    # ``item.metadata['entity_uids']`` off its top-``ltm_entity_seed_pool`` hits — the entities
+    # the MTM channel's own fact-embedding (``"{subject} {predicate} {object}"``,
+    # ``pipelines/concrete/ingest.py``'s docstring) already resolved as semantically relevant to
+    # the query, whether or not the query names them verbatim. ``0`` disables the seed entirely
+    # (pre-fix token-only behavior — A/B comparison, DEV-STANDARDS rule 3).
+    #
+    # DEFAULT ``0``, same shipped-cautious posture as ``ltm_protect_limit`` above and for the same
+    # reason: at ``ltm_protect_limit=0`` the RRF structural exclusion means a better seed changes
+    # NOTHING about what a caller gets back (the channel still never wins a fused slot) while
+    # still paying a real cost every recall — ``_ltm_channel`` now has to await the MTM channel's
+    # own semantic-search task before it can run ``traverse_entities``, serializing work that used
+    # to run fully concurrently with MTM. Shipping a non-zero default here would be an unmeasured
+    # latency regression for a mechanism inert at the shipped ``ltm_protect_limit``. Raise BOTH
+    # together, deliberately, once measured — never this one alone. Env override:
+    # ``MU_RECALL__LTM_ENTITY_SEED_POOL``.
+    ltm_entity_seed_pool: int = Field(default=0, ge=0)
+
     # Rerank gate (ACCURACY-PLAN-0831.md item 6 / recall-service-design.md §1.5, ADR 0010/0023):
     # `ModelRouter.rerank` (`providers/model_router.py:265`) was fully built — a local
     # `BAAI/bge-reranker-v2-m3` configured, a `Task.RERANK` route registered — and had NO caller
