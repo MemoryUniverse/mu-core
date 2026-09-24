@@ -8,9 +8,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from redis.asyncio import Redis
 
+from mu_contracts.domain.model.lifecycle import UserPrefix
 from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace
+from mu_engine.storage.mappers.redis_mapper import RedisMapper
+from mu_engine.storage.user_registry import UserPrefixRegistryPort
 
 pytestmark = pytest.mark.integration
 
@@ -197,3 +200,101 @@ async def test_write_time_dedup_toggle_off_allows_duplicates(
 
     await adapter.evict(ns, first.id)
     await adapter.evict(ns, second.id)
+
+
+# =====================================================================================
+# AD-268 (ADR 0071, PROTOTYPE-DEBT-0924.md D5) — the durable, cross-namespace user-prefix
+# registry. Proves the adapter half of the fix against REAL Redis/Valkey: a namespace that has
+# never fired a bus event is still durably discoverable, which is exactly the gap
+# ``MaintenanceLoop``'s own probe measured (``active_user_count 0`` after a restart).
+# =====================================================================================
+
+
+async def _cleanup_registry(client: Redis, *prefixes: UserPrefix) -> None:
+    if prefixes:
+        await client.zrem(RedisMapper.user_registry_key(), *(str(p) for p in prefixes))
+
+
+async def test_adapter_satisfies_user_prefix_registry_port(redis_client: Redis) -> None:
+    """Structural (PEP 544) contract check: a real ``RedisStmAdapter`` IS a
+    ``UserPrefixRegistryPort`` with no inheritance and no import of that module — mirrors the
+    same structural-satisfaction proof every other narrow capability port in this package gets."""
+    assert isinstance(RedisStmAdapter(redis_client), UserPrefixRegistryPort)
+
+
+async def test_put_registers_the_namespace_in_the_durable_registry(
+    redis_client: Redis,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """A single ``put()`` — no bus event, no second call — is enough for this namespace's
+    ``UserPrefix`` to show up in a FRESH adapter instance's ``list_user_prefixes()``. Proves the
+    registration survives independently of any in-process state (a new ``RedisStmAdapter`` here
+    shares nothing with the one that wrote, exactly like a restarted daemon reconnecting)."""
+    adapter = RedisStmAdapter(redis_client)
+    ns = make_ns()
+    item = make_item(ns, "Ada prefers filter coffee")
+    prefix = UserPrefix(ns)
+    try:
+        await adapter.put(item)
+        fresh = RedisStmAdapter(redis_client)  # a second instance — no shared Python state
+        prefixes = await fresh.list_user_prefixes(limit=1000)
+        assert prefix in prefixes
+    finally:
+        await adapter.evict(ns, item.id)
+        await _cleanup_registry(redis_client, prefix)
+
+
+async def test_list_user_prefixes_is_most_recently_active_first(
+    redis_client: Redis,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """Two distinct users, written oldest-first: the registry orders by LAST WRITE, not by
+    insertion order, and a namespace written to twice appears once (`ZADD` overwrites the score,
+    module docstring) — never a duplicate entry piling up per write."""
+    adapter = RedisStmAdapter(redis_client)
+    ns_older = make_ns(user="older-user")
+    ns_newer = make_ns(user="newer-user")
+    prefix_older, prefix_newer = UserPrefix(ns_older), UserPrefix(ns_newer)
+    try:
+        item_older = make_item(ns_older, "older user's memory")
+        await adapter.put(item_older)
+        item_newer = make_item(ns_newer, "newer user's memory")
+        await adapter.put(item_newer)
+        # a second write to the OLDER user's namespace should re-promote it to most-recent.
+        item_older_again = make_item(ns_older, "older user's second memory")
+        await adapter.put(item_older_again)
+
+        prefixes = await adapter.list_user_prefixes(limit=1000)
+        assert prefixes.count(prefix_older) == 1  # deduped despite two writes
+        assert prefixes.index(prefix_older) < prefixes.index(prefix_newer)
+
+        await adapter.evict(ns_older, item_older.id)
+        await adapter.evict(ns_older, item_older_again.id)
+        await adapter.evict(ns_newer, item_newer.id)
+    finally:
+        await _cleanup_registry(redis_client, prefix_older, prefix_newer)
+
+
+async def test_list_user_prefixes_limit_is_never_exceeded(
+    redis_client: Redis,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """The "never unbounded" discipline every enumeration verb in this package follows
+    (``tier_capabilities.py``): a ``limit`` narrower than the true registered population is
+    honored, not silently widened."""
+    adapter = RedisStmAdapter(redis_client)
+    namespaces = [make_ns(user=f"bounded-user-{i}") for i in range(3)]
+    prefixes = [UserPrefix(ns) for ns in namespaces]
+    items = [make_item(ns, f"fact {i}") for i, ns in enumerate(namespaces)]
+    try:
+        for item in items:
+            await adapter.put(item)
+        page = await adapter.list_user_prefixes(limit=2)
+        assert len(page) == 2
+        for ns, item in zip(namespaces, items, strict=True):
+            await adapter.evict(ns, item.id)
+    finally:
+        await _cleanup_registry(redis_client, *prefixes)

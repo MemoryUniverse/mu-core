@@ -102,6 +102,7 @@ from mu_engine.services.recall.mapping import (
 )
 from mu_engine.storage.domain.memory import MemoryItem, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.user_registry import UserPrefixRegistryPort
 from mu_engine.surface.facade import SurfaceFacade
 from mu_local.composition import LocalContainer
 from mu_local.config import StorageSettings
@@ -550,6 +551,24 @@ class LocalMemory:
         bound is counted with one bounded ``enumerate`` page). Same accessor rationale as
         :attr:`health`."""
         return self._container.pin
+
+    @property
+    def user_registry(self) -> UserPrefixRegistryPort | None:
+        """AD-268 fix (ADR 0071, PROTOTYPE-DEBT-0924.md D5) — THIS instance's durable,
+        cross-namespace user-prefix registry, or ``None`` when the bound STM backend does not
+        satisfy :class:`~mu_engine.storage.user_registry.UserPrefixRegistryPort` (the in-process
+        ``memory_stm`` test/degrade adapter has no durable substrate to register a namespace
+        INTO). Structural check, not a ``LocalContainer`` field: ``self._container.stm`` is
+        always built (``StmTierRepository`` is required, never optional), so there is nothing to
+        thread through construction — this accessor only asks whether the ALREADY-built store
+        happens to also satisfy the narrower capability, the identical discipline
+        ``tier_capabilities.py``'s ``TierEnumerationPort``/``TierPinPort`` document. Same accessor
+        rationale as :attr:`health`/:attr:`pin`: without it mu-client's ``MaintenanceLoop`` has no
+        way to reach the store the composition root already built, and reseeds its active-user
+        registry from nothing on every restart — the exact defect this property exists to close.
+        """
+        stm = self._container.stm
+        return stm if isinstance(stm, UserPrefixRegistryPort) else None
 
     def build_lifecycle_manager(
         self,

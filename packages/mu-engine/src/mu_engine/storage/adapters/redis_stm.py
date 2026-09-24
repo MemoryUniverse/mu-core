@@ -38,6 +38,7 @@ from typing import cast
 
 from redis.asyncio import Redis
 
+from mu_contracts.domain.model.lifecycle import UserPrefix
 from mu_contracts.domain.model.recall import CallerIdentitySet
 from mu_engine.platform.decorators import retry_io
 from mu_engine.storage.authz import authorized_item, authorized_window
@@ -95,6 +96,14 @@ class RedisStmAdapter:
         return await self._retry(self._put_impl)(item, ttl_s=ttl_s)
 
     async def _put_impl(self, item: MemoryItem, *, ttl_s: int | None = None) -> str:
+        # AD-268 fix (ADR 0071, PROTOTYPE-DEBT-0924.md D5): register this namespace's
+        # session-truncated UserPrefix in the durable, cross-namespace registry on EVERY write
+        # (dedup-hit included — a bump is still evidence this user is active), so a restarted
+        # daemon can rediscover it. Deliberately best-effort and OUTSIDE the payload's atomic
+        # pipeline below: a registry write that raced or briefly lagged the payload it describes
+        # costs one sweep's delayed DISCOVERY of an already-durable memory, never that memory's
+        # content — it must never become a reason a genuine content write could fail or roll back.
+        await self._register_user_prefix(item.namespace, at=item.created_at)
         row = self._mapper.to_store(item)
         if ttl_s is not None:
             # F1 fix (ADR 0054): explicit per-write TTL override — e.g. DemotionService's
@@ -567,6 +576,39 @@ class RedisStmAdapter:
             queued = True
         if queued:
             await write_pipe.execute()
+
+    # ============================================================== AD-268 user registry (D5) ===
+    async def _register_user_prefix(self, ns: Namespace, *, at: datetime) -> None:
+        """``UserPrefixRegistryPort`` write half — see ``storage/user_registry.py`` for the
+        Protocol this satisfies structurally and ``RedisMapper.user_registry_key`` for the key's
+        rationale. A single ``ZADD`` (member=``str(UserPrefix(ns))``, score=``at`` epoch) —
+        `ZADD` is naturally idempotent-per-member (it OVERWRITES the score), so calling this on
+        every write, including a dedup-hit bump, never creates a duplicate registry entry; it
+        just moves an already-registered prefix's "last active" score forward."""
+        prefix = UserPrefix(ns)
+        await self._redis.zadd(RedisMapper.user_registry_key(), {str(prefix): at.timestamp()})
+
+    async def list_user_prefixes(self, *, limit: int = 500) -> list[UserPrefix]:
+        """``UserPrefixRegistryPort`` read half. Most-recently-active first (``ZREVRANGE``),
+        bounded by ``limit`` — the same "never unbounded" discipline every enumeration verb in
+        this package follows (``tier_capabilities.py``'s ``ENUMERATE_INSPECT_BUDGET``). Returns
+        ``[]`` on an empty registry (a fresh store, or one that predates this fix and has not
+        taken a write since) rather than raising — an empty answer here is a legitimate state a
+        caller (``MaintenanceLoop``) must be able to tell apart from a backend fault, which is why
+        a genuine Redis error is left to propagate from :func:`retry_io` unchanged, exactly like
+        every other read on this adapter."""
+        if limit <= 0:
+            return []
+        raw = await self._retry(self._list_user_prefixes_impl)(limit=limit)
+        return raw
+
+    async def _list_user_prefixes_impl(self, *, limit: int) -> list[UserPrefix]:
+        members = await self._redis.zrevrange(RedisMapper.user_registry_key(), 0, limit - 1)
+        # `_from_validated_str` is the sanctioned rehydration path (see `UserPrefix`'s own module
+        # docstring: "Round-tripping an already-serialized prefix string ... is handled by ...
+        # the pydantic core schema") — this adapter round-trips the identical byte-shape it wrote
+        # via `_register_user_prefix`'s `str(prefix)`, never an arbitrary external string.
+        return [UserPrefix._from_validated_str(_as_str(m)) for m in members]
 
 
 def _as_str(value: str | bytes) -> str:

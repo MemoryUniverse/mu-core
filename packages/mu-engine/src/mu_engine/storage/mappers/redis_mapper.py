@@ -65,6 +65,29 @@ class RedisMapper:
         docstring promise ("Recency floor + TTL + chash dedup") this key finally implements."""
         return f"{_KEY_PREFIX}/{ns.to_prefix()}:stm:chash"
 
+    @staticmethod
+    def user_registry_key() -> str:
+        """AD-268 fix (ADR 0071) — the durable, **cross-namespace** user-prefix registry.
+
+        Deliberately the ONLY key in this class with no ``ns.to_prefix()`` component: every other
+        key here is scoped INSIDE one tenant's partition (the whole point of ``mu/{to_prefix}:…``),
+        but this registry's entire job is to be readable BEFORE any specific namespace is known —
+        "which user prefixes have STM data at all" is a question a per-namespace key cannot
+        answer. ``mu:registry:…`` (colon-joined, no ``/``) is the same "global, not a tenant
+        partition" shape ``storage-models-design.md``'s (un-ported) ``mu:session_last_activity``
+        already reserves, so this key can never collide with a real ``ns.to_prefix()`` value
+        (``Namespace._no_separator_injection`` forbids ``:`` inside a component, and every
+        per-tenant key here starts ``mu/…`` — a ``/`` immediately after ``mu``, not a ``:``).
+
+        Holds a single ZSET, ``member=str(UserPrefix)``, ``score=`` last-write unix timestamp —
+        deliberately NOT per-org/workspace-sharded: a single local daemon's whole STM store is
+        small enough (PROTOTYPE-DEBT-0924.md D5) that one bounded ``ZREVRANGE`` answers "every
+        user prefix this store has ever written for" in one round trip, which is exactly what
+        :class:`~mu_client.daemon.maintenance.MaintenanceLoop` needs to rebuild its active-user
+        registry on a restart instead of starting from empty (the defect this key exists to fix).
+        """
+        return f"{_KEY_PREFIX}:registry:user_prefix"
+
     def to_store(self, item: MemoryItem) -> RedisRecord:
         return RedisRecord(
             key=self.memory_key(item.namespace, item.id),
