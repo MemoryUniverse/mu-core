@@ -248,6 +248,57 @@ async def test_ltm_reinforce_many_batches_into_a_constant_number_of_round_trips(
     )
 
 
+# -------------------------------------------------------------------------------------------
+# 4. D1/D2 (AD-266) on the LTM tier — same claim as `test_reinforce_many_batched_int.py`'s STM/
+# MTM coverage, proven against REAL FalkorDB.
+# -------------------------------------------------------------------------------------------
+
+
+async def test_ltm_reinforce_writes_relevance_score_and_last_seen(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    ns = make_ns(session="reinforce-d1-ltm-single")
+    item = _make_facts(ns, make_item, 1, "d1")[0]
+    await ltm.upsert_fact(item)
+
+    reinforced = await ltm.reinforce(ns, item.id, at=_AT, relevance_score=0.77)
+    assert reinforced is not None
+    assert reinforced.relevance_score == pytest.approx(0.77)
+    assert reinforced.last_seen == _AT
+
+    fact = await ltm.get_fact(ns, item.id)
+    assert fact is not None
+    assert fact.relevance_score == pytest.approx(
+        0.77
+    ), "relevance_score did not survive the round trip through FalkorDB's memory_json"
+    assert fact.last_seen == _AT
+
+
+async def test_ltm_reinforce_many_writes_relevance_score_per_id(
+    ltm: FalkorLtmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    ns = make_ns(session="reinforce-d1-ltm-many")
+    scored, unscored = _make_facts(ns, make_item, 2, "d1many")
+    for item in (scored, unscored):
+        await ltm.upsert_fact(item)
+
+    await ltm.reinforce_many(
+        ns, [scored.id, unscored.id], at=_AT, relevance_scores={scored.id: 0.64}
+    )
+
+    scored_fact = await ltm.get_fact(ns, scored.id)
+    assert scored_fact is not None
+    assert scored_fact.relevance_score == pytest.approx(0.64)
+    unscored_fact = await ltm.get_fact(ns, unscored.id)
+    assert unscored_fact is not None
+    assert unscored_fact.relevance_score == 0.0
+    assert unscored_fact.last_seen == _AT, "last_seen must advance even with no score supplied"
+
+
 class _CallCounter:
     """Counts invocations of a wrapped bound-ish async method, independent of which ``AsyncGraph``
     instance receives the call — ``FalkorDB.select_graph`` returns a fresh wrapper object per

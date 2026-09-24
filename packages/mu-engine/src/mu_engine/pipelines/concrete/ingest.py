@@ -344,7 +344,18 @@ class WriteStmStage(BaseStage):
         # a no-op and ``add()`` reverts to minting a fresh id every call, unchanged.
         resident_id = await self._stm.put(item)
         if resident_id != item.id:
-            item = item.model_copy(update={"id": resident_id})
+            # D3 fix (AD-266b): a dedup hit means `resident_id` names the WINNER row
+            # `RedisStmAdapter._bump_if_duplicate` just bumped `mention_count` on — re-stamping
+            # `item.id` alone onto this stage's OWN fresh copy (the pre-fix behaviour) would carry
+            # that fresh copy's stale `mention_count=1` forward into `ctx.state["stm_item"]`,
+            # which is exactly what `DeterministicPromoteStage._resolve_item`'s fast path reads
+            # to decide `mention_promote` — silently hiding the very bump this stage exists to
+            # surface. Re-read the ACTUAL resident row instead of re-stamping a field onto the
+            # discarded one; a `None` (raced away between the store's own dedup write and this
+            # read) falls back to the previous re-stamp so the pipeline still has SOME id to carry
+            # forward rather than raising on a narrow, already-benign race.
+            resident = await self._stm.get(activity.namespace, resident_id)
+            item = resident if resident is not None else item.model_copy(update={"id": resident_id})
         return StageOutcome(
             status=StageStatus.OK,
             produced={"stm_item": item, "memory_ids": [item.id], "content_hash": item.content_hash},
@@ -386,12 +397,16 @@ class WriteStmStage(BaseStage):
 class DeterministicPromoteStage(BaseStage):
     """Stage 2 — deterministic STM->MTM promotion, idempotent on ``content_hash`` (§6.4).
 
-    NO LLM. Promotes on the two LLM-free signals available at capture (the ``service.py:335`` rule,
-    minus the ``mention_count`` arm which needs the content-hash-indexed STM lookup): explicit
-    ``promote`` OR ``importance >= importance_promote``. When it promotes it embeds the ATOMIC-FACT
-    vector via the REAL local ``EmbeddingPort`` and upserts the promoted copy (same id) to MTM. When
-    it does not promote it is a normal ``OK`` no-op with NO ledger mark (a later reinforcement may
-    still promote) and NO event.
+    NO LLM. Promotes on three LLM-free signals available at capture (the ``service.py:335``
+    rule): explicit ``promote``, ``importance >= importance_promote``, OR
+    ``mention_count >= mention_promote`` (D3 fix, AD-266b — the third arm this class's own
+    docstring used to report as unwired "minus the mention_count arm which needs the
+    content-hash-indexed STM lookup"; that lookup (D4, ``redis_stm.py::_bump_if_duplicate``)
+    shipped, and ``WriteStmStage`` now hands this stage the WINNER row's true, bumped
+    ``mention_count`` via ``ctx.state["stm_item"]`` — see :meth:`_mention_count`). When it
+    promotes it embeds the ATOMIC-FACT vector via the REAL local ``EmbeddingPort`` and upserts
+    the promoted copy (same id) to MTM. When it does not promote it is a normal ``OK`` no-op
+    with NO ledger mark (a later reinforcement may still promote) and NO event.
     """
 
     name = "deterministic_promote"
@@ -412,18 +427,32 @@ class DeterministicPromoteStage(BaseStage):
         self._embedder = embedder
         self._settings = settings
 
-    def _promotion_reason(self, activity: IngestActivity) -> str | None:
+    def _mention_count(self, ctx: PipelineContext) -> int:
+        """The STM winner row's CURRENT ``mention_count`` (D3 fix, AD-266b) — read from
+        ``ctx.state["stm_item"]``, which ``WriteStmStage`` populates BEFORE this stage runs on
+        every path (a fresh ``_execute``, a dedup-hit re-fetch of the winner, AND a ledger-hit
+        ``reconstruct_produced`` replay — that method's own docstring: it re-reads the durable
+        STM record, never re-mints). Defaults to ``1`` (a never-deduplicated item's true count)
+        when ``stm_item`` is absent for any reason, never a raise — this arm degrading to
+        unavailable must never block the ``explicit``/``importance`` arms above it."""
+        item = ctx.state.get("stm_item")
+        return item.mention_count if isinstance(item, MemoryItem) else 1
+
+    def _promotion_reason(self, activity: IngestActivity, *, mention_count: int = 1) -> str | None:
         if activity.promote:
             return "explicit"
         if activity.importance >= self._settings.importance_promote:
             return "importance"
+        if mention_count >= self._settings.mention_promote:
+            return "mention_count"
         return None
 
     def idempotency_key(self, ctx: PipelineContext) -> str:
         # Ledger-gate ONLY when we will actually promote; a non-promotion is not a completed write,
         # so it must not be marked (empty key => BaseStage runs but never marks — PIPELINES §2.2).
         activity = _activity(ctx)
-        if self._promotion_reason(activity) is None:
+        reason = self._promotion_reason(activity, mention_count=self._mention_count(ctx))
+        if reason is None:
             return ""
         content_hash = (
             ctx.state.get("content_hash")
@@ -461,7 +490,7 @@ class DeterministicPromoteStage(BaseStage):
 
     async def _execute(self, ctx: PipelineContext) -> StageOutcome:
         activity = _activity(ctx)
-        reason = self._promotion_reason(activity)
+        reason = self._promotion_reason(activity, mention_count=self._mention_count(ctx))
         if reason is None:
             return StageOutcome(status=StageStatus.OK, produced={"promoted": False})
 

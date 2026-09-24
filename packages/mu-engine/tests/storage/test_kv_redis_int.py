@@ -129,6 +129,49 @@ async def test_write_time_dedup_bumps_recency_on_the_winner(
     await adapter.evict(ns, older_other.id)
 
 
+async def test_write_time_dedup_bumps_mention_count_on_the_winner(
+    redis_client: Redis,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    """D3 fix (AD-266b, ``docs/tracking/PROTOTYPE-DEBT-0924.md``): before this fix,
+    ``_bump_if_duplicate`` moved the winner's recency score + TTL but never re-read/rewrote its
+    payload, so ``mention_count`` stayed pinned at 1 forever and
+    ``IngestSettings.mention_promote`` (default 2) could never fire against a real STM row.
+
+    MUTATION CHECK (run, red, restored): drop the ``"mention_count": current.mention_count + 1``
+    key from ``_bump_if_duplicate``'s ``update`` dict — this test goes red
+    (``mention_count == 1``) while ``test_write_time_dedup_bumps_recency_on_the_winner`` above
+    stays green, proving that test alone could not have caught D3."""
+    adapter = RedisStmAdapter(redis_client)
+    ns = make_ns()
+    first = make_item(ns, "Ada drinks black coffee every morning")
+    second = make_item(ns, "Ada drinks black coffee every morning")
+    third = make_item(ns, "Ada drinks black coffee every morning")
+    assert first.content_hash == second.content_hash == third.content_hash
+
+    await adapter.put(first)
+    row = await adapter.get(ns, first.id)
+    assert row is not None and row.mention_count == 1
+
+    await adapter.put(second)
+    row = await adapter.get(ns, first.id)
+    assert (
+        row is not None and row.mention_count == 2
+    ), f"first repeat did not bump mention_count (got {row.mention_count if row else None})"
+
+    await adapter.put(third)
+    row = await adapter.get(ns, first.id)
+    assert row is not None and row.mention_count == 3, "second repeat did not bump mention_count"
+    # last_seen must advance with each repeat too (D2), and access_count/created_at (a DIFFERENT
+    # axis — genuine RECALLS, not re-assertions) must NOT move just from a repeat write.
+    assert row.last_seen == third.created_at
+    assert row.access_count == 0
+    assert row.created_at == first.created_at
+
+    await adapter.evict(ns, first.id)
+
+
 async def test_write_time_dedup_toggle_off_allows_duplicates(
     redis_client: Redis,
     make_ns: Callable[..., Namespace],

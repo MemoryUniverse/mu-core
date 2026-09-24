@@ -26,7 +26,7 @@ truncated in storage. SHARED and any session-narrowed PRIVATE recall keep the ex
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any, Final
 
@@ -504,14 +504,29 @@ class QdrantMtmAdapter:
         # ...and a write that matched nothing is reported ABSENT rather than silently succeeding.
         await self._raise_if_write_missed(name, ns, memory_id, verb="expire")
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
-        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
+        return await self._retry(self._reinforce_impl)(
+            ns, memory_id, at=at, relevance_score=relevance_score
+        )
 
     async def _reinforce_impl(
-        self, ns: Namespace, memory_id: str, *, at: datetime
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
     ) -> MemoryItem | None:
         """AD-259 — the recall-time read-stat write-back for a LIVE MTM point (``ports.py``'s
-        ``MtmTierRepository.reinforce`` docstring has the full rationale).
+        ``MtmTierRepository.reinforce`` docstring has the full rationale). AD-266 added
+        ``relevance_score``/``last_seen`` — see that docstring for the D1/D2 rationale.
 
         Read-modify-write rather than an atomic increment: Qdrant has no server-side counter
         primitive, exactly as Redis has none for a field inside a JSON blob — ``redis_stm.py``'s
@@ -535,21 +550,34 @@ class QdrantMtmAdapter:
             # Absent (never existed, or in another partition) — a no-op by contract, never a
             # raise: the caller passes only ids its own prior read just returned.
             return None
-        reinforced = current.model_copy(
-            update={"access_count": current.access_count + 1, "updated_at": at}
-        )
+        update: dict[str, object] = {
+            "access_count": current.access_count + 1,
+            "updated_at": at,
+            "last_seen": at,
+        }
+        payload: dict[str, object] = {
+            "access_count": current.access_count + 1,
+            "updated_at": at.isoformat(),
+            "last_seen": at.isoformat(),
+        }
+        if relevance_score is not None:
+            update["relevance_score"] = relevance_score
+            payload["relevance_score"] = relevance_score
+        reinforced = current.model_copy(update=update)
         await self._qdrant.set_payload(
             collection_name=name,
-            payload={
-                "access_count": reinforced.access_count,
-                "updated_at": at.isoformat(),
-            },
+            payload=payload,
             points=_scoped_point_selector(ns, memory_id),
         )
         return reinforced
 
     async def reinforce_many(
-        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+        self,
+        ns: Namespace,
+        memory_ids: Sequence[str],
+        *,
+        at: datetime,
+        relevance_scores: Mapping[str, float] | None = None,
     ) -> None:
         """AD-260 — the batched twin of :meth:`reinforce`. MEASURED
         (``docs/tracking/ARCHITECTURE-DELTAS.md`` AD-260): ``ThreeChannelRecallRanker`` firing one
@@ -573,10 +601,17 @@ class QdrantMtmAdapter:
         ``MtmTierRepository.reinforce`` docstring)."""
         if not memory_ids:
             return
-        await self._retry(self._reinforce_many_impl)(ns, memory_ids, at=at)
+        await self._retry(self._reinforce_many_impl)(
+            ns, memory_ids, at=at, relevance_scores=relevance_scores
+        )
 
     async def _reinforce_many_impl(
-        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+        self,
+        ns: Namespace,
+        memory_ids: Sequence[str],
+        *,
+        at: datetime,
+        relevance_scores: Mapping[str, float] | None = None,
     ) -> None:
         name = collection_name(ns, self._dim)
         if not await self._qdrant.collection_exists(name):
@@ -610,13 +645,18 @@ class QdrantMtmAdapter:
             current = current_by_point.get(str(point_id(memory_id)))
             if current is None:
                 continue  # absent, or in another partition — a no-op, never a raise (see above)
+            payload: dict[str, object] = {
+                "access_count": current.access_count + 1,
+                "updated_at": at.isoformat(),
+                "last_seen": at.isoformat(),
+            }
+            score = None if relevance_scores is None else relevance_scores.get(memory_id)
+            if score is not None:
+                payload["relevance_score"] = score
             operations.append(
                 models.SetPayloadOperation(
                     set_payload=models.SetPayload(
-                        payload={
-                            "access_count": current.access_count + 1,
-                            "updated_at": at.isoformat(),
-                        },
+                        payload=payload,
                         filter=_scoped_point_selector(ns, memory_id),
                     )
                 )

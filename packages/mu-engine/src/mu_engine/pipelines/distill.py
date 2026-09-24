@@ -746,7 +746,15 @@ class DistillPipeline:
                 )
             reinforced = current.model_copy(deep=True)
             reinforced.access_count += 1
-            reinforced.updated_at = self._clock.now()
+            # D3 fix (AD-266b): this IS the "the user said this again" signal for the MTM/LTM
+            # distill window — the mem0 NONE / `graph_falkor.py:113` ON MATCH semantics this
+            # branch already cites ("bump mention_count, reinforce",
+            # `memory-layer-design.md:613`). `_bump_if_duplicate` (`redis_stm.py`) is the
+            # write-time twin of this same signal for the STM tier.
+            reinforced.mention_count += 1
+            now = self._clock.now()
+            reinforced.updated_at = now
+            reinforced.last_seen = now
             await self._ltm.upsert_fact(reinforced)
             return self._action(DistillActionKind.NOOP, reinforced, (), "identical_active_fact")
 

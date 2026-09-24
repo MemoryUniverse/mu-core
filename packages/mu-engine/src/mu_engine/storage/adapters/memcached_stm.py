@@ -275,10 +275,18 @@ class MemcachedStmAdapter:
         # identical comment for why (removing an id absent from a list is a harmless no-op here).
         await self._update_demoted(ns, memory_id, None, ttl_s=self._default_ttl_s)
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
         """The read-stat write-back (AD-250 fix, ADR 0061 — ``ports.py``'s own docstring has the
-        full rationale). CAS read-modify-write over the SAME row primitive ``put``/``get`` use —
-        parity with ``_update_index_impl``'s own CAS loop, for the SAME concurrency reason.
+        full rationale; AD-266 added ``relevance_score``/``last_seen``). CAS read-modify-write
+        over the SAME row primitive ``put``/``get`` use — parity with ``_update_index_impl``'s
+        own CAS loop, for the SAME concurrency reason.
 
         Memcached exposes no ``KEEPTTL``/remaining-TTL-read primitive (D6, module docstring: "dev
         only has Memcached"), so unlike the Redis/Valkey leg this cannot preserve the row's exact
@@ -286,10 +294,17 @@ class MemcachedStmAdapter:
         (the same ``effective_ttl_s`` fallback ``_put_impl`` already uses when no override is
         given). Documented, not silently approximated: this is a real behavioural gap on a
         dev-only backend, not the production (Redis/Valkey) path this fix is proven against."""
-        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+        return await self._retry(self._reinforce_impl)(
+            ns, memory_id, at=at, relevance_score=relevance_score
+        )
 
     async def _reinforce_impl(
-        self, ns: Namespace, memory_id: str, *, at: datetime
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
     ) -> MemoryItem | None:
         key = RedisMapper.memory_key(ns, memory_id).encode("utf-8")
         for _attempt in range(self._cas_max_attempts):
@@ -303,9 +318,14 @@ class MemcachedStmAdapter:
             current = self._mapper.from_store(
                 RedisRecord(key=key.decode("utf-8"), ttl_s=None, blob=raw.decode("utf-8"))
             )
-            reinforced = current.model_copy(
-                update={"access_count": current.access_count + 1, "updated_at": at}
-            )
+            update: dict[str, object] = {
+                "access_count": current.access_count + 1,
+                "updated_at": at,
+                "last_seen": at,
+            }
+            if relevance_score is not None:
+                update["relevance_score"] = relevance_score
+            reinforced = current.model_copy(update=update)
             new_blob = reinforced.model_dump_json().encode("utf-8")
             ok = await self._mc.cas(key, new_blob, cas_token, exptime=self._default_ttl_s)
             if ok:

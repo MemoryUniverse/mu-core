@@ -191,9 +191,31 @@ class MemoryItem(BaseModel):
     valid_at: datetime | None = None
     invalid_at: datetime | None = None
 
+    # D2 fix (AD-266a, ``docs/tracking/PROTOTYPE-DEBT-0924.md``): "when was this memory last
+    # RECALLED" — a genuinely distinct signal from ``updated_at`` (a WRITE timestamp that also
+    # moves on a lifecycle transition or a payload patch, `services/memory/translation.py`'s
+    # ``_last_seen`` docstring has the full history of this gap). Defaults to construction time
+    # (a never-yet-recalled memory was "last seen" when it was captured — the same assumption
+    # ``created_at``/``updated_at`` already make) and is stamped forward by
+    # :meth:`StmTierRepository.reinforce` / :meth:`MtmTierRepository.reinforce` /
+    # :meth:`GraphStorePort.reinforce` on every genuine recall hit (``ports.py``).
+    last_seen: datetime = Field(default_factory=_utcnow)
+
     importance_score: float = 0.5
+    # D1 fix (AD-266): the observed relevance of this memory the LAST TIME a query found it — a
+    # recall-time write-back (``ports.py``'s three ``reinforce`` docstrings), never touched by any
+    # write path other than a genuine recall hit. ``0.0`` for a memory that has never been
+    # recalled, which is a true zero, not the "always zero, forever" defect AD-266 found.
     relevance_score: float = 0.0
     access_count: int = 0
+    # D3 fix (AD-266b): how many times this exact content has been asserted. ``1`` at capture
+    # (saying something once is one mention); bumped by the STM content-hash write-time dedup
+    # (``redis_stm.py::_bump_if_duplicate``) on a repeat assertion and by the MTM/LTM distill-time
+    # identical-active-fact reconciliation (``pipelines/distill.py::_resolve``) — the two places
+    # this engine can observe "the user said this again", mirroring the prototype's
+    # ``graph_falkor.py:113`` ``ON MATCH`` (D3). Feeds ``IngestSettings.mention_promote`` (the
+    # STM->MTM gate) and ``persona/aggregator.py``'s ``ln(1 + mention_count + access_count)`` term.
+    mention_count: int = Field(default=1, ge=0)
 
     # validity-first LTM retention (ADR 0035; spec §9) — additive, backward-compatible
     # defaults; NO ``valid_until`` field: EPHEMERAL end-of-validity reuses ``invalid_at``
@@ -292,7 +314,7 @@ class MemoryItem(BaseModel):
         )
         return sha256(basis.encode("utf-8")).hexdigest()
 
-    @field_serializer("created_at", "updated_at", "valid_at", "invalid_at")
+    @field_serializer("created_at", "updated_at", "valid_at", "invalid_at", "last_seen")
     def _ser_dt(self, value: datetime | None) -> str | None:
         return value.isoformat() if value is not None else None
 

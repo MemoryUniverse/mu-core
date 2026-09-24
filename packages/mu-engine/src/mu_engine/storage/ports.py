@@ -197,7 +197,14 @@ class StmTierRepository(Protocol):
         excluded, never included unstamped)."""
         ...
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
         """The read-stat write-back a genuine recall hit performs (AD-250 fix, ADR 0061).
 
         `recall-service-design.md` §5.1/line 609 has always CLAIMED this: *"the only mutation
@@ -234,7 +241,17 @@ class StmTierRepository(Protocol):
         which is exactly the race :meth:`recent`'s own self-heal branch already treats as
         ordinary. Best-effort by contract — a caller MUST NOT let a failure here fail the read it
         is reinforcing (the same "enhancement, not a named channel" degrade discipline
-        ``ranker.py``'s neighbour expansion already uses)."""
+        ``ranker.py``'s neighbour expansion already uses).
+
+        **AD-266 fix — ``relevance_score``.** ``None`` (the default) leaves the stored
+        ``relevance_score`` untouched, exactly as every call site before this fix behaved. When
+        the caller passes the query-relevance score this hit was actually found at (the fused or
+        reranked score ``ThreeChannelRecallRanker`` already computed for the same hit —
+        ``recall-service-design.md`` §5.1's "``relevance=score``" — the prototype's
+        ``stm_redis.py:323-341`` had always done this), it is written back alongside
+        ``access_count``/``last_seen`` in the SAME payload PATCH, never a second round trip. Also
+        stamps ``last_seen=at`` (the D2 fix — a distinct field from ``updated_at``, see
+        ``storage/domain/memory.py``'s ``last_seen`` docstring)."""
         ...
 
 
@@ -243,7 +260,14 @@ class MtmTierRepository(Protocol):
 
     async def upsert(self, item: MemoryItem) -> None: ...
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
         """The read-stat write-back a genuine recall hit performs on a LIVE MTM point (AD-259).
 
         The exact twin of :meth:`StmTierRepository.reinforce`, for the tier the user is actually
@@ -267,7 +291,13 @@ class MtmTierRepository(Protocol):
         ``None`` if ``memory_id`` is absent from ``ns``'s partition — a no-op, never a raise, for
         the same reason :meth:`StmTierRepository.reinforce` gives: the caller passes only ids its
         own prior read just returned. Best-effort by contract — a caller MUST NOT let a failure
-        here fail the read it is reinforcing."""
+        here fail the read it is reinforcing.
+
+        **AD-266 fix — ``relevance_score`` + ``last_seen``, same contract as
+        :meth:`StmTierRepository.reinforce`** (that method's docstring has the full rationale):
+        ``relevance_score=None`` leaves the stored value untouched; a real score is written back
+        in the same payload PATCH as ``access_count``/``updated_at``/``last_seen`` — closing the
+        gap AD-266 found (``mtm_qdrant.py:375-399`` wrote it, ``qdrant_mtm.py:538-545`` did not)."""
         ...
 
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
@@ -336,7 +366,14 @@ class GraphStorePort(Protocol):
 
     async def upsert_fact(self, item: MemoryItem) -> None: ...
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
         """The LTM twin of :meth:`MtmTierRepository.reinforce` (ADR 0062 / AD-259 named this the
         one still-missing half: ``recall-service-design.md`` §5.1 describes a ``COLD -> ACTIVE``
         reactivate-on-recall edge (spec §9) built on "the existing access_count/last_seen
@@ -366,7 +403,11 @@ class GraphStorePort(Protocol):
         ``promote_stm_mtm`` sweep, never inline; MTM's rescues only on the NEXT
         ``scan_for_demotion`` sweep). Keeping this port method a pure stat bump — no
         ``LifecycleSettings`` import here, no ``cold`` mutation here — keeps the storage layer
-        from depending downward on the lifecycle layer that owns the policy over it."""
+        from depending downward on the lifecycle layer that owns the policy over it.
+
+        **AD-266 fix — ``relevance_score`` + ``last_seen``**, same optional-and-additive contract
+        as :meth:`MtmTierRepository.reinforce`: ``None`` leaves ``relevance_score`` untouched;
+        ``last_seen`` is always stamped to ``at`` alongside ``updated_at``."""
         ...
 
     async def get_fact(self, ns: Namespace, memory_id: str) -> MemoryItem | None:

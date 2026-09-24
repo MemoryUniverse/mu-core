@@ -13,17 +13,21 @@ adapters or improvised per call site.
 landing on one enum and not the other must fail LOUD with a ``KeyError`` at the point of use,
 rather than silently coercing a state the other side has never heard of.
 
-**Three fields do not survive the crossing intact, and pretending otherwise would be the defect.**
-Each is named at its mapping below with what it costs:
+**One field does not survive the crossing intact, and pretending otherwise would be the defect.**
 
-* ``last_seen`` (contracts, REQUIRED) has NO honest engine source. See :func:`_last_seen`.
 * ``salience`` maps to ``None``. The engine record carries flat ``importance_score`` /
   ``relevance_score`` and none of the other five ``SalienceComponents`` fields (recency, usage,
   score, strength, scored_at). Synthesising a composite from two of seven inputs would hand the
   health lens a number that looks computed and is not. ``None`` is the truthful answer, and
   ``MemoryHealthService._summarize`` already treats it as ``retention_unknown`` — it TELLS the
   caller the lens was partly blind instead of reporting an all-clear that was never computed.
-* ``mention_count`` has no engine field at all and takes the published default.
+
+**AMENDMENT (AD-266a/AD-266b, ``docs/tracking/PROTOTYPE-DEBT-0924.md``): two more fields used to
+be on this list and no longer are.** ``last_seen`` and ``mention_count`` were both reported here
+as having "no honest engine source" / "no engine field at all" — true when this module was
+written, false since ``storage/domain/memory.py`` grew real ``last_seen``/``mention_count``
+fields that the recall/ingest/distill write paths now stamp. Both map directly, below, like every
+other field on this record.
 
 These are reported as design gaps, not silently absorbed.
 """
@@ -128,21 +132,20 @@ _ENGINE_TO_CONTRACT_CHANNEL: dict[EngineChannel, ContractChannel] = {
 
 
 def _last_seen(item: EngineMemoryItem) -> datetime:
-    """``updated_at`` — and this mapping is a REPORTED GAP, not a clean translation.
+    """``item.last_seen`` — a genuinely honest mapping since AD-266a.
 
     The published record's ``last_seen`` means "when this memory was last RECALLED"; the health
-    assessor's staleness rule reads it as exactly that. The engine record has no such field. Its
-    nearest neighbour, ``updated_at``, is a WRITE timestamp: it moves when a lifecycle transition
-    or a payload patch touches the row, and it does not move on a recall that does not write back.
-
-    So the health view's staleness flag currently reads a write-time, which makes a recently
-    REWRITTEN item look recently USED. Mapping it anyway — rather than inventing a field nothing
-    maintains — is the lesser distortion: a ``last_seen`` that never advances would be equally
-    blind while looking authoritative, and there is no third candidate on the record. The real fix
-    is a ``last_seen`` on the engine record that the recall path stamps, which is an owner
-    decision about the write path, not something this façade may make on its own.
+    assessor's staleness rule reads it as exactly that. Before AD-266a the engine record had no
+    such field and this function mapped ``updated_at`` instead — a WRITE timestamp that also
+    moves on any lifecycle transition or payload patch, so a recently REWRITTEN item looked
+    recently USED even if nobody had recalled it. ``storage/domain/memory.py``'s ``last_seen``
+    field now carries the honest signal directly: stamped at construction (a never-recalled
+    memory was "last seen" when captured) and advanced by every ``reinforce``/``reinforce_many``
+    call on a genuine recall hit (``ports.py``'s three ``reinforce`` docstrings). Kept as a
+    one-line function, not inlined at the call site, so the history above stays attached to the
+    ONE place this crossing happens (this module's own docstring) rather than being lost.
     """
-    return item.updated_at
+    return item.last_seen
 
 
 def _validity(item: EngineMemoryItem) -> Validity:
@@ -193,6 +196,7 @@ def to_contract_item(item: EngineMemoryItem) -> ContractMemoryItem:
         # See the module docstring: two of seven components exist, so no composite is computed.
         salience=None,
         access_count=item.access_count,
+        mention_count=item.mention_count,
         importance=item.importance_score,
         last_seen=_last_seen(item),
         pinned=item.pinned,
@@ -228,10 +232,12 @@ def to_engine_item(item: ContractMemoryItem) -> EngineMemoryItem:
         session_id=ns.session,
         created_at=item.validity.recorded_at,
         updated_at=item.last_seen,
+        last_seen=item.last_seen,
         valid_at=item.validity.valid_at,
         invalid_at=item.validity.invalid_at,
         importance_score=item.importance,
         access_count=item.access_count,
+        mention_count=item.mention_count,
         pinned=item.pinned,
         pinned_at=item.pinned_at,
         pinned_by=item.pinned_by,

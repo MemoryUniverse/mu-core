@@ -176,3 +176,55 @@ async def test_low_importance_stays_stm_only(
         qv = await query_vector("Ada works at Acme")
         hits = await mtm.semantic(private_ns, qv, limit=10)
         assert result.memory_id not in [h.item.id for h in hits]
+
+
+async def test_mention_promote_gate_fires_on_repeated_low_importance_content(
+    ingest_service: IngestService,
+    private_ns: Namespace,
+    redis_client: Redis,
+    qdrant_client: AsyncQdrantClient,
+    embedder: SentenceTransformerEmbedder,
+    query_vector: Callable[[str], Awaitable[list[float]]],
+) -> None:
+    """D3 fix (AD-266b, ``docs/tracking/PROTOTYPE-DEBT-0924.md``): ``IngestSettings.
+    mention_promote`` (default 2) used to be a shipped gate with no reachable trigger —
+    ``mention_count`` was 1 for every memory, forever, because nothing ever incremented it. This
+    proves the arm actually fires now, on REAL Redis + REAL Qdrant, for content that clears
+    NEITHER of the other two gates (``promote=False``, ``importance`` below the 0.6 default).
+
+    MUTATION CHECK (run, red, restored): comment out the
+    ``if mention_count >= self._settings.mention_promote: return "mention_count"`` line in
+    ``DeterministicPromoteStage._promotion_reason`` — the THIRD call below (still
+    ``promoted=False``) goes red on this test while every other test in this file (none of which
+    repeats identical low-importance content) stays green.
+    """
+    low = 0.2  # well under the 0.6 default `importance_promote` gate
+    first = await ingest_service.remember(_fact(private_ns, offset="mp-1", importance=low))
+    assert first.promoted is False, "first mention alone must not promote (mention_count=1 < 2)"
+
+    stm = RedisStmAdapter(redis_client)
+    row = await stm.get(private_ns, first.memory_id)
+    assert row is not None and row.mention_count == 1
+
+    # SAME content, a SECOND independent capture (distinct session_offset, D4's write-time
+    # content-hash dedup collapses it onto the SAME resident STM row and bumps mention_count).
+    second = await ingest_service.remember(_fact(private_ns, offset="mp-2", importance=low))
+    assert second.memory_id == first.memory_id, "identical content must dedup onto the same row"
+
+    row_after = await stm.get(private_ns, second.memory_id)
+    assert row_after is not None and row_after.mention_count == 2, (
+        "a second identical-content capture must bump the resident row's mention_count — the "
+        "signal `mention_promote` gates on"
+    )
+    # THE GATE FIRES: neither `promote` nor `importance` cleared it, but `mention_count` (2) now
+    # meets the default `mention_promote` (2) threshold.
+    assert second.promoted is True, "mention_promote (D3) did not fire at mention_count=2"
+    assert second.tiers_written == ("stm", "mtm")
+    assert "MemoryPromoted" in second.events_emitted
+
+    mtm = QdrantMtmAdapter(qdrant_client, dim=embedder.dimension)
+    qv = await query_vector("Ada works at Acme as a staff engineer")
+    hits = await mtm.semantic(private_ns, qv, limit=5)
+    assert second.memory_id in [
+        h.item.id for h in hits
+    ], "mention_promote fired but the promoted copy never reached MTM"

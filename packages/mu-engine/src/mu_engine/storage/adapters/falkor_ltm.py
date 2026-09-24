@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
@@ -434,11 +434,25 @@ class FalkorLtmAdapter:
             )
         await self._materialize_entity_edge(g, item, props)
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
-        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
+        return await self._retry(self._reinforce_impl)(
+            ns, memory_id, at=at, relevance_score=relevance_score
+        )
 
     async def _reinforce_impl(
-        self, ns: Namespace, memory_id: str, *, at: datetime
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
     ) -> MemoryItem | None:
         """AD-259 / ADR 0062's named-open LTM half — the recall-time read-stat write-back for a
         ``:Memory`` node (``ports.py``'s ``GraphStorePort.reinforce`` docstring has the full
@@ -462,14 +476,24 @@ class FalkorLtmAdapter:
             # contract, never a raise: the caller passes only ids its own prior read just
             # returned.
             return None
-        reinforced = current.model_copy(
-            update={"access_count": current.access_count + 1, "updated_at": at}
-        )
+        update: dict[str, object] = {
+            "access_count": current.access_count + 1,
+            "updated_at": at,
+            "last_seen": at,
+        }
+        if relevance_score is not None:
+            update["relevance_score"] = relevance_score
+        reinforced = current.model_copy(update=update)
         await self._upsert_fact_impl(reinforced)
         return reinforced
 
     async def reinforce_many(
-        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+        self,
+        ns: Namespace,
+        memory_ids: Sequence[str],
+        *,
+        at: datetime,
+        relevance_scores: Mapping[str, float] | None = None,
     ) -> None:
         """AD-263 (ADR 0066 §1/§6) — the batched twin of :meth:`reinforce`, preferred by the SAME
         ``getattr(self._ltm, "reinforce_many", None)`` capability check
@@ -507,10 +531,17 @@ class FalkorLtmAdapter:
         """
         if not memory_ids:
             return
-        await self._retry(self._reinforce_many_impl)(ns, memory_ids, at=at)
+        await self._retry(self._reinforce_many_impl)(
+            ns, memory_ids, at=at, relevance_scores=relevance_scores
+        )
 
     async def _reinforce_many_impl(
-        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+        self,
+        ns: Namespace,
+        memory_ids: Sequence[str],
+        *,
+        at: datetime,
+        relevance_scores: Mapping[str, float] | None = None,
     ) -> None:
         g = await self._graph(ns)
         ns_prefix = ns.to_prefix()
@@ -535,9 +566,15 @@ class FalkorLtmAdapter:
         rows: list[dict[str, Any]] = []
         for memory_id, memory_json in res:
             current = MemoryItem.model_validate_json(memory_json)
-            reinforced = current.model_copy(
-                update={"access_count": current.access_count + 1, "updated_at": at}
-            )
+            update: dict[str, object] = {
+                "access_count": current.access_count + 1,
+                "updated_at": at,
+                "last_seen": at,
+            }
+            score = None if relevance_scores is None else relevance_scores.get(memory_id)
+            if score is not None:
+                update["relevance_score"] = score
+            reinforced = current.model_copy(update=update)
             rows.append({"id": memory_id, "memory_json": reinforced.model_dump_json()})
         await g.query(
             "UNWIND $rows AS row "

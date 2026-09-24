@@ -206,7 +206,16 @@ class InMemoryStmAdapter:
         # recency-order key vs. real-time expiry are independent axes in this adapter). Dedup is
         # an ordinary-capture concern only (AD-250 fix, ADR 0061 — `put_demoted`'s own docstring):
         # this path always bumps the ORDINARY `recency` index, never `demoted`.
-        bumped = existing_item.model_copy(update={"created_at": item.created_at})
+        # D3 fix (AD-266b), parity with `RedisStmAdapter._bump_if_duplicate`: a repeat
+        # content-hash hit is a re-assertion of the same fact — bump `mention_count` too, not
+        # just recency, or `IngestSettings.mention_promote` can never fire against this backend.
+        bumped = existing_item.model_copy(
+            update={
+                "created_at": item.created_at,
+                "mention_count": existing_item.mention_count + 1,
+                "last_seen": item.created_at,
+            }
+        )
         expires_at = (
             now + timedelta(seconds=self._default_ttl_s)
             if self._default_ttl_s is not None
@@ -392,10 +401,18 @@ class InMemoryStmAdapter:
         async with self._lock:
             self._evict_locked(self._partition(ns), memory_id)
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
         """The read-stat write-back (AD-250 fix, ADR 0061 — ``ports.py``'s own docstring has the
-        full rationale). Held under the SAME ``self._lock`` as every other mutation — the
-        in-process equivalent of the Redis leg's single ``SET ... KEEPTTL``."""
+        full rationale; AD-266 added ``relevance_score``/``last_seen``). Held under the SAME
+        ``self._lock`` as every other mutation — the in-process equivalent of the Redis leg's
+        single ``SET ... KEEPTTL``."""
         async with self._lock:
             part = self._partition(ns)
             entry = part.items.get(memory_id)
@@ -405,9 +422,14 @@ class InMemoryStmAdapter:
             if self._is_expired(expires_at, now=datetime.now(UTC)):
                 self._evict_locked(part, memory_id)
                 return None
-            reinforced = item.model_copy(
-                update={"access_count": item.access_count + 1, "updated_at": at}
-            )
+            update: dict[str, object] = {
+                "access_count": item.access_count + 1,
+                "updated_at": at,
+                "last_seen": at,
+            }
+            if relevance_score is not None:
+                update["relevance_score"] = relevance_score
+            reinforced = item.model_copy(update=update)
             # expires_at/demoted_at UNCHANGED — no index re-scoring needed (`put_demoted`'s own
             # docstring: the demoted channel's window does not shrink from unrelated activity).
             part.items[memory_id] = (reinforced, expires_at, demoted_at)

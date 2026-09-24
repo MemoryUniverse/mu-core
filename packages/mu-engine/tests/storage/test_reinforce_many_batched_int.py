@@ -280,3 +280,111 @@ async def test_reinforce_many_tolerates_absent_ids_mixed_with_present_ones(
     for ghost in (absent_before, absent_after):
         assert await stm.get(ns, ghost.id) is None
         assert await _raw(qdrant_client, ns, ghost.id) is None
+
+
+# -------------------------------------------------------------------------------------------
+# 5. D1/D2 (AD-266, PROTOTYPE-DEBT-0924.md): relevance_score + last_seen write back on a
+# genuine recall hit, on REAL Valkey and REAL Qdrant. MUTATION CHECK (run, red, restored): drop
+# the ``if relevance_score is not None: update[...] = relevance_score`` line from
+# ``_reinforce_impl``/``_reinforce_many_impl`` on either adapter — the corresponding assertion
+# below goes red while every pre-existing test in this file (which never passes a score) stays
+# green, proving those tests could not have caught D1's "always 0.0" regression.
+# -------------------------------------------------------------------------------------------
+
+
+async def test_stm_reinforce_writes_relevance_score_and_last_seen(
+    stm: ValkeyStmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    ns = make_ns(session="reinforce-d1-stm-single")
+    item = make_item(ns, "a fact worth recalling")
+    await stm.put(item)
+    assert item.relevance_score == 0.0  # the pre-fix "always zero" value, for contrast
+
+    reinforced = await stm.reinforce(ns, item.id, at=_AT, relevance_score=0.83)
+    assert reinforced is not None
+    assert reinforced.relevance_score == pytest.approx(0.83)
+    assert reinforced.last_seen == _AT
+
+    row = await stm.get(ns, item.id)
+    assert row is not None
+    assert row.relevance_score == pytest.approx(0.83), (
+        "relevance_score did not survive the round trip through Valkey — D1 not actually fixed "
+        "on the STORED row, only on the in-process return value"
+    )
+    assert row.last_seen == _AT, "last_seen did not survive the round trip through Valkey"
+
+
+async def test_stm_reinforce_many_writes_relevance_score_and_last_seen_per_id(
+    stm: ValkeyStmAdapter,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    ns = make_ns(session="reinforce-d1-stm-many")
+    scored, unscored = make_item(ns, "row with a score"), make_item(ns, "row with no score")
+    for item in (scored, unscored):
+        await stm.put(item)
+
+    await stm.reinforce_many(
+        ns, [scored.id, unscored.id], at=_AT, relevance_scores={scored.id: 0.42}
+    )
+
+    scored_row = await stm.get(ns, scored.id)
+    assert scored_row is not None
+    assert scored_row.relevance_score == pytest.approx(0.42)
+    assert scored_row.last_seen == _AT
+
+    # an id ABSENT from relevance_scores leaves the stored value untouched (never coerced to 0.0
+    # — that coercion would just be D1's defect reintroduced through the batched leg).
+    unscored_row = await stm.get(ns, unscored.id)
+    assert unscored_row is not None
+    assert unscored_row.relevance_score == 0.0
+    assert unscored_row.last_seen == _AT, "last_seen must advance even with no score supplied"
+
+
+async def test_mtm_reinforce_writes_relevance_score_and_last_seen(
+    mtm: QdrantMtmAdapter,
+    qdrant_client: AsyncQdrantClient,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    ns = make_ns(session="reinforce-d1-mtm-single")
+    item = make_item(ns, "a fact worth recalling in mtm")
+    await mtm.upsert(item)
+
+    reinforced = await mtm.reinforce(ns, item.id, at=_AT, relevance_score=0.91)
+    assert reinforced is not None
+    assert reinforced.relevance_score == pytest.approx(0.91)
+    assert reinforced.last_seen == _AT
+
+    payload = await _raw(qdrant_client, ns, item.id)
+    assert payload is not None
+    assert payload["relevance_score"] == pytest.approx(
+        0.91
+    ), "relevance_score did not survive the round trip through Qdrant's payload"
+    assert payload["last_seen"] == _AT.isoformat()
+
+
+async def test_mtm_reinforce_many_writes_relevance_score_per_id(
+    mtm: QdrantMtmAdapter,
+    qdrant_client: AsyncQdrantClient,
+    make_ns: Callable[..., Namespace],
+    make_item: Callable[..., MemoryItem],
+) -> None:
+    ns = make_ns(session="reinforce-d1-mtm-many")
+    scored, unscored = make_item(ns, "mtm row with a score"), make_item(ns, "mtm row unscored")
+    for item in (scored, unscored):
+        await mtm.upsert(item)
+
+    await mtm.reinforce_many(
+        ns, [scored.id, unscored.id], at=_AT, relevance_scores={scored.id: 0.55}
+    )
+
+    scored_payload = await _raw(qdrant_client, ns, scored.id)
+    assert scored_payload is not None
+    assert scored_payload["relevance_score"] == pytest.approx(0.55)
+    unscored_payload = await _raw(qdrant_client, ns, unscored.id)
+    assert unscored_payload is not None
+    assert unscored_payload.get("relevance_score", 0.0) == 0.0
+    assert unscored_payload["last_seen"] == _AT.isoformat()

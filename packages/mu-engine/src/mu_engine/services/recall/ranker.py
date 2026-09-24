@@ -1023,11 +1023,12 @@ class ThreeChannelRecallRanker:
         if not ids:
             return
         at = self._clock.now()
+        relevance_scores = self._relevance_scores(items)
 
         reinforce_many = getattr(self._stm, "reinforce_many", None)
         if callable(reinforce_many):
             try:
-                await reinforce_many(ns, ids, at=at)
+                await reinforce_many(ns, ids, at=at, relevance_scores=relevance_scores)
             except StoreUnavailableError as exc:
                 _log.warning(
                     "recall.reinforce_unavailable",
@@ -1039,7 +1040,9 @@ class ThreeChannelRecallRanker:
 
         async def _one(memory_id: str) -> None:
             try:
-                await self._stm.reinforce(ns, memory_id, at=at)
+                await self._stm.reinforce(
+                    ns, memory_id, at=at, relevance_score=relevance_scores.get(memory_id)
+                )
             except StoreUnavailableError as exc:
                 _log.warning(
                     "recall.reinforce_unavailable",
@@ -1049,6 +1052,29 @@ class ThreeChannelRecallRanker:
                 )
 
         await asyncio.gather(*(_one(mid) for mid in ids))
+
+    @staticmethod
+    def _relevance_scores(items: list[RecallItemView]) -> dict[str, float]:
+        """AD-266 (D1) — the per-id relevance signal :meth:`_reinforce_stm_hits`/
+        :meth:`_reinforce_mtm_hits`/:meth:`_reinforce_ltm_hits` write back as
+        ``MemoryItem.relevance_score`` (``ports.py``'s three ``reinforce`` docstrings; the
+        prototype's ``mtm_qdrant.py:375-399``/``stm_redis.py:323-341`` wrote "the observed ANN
+        score" on every recall hit — AD-266 found the shipped code never did).
+
+        Prefers ``rerank_score`` when the rerank gate fired for this hit (a strictly more precise
+        relevance judgement than the rank-fusion score) and falls back to ``fused_score``
+        otherwise — ``rerank_score`` is ``None`` exactly when the gate is dark or this hit fell
+        outside ``rerank_pool_size`` (``dto.py``'s own field docstring), never a third state to
+        handle here. A memory occupying two slots in the SAME result (e.g. a floor member that is
+        also a neighbour-expansion extra) keeps its FIRST-seen score — an arbitrary but stable
+        tie-break, since both slots describe the identical underlying relevance judgement for the
+        identical memory, not two independent ones."""
+        scores: dict[str, float] = {}
+        for v in items:
+            if v.memory_id in scores:
+                continue
+            scores[v.memory_id] = v.rerank_score if v.rerank_score is not None else v.fused_score
+        return scores
 
     async def _reinforce_mtm_hits(self, ns: Namespace, items: list[RecallItemView]) -> None:
         """AD-259: the MTM twin of :meth:`_reinforce_stm_hits` — same contract, same de-dupe,
@@ -1077,6 +1103,7 @@ class ThreeChannelRecallRanker:
         if not hasattr(self._mtm, "reinforce"):
             return
         at = self._clock.now()
+        relevance_scores = self._relevance_scores(items)
 
         # AD-260 — same batching preference as `_reinforce_stm_hits` (that method's own docstring
         # has the measurement): `QdrantMtmAdapter.reinforce_many` collapses the per-id `retrieve`
@@ -1086,7 +1113,7 @@ class ThreeChannelRecallRanker:
         reinforce_many = getattr(self._mtm, "reinforce_many", None)
         if callable(reinforce_many):
             try:
-                await reinforce_many(ns, ids, at=at)
+                await reinforce_many(ns, ids, at=at, relevance_scores=relevance_scores)
             except StoreUnavailableError as exc:
                 _log.warning(
                     "recall.reinforce_mtm_unavailable",
@@ -1098,7 +1125,9 @@ class ThreeChannelRecallRanker:
 
         async def _one(memory_id: str) -> None:
             try:
-                await self._mtm.reinforce(ns, memory_id, at=at)
+                await self._mtm.reinforce(
+                    ns, memory_id, at=at, relevance_score=relevance_scores.get(memory_id)
+                )
             except StoreUnavailableError as exc:
                 _log.warning(
                     "recall.reinforce_mtm_unavailable",
@@ -1146,6 +1175,7 @@ class ThreeChannelRecallRanker:
         if not hasattr(self._ltm, "reinforce"):
             return
         at = self._clock.now()
+        relevance_scores = self._relevance_scores(items)
 
         # AD-263 — same batching preference as `_reinforce_stm_hits`/`_reinforce_mtm_hits`:
         # `FalkorLtmAdapter.reinforce_many` collapses the per-id fetch-then-upsert fan-out into
@@ -1155,7 +1185,7 @@ class ThreeChannelRecallRanker:
         reinforce_many = getattr(self._ltm, "reinforce_many", None)
         if callable(reinforce_many):
             try:
-                await reinforce_many(ns, ids, at=at)
+                await reinforce_many(ns, ids, at=at, relevance_scores=relevance_scores)
             except StoreUnavailableError as exc:
                 _log.warning(
                     "recall.reinforce_ltm_unavailable",
@@ -1167,7 +1197,9 @@ class ThreeChannelRecallRanker:
 
         async def _one(memory_id: str) -> None:
             try:
-                await self._ltm.reinforce(ns, memory_id, at=at)
+                await self._ltm.reinforce(
+                    ns, memory_id, at=at, relevance_score=relevance_scores.get(memory_id)
+                )
             except StoreUnavailableError as exc:
                 _log.warning(
                     "recall.reinforce_ltm_unavailable",

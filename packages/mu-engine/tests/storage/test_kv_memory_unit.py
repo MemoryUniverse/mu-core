@@ -166,6 +166,25 @@ async def test_write_time_dedup_bumps_recency_on_the_winner(
     assert len(after) == 2  # still no forked third row
 
 
+async def test_write_time_dedup_bumps_mention_count_on_the_winner(
+    make_ns: Callable[..., Namespace], make_item: Callable[..., MemoryItem]
+) -> None:
+    """D3 fix (AD-266b) — parity with ``test_kv_redis_int.py``'s identical-named test, on the
+    in-memory backend (``memory_stm.py``'s own ``_bump_if_duplicate_locked``)."""
+    adapter = InMemoryStmAdapter()
+    ns = make_ns()
+    first = make_item(ns, "Ada drinks black coffee every morning")
+    second = make_item(ns, "Ada drinks black coffee every morning")
+
+    await adapter.put(first)
+    row = await adapter.get(ns, first.id)
+    assert row is not None and row.mention_count == 1
+
+    await adapter.put(second)
+    row = await adapter.get(ns, first.id)
+    assert row is not None and row.mention_count == 2
+
+
 async def test_write_time_dedup_self_heals_a_stale_mapping(
     make_ns: Callable[..., Namespace], make_item: Callable[..., MemoryItem]
 ) -> None:

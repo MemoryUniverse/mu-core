@@ -32,7 +32,7 @@ docstring).
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Mapping, Sequence
 from datetime import datetime
 from typing import cast
 
@@ -141,6 +141,18 @@ class RedisStmAdapter:
         as a miss, so ``_put_impl`` falls through to a normal write-through that overwrites the
         mapping with the new id (exactly the existing recency-ZSET self-heal pattern
         ``_recent_impl`` already uses for expired members).
+
+        **D3 fix (AD-266b, ``docs/tracking/PROTOTYPE-DEBT-0924.md``).** This IS the "the user
+        said this again" signal — a repeat content-hash hit is a re-assertion of the exact same
+        fact, the write-time twin of the distill-time identical-active-fact reconciliation
+        (``pipelines/distill.py::_resolve``'s NOOP branch, mem0 NONE / ``graph_falkor.py:113`` ON
+        MATCH). Before this fix the winner's payload was never re-read or rewritten here — only
+        its recency score + TTL moved — so ``mention_count`` stayed at its capture-time default
+        forever and ``IngestSettings.mention_promote`` (default 2) could never fire, no matter how
+        many times the same content was asserted. Now the winner's stored blob is GET-decoded,
+        ``mention_count`` incremented, and the re-encoded blob rides in the SAME pipelined
+        transaction as the recency/TTL bumps below — one extra round trip (the GET), zero extra
+        transactions.
         """
         chash_key = RedisMapper.content_hash_key(item.namespace)
         # redis-py's stub types `hget` as `Awaitable[str | None] | str | None` (a sync/async
@@ -155,12 +167,25 @@ class RedisStmAdapter:
         if existing_id == item.id:
             return None  # a genuine re-put of the SAME id — let the normal path re-write it.
         existing_key = RedisMapper.memory_key(item.namespace, existing_id)
-        if not await self._redis.exists(existing_key):
+        existing_blob = await self._redis.get(existing_key)
+        if existing_blob is None:
             return None  # stale index entry (winner expired/evicted) — treat as a fresh write.
+        current = self._mapper.from_store(
+            RedisRecord(key=existing_key, ttl_s=None, blob=_as_str(existing_blob))
+        )
+        reinforced = current.model_copy(
+            update={"mention_count": current.mention_count + 1, "last_seen": item.created_at}
+        )
         pipe = self._redis.pipeline(transaction=True)
+        # KEEPTTL when this write carries no explicit override (the same discipline
+        # `reinforce`/`_set_pinned_impl` already use) — a repeat mention must not reset the
+        # winner's retention clock any more than the recency/TTL bumps below already don't.
+        if ttl_s:
+            pipe.set(existing_key, reinforced.model_dump_json(), ex=ttl_s)
+        else:
+            pipe.set(existing_key, reinforced.model_dump_json(), keepttl=True)
         pipe.zadd(recency, {existing_id: item.created_at.timestamp()})
         if ttl_s:
-            pipe.expire(existing_key, ttl_s)
             pipe.expire(recency, ttl_s)
             pipe.expire(chash_key, ttl_s)
         await pipe.execute()
@@ -427,13 +452,27 @@ class RedisStmAdapter:
         pipe.zrem(RedisMapper.demoted_key(ns), memory_id)
         await pipe.execute()
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
         """The read-stat write-back a genuine recall hit performs (AD-250 fix, ADR 0061 —
-        ``ports.py``'s own docstring has the full rationale)."""
-        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+        ``ports.py``'s own docstring has the full rationale; AD-266 added ``relevance_score``)."""
+        return await self._retry(self._reinforce_impl)(
+            ns, memory_id, at=at, relevance_score=relevance_score
+        )
 
     async def _reinforce_impl(
-        self, ns: Namespace, memory_id: str, *, at: datetime
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
     ) -> MemoryItem | None:
         # Read-modify-write over the SAME `_get_impl` primitive `_recent_impl`/`get` already use
         # (never the public `get`: an internal maintenance call has no caller to authorize
@@ -444,9 +483,14 @@ class RedisStmAdapter:
         if blob is None:
             return None  # expired/evicted in the window between the caller's read and this call.
         current = self._mapper.from_store(RedisRecord(key=key, ttl_s=None, blob=_as_str(blob)))
-        reinforced = current.model_copy(
-            update={"access_count": current.access_count + 1, "updated_at": at}
-        )
+        update: dict[str, object] = {
+            "access_count": current.access_count + 1,
+            "updated_at": at,
+            "last_seen": at,  # D2 fix (AD-266a)
+        }
+        if relevance_score is not None:
+            update["relevance_score"] = relevance_score  # D1 fix (AD-266)
+        reinforced = current.model_copy(update=update)
         # KEEPTTL: a recall must never reset a demoted item's `demoted_stm_ttl_s` retention clock
         # back to a fresh one (the same discipline `_set_pinned_impl` already uses, for the same
         # reason — a read-stat write-back is not a re-capture). Deliberately does NOT touch
@@ -458,7 +502,12 @@ class RedisStmAdapter:
         return reinforced
 
     async def reinforce_many(
-        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+        self,
+        ns: Namespace,
+        memory_ids: Sequence[str],
+        *,
+        at: datetime,
+        relevance_scores: Mapping[str, float] | None = None,
     ) -> None:
         """AD-260 — the batched twin of :meth:`reinforce`. MEASURED
         (``docs/tracking/ARCHITECTURE-DELTAS.md`` AD-260): ``ThreeChannelRecallRanker`` firing one
@@ -475,13 +524,22 @@ class RedisStmAdapter:
         retention clock), ``created_at`` untouched, an id that raced away between the read and the
         write (already expired/evicted) is silently skipped in the write pipeline — the pipelined
         equivalent of :meth:`reinforce`'s own ``None`` return, best-effort by the same contract
-        (``ports.py``'s ``StmTierRepository.reinforce`` docstring)."""
+        (``ports.py``'s ``StmTierRepository.reinforce`` docstring). ``relevance_scores`` (AD-266)
+        is an optional ``memory_id -> score`` map; an id absent from it leaves that row's stored
+        ``relevance_score`` untouched, exactly like :meth:`reinforce`'s own ``None`` default."""
         if not memory_ids:
             return
-        await self._retry(self._reinforce_many_impl)(ns, memory_ids, at=at)
+        await self._retry(self._reinforce_many_impl)(
+            ns, memory_ids, at=at, relevance_scores=relevance_scores
+        )
 
     async def _reinforce_many_impl(
-        self, ns: Namespace, memory_ids: Sequence[str], *, at: datetime
+        self,
+        ns: Namespace,
+        memory_ids: Sequence[str],
+        *,
+        at: datetime,
+        relevance_scores: Mapping[str, float] | None = None,
     ) -> None:
         keys = [RedisMapper.memory_key(ns, memory_id) for memory_id in memory_ids]
 
@@ -492,13 +550,19 @@ class RedisStmAdapter:
 
         write_pipe = self._redis.pipeline(transaction=False)
         queued = False
-        for key, blob in zip(keys, blobs, strict=True):
+        for memory_id, key, blob in zip(memory_ids, keys, blobs, strict=True):
             if blob is None:
                 continue  # expired/evicted in the window between the caller's read and this call
             current = self._mapper.from_store(RedisRecord(key=key, ttl_s=None, blob=_as_str(blob)))
-            reinforced = current.model_copy(
-                update={"access_count": current.access_count + 1, "updated_at": at}
-            )
+            update: dict[str, object] = {
+                "access_count": current.access_count + 1,
+                "updated_at": at,
+                "last_seen": at,
+            }
+            score = None if relevance_scores is None else relevance_scores.get(memory_id)
+            if score is not None:
+                update["relevance_score"] = score
+            reinforced = current.model_copy(update=update)
             write_pipe.set(key, reinforced.model_dump_json(), keepttl=True)
             queued = True
         if queued:

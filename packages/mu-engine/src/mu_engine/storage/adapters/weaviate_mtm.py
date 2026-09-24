@@ -623,15 +623,30 @@ class WeaviateMtmAdapter:
             verb="expire",
         )
 
-    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
-        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+    async def reinforce(
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
+    ) -> MemoryItem | None:
+        return await self._retry(self._reinforce_impl)(
+            ns, memory_id, at=at, relevance_score=relevance_score
+        )
 
     async def _reinforce_impl(
-        self, ns: Namespace, memory_id: str, *, at: datetime
+        self,
+        ns: Namespace,
+        memory_id: str,
+        *,
+        at: datetime,
+        relevance_score: float | None = None,
     ) -> MemoryItem | None:
         """AD-259 — the recall-time read-stat write-back (``ports.py``'s
         ``MtmTierRepository.reinforce`` docstring has the rationale; ``qdrant_mtm.py``'s own
-        ``_reinforce_impl`` has the read-modify-write / benign-race note this shares).
+        ``_reinforce_impl`` has the read-modify-write / benign-race note this shares; AD-266
+        added ``relevance_score``/``last_seen``).
 
         Reuses :meth:`_scoped_patch`, the same namespace-scoped by-id PATCH primitive
         :meth:`expire` / :meth:`invalidate` / :meth:`set_entity_uids` use — so this verb inherits
@@ -641,13 +656,24 @@ class WeaviateMtmAdapter:
         current = await self._get_impl(ns, memory_id)
         if current is None:
             return None
-        reinforced = current.model_copy(
-            update={"access_count": current.access_count + 1, "updated_at": at}
-        )
+        update: dict[str, object] = {
+            "access_count": current.access_count + 1,
+            "updated_at": at,
+            "last_seen": at,
+        }
+        patch: dict[str, object] = {
+            "access_count": current.access_count + 1,
+            "updated_at": at.isoformat(),
+            "last_seen": at.isoformat(),
+        }
+        if relevance_score is not None:
+            update["relevance_score"] = relevance_score
+            patch["relevance_score"] = relevance_score
+        reinforced = current.model_copy(update=update)
         await self._scoped_patch(
             ns,
             memory_id,
-            {"access_count": reinforced.access_count, "updated_at": at.isoformat()},
+            patch,
             verb="reinforce",
         )
         return reinforced

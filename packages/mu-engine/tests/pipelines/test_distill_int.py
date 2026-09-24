@@ -268,6 +268,16 @@ async def test_distill_noop_reinforces_identical_fact(
     assert len(hits) == 1
     assert hits[0].item.id == item.id
     assert hits[0].item.access_count == 1  # reinforced once
+    # D3 fix (AD-266b): the mem0 NONE / `graph_falkor.py:113` ON MATCH semantics this branch's
+    # own docstring cites ("bump mention_count, reinforce") — MUTATION CHECK (run, red,
+    # restored): delete `reinforced.mention_count += 1` from `_resolve`'s NOOP branch and this
+    # assertion alone goes red, `access_count` above stays green.
+    assert hits[0].item.mention_count == 2, (
+        "an identical-active-fact NOOP must bump mention_count — the 'said it again' signal — "
+        "not just access_count"
+    )
+    # D2 fix (AD-266a): last_seen must advance too, distinctly from created_at.
+    assert hits[0].item.last_seen > item.created_at
 
 
 async def test_distill_non_functional_predicate_coexists(
