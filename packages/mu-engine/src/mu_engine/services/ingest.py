@@ -51,6 +51,7 @@ from mu_engine.platform.observability import (
     NoopMetricSink,
     NoopTracer,
     TraceScope,
+    redact_credentials,
 )
 from mu_engine.providers._contracts import EmbeddingPort
 from mu_engine.services.settings import IngestSettings
@@ -194,7 +195,16 @@ class IngestService:
 
         Wrapped in central observability (DEV-STANDARDS rule 4): a content-free span, a latency
         histogram (always) + an error counter (on failure), and a content-free audit row on
-        success. ``CancelledError`` propagates and is NOT counted as a failure (it is not one)."""
+        success. ``CancelledError`` propagates and is NOT counted as a failure (it is not one).
+
+        AD-294 — the credential guard runs FIRST, before ``_ensure_turn_seq`` or any stage, on
+        this exact method: the one every ingest path in this tree already funnels through
+        (``LocalMemory.add``, ``SurfaceFacade.add``, mu-server's ``SharedMemoryService.add`` —
+        the SAME "centralise here, not at every caller" precedent ``_ensure_turn_seq``'s own
+        docstring documents). Under ``CredentialPolicy.REFUSE`` this raises
+        :class:`~mu_engine.platform.observability.CredentialInTextRejectedError` before a single
+        byte reaches STM, an artifact, or the enrichment queue — never a partial durable write."""
+        activity = self._apply_credential_policy(activity)
         activity = await self._ensure_turn_seq(activity)
         correlation_id = activity_id_for(activity)
         started = time.perf_counter()
@@ -220,6 +230,22 @@ class IngestService:
             counts={"tiers_written": len(result.tiers_written)},
         )
         return result
+
+    def _apply_credential_policy(self, activity: IngestActivity) -> IngestActivity:
+        """AD-294 — run ``activity.text`` through the AD-267 credential-shape catalog
+        (:func:`~mu_engine.platform.observability.redact_credentials`, never a second matcher)
+        under this service's configured :class:`~mu_engine.services.settings.IngestSettings.
+        credential_policy` (default ``REDACT``).
+
+        Pure and synchronous — no I/O, no log line (a matched shape name only ever reaches the
+        raised exception message under ``REFUSE``, never a log call, holding rule 3). Returns a
+        NEW ``IngestActivity`` (frozen — ``model_copy``); the caller's own object is untouched."""
+        outcome = redact_credentials(activity.text, policy=self._settings.credential_policy)
+        if not outcome.credential_shaped:
+            return activity
+        return activity.model_copy(
+            update={"text": outcome.text, "credential_shaped": True},
+        )
 
     async def _ensure_turn_seq(self, activity: IngestActivity) -> IngestActivity:
         """S1b write-side blocker (``docs/tracking/TRACE-0923.md`` §7/§6.2, AD-234): auto-assign

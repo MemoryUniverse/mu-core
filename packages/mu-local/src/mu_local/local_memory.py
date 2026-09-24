@@ -88,6 +88,7 @@ from mu_contracts.ports.lifecycle_lease import LifecycleLeasePort
 from mu_contracts.ports.lifecycle_workflow import LifecycleWorkflowRunnerPort
 from mu_contracts.ports.time import Clock
 from mu_contracts.validation import validate_plane_fields
+from mu_engine.config import EngineSettings
 from mu_engine.lifecycle.settings import LifecycleSettings
 from mu_engine.pipelines.concrete.ingest import IngestActivity
 from mu_engine.pipelines.distill import DistillActionKind
@@ -153,11 +154,24 @@ class LocalMemory:
         namespace: str = "default",
         settings: Any | None = None,
         lifecycle: LifecycleSettings | None = None,
+        # AD-294: an injection seam for the WIRED ``EngineSettings`` (mirrors the ``settings``/
+        # ``lifecycle`` params above — same "a caller/test can pass an already-constructed
+        # instance without touching os.environ" precedent ``LocalContainer.__init__``'s own
+        # ``engine_settings`` docstring states). ``None`` (the default) keeps the pre-existing
+        # behaviour byte-for-byte: ``LocalContainer`` falls back to ``get_engine_settings()``
+        # (env-read). The one caller-visible knob this adds today is
+        # ``EngineSettings.ingest.credential_policy`` — the owner's AD-294 redact/refuse/mark
+        # choice — without requiring every caller to mutate ``MU_INGEST__CREDENTIAL_POLICY`` and
+        # clear the settings cache just to configure it.
+        engine_settings: EngineSettings | None = None,
     ) -> None:
         self._workspace = workspace
         self._org = namespace  # the η.org slot (spec §3.2: namespace fixes org)
         self._container = LocalContainer(
-            storage or StorageSettings(), settings=settings, lifecycle=lifecycle
+            storage or StorageSettings(),
+            settings=settings,
+            engine_settings=engine_settings,
+            lifecycle=lifecycle,
         )
         # Stage A's unified-surface facade, injected with THIS instance's own composition root
         # (never a second, independently-constructed container — DEV-STANDARDS rule 9). Used only

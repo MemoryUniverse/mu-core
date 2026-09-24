@@ -261,6 +261,14 @@ class MemoryItem(BaseModel):
 
     source: MemorySource = MemorySource.USER
 
+    # AD-294 — capture-time credential guard. `True` when `IngestService.remember` matched
+    # `content` against the AD-267 credential-shape catalog under `CredentialPolicy.REDACT` (the
+    # match was replaced with a placeholder) or `CredentialPolicy.MARK` (content kept verbatim,
+    # flagged). Content-free by construction: a boolean, never the matched value or its shape —
+    # a reader who needs the shape re-derives it from `content` itself. `False` (the default) for
+    # every pre-existing row and every write path that predates this field.
+    credential_shaped: bool = False
+
     # proposition triple (content-free relational mirror stores hashes/uids, never this text)
     subject: str | None = None
     predicate: str | None = None
