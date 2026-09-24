@@ -296,9 +296,10 @@ async def test_set_entity_uids_round_trips_through_get(
     got = await mtm.get(ns, item.id)
 
     assert got is not None
-    assert got.metadata["entity_uids"] == ["ent_subject", "ent_object"], (
-        f"entity_uids did not round-trip through MemoryItem.metadata: {got.metadata!r}"
-    )
+    assert got.metadata["entity_uids"] == [
+        "ent_subject",
+        "ent_object",
+    ], f"entity_uids did not round-trip through MemoryItem.metadata: {got.metadata!r}"
 
 
 # --------------------------------------------------------------------------------------

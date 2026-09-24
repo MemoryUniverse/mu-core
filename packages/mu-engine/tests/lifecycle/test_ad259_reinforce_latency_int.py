@@ -114,6 +114,33 @@ def _percentile(samples: list[float], pct: float) -> float:
     return ordered[k]
 
 
+class _LtmWithoutReinforce:
+    """A ``GraphStorePort`` implementation that deliberately does NOT expose ``reinforce`` —
+    the exact shape ``ranker.py``'s ``_reinforce_ltm_hits`` capability guard exists for
+    ("an alternate/future graph backend... built against the pre-AD-259 port shape", that
+    method's own docstring, and ``test_recall_ranker_unit.py``'s
+    ``test_a_graph_backend_without_reinforce_does_not_break_recall``).
+
+    Used here as a MEASUREMENT arm, not a mock: every graph verb the ranker actually calls is
+    delegated to the REAL ``FalkorLtmAdapter`` against the REAL FalkorDB, so the LTM *channel*
+    costs exactly what it costs in the other two arms. The ONLY difference is that the LTM
+    write-back leg turns itself off through its own production guard — which isolates what that
+    leg costs, the one thing AD-260's batching deliberately did not touch
+    (``ARCHITECTURE-DELTAS.md`` AD-260 "NOT touched", AD-261's own "NOT touched" row).
+    """
+
+    def __init__(self, inner: FalkorLtmAdapter) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> object:
+        if name == "reinforce":
+            # Not `return None`: the guard is `hasattr`, so the attribute must genuinely not
+            # resolve — the same way it does not resolve on a pgvector/chroma/faiss vector
+            # backend today.
+            raise AttributeError(name)
+        return getattr(self._inner, name)
+
+
 async def _seed_items(
     *,
     ns: Namespace,
@@ -229,8 +256,24 @@ async def test_reinforce_on_recall_latency_cost_measured(
     expected = set(ids)
 
     results: dict[str, dict] = {}
-    for label, on in (("reinforce_OFF", False), ("reinforce_ON", True)):
-        ranker = _ranker(stm=stm, mtm=mtm, ltm=ltm, clock=clock, reinforce_on_recall=on)
+    # Three arms, not two. The third isolates AD-261's UNBATCHED LTM write-back leg — the one
+    # AD-260 explicitly left alone — from the two tiers AD-260 batched, by swapping in a graph
+    # backend that turns that leg off through the ranker's own production capability guard.
+    # Without it, "recall costs +Xms with reinforcement on" cannot say which tier the X is in,
+    # and the follow-up AD-260/AD-261 both named cannot be prioritised from evidence.
+    arms: tuple[tuple[str, bool, object], ...] = (
+        ("reinforce_OFF", False, ltm),
+        ("reinforce_ON_stm_mtm_only", True, _LtmWithoutReinforce(ltm)),
+        ("reinforce_ON", True, ltm),
+    )
+    for label, on, ltm_for_arm in arms:
+        ranker = _ranker(
+            stm=stm,
+            mtm=mtm,
+            ltm=ltm_for_arm,  # type: ignore[arg-type]
+            clock=clock,
+            reinforce_on_recall=on,
+        )
         # Untimed warmup — connection-pool/TLS/handshake setup is a one-time cost, not a
         # per-recall cost, and charging it to round 1 would make the OFF/ON comparison noisy in
         # whichever arm happens to run first.
@@ -249,13 +292,26 @@ async def test_reinforce_on_recall_latency_cost_measured(
         all_calls = [x for r in rounds for x in r]
         results[label] = _summarize(label, all_calls, rounds)
 
-    off, on = results["reinforce_OFF"], results["reinforce_ON"]
+    off = results["reinforce_OFF"]
+    on = results["reinforce_ON"]
+    no_ltm = results["reinforce_ON_stm_mtm_only"]
     p50_delta = on["p50_ms"] - off["p50_ms"]
     p95_delta = on["p95_ms"] - off["p95_ms"]
     print(  # noqa: T201
         f"\n[AD-259 latency] DELTA (ON - OFF): p50={p50_delta:.2f}ms p95={p95_delta:.2f}ms "
         f"| p95 budget (storage-indexing-design.md §5.2, no-rerank) = {_P95_BUDGET_MS:.0f}ms "
         f"| delta as % of budget: p95={100 * p95_delta / _P95_BUDGET_MS:.1f}%"
+    )
+    # The split AD-260/AD-261 both named as open and neither measured: how much of the cost
+    # above is the two BATCHED tiers, and how much is the one still-unbatched LTM leg.
+    batched_p95 = no_ltm["p95_ms"] - off["p95_ms"]
+    ltm_leg_p95 = on["p95_ms"] - no_ltm["p95_ms"]
+    ltm_share = f"{100 * ltm_leg_p95 / p95_delta:.0f}%" if p95_delta else "n/a"
+    print(  # noqa: T201
+        f"\n[AD-261 latency] SPLIT: batched STM+MTM legs p95=+{batched_p95:.2f}ms "
+        f"({100 * batched_p95 / _P95_BUDGET_MS:.1f}% of budget) | UNBATCHED LTM leg "
+        f"p95=+{ltm_leg_p95:.2f}ms ({100 * ltm_leg_p95 / _P95_BUDGET_MS:.1f}% of budget) "
+        f"| LTM leg as a share of the total reinforce cost: {ltm_share}"
     )
 
     # This test's job is to MEASURE and REPORT, not to assert a verdict on the number — the
