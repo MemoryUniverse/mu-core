@@ -110,6 +110,14 @@ from mu_engine.providers.settings import (
     default_local_catalog,
 )
 from mu_engine.providers.sparse_encoder import build_sparse_encoder
+from mu_engine.services.conflict.policy_resolver import ConflictPolicyResolver
+from mu_engine.services.conflict.ports import (
+    InMemoryMemoryConflictPolicyStore,
+    InMemoryNamespaceConflictPolicyStore,
+    RecordBackedResolutionQueue,
+    UnappliedConflictRecordReader,
+)
+from mu_engine.services.conflict.resolution import ConflictResolutionService
 from mu_engine.services.extract import (
     FactExtractorPort,
     HeuristicSpoExtractor,
@@ -606,6 +614,51 @@ class LocalContainer:
         self._conflict_records: ConflictRecordRepository = (
             self._injected_conflict_records or InMemoryConflictRecordRepository()
         )
+
+        # AD-269 fix (ADR 0067/0071, PROTOTYPE-DEBT-0924.md §3 B1): the four objects
+        # `mu-engine-server/composition.py:508-524` already builds — this composition root built
+        # the adjudicator and the inbox it PARKS a MANUAL verdict in, but never the two arms that
+        # CLOSE one: a `ConflictPolicyResolver` (so AUTOMATIC vs MANUAL is a real per-namespace/
+        # per-memory decision, not always the constructor-time default) and a
+        # `ConflictResolutionService` + `RecordBackedResolutionQueue` over `self._conflict_records`
+        # (so a resolved conflict is actually APPLIED to a store and its `ConflictRecord` closed).
+        # RUN-verified before this fix (ADR 0070 §2): a real `LocalContainer` had
+        # `distill._conflict_apply = None`, `distill._resolution_queue = None`, and no
+        # `conflict_resolution`/`conflict_resolution_queue`/`conflict_policy_resolver` attribute
+        # at all — root `CLAUDE.md`'s boundary rule names conflict resolution explicitly as part
+        # of the open-core engine that must work well on FULL-LOCAL, so a conflict the adjudicator
+        # opened here was never closed: the CONFLICTING health flag stayed raised until restart,
+        # then the whole inbox vanished with the process. Same in-process stores the server root
+        # uses for its own single-tenant case (their own docstring there: "the sanctioned
+        # LOCAL-plane defaults") — a durable control-plane row is the multi-tenant SERVER's
+        # concern (mu-server), never this single-user daemon's.
+        self._namespace_conflict_policies = InMemoryNamespaceConflictPolicyStore()
+        self._memory_conflict_policies = InMemoryMemoryConflictPolicyStore()
+        self.conflict_policy_resolver: ConflictPolicyResolver = ConflictPolicyResolver(
+            settings=self._engine_settings.conflict,
+            namespace_policies=self._namespace_conflict_policies,
+            memory_policies=self._memory_conflict_policies,
+        )
+        self.conflict_resolution_queue: RecordBackedResolutionQueue = RecordBackedResolutionQueue(
+            # `self._conflict_records` is typed to the narrower `ConflictRecordRepository` port
+            # (governance's own file, per that port's docstring) which does not declare
+            # `awaiting_apply` — but both shipped adapters this attribute can ever hold
+            # (`InMemoryConflictRecordRepository`, a durable `conflict_records=` injection) DO
+            # implement it (`UnappliedConflictRecordReader`'s own docstring), the same structural
+            # gap `RedisConflictRecordRepository`'s CONCRETE type annotation lets the server root
+            # avoid — this composition root's attribute is deliberately typed to the PORT, not
+            # the concrete adapter, so the narrowing is made explicit here instead.
+            cast(UnappliedConflictRecordReader, self._conflict_records)
+        )
+        self.conflict_resolution: ConflictResolutionService = ConflictResolutionService(
+            records=self._conflict_records,
+            queue=self.conflict_resolution_queue,
+            clock=self._clock,
+            bus=self._bus,
+            namespace_policies=self._namespace_conflict_policies,
+            memory_policies=self._memory_conflict_policies,
+        )
+
         self.conflict_adjudicator: ConflictAdjudicator | None = None
         if self.llm is not None and self._distill_settings.use_llm_adjudicator:
             # C3: `settings=` threaded from the WIRED `EngineSettings.lifecycle`
@@ -620,6 +673,12 @@ class LocalContainer:
                 clock=self._clock,
                 bus=self._bus,
                 conflict_records=self._conflict_records,
+                # AD-269 / §4.1 — the resolver WINS over the constructor-time `policy`, the SAME
+                # "per-memory beats per-namespace beats workspace-default" wiring the server root
+                # uses; without it every conflict on this plane resolved under one hardcoded
+                # `ConflictResolutionPolicy()` no matter what a caller wrote through the policy
+                # stores above.
+                policy_resolver=self.conflict_policy_resolver,
             )
 
         # (8) application services — each facade verb delegates to exactly one of these; each gets
@@ -660,6 +719,14 @@ class LocalContainer:
             metrics=self.metrics,
             audit=self.audit,
             adjudicator=self.conflict_adjudicator,
+            # AD-269 fix — ResolveConflictStage's two arms (conflict-async §2 table; the SAME
+            # kwargs the server root passes at composition.py:587-588). Without these the
+            # machinery above is inert: a human decision recorded by `conflict_resolution` would
+            # never be applied to any store, and an AUTOMATIC supersession would never close its
+            # own `ConflictRecord`, leaving `AUTO_RESOLVED`/`origin=auto` unreachable — exactly
+            # the RUN-verified `distill._conflict_apply = None` finding this fix closes.
+            resolution_queue=self.conflict_resolution_queue,
+            conflict_apply=self.conflict_resolution,
         )
         # C1: from the WIRED `EngineSettings.recall` (`MU_RECALL__WEIGHT_MTM`,
         # `MU_RECALL__RRF_K`, `MU_RECALL__FLOOR_PROTECT_LIMIT`, …) — the exact class the
