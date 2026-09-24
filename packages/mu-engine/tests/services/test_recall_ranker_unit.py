@@ -511,6 +511,152 @@ async def test_default_settings_rank_the_relevant_mtm_hit_ahead_of_query_blind_l
     )
 
 
+# =================================================================================================
+# ADR 0060 — `ltm_protect_limit`: the LTM channel was not merely discounted, it was
+# STRUCTURALLY EXCLUDED. See `dto.py`'s `ltm_protect_limit` docstring and
+# `docs/tracking/eval-runs/2026-09-24-ltm-channel-zero-slots.md` for the full arithmetic proof.
+# =================================================================================================
+def test_shipped_default_ltm_protect_limit_is_zero() -> None:
+    """Literal regression guard — ADR 0060's own measurement (`dto.py`'s field docstring) is the
+    reason this is 0, not 1: at 1, 383/383 real LoCoMo queries got their guaranteed graph slot
+    and gold_in_context DROPPED (280->273/383). The mechanism is shipped; it is not turned on."""
+    assert RecallSettings().ltm_protect_limit == 0
+
+
+@pytest.mark.asyncio
+async def test_default_settings_still_exclude_ltm_at_protect_limit_zero() -> None:
+    """MUTATION CHECK (baseline half): the SHIPPED bare default (`ltm_protect_limit=0`)
+    reproduces the PRE-FIX structural exclusion exactly — an LTM candidate that cannot win the
+    RRF fuse on its own (buried under a full MTM pool) never appears in the result at all, not
+    merely low-ranked."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = (0.9, 0.1)
+    decoys = [_item(f"unrelated MTM decoy #{n}", tier=MemoryTier.MTM, at=base) for n in range(20)]
+    graph_fact = _item("Ada's team meets on Mondays", tier=MemoryTier.LTM, at=base)
+    ranker = _build_ranker(
+        stm_items=[],
+        mtm_hits_by_query={query_vec: decoys},
+        ltm_hits=[graph_fact],
+        settings=RecallSettings(stm_scoring="recency", ltm_protect_limit=0),
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "q",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ids = [it.memory_id for it in result.items]
+    assert graph_fact.id not in ids, (
+        "ltm_protect_limit=0 must reproduce the structural exclusion this ADR fixes — a real "
+        "graph fact, present and query-relevant-by-recency, still winning zero slots"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ltm_protect_limit_rescues_a_graph_fact_the_fuse_would_otherwise_exclude() -> None:
+    """MUTATION CHECK (fix half): the SAME setup as the test above, but with the MECHANISM turned
+    on (`ltm_protect_limit=1` — not the shipped default; see ADR 0060 / `dto.py`'s field
+    docstring for why the default stays 0) — the graph fact must now appear. Reverting the merge
+    in `ranker.py` turns this red while the test above stays green, isolating exactly what the
+    mechanism does when an operator enables it."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = (0.9, 0.1)
+    decoys = [_item(f"unrelated MTM decoy #{n}", tier=MemoryTier.MTM, at=base) for n in range(20)]
+    graph_fact = _item("Ada's team meets on Mondays", tier=MemoryTier.LTM, at=base)
+    ranker = _build_ranker(
+        stm_items=[],
+        mtm_hits_by_query={query_vec: decoys},
+        ltm_hits=[graph_fact],
+        settings=RecallSettings(stm_scoring="recency", ltm_protect_limit=1),
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "q",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ids = [it.memory_id for it in result.items]
+    assert graph_fact.id in ids, (
+        "ltm_protect_limit=1 must rescue at least one graph-tier candidate instead of pinning "
+        "the channel at exactly zero — an operator who turns this on must get what it promises"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ltm_protect_limit_never_outranks_a_relevant_mtm_hit() -> None:
+    """The rescue is PRESENCE, not PRIORITY: reproduces
+    `test_default_settings_rank_the_relevant_mtm_hit_ahead_of_query_blind_ltm_noise`'s exact
+    scenario but with `ltm_protect_limit=1` (the shipped default, which that test leaves
+    implicit) made explicit — the query-blind noise item is now GUARANTEED a slot, and it must
+    STILL rank behind the genuinely relevant MTM hit, never ahead of it."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = (0.9, 0.1)
+    decoys = [_item(f"unrelated MTM decoy #{n}", tier=MemoryTier.MTM, at=base) for n in range(3)]
+    target = _item("Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base)
+    noise = _item("Let me know if you need anything", tier=MemoryTier.LTM, at=base)
+    ranker = _build_ranker(
+        stm_items=[],
+        mtm_hits_by_query={query_vec: [*decoys, target]},
+        ltm_hits=[noise],
+        settings=RecallSettings(stm_scoring="recency", ltm_protect_limit=1),
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "q",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ids = [it.memory_id for it in result.items]
+    assert noise.id in ids, "the rescue should have guaranteed the noise item a slot this time"
+    assert ids.index(target.id) < ids.index(noise.id), (
+        "a rescued LTM candidate must never rank AHEAD of a genuinely relevant MTM hit — presence "
+        "is guaranteed, priority is not"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ltm_protect_limit_is_bounded_not_the_whole_pool() -> None:
+    """A graph tier with far more qualifying candidates than `ltm_protect_limit` must still only
+    ever spend AT MOST `ltm_protect_limit` of the `limit` result slots on rescued LTM items —
+    bounded regardless of corpus size, the whole point of a floor rather than a raised weight."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = (0.9, 0.1)
+    decoys = [_item(f"unrelated MTM decoy #{n}", tier=MemoryTier.MTM, at=base) for n in range(20)]
+    graph_facts = [_item(f"graph fact #{n}", tier=MemoryTier.LTM, at=base) for n in range(5)]
+    ranker = _build_ranker(
+        stm_items=[],
+        mtm_hits_by_query={query_vec: decoys},
+        ltm_hits=graph_facts,
+        settings=RecallSettings(stm_scoring="recency", ltm_protect_limit=2),
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "q",
+        list(query_vec),
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ltm_ids_in_result = {f.id for f in graph_facts} & {it.memory_id for it in result.items}
+    assert (
+        len(ltm_ids_in_result) == 2
+    ), f"expected exactly ltm_protect_limit=2 rescued LTM items, got {len(ltm_ids_in_result)}"
+
+
 @pytest.mark.asyncio
 async def test_most_recent_facts_are_still_unconditionally_protected() -> None:
     """The recency-floor INTENT (never evict a just-said fact) must survive the fix: the

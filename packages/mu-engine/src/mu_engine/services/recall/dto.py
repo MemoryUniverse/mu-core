@@ -335,6 +335,61 @@ class RecallSettings(BaseModel):
     weight_mtm: float = Field(default=1.0, ge=0.0)  # in-arm dense weight (§1.3 fuse)
     weight_ltm: float = Field(default=0.1, ge=0.0)  # in-arm graph weight (§1.3 fuse; see above)
     weight_private: float = Field(default=1.0, ge=0.0)  # federation: private-arm weight (§1.6)
+    # ADR 0060 (`docs/tracking/eval-runs/2026-09-24-ltm-channel-zero-slots.md`): "why does the
+    # LTM channel win zero slots even when it is populated" (the open question the 2026-08-31
+    # `weight_ltm` fix left, and ADR 0058's own verify pass re-raised) turned out to be a
+    # STRUCTURAL exclusion, not a discount. `reciprocal_rank_fusion`'s per-channel contribution is
+    # `weight/(k+rank+1)` — at shipped `weight_ltm=0.1`/`weight_mtm=1.0`/`rrf_k=60`, the LTM
+    # channel's best POSSIBLE contribution (its own rank 0: `0.1/61=0.00164`) is always smaller
+    # than the MTM channel's WORST-pool-item contribution (rank `pool-1`: `1.0/(60+pool)`, e.g.
+    # `0.0125` at `pool=20`) for every `channel_pool_size`/`channel_pool_multiplier` this repo
+    # ships — PROVED exhaustively in `tests/services/test_recall_ranker_unit.py`'s
+    # `test_ltm_protect_limit_*` family (a pure-math bisection over the shipped
+    # `reciprocal_rank_fusion`) and reproduced end to end: 960 real distilled facts in FalkorDB,
+    # 383 real LoCoMo queries, **0** LTM items in **any** fused result (`by_channel` byte-identical
+    # to the LTM-empty control).
+    #
+    # This field is the MECHANISM that fixes the structural exclusion — it reuses the STM floor's
+    # own "protect membership, RESCUE AT THE TAIL if fusion ranked the member outside the window"
+    # shape (`_merge_floor`, unchanged) for the graph tier's own top `ltm_protect_limit`
+    # candidates, so presence no longer requires winning RRF outright. A rescued member is
+    # APPENDED after the naturally-fused head, never re-ordered ahead of a genuinely relevant hit
+    # — `test_default_settings_rank_the_relevant_mtm_hit_ahead_of_query_blind_ltm_noise` (the
+    # regression test the 2026-08-31 fix shipped) keeps passing UNCHANGED at any `ltm_protect_
+    # limit` value: a query-blind LTM candidate still never OUTRANKS a relevant MTM hit.
+    #
+    # **But the mechanism WORKING is not the same question as the mechanism being WORTH shipping
+    # on, and MEASURED it is not, yet — so the default stays `0`.** `docs/tracking/eval-runs/
+    # 2026-09-24-ltm-channel-zero-slots.md`, matched-width, conv-26/30/41 (383 queries), 960
+    # distilled facts:
+    #     ltm_protect_limit=0 (structural exclusion, unchanged):
+    #         ltm items=0,   gold_in_context=280/383 (0.7311)
+    #     ltm_protect_limit=1 (mechanism ON):
+    #         ltm items=383, gold_in_context=273/383 (0.7128)
+    # The mechanism does exactly what it says — EXACTLY one graph item per query, every query,
+    # confirming the rescue fires and is bounded, not probabilistic — and gold_in_context DROPS by
+    # 7 queries (-1.83pt) for it. This is not "the channel contributes nothing," it is worse: **the
+    # channel contributes NEGATIVE value the moment it is allowed to place at all**, at the SAME
+    # root cause AD-204/the 2026-08-31 `weight_ltm` fix already diagnosed — `graph_recall`'s flat
+    # seed is query-BLIND (whole-partition, recency-ordered, `subject=None`), so the one slot it
+    # is guaranteed is, on average, a worse candidate than whatever query-relevant MTM/STM item it
+    # bumped to make room. The earlier `weight_ltm=1.0`->`0.1` fix and this field's default both
+    # answer the SAME question the same way: an unconditional, query-blind graph contribution is a
+    # net cost proportional to how much of the result budget it spends (30% of slots: -25pt
+    # full-corpus answer-quality; 1 of ~10 slots here: -1.83pt gold_in_context) — there is no slot
+    # count tested at which this seed's unconditional presence is a net positive.
+    #
+    # Left at `0` — reproducing today's structural exclusion, now by EXPLICIT, documented,
+    # measured choice rather than as an accidental side effect of a weight tuned for a different
+    # purpose — until the graph arm's seed stops being query-blind (entity-resolved seeding behind
+    # `resolve_entity`, already named as future work in `ranker.py`'s own module docstring: "a
+    # bigger change, not attempted here"). The mechanism itself is shipped, tested and
+    # mutation-checked so that future work has a bounded, presence-not-priority lever ready the
+    # day the seed is worth trusting with even one guaranteed slot — raising this past `0` without
+    # first fixing the seed would be motion, not progress, exactly the trap
+    # `2026-09-24-verify-graph-tier-contribution.md`'s own closing line named. Env override:
+    # `MU_RECALL__LTM_PROTECT_LIMIT`.
+    ltm_protect_limit: int = Field(default=0, ge=0)
     weight_shared: float = Field(default=1.0, ge=0.0)  # federation: shared-arm weight (§1.6)
 
     # D4 read-time cross-tier dedup (CONFIG-AND-DATA-FIX-PLAN.md PART 2 D4; conformance D-8):

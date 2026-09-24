@@ -385,6 +385,45 @@ class ThreeChannelRecallRanker:
             _to_view(s, "stm") for s in floor_scored if s.item.id in protected_ids
         ]
 
+        # ADR 0060 (docs/tracking/eval-runs/2026-09-24-ltm-channel-zero-slots.md): "why does the
+        # LTM channel win zero slots even when it is populated" — a STRUCTURAL exclusion, not a
+        # discount. `weight_ltm=0.1`'s best-possible RRF contribution (rank 0: `0.1/(k+1)`) is
+        # PROVABLY smaller than `weight_mtm=1.0`'s worst-pool-item contribution (rank pool-1:
+        # `1.0/(k+pool)`) for every shipped `channel_pool_size`/`channel_pool_multiplier`/`rrf_k`
+        # combination — so whenever the MTM channel returns >= `limit` candidates (the normal
+        # case once a namespace has more than a handful of MTM facts), NO LTM candidate can ever
+        # place in the fused top-`limit`, regardless of how many facts the graph tier holds or
+        # how genuinely valid they are. Simply raising `weight_ltm` to cross that threshold
+        # (measured ~0.68-0.87 at shipped settings) reopens the EXACT collapse `weight_ltm`'s own
+        # 2026-08-31 fix was written to close (full-corpus answer-quality 37.2% -> 11.9% at
+        # `weight_ltm=1.0` — `dto.py`'s own docstring) — a weight-only fix cannot both let LTM
+        # place and keep the query-blind flat seed from flooding.
+        #
+        # `ltm_protect_limit` (default 0 — see dto.py's field docstring for why the mechanism
+        # ships but is not turned on) reuses the SAME "protect membership, rescue at the TAIL if
+        # fusion ranked it outside the window" mechanism already built for the STM floor
+        # (`_merge_floor` below) instead of granting the channel more rank AUTHORITY: the graph
+        # tier's top `ltm_protect_limit` candidates (already rank-ordered — recency-over-
+        # currently-valid-facts, `_ltm_channel`) are guaranteed ONE OF the `limit` result slots
+        # when the tier has any qualifying candidate, but `_merge_floor`'s rescue always APPENDS
+        # a rescued member after the naturally-fused head — never re-orders it ahead of a
+        # genuinely relevant hit. This is presence, not priority: it does not touch the ordering
+        # property `test_default_settings_rank_the_relevant_mtm_hit_ahead_of_query_blind_ltm_
+        # noise` already locks in (a query-blind LTM candidate still never outranks a relevant
+        # MTM hit within the window) — it only stops the channel being pinned at exactly zero, IF
+        # an operator turns it on. MEASURED at `ltm_protect_limit=1` (matched-width, 383 real
+        # LoCoMo queries, 960 distilled facts, `docs/tracking/eval-runs/
+        # 2026-09-24-ltm-channel-zero-slots.md`): the mechanism fires exactly as designed (383/383
+        # queries got their guaranteed graph slot) and `gold_in_context` DROPS 280->273/383
+        # (-1.83pt) — presence without a query-aware seed is a net cost, not merely inert, the
+        # same shape the 2026-08-31 `weight_ltm` fix already found at a larger scale. Left at `0`
+        # pending an entity-resolved graph seed (`ranker.py` module docstring's own "future work"
+        # line); raising it before that would be motion, not progress.
+        protected_ltm_views = [
+            _to_view(s, "ltm") for s in ltm_hits[: self._settings.ltm_protect_limit]
+        ]
+        protected_floor_views = [*protected_floor_views, *protected_ltm_views]
+
         # Shape B — "fetch wider, narrow after expansion" (dto.py's own `neighbor_expand_widen`
         # docstring has the full rationale): widen `_merge_floor`'s working limit so an inserted
         # neighbour (and a protected-floor rescue) has more room to survive the rescue/cross-tier-
