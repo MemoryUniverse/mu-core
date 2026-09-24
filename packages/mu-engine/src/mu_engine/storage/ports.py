@@ -209,8 +209,12 @@ class StmTierRepository(Protocol):
         narrative — "a re-recalled item's raised ``access_count`` rescues it" — had no real
         trigger, even for an item :meth:`recent`/:meth:`demoted` could genuinely see. This method
         is that trigger, implemented for real: called by
-        :class:`~mu_engine.services.recall.ranker.ThreeChannelRecallRanker` once per DISTINCT
-        STM-channel (either index) item that actually made it into a returned ``RecallResult``.
+        :class:`~mu_engine.services.recall.ranker.ThreeChannelRecallRanker` once per DISTINCT id
+        that actually made it into a returned ``RecallResult``. (ADR 0061 shipped this filtered
+        to ``channel == "stm"``; AD-259 widened it to every returned id — a memory living in BOTH
+        tiers fuses to ONE view under ONE label, so the label filter silently reinforced only one
+        of its two independently-gated rows. Over-inclusion is free: see the ``None`` contract
+        below.)
 
         Increments ``access_count`` by 1 and refreshes ``updated_at`` to ``at`` — MUST leave
         ``item.created_at`` untouched (the field :meth:`~mu_engine.lifecycle.salience.
@@ -237,6 +241,33 @@ class MtmTierRepository(Protocol):
     """Vector / MTM tier (``storage-pluggable §2.3``; filter-before-truncation for SHARED)."""
 
     async def upsert(self, item: MemoryItem) -> None: ...
+
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        """The read-stat write-back a genuine recall hit performs on a LIVE MTM point (AD-259).
+
+        The exact twin of :meth:`StmTierRepository.reinforce`, for the tier the user is actually
+        still using. ADR 0061 gave the demoted STM copy a real trigger; this gives the same
+        trigger to the memory that has not been demoted YET — which is the half
+        ``memory-layer §6.2`` and ``recall-service-design.md`` §5.1 have always described as the
+        forgetting curve's "remembering" side, and which §5.1 cited ``mtm_qdrant.py:388`` for.
+        MEASURED: that file contained the string ``access_count`` **zero** times, and after ADR
+        0061 the only adapters reinforcing anything were the three STM ones — so every MTM
+        memory demoted on the identical schedule whether the user recalled it a hundred times or
+        never. ``SalienceStrategy``'s usage term (``w_usage=0.2``, ``usage_cap=10``) was the
+        difference between S=0.2725 (DEMOTE) and S=0.4725 (KEEP) at importance 0.70/age 72h, and
+        nothing could ever move it.
+
+        Increments ``access_count`` by 1 and refreshes ``updated_at`` to ``at``. MUST leave
+        ``created_at`` untouched (``SalienceStrategy._recency``'s input — this is a read-STAT
+        write-back, not a re-capture) and MUST NOT touch the stored vector, the ``state``, or any
+        bi-temporal field: it is a payload-only PATCH, the same shape :meth:`expire` /
+        :meth:`set_pinned` already use.
+
+        ``None`` if ``memory_id`` is absent from ``ns``'s partition — a no-op, never a raise, for
+        the same reason :meth:`StmTierRepository.reinforce` gives: the caller passes only ids its
+        own prior read just returned. Best-effort by contract — a caller MUST NOT let a failure
+        here fail the read it is reinforcing."""
+        ...
 
     async def get(self, ns: Namespace, memory_id: str) -> MemoryItem | None:
         """Point-get ONE MTM point by id from ``ns``'s partition (``None`` if absent) — the vector-

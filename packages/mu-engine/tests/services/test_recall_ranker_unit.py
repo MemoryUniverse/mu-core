@@ -1853,3 +1853,155 @@ def test_narrow_after_expansion_still_keeps_every_protected_member() -> None:
     ids = [v.memory_id for v in out]
 
     assert ids == ["F1", "F2"], f"a protected member lost its slot to the neighbour budget: {ids!r}"
+
+
+# =================================================================================================
+# AD-259 — the MTM read-stat write-back (`_reinforce_mtm_hits`)
+# =================================================================================================
+class _ReinforcingMtm(_FakeMtm):
+    """``_FakeMtm`` plus a real, functioning ``reinforce`` — the SHIPPED shape (Qdrant/Weaviate).
+
+    Deliberately a SUBCLASS rather than an edit to ``_FakeMtm``: the base class staying WITHOUT
+    ``reinforce`` is what keeps every other test in this module an ongoing regression test for
+    the capability guard in ``_reinforce_mtm_hits`` (see
+    ``test_a_vector_backend_without_reinforce_does_not_break_recall`` below).
+    """
+
+    def __init__(self, hits_by_query: dict[tuple[float, ...], list[MemoryItem]]) -> None:
+        super().__init__(hits_by_query)
+        self.reinforced: list[str] = []
+
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        self.reinforced.append(memory_id)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_a_recalled_mtm_hit_is_reinforced_exactly_once() -> None:
+    """AD-259: the trigger that was missing entirely. ``recall-service-design.md`` §5.1 cites
+    ``mtm_qdrant.py:388`` as already doing this write-back; that file contained the string
+    ``access_count`` ZERO times, so a memory recalled every day demoted on the identical schedule
+    as one nobody ever touched — ``access_count`` is the only salience term a recall can move.
+
+    Proved end to end against real Qdrant in
+    ``tests/lifecycle/test_lifecycle_walk_end_to_end_int.py::
+    test_a_memory_the_user_keeps_recalling_is_not_demoted_on_schedule``; this unit test pins the
+    ranker-side contract (once per DISTINCT surviving MTM id, never per channel candidate).
+
+    MUTATION CHECK (run, red): remove ``self._reinforce_mtm_hits(ns, items)`` from the
+    ``asyncio.gather`` in ``rank`` — ``mtm.reinforced`` stays empty.
+    """
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    target = _item("the deploy window is Friday 16:00", tier=MemoryTier.MTM, at=base)
+    query_vec = (0.9, 0.1)
+    mtm = _ReinforcingMtm({query_vec: [target]})
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),
+        mtm=mtm,  # type: ignore[arg-type]
+        ltm=_EmptyLtm(),  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency"),
+        clock=FrozenClock(base),
+    )
+
+    ids = await _rank(ranker, list(query_vec))
+
+    assert target.id in ids
+    assert mtm.reinforced == [
+        target.id
+    ], f"expected exactly one reinforcement of the surviving MTM hit, got {mtm.reinforced}"
+
+
+@pytest.mark.asyncio
+async def test_reinforce_on_recall_off_reinforces_no_mtm_hit() -> None:
+    """The A/B off-switch covers BOTH channels, not just STM — an operator who turns the
+    write-back off must get a genuinely read-only recall."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    target = _item("the deploy window is Friday 16:00", tier=MemoryTier.MTM, at=base)
+    query_vec = (0.9, 0.1)
+    mtm = _ReinforcingMtm({query_vec: [target]})
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),
+        mtm=mtm,  # type: ignore[arg-type]
+        ltm=_EmptyLtm(),  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency", reinforce_on_recall=False),
+        clock=FrozenClock(base),
+    )
+
+    ids = await _rank(ranker, list(query_vec))
+
+    assert target.id in ids
+    assert mtm.reinforced == []
+
+
+@pytest.mark.asyncio
+async def test_a_vector_backend_without_reinforce_does_not_break_recall() -> None:
+    """AD-259's blast radius, pinned. ``STORE_REGISTRY.build`` is typed ``-> Any``, and three of
+    the six shipped vector backends (``PgVectorMtmAdapter``/``ChromaMtmAdapter``/
+    ``FaissMtmAdapter``) implement no by-id verbs at all (``tier_capabilities.py``'s own module
+    docstring names them). Adding an unconditional by-id WRITE to the READ path would therefore
+    turn every recall on those deployments into an ``AttributeError`` — a hot-path crash bought
+    for a best-effort stat write.
+
+    ``_FakeMtm`` (the base class, with no ``reinforce``) stands in for exactly that backend.
+
+    MUTATION CHECK (run, red): delete the ``if not hasattr(self._mtm, "reinforce"): return``
+    guard in ``_reinforce_mtm_hits`` — this test fails with
+    ``AttributeError: '_FakeMtm' object has no attribute 'reinforce'``, and so do ~40 others in
+    this module.
+    """
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    target = _item("the deploy window is Friday 16:00", tier=MemoryTier.MTM, at=base)
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(stm_items=[], mtm_hits_by_query={query_vec: [target]})
+
+    ids = await _rank(ranker, list(query_vec))  # must not raise
+
+    assert target.id in ids
+
+
+@pytest.mark.asyncio
+async def test_a_memory_in_both_tiers_is_reinforced_in_both_stores() -> None:
+    """AD-259's correction to ADR 0061, and the reason the end-to-end walk caught what the
+    piece-tests could not.
+
+    ``_channel_label`` labels the FUSED WINNER. A memory that lives in BOTH tiers — the ordinary
+    case for anything recently ingested, since ``WriteStmStage`` and ``DeterministicPromoteStage``
+    both write it — fuses to ONE view under ONE label. ADR 0061's ``channel == "stm"`` filter
+    therefore reinforced the Valkey row and left the Qdrant point at ``access_count=0``, which is
+    the row the DEMOTION gate reads (``scan_for_demotion``). MEASURED on real stores: ten genuine
+    recalls, Valkey 10, Qdrant 0.
+
+    The two copies are distinct rows with independent lifecycle gates, so a recall of that memory
+    is a genuine use of both. Both legs now take every returned id; ``reinforce`` on a store that
+    does not hold the id is a documented no-op.
+
+    MUTATION CHECK (run, red): restore either leg's ``if v.channel == "..."`` filter — the store
+    on the other side of the label records nothing.
+    """
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    both = _item("the deploy window is Friday 16:00", tier=MemoryTier.MTM, at=base)
+    query_vec = (0.9, 0.1)
+    stm = _FakeStm([both])  # the SAME id also sits in the STM recency floor
+    mtm = _ReinforcingMtm({query_vec: [both]})
+    ranker = ThreeChannelRecallRanker(
+        stm=stm,  # type: ignore[arg-type]
+        mtm=mtm,  # type: ignore[arg-type]
+        ltm=_EmptyLtm(),  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency"),
+        clock=FrozenClock(base),
+    )
+
+    ids = await _rank(ranker, list(query_vec))
+
+    assert both.id in ids
+    assert mtm.reinforced == [both.id], (
+        "the MTM point was not reinforced — this is the AD-259 defect: the fused view carried the "
+        "STM label, so only the Valkey row was reinforced and the Qdrant point the demotion gate "
+        "reads stayed at access_count=0"
+    )
+    stm_row = await stm.get(_NS, both.id)
+    assert stm_row is not None
+    assert stm_row.access_count == 1, "the STM row was not reinforced either"

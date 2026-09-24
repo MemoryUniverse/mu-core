@@ -623,6 +623,35 @@ class WeaviateMtmAdapter:
             verb="expire",
         )
 
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+
+    async def _reinforce_impl(
+        self, ns: Namespace, memory_id: str, *, at: datetime
+    ) -> MemoryItem | None:
+        """AD-259 — the recall-time read-stat write-back (``ports.py``'s
+        ``MtmTierRepository.reinforce`` docstring has the rationale; ``qdrant_mtm.py``'s own
+        ``_reinforce_impl`` has the read-modify-write / benign-race note this shares).
+
+        Reuses :meth:`_scoped_patch`, the same namespace-scoped by-id PATCH primitive
+        :meth:`expire` / :meth:`invalidate` / :meth:`set_entity_uids` use — so this verb inherits
+        their tenancy predicate and their absent-point handling unchanged, and touches neither
+        the stored vector nor ``created_at``.
+        """
+        current = await self._get_impl(ns, memory_id)
+        if current is None:
+            return None
+        reinforced = current.model_copy(
+            update={"access_count": current.access_count + 1, "updated_at": at}
+        )
+        await self._scoped_patch(
+            ns,
+            memory_id,
+            {"access_count": reinforced.access_count, "updated_at": at.isoformat()},
+            verb="reinforce",
+        )
+        return reinforced
+
     async def invalidate(
         self, ns: Namespace, loser_id: str, winner_id: str, *, at: datetime, reason: str
     ) -> None:

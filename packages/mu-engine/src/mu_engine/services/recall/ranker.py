@@ -510,8 +510,17 @@ class ThreeChannelRecallRanker:
         # merely "was a channel candidate"), so this never reinforces a fused-out or
         # rerank-pruned STM row. `dto.py`'s `reinforce_on_recall` docstring has the full
         # rationale.
+        # AD-259: and the SAME write-back for the MTM channel — the tier the user is still
+        # actively using, where the whole point of the usage term lives. ADR 0061 gave the
+        # trigger to a memory that had ALREADY been demoted; without this line a memory that is
+        # recalled every single day still demotes on the identical schedule as one nobody has
+        # touched, because `access_count` is the ONLY salience term a recall can move and nothing
+        # moved it (`ports.py`'s `MtmTierRepository.reinforce` docstring has the measurement).
+        # One gather over both channels, not two round trips: they are independent writes.
         if self._settings.reinforce_on_recall:
-            await self._reinforce_stm_hits(ns, items)
+            await asyncio.gather(
+                self._reinforce_stm_hits(ns, items), self._reinforce_mtm_hits(ns, items)
+            )
 
         ran = RecallChannels(
             stm=channels.stm,
@@ -883,14 +892,23 @@ class ThreeChannelRecallRanker:
     async def _reinforce_stm_hits(self, ns: Namespace, items: list[RecallItemView]) -> None:
         """AD-250 fix (ADR 0061): the read-stat write-back a genuine recall hit performs.
 
-        Fires :meth:`~mu_engine.storage.ports.StmTierRepository.reinforce` once per DISTINCT
-        STM-channel id in the FINAL result (``channel == "stm"`` — both the ordinary recency
-        floor AND the new demoted channel fold to this label, `_channel_label`'s own comment — a
-        protected floor member, a fused-in ordinary/demoted row, and a cost-a-slot/free-riding
-        neighbour are ALL genuinely STM-sourced rows and all count; a ``dict`` keyed by id below
-        de-dupes a row that appears more than once in ``items`` so it is reinforced exactly once
-        per call even if it occupies two slots). Concurrent (``asyncio.gather``), never
-        serialised — the point is a bounded, small number of independent writes, not a chain.
+        Fires :meth:`~mu_engine.storage.ports.StmTierRepository.reinforce` once per DISTINCT id
+        in the FINAL result, de-duped so a row occupying two slots is reinforced exactly once per
+        call. Concurrent (``asyncio.gather``), never serialised — a bounded, small number of
+        independent writes, not a chain.
+
+        **Every id, not just the ``channel == "stm"`` ones (AD-259 correction).** ADR 0061
+        filtered on the channel label, which is the label of the FUSED winner: a memory that
+        lives in BOTH tiers — the ordinary case for anything recently ingested, since
+        ``WriteStmStage`` and ``DeterministicPromoteStage`` both write it — fuses to ONE view
+        under ONE label, so filtering by label silently reinforced only one of the two rows.
+        MEASURED: after ten genuine recalls of an item present in both tiers, the Valkey row's
+        ``access_count`` was 10 and the Qdrant point's was **0** — and the demotion gate reads
+        the Qdrant point. The two copies are DISTINCT ROWS with INDEPENDENT lifecycle gates
+        (``scan_for_demotion`` over MTM, ``promote_stm_mtm`` over STM), so a recall of that
+        memory is a genuine use of BOTH and each gate needs to see it. Over-inclusion is free
+        and safe by contract: ``reinforce`` on a store that does not hold the id is a documented
+        no-op returning ``None`` (``ports.py``), never a raise.
 
         Best-effort by design (this docstring's own contract, ``ports.py``'s ``reinforce``
         docstring): a store outage here degrades to NO reinforcement for this call, exactly like
@@ -899,7 +917,7 @@ class ThreeChannelRecallRanker:
         reinforcing. Only ``StoreUnavailableError`` is swallowed (logged); anything else is a
         programming bug and is left to raise — catching it here would hide a real defect behind
         "best effort"."""
-        ids = list({v.memory_id for v in items if v.channel == "stm"})
+        ids = list({v.memory_id for v in items})
         if not ids:
             return
         at = self._clock.now()
@@ -910,6 +928,47 @@ class ThreeChannelRecallRanker:
             except StoreUnavailableError as exc:
                 _log.warning(
                     "recall.reinforce_unavailable",
+                    ns=ns.to_prefix(),
+                    memory_id=memory_id,
+                    error=str(exc),
+                )
+
+        await asyncio.gather(*(_one(mid) for mid in ids))
+
+    async def _reinforce_mtm_hits(self, ns: Namespace, items: list[RecallItemView]) -> None:
+        """AD-259: the MTM twin of :meth:`_reinforce_stm_hits` — same contract, same de-dupe,
+        same concurrency, same best-effort degrade, same "every returned id" rule (that method's
+        docstring has the reasoning), a different port and one extra guard.
+
+        Kept as a second method rather than folded into one generic helper: the two ports are
+        structurally unrelated Protocols and only this one needs the capability check below, so a
+        generic version would have to erase the port types AND carry the guard for a caller that
+        does not need it — cost with no reuse to show for it at two call sites.
+        """
+        ids = list({v.memory_id for v in items})
+        if not ids:
+            return
+        # CAPABILITY CHECK, not a type check. `STORE_REGISTRY.build` is typed `-> Any`
+        # (`storage/registry.py`), so the object bound to the `vector` role is whatever
+        # `MU_STORAGE__VECTOR__BACKEND` selected, and three of the six shipped vector backends
+        # (`PgVectorMtmAdapter`/`ChromaMtmAdapter`/`FaissMtmAdapter`) implement no by-id verbs at
+        # all — `tier_capabilities.py`'s own module docstring names those three for exactly this
+        # reason, and `mu_local/composition.py:413` already gates `set_entity_uids` on the same
+        # `hasattr`. Without this line, adding an unconditional by-id write to the READ path
+        # would turn every recall on a chroma/faiss/pgvector deployment into an AttributeError —
+        # a hot-path crash bought for a best-effort stat write. Degrades silently on purpose:
+        # this is an enhancement, and a backend that cannot answer it is a documented shape, not
+        # an incident (an outage of a backend that CAN is logged, in `_one` below).
+        if not hasattr(self._mtm, "reinforce"):
+            return
+        at = self._clock.now()
+
+        async def _one(memory_id: str) -> None:
+            try:
+                await self._mtm.reinforce(ns, memory_id, at=at)
+            except StoreUnavailableError as exc:
+                _log.warning(
+                    "recall.reinforce_mtm_unavailable",
                     ns=ns.to_prefix(),
                     memory_id=memory_id,
                     error=str(exc),

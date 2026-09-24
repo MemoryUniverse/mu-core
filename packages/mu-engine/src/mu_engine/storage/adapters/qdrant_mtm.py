@@ -503,6 +503,50 @@ class QdrantMtmAdapter:
         # ...and a write that matched nothing is reported ABSENT rather than silently succeeding.
         await self._raise_if_write_missed(name, ns, memory_id, verb="expire")
 
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+
+    async def _reinforce_impl(
+        self, ns: Namespace, memory_id: str, *, at: datetime
+    ) -> MemoryItem | None:
+        """AD-259 — the recall-time read-stat write-back for a LIVE MTM point (``ports.py``'s
+        ``MtmTierRepository.reinforce`` docstring has the full rationale).
+
+        Read-modify-write rather than an atomic increment: Qdrant has no server-side counter
+        primitive, exactly as Redis has none for a field inside a JSON blob — ``redis_stm.py``'s
+        own ``_reinforce_impl`` takes the identical shape for the identical reason, and the
+        identical benign race (two concurrent recalls of the same point can both read N and both
+        write N+1, losing one tick of a usage counter whose only consumer saturates at
+        ``usage_cap``). A lost tick moves ``SalienceStrategy._usage`` by at most 1/10th of a
+        0.2-weighted term; a lock or a Lua script here would cost a round trip on every recall to
+        buy nothing the gate can see.
+
+        Payload-only PATCH addressed through :func:`_scoped_point_selector`, NOT a re-``upsert``:
+        an upsert would rewrite the vector (and re-derive every payload field from a possibly
+        stale in-memory copy) for what is a two-field stat update. The vector, ``state``,
+        ``created_at`` and every bi-temporal field are untouched by construction.
+        """
+        name = collection_name(ns, self._dim)
+        if not await self._qdrant.collection_exists(name):
+            return None
+        current = await self._get_impl(ns, memory_id)
+        if current is None:
+            # Absent (never existed, or in another partition) — a no-op by contract, never a
+            # raise: the caller passes only ids its own prior read just returned.
+            return None
+        reinforced = current.model_copy(
+            update={"access_count": current.access_count + 1, "updated_at": at}
+        )
+        await self._qdrant.set_payload(
+            collection_name=name,
+            payload={
+                "access_count": reinforced.access_count,
+                "updated_at": at.isoformat(),
+            },
+            points=_scoped_point_selector(ns, memory_id),
+        )
+        return reinforced
+
     def _recall_filter(
         self,
         ns: Namespace,
