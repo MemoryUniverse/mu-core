@@ -903,10 +903,34 @@ class FalkorLtmAdapter:
         # invalid_at, MERGE (old)-[:SUPERSEDED_BY]->(new) + (old)-[:CONFLICTS_WITH]->(new).
         g = await self._graph(ns)
         at_iso = at.isoformat()
+
+        # AD-269 fix-adjacent (found proving AD-269 by running, not reading): the promoted
+        # ``loser.state``/``loser.invalid_at`` NODE PROPERTIES below are what `graph_recall`/
+        # `facts_at` filter on server-side, but :meth:`_get_fact_impl` — every BY-ID read on this
+        # tier, `get_fact`'s own docstring — reads the fact back OUT of `m.memory_json`, NEVER
+        # the individual properties (the same lossless-carrier discipline `reinforce`'s own
+        # docstring names as the reason it avoids this exact shortcut for ITSELF). Before this
+        # fix `_invalidate_impl` updated only the promoted properties, so a real, RUN-verified
+        # sequence — supersede a fact, then `get_fact` it — returned `state=ACTIVE` forever: the
+        # loser correctly vanished from every FILTERED read (`graph_recall`, `facts_at`) while
+        # lying to every BY-ID one. That is exactly the idempotency check
+        # `DistillPipeline._apply_resolution_intent`'s own manual-apply loop makes
+        # (`loser.state is not MemoryState.ACTIVE: continue`) to decide "already applied, skip" —
+        # against a `get_fact` read, so a retried apply could never detect it had already run.
+        current = await self._get_fact_impl(ns, loser_id)
+        memory_json = (
+            current.model_copy(
+                update={"state": MemoryState.SUPERSEDED, "invalid_at": at}
+            ).model_dump_json()
+            if current is not None
+            else None
+        )
+
         await g.query(
             "MATCH (loser:Memory {namespace: $ns, id: $loser}) "
-            "SET loser.state = $superseded, loser.invalid_at = $at "
-            "WITH loser MATCH (winner:Memory {namespace: $ns, id: $winner}) "
+            "SET loser.state = $superseded, loser.invalid_at = $at"
+            + (", loser.memory_json = $memory_json" if memory_json is not None else "")
+            + " WITH loser MATCH (winner:Memory {namespace: $ns, id: $winner}) "
             "MERGE (loser)-[s:SUPERSEDED_BY]->(winner) SET s.created_at = $at, s.reason = $reason "
             "MERGE (loser)-[c:CONFLICTS_WITH]->(winner) SET c.created_at = $at",
             params={
@@ -916,6 +940,7 @@ class FalkorLtmAdapter:
                 "superseded": MemoryState.SUPERSEDED.value,
                 "at": at_iso,
                 "reason": reason,
+                **({"memory_json": memory_json} if memory_json is not None else {}),
             },
         )
         await self._invalidate_entity_edge(g, ns, loser_id, at_iso)

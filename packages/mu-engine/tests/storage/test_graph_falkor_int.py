@@ -20,7 +20,7 @@ from mu_contracts.config import get_settings
 from mu_contracts.domain.errors import CallerIdentitySetRequiredError
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.authz import INTERNAL_ENGINE_READ
-from mu_engine.storage.domain.memory import MemoryItem
+from mu_engine.storage.domain.memory import MemoryItem, MemoryState
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.factories import STORE_REGISTRY
 from mu_engine.storage.mappers.tenancy import tenant_partition_digest
@@ -200,6 +200,21 @@ async def test_bitemporal_invalidate_dont_delete(
     # ... but history at t_old STILL contains it (invalidate-don't-delete, spec §8.7).
     hist_ids = {m.id for m in await ltm.facts_at(ns, t_old, subject="Ada")}
     assert loser.id in hist_ids
+
+    # AD-269-adjacent fix (found proving AD-269 by running): a BY-ID read must see the SAME
+    # supersession `graph_recall`/`facts_at` already do — `get_fact` reads the fact back out of
+    # `m.memory_json`, so `invalidate` must rewrite that JSON carrier, not only the promoted
+    # `state`/`invalid_at` NODE PROPERTIES the filtered reads use. MUTATION CHECK (run, red,
+    # restored): drop the `loser.memory_json = $memory_json` clause from `_invalidate_impl`'s
+    # Cypher — this assertion alone goes red (`state == ACTIVE`) while every assertion above it
+    # stays green, since those all go through the FILTERED read paths this bug never touched.
+    reread = await ltm.get_fact(ns, loser.id)
+    assert reread is not None
+    assert reread.state is MemoryState.SUPERSEDED, (
+        "get_fact returned a stale state after invalidate() — the promoted node property and "
+        "the memory_json carrier diverged"
+    )
+    assert reread.invalid_at == t_now
 
 
 async def _node_count(falkor_db: FalkorDB, graph_name: str) -> int:
