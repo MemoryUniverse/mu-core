@@ -203,7 +203,7 @@ def test_score_for_ltm_gate_ignores_clock_entirely() -> None:
 
 def test_score_for_ltm_gate_low_usage_and_importance_stays_below_gate() -> None:
     """A genuinely unremarkable item (low importance, never recalled) must NOT be rescuable by
-    this gate just because it is old — dropping recency must not turn into "age alone promotes.\""""
+    this gate just because it is old — dropping recency must not turn into "age alone promotes"."""
     settings = SalienceSettings()
     strategy = SalienceStrategy(settings)
     unremarkable = _item(importance_score=0.1, access_count=0, created_at=_EPOCH)

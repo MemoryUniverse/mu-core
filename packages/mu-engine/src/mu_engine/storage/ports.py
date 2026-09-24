@@ -353,6 +353,24 @@ class ContextRepository(Protocol):
         """Hydrate the BODY by id (the bounded floor beneath spec l.262's streaming ``open``)."""
         ...
 
+    async def delete(self, ns: Namespace, artifact_id: str) -> bool:
+        """Remove the metadata handle for ``artifact_id`` (FAULT-HUNT-0924.md F4b: this port
+        shipped ``put``/``get``/``get_blob`` and no delete path at all — "no port to add one
+        to"). Returns ``True`` when a handle was found and removed, ``False`` when it was already
+        absent (idempotent — a retried delete is a no-op, never an error).
+
+        **Reference-aware, per ``ContextArtifact.retention`` (``mu_contracts.domain.model.
+        artifact.Retention``, ``RetentionPolicy.REFERENCE_COUNTED``):** the underlying
+        content-addressed BLOB may still be the SAME bytes another live ``ContextArtifact`` (a
+        distinct id, identical ``content_hash`` — e.g. two captures of identical text) points at,
+        so an implementation deletes the blob only when no other handle in this namespace still
+        references its ``content_hash``. The caller is responsible for the ONE ref-count question
+        this port cannot answer on its own — whether any ``MemoryItem.artifact_ref`` across the
+        tiers still points at THIS ``artifact_id`` (``MemoryTierRepository.by_artifact`` is that
+        authority, ``artifact.py``'s own ``Retention`` docstring: "authority = by_artifact()").
+        Calling this before that check is deleting a still-referenced artifact's handle."""
+        ...
+
 
 # ------------------------------------------------------------------ relational control plane
 class ControlPlaneRepository(Protocol):

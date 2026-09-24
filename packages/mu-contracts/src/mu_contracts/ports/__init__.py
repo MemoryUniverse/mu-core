@@ -9,6 +9,7 @@ from mu_contracts.ports.bus import EventBusPort, Handler, Subscription
 from mu_contracts.ports.conflict import ConflictEdgeReader
 from mu_contracts.ports.device import ClientMetadata, DeviceRegistryPort
 from mu_contracts.ports.device_sync import PrivateSyncLogPort
+from mu_contracts.ports.enrichment import EnrichmentExtractorPort, EnrichmentQueuePort
 from mu_contracts.ports.governance import ConflictRecordRepository, GrantRepository
 from mu_contracts.ports.health import HealthStatus
 from mu_contracts.ports.health_assessor import HealthAssessor
@@ -64,6 +65,8 @@ __all__ = [
     "DeviceRegistryPort",
     "EdgeSpec",
     "EmbeddingPort",
+    "EnrichmentExtractorPort",
+    "EnrichmentQueuePort",
     "EventBusPort",
     "GrantRepository",
     "GraphNodeRow",

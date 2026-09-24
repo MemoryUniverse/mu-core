@@ -13,6 +13,17 @@ l.338-342, provides the numbering ``PersistRawArtifactStage`` now fills in as st
                                  ``activity_id`` (M12)                  -> ``MemoryCaptured``
 2. ``DeterministicPromoteStage`` — MTM upsert, key ``content_hash``    -> ``MemoryPromoted``
 3. ``EmitIngestCompletedStage``  — fan-out trigger                     -> ``IngestCompleted``
+4. ``EnqueueEnrichmentStage``    — S2 write-time enrichment (ADR-0055, AD-241): durable, best-
+                                    -effort enqueue of the just-written memory onto
+                                    ``EnrichmentQueuePort`` for a background worker
+                                    (``pipelines/enrichment_worker.py``) to enrich AFTER this
+                                    call returns. Still NO LLM on this path — this stage only
+                                    writes a small job row; the LLM call happens later, off the
+                                    request path. Optional (only present when the composition
+                                    root threads an ``enrichment_queue``, same backward-compatible
+                                    precedent as ``artifacts``/``PersistRawArtifactStage`` above);
+                                    NEVER raises — a full/unavailable queue is a named
+                                    ``StageDegraded``, never a failed ``add()``.
 """
 
 from __future__ import annotations
@@ -22,11 +33,21 @@ from datetime import datetime
 from hashlib import sha256
 from typing import Any
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from mu_contracts.domain.events import DomainEvent, IngestCompleted, MemoryCaptured, MemoryPromoted
+from mu_contracts.domain.events import (
+    DegradeReason,
+    DomainEvent,
+    IngestCompleted,
+    MemoryCaptured,
+    MemoryPromoted,
+    StageDegraded,
+)
 from mu_contracts.domain.model.authorized_ids import AUTHORIZED_IDS_KEY, validate_stamp_subjects
+from mu_contracts.domain.model.enrichment import EnrichmentJob
 from mu_contracts.domain.model.memory import Namespace, Tier, Visibility
+from mu_contracts.ports.enrichment import EnrichmentQueuePort
 from mu_contracts.ports.time import Clock
 from mu_engine.pipelines.base import BaseStage, PipelineContext, StageOutcome, StageStatus
 from mu_engine.pipelines.errors import StageExecutionError
@@ -48,11 +69,14 @@ from mu_engine.storage.ports import ContextRepository, MtmTierRepository, StmTie
 __all__ = [
     "DeterministicPromoteStage",
     "EmitIngestCompletedStage",
+    "EnqueueEnrichmentStage",
     "IngestActivity",
     "PersistRawArtifactStage",
     "WriteStmStage",
     "activity_id_for",
 ]
+
+_log = structlog.get_logger("mu_engine.pipelines.concrete.ingest")
 
 
 class IngestActivity(BaseModel):
@@ -487,3 +511,107 @@ class EmitIngestCompletedStage(BaseStage):
             events=[IngestCompleted(namespace=ctx.namespace, memory_ids=memory_ids)],
             idempotency_key=self.idempotency_key(ctx),
         )
+
+
+class EnqueueEnrichmentStage(BaseStage):
+    """Stage 4 — S2 write-time enrichment enqueue (ADR-0055; AD-241; engine-core-spec §6.4).
+
+    The owner's shape, in one stage: ``add()`` (this pipeline) stays synchronous and LLM-free —
+    this stage does exactly ONE cheap durable write (a small job row: ids + namespace + hashes,
+    never content, see ``mu_contracts.domain.model.enrichment`` module docstring) and returns. The
+    LLM call happens later, off this request, in ``pipelines.enrichment_worker.EnrichmentWorker``.
+
+    **NOT ledger-gated** (``idempotency_key`` -> ``""``, the SAME "not every stage needs the
+    ledger" precedent ``PersistRawArtifactStage`` documents): the underlying write is ALREADY
+    idempotent by construction — ``EnrichmentQueuePort.submit`` is idempotent on ``job.job_id``,
+    which is itself a deterministic function of ``memory_id`` (:func:`_enrichment_job_id`). A
+    crash-replay of this stage submits the byte-identical row; ``INSERT OR IGNORE`` (the shipped
+    adapters) makes that a harmless no-op, never a duplicate job.
+
+    **NEVER raises, NEVER fails ``add()``** (the owner's explicit rule: "a failed or slow
+    enrichment must never degrade the unenriched memory"). Every way this stage can fail to
+    enqueue — the queue rejecting for backpressure, or the port raising outright — becomes a
+    ``DEGRADED`` :class:`StageOutcome` carrying a named ``StageDegraded`` event (DEV-STANDARDS: a
+    degrade is a NAMED reason + emitted event, never a bare fallback), and the pipeline proceeds
+    exactly as if this stage were absent. The raw memory this pipeline already wrote (STM, and
+    MTM if promoted) is completely unaffected either way.
+    """
+
+    name = "enqueue_enrichment"
+
+    def __init__(
+        self,
+        *,
+        queue: EnrichmentQueuePort,
+        ledger: StageLedger,
+        clock: Clock,
+    ) -> None:
+        super().__init__(ledger=ledger, clock=clock)
+        self._queue = queue
+
+    def idempotency_key(self, ctx: PipelineContext) -> str:
+        return ""  # not ledger-gated — see class docstring (submit() is self-idempotent).
+
+    async def _execute(self, ctx: PipelineContext) -> StageOutcome:
+        memory_ids = list(ctx.state.get("memory_ids") or [])
+        if not memory_ids:
+            # Nothing was written upstream (should be unreachable — WriteStmStage always mints
+            # one) — no memory to enrich, quietly OK.
+            return StageOutcome(status=StageStatus.OK, produced={"enrichment_enqueued": False})
+        content_hash = str(ctx.state.get("content_hash") or "")
+        job = EnrichmentJob(
+            job_id=_enrichment_job_id(memory_ids[0]),
+            namespace_parts=ctx.namespace.parts(),
+            memory_id=memory_ids[0],
+            content_hash=content_hash,
+            enqueued_at=self._clock.now(),
+        )
+        try:
+            accepted = await self._queue.submit(job)
+        except Exception as exc:  # broad except is deliberate — see class docstring
+            _log.warning(
+                "enrichment_enqueue_failed",
+                pipeline=ctx.pipeline,
+                stage=self.name,
+                memory_id=job.memory_id,
+                error=type(exc).__name__,  # content-free: exception class name only
+            )
+            return StageOutcome(
+                status=StageStatus.DEGRADED,
+                reason="enrichment_enqueue_failed",
+                produced={"enrichment_enqueued": False},
+                events=[
+                    StageDegraded(
+                        pipeline=ctx.pipeline,
+                        stage=self.name,
+                        reason=DegradeReason.DURABLE_SUBSTRATE_DOWN.value,
+                    )
+                ],
+            )
+        if not accepted:
+            # Bounded queue at capacity (backpressure) — a burst of writes sheds enrichment
+            # rather than growing the job log unboundedly (DEV-STANDARDS: bounded queues, never
+            # unbounded). The memory itself was already written by the earlier stages; only its
+            # future enrichment is skipped.
+            return StageOutcome(
+                status=StageStatus.DEGRADED,
+                reason="enrichment_queue_full",
+                produced={"enrichment_enqueued": False},
+                events=[
+                    StageDegraded(
+                        pipeline=ctx.pipeline,
+                        stage=self.name,
+                        reason=DegradeReason.BACKPRESSURE_SHED.value,
+                    )
+                ],
+            )
+        return StageOutcome(
+            status=StageStatus.OK,
+            produced={"enrichment_enqueued": True, "enrichment_job_id": job.job_id},
+        )
+
+
+def _enrichment_job_id(memory_id: str) -> str:
+    """Deterministic job id (§7.1 id-stability applied to the enrichment queue): one memory is
+    enriched (at most) once, and a crash-replayed enqueue resubmits the identical row."""
+    return f"enr_{memory_id}"

@@ -86,6 +86,7 @@ from mu_engine.storage.adapters.redis_stm import RedisStmAdapter
 from mu_engine.storage.adapters.relational_control import RelationalControlPlaneAdapter
 from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
 from mu_engine.storage.adapters.weaviate_mtm import WeaviateMtmAdapter
+from mu_engine.storage.mappers.redis_mapper import RedisMapper
 from mu_engine.storage.registry import StoreRegistry
 
 __all__ = ["STORE_REGISTRY"]
@@ -211,6 +212,19 @@ def _build_redis(**cfg: Any) -> RedisStmAdapter:
     return RedisStmAdapter(
         client,
         store_io_timeout_s=cfg.get("store_io_timeout_s", redis_settings.store_io_timeout_s),
+        # FAULT-HUNT-0924 verify pass (AD-256): the STM TTL is a CENTRAL knob, not the mapper's
+        # own module literal. Until this line existed neither KV factory passed a `mapper`, so
+        # every registry-built adapter — i.e. every real deployment, both planes — used
+        # `RedisMapper()`'s hardcoded 3600s and `IngestSettings.stm_ttl_s`
+        # (`MU_INGEST__STM_TTL_S`) had NO reader on the write path at all. The two agreed only by
+        # coincidence, and the knob was worse than dead: `PromotionService._remaining_ttl_s` —
+        # the pre-TTL rescue's own window, which ADR 0054's F5 fix just made LIVE — derives from
+        # `stm_ttl_s`, so an operator who set it moved the rescue window without moving the TTL
+        # it was supposed to track. DEV-STANDARDS rule 3, and this file's own sibling comment:
+        # "a declared knob with no reader is a lie".
+        mapper=RedisMapper(
+            default_ttl_s=int(cfg.get("stm_ttl_s", get_engine_settings().ingest.stm_ttl_s))
+        ),
         # D4 write-time dedup toggle (conformance D-8) — DI-threaded from the mu-engine
         # intelligence-knob root (``EngineSettings.ingest.stm_dedup``, env
         # ``MU_INGEST__STM_DEDUP``), never hardcoded (DEV-STANDARDS rule 3).
@@ -230,6 +244,11 @@ def _build_valkey(**cfg: Any) -> ValkeyStmAdapter:
     return ValkeyStmAdapter(
         client,
         store_io_timeout_s=cfg.get("store_io_timeout_s", valkey_settings.store_io_timeout_s),
+        # Same central-knob fix as `_build_redis` above (AD-256) — the wire-identical backends
+        # share one env knob here exactly as they already do for `stm_dedup`.
+        mapper=RedisMapper(
+            default_ttl_s=int(cfg.get("stm_ttl_s", get_engine_settings().ingest.stm_ttl_s))
+        ),
         # D4 write-time dedup toggle (conformance D-8) — same knob as ``_build_redis`` (SAME
         # ``EngineSettings.ingest.stm_dedup``; the wire-identical backends share one env knob).
         stm_dedup_enabled=cfg.get("stm_dedup_enabled", get_engine_settings().ingest.stm_dedup),

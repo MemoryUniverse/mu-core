@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict
 
 from mu_contracts.domain.events import DomainEvent, MemoryCaptured
 from mu_contracts.ports.bus import EventBusPort
+from mu_contracts.ports.enrichment import EnrichmentQueuePort
 from mu_contracts.ports.observability import AuditLog, MetricSink, Tracer
 from mu_contracts.ports.time import Clock
 from mu_engine.pipelines.base import (
@@ -36,6 +37,7 @@ from mu_engine.pipelines.base import (
 from mu_engine.pipelines.concrete.ingest import (
     DeterministicPromoteStage,
     EmitIngestCompletedStage,
+    EnqueueEnrichmentStage,
     IngestActivity,
     PersistRawArtifactStage,
     WriteStmStage,
@@ -104,6 +106,7 @@ class IngestService:
         metrics: MetricSink | None = None,
         audit: AuditLog | None = None,
         artifacts: ContextRepository | None = None,
+        enrichment_queue: EnrichmentQueuePort | None = None,
     ) -> None:
         self._bus = bus
         self._clock = clock
@@ -151,6 +154,20 @@ class IngestService:
             if artifacts is not None
             else ()
         )
+        # NEW — ``enrichment_queue`` (S2, ADR-0055, AD-241): the SAME optional/backward-compatible
+        # precedent as ``artifacts`` above. Every EXISTING caller that constructs an
+        # ``IngestService`` without a queue (every unit/integration test in this tree today, and
+        # any composition root that has not opted in) keeps byte-identical behaviour — no
+        # ``EnqueueEnrichmentStage``, no enrichment ever runs, nothing changes about ``remember()``.
+        # A caller that DOES thread a real ``EnrichmentQueuePort`` gets the stage appended LAST
+        # (after the fan-out trigger) — its own job write is independent of, and ordered after,
+        # every durable write this pipeline makes, so a memory is always fully written before it
+        # is ever queued for enrichment.
+        enrichment_stage: tuple[Stage, ...] = (
+            (EnqueueEnrichmentStage(queue=enrichment_queue, ledger=ledger, clock=clock),)
+            if enrichment_queue is not None
+            else ()
+        )
         self._pipeline = Pipeline(
             name=_PIPELINE_NAME,
             halt_policy=HaltPolicy.HALT_LOUD,
@@ -167,6 +184,7 @@ class IngestService:
                     clock=clock,
                 ),
                 EmitIngestCompletedStage(ledger=ledger, clock=clock),
+                *enrichment_stage,
             ),
         )
 

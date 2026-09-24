@@ -190,17 +190,15 @@ async def test_demoted_item_gets_the_configurable_demoted_ttl_not_the_capture_bu
 
     key = RedisMapper.memory_key(ns, item.id)
     real_ttl_s = await valkey_client.ttl(key)
-    assert real_ttl_s > short_capture_ttl_s + 60, (
-        "the write-ahead copy must NOT carry the STM adapter's own short capture-buffer default"
-    )
+    assert (
+        real_ttl_s > short_capture_ttl_s + 60
+    ), "the write-ahead copy must NOT carry the STM adapter's own short capture-buffer default"
     # Redis TTL counts down in real time between the SET and this read — allow a few seconds of
     # slack rather than asserting exact equality against a wall-clock-dependent countdown.
     assert demoted_ttl_s - 30 <= real_ttl_s <= demoted_ttl_s
     # cleanup: this test's deliberately long TTL (~11.5 days) would otherwise outlive every other
     # fixture's own housekeeping on the shared mu-dev-cache instance.
-    await valkey_client.delete(
-        key, RedisMapper.recency_key(ns), RedisMapper.content_hash_key(ns)
-    )
+    await valkey_client.delete(key, RedisMapper.recency_key(ns), RedisMapper.content_hash_key(ns))
 
 
 async def test_rescued_item_leaves_the_real_mtm_point_untouched_via_the_real_port(

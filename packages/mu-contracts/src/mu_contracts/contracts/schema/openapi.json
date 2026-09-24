@@ -1123,6 +1123,11 @@
             "title": "Is Floor",
             "type": "boolean"
           },
+          "is_neighbor": {
+            "default": false,
+            "title": "Is Neighbor",
+            "type": "boolean"
+          },
           "memory_id": {
             "title": "Memory Id",
             "type": "string"
@@ -1141,6 +1146,18 @@
           },
           "tier": {
             "$ref": "#/components/schemas/Tier"
+          },
+          "turn_seq": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Seq"
           }
         },
         "required": [

@@ -46,9 +46,11 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
+from mu_contracts.domain.model.enrichment import EnrichmentPayload
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 
 __all__ = [
+    "EnrichmentPayload",
     "FactObjectKind",
     "MemoryItem",
     "MemoryKind",
@@ -255,6 +257,17 @@ class MemoryItem(BaseModel):
 
     # content-free tags/counts only (never raw text in the relational mirror)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # ---- S2 write-time enrichment (ADR-0055, AD-241) ----
+    # ``None`` = not yet enriched (or enrichment disabled) — BYTE-IDENTICAL to every row this
+    # class ever wrote before this field existed (additive default, the same precedent as
+    # `turn_seq`/`pinned_at`). Written back by `EnrichmentWorker` (`pipelines/enrichment_worker
+    # .py`) onto the SAME id the row already occupies (CANONICAL §7.1) via a plain re-`put`/
+    # `upsert` of the fetched item with only this field changed — no new repository verb needed.
+    # A failed/slow/disabled enrichment leaves this `None` forever; the row is exactly as
+    # retrievable either way (the "enrichment only adds" invariant this field exists to make
+    # checkable: `item.enrichment is not None` is the one place that invariant is observable).
+    enrichment: EnrichmentPayload | None = None
 
     def model_post_init(self, _context: Any) -> None:  # pydantic post-init hook signature
         # content_hash is a version/dedupe key derived from the content + triple,

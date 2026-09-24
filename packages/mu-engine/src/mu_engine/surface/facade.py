@@ -70,6 +70,7 @@ deliberate, NAMED gap (DEV-STANDARDS: never a silent no-op / fake success), not 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from typing import Any, NoReturn, Protocol
 
 from mu_contracts.contracts.memory import MemoryResponse
@@ -114,7 +115,12 @@ from mu_engine.services.recall.mapping import (
 from mu_engine.services.recall.service import RecallService
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
-from mu_engine.storage.ports import GraphStorePort, MtmTierRepository, StmTierRepository
+from mu_engine.storage.ports import (
+    ContextRepository,
+    GraphStorePort,
+    MtmTierRepository,
+    StmTierRepository,
+)
 
 __all__ = [
     "LlmNotConfiguredError",
@@ -164,6 +170,31 @@ class LocalContainerLike(Protocol):
     # ``GraphStorePort``) — ZERO adapter code.
     mtm: MtmTierRepository
     ltm: GraphStorePort
+
+    # FAULT-HUNT-0924.md F4a: the provenance-root store `delete`'s per-tier flow below needs to
+    # GC a `kind=REFERENCE` item's artifact body once nothing live still points at it — never
+    # reachable before this field existed. `| None` (not a bare `ContextRepository`) because
+    # wiring `artifact` is OPTIONAL on every composition root today (`_build_artifact_fs`'s own
+    # docstring: "NOT one of `StoreRegistry.MANDATORY_ROLES`... a composition root that never
+    # wires `artifact` simply never gets `PersistRawArtifactStage`") — a real container that HAS
+    # wired one (every one that ships today: `LocalContainer`/`EngineContainer`/`SharedContainer`
+    # all build `self.artifacts` unconditionally) satisfies this with zero adapter code; one that
+    # has not simply reads `None` here and `delete()`'s GC leg is a documented no-op, exactly the
+    # same absence-is-a-real-state discipline `health`/`pin` already use on `LocalMemory`.
+    #
+    # A read-only ``@property``, not a plain attribute — the SAME reason ``bus``/``embedder``
+    # below are properties (their own comments): mypy checks a Protocol's plain attribute
+    # INVARIANTLY (it could be written through), so a real container typing its own field as the
+    # narrower, always-present ``ContextRepository`` (every one that ships today does — none
+    # actually leaves it unwired) would NOT structurally satisfy a plain ``ContextRepository |
+    # None`` attribute declaration here. A property matches covariantly, so
+    # ``LocalContainer``/``EngineContainer``/``SharedContainer`` all satisfy this with zero
+    # adapter code regardless of how narrowly each types its own field — verified: this was a
+    # real ``mypy --strict`` failure in ``mu_local.local_memory``/``mu_engine_server.composition``
+    # until this was made a property, not a hypothetical one.
+    @property
+    def artifacts(self) -> ContextRepository | None: ...
+
     recall: RecallService
     mode_gate: ManagerModeGate
     llm: ModelRouter | None
@@ -668,12 +699,90 @@ class SurfaceFacade:
         if ltm_item is not None:
             await self._container.ltm.expire(ns, memory_id, at=now)
             affected.append(MemoryTier.LTM.value)
+        # FAULT-HUNT-0924.md F4a — GC the provenance-root artifact, AFTER every tier above has
+        # been invalidated (ordering matters: `by_artifact` below must not see this memory's own
+        # copy as a still-live reference). A `kind=REFERENCE` item's `artifact_ref` is the SAME
+        # across whichever tier copies existed (mint-once, `IngestService.ingest` step 1), so at
+        # most one artifact id is ever in play for this call.
+        artifact_ref = next(
+            (
+                located.artifact_ref
+                for located in (stm_item, mtm_item, ltm_item)
+                if located is not None and located.artifact_ref is not None
+            ),
+            None,
+        )
+        if artifact_ref is not None and self._container.artifacts is not None:
+            await self._maybe_gc_artifact(ns, artifact_ref)
         return MemoryVerbResult(
             memory_id=memory_id,
             verb="delete",
             tiers_affected=tuple(affected),
             invalidated=True,
         )
+
+    async def _maybe_gc_artifact(self, ns: Namespace, artifact_id: str) -> None:
+        """Deletes ``artifact_id``'s ``ContextRepository`` handle only when NO live
+        ``MemoryItem`` in MTM or LTM still references it (``MemoryTierRepository.by_artifact`` —
+        the docstring-cited authority on ``mu_contracts.domain.model.artifact.Retention``:
+        "authority = by_artifact()"; see this method's own STM note below for why that tier is
+        not part of the fan-out). ``delete()``'s own tier loop above has already
+        invalidated/evicted the item this call started from, so a fan-out that still finds a
+        reference means a DIFFERENT, still-active memory legitimately shares this artifact
+        (e.g. two propositions distilled from the same captured turn) — the store stays.
+
+        Every tier's invalidate/evict above has already committed by the time this runs, so a
+        `by_artifact` fan-out arm or the store's own `delete` raising here does NOT roll any of
+        that back (DEV-STANDARDS rule 8: fail loud, never a silent swallow) — it propagates, and
+        the memory stays correctly invalidated either way; only the artifact body's GC did not
+        complete, and it is retried the next time any memory pointing at the same reference set
+        is deleted.
+
+        **STM is deliberately not a fan-out arm**: `mu_engine.storage.ports.StmTierRepository`
+        (the port `self._container.stm` is typed against) declares no `by_artifact` — verified
+        against the shipped `RedisStmAdapter`, which has none either (STM has no
+        reverse-provenance index; its own write-time content-hash dedup already keeps at most one
+        physical row per `content_hash` per namespace, and that row is the one THIS call already
+        evicted above if it existed).
+
+        **LTM's `by_artifact` is REQUIRED on `GraphStorePort`** (every shipped graph backend —
+        FalkorDB — implements it), so it is called unconditionally. **MTM's is NOT** —
+        `mu_engine.storage.ports.MtmTierRepository` does not declare it, and only
+        `QdrantMtmAdapter` implements it today; `pgvector`/`chroma`/`faiss`/`weaviate` do not
+        (verified: grepped, no `by_artifact` in any of the four). Duck-typed via `getattr` rather
+        than widening the port (which would break those four backends' structural conformance for
+        a method this pass does not implement on them — a real, separate gap, reported, not
+        papered over): a backend WITHOUT it cannot answer "still referenced?", and the only safe
+        answer to an unanswerable ref-count question is to SKIP the delete, never to guess. That
+        makes this GC a no-op (space is not reclaimed, nothing is ever wrongly deleted) on any
+        MTM backend but Qdrant until that backend gains the method — a named, honest degrade.
+
+        **Only ACTIVE references count** (verify pass on ADR 0056, AD-251). Neither
+        ``QdrantMtmAdapter.by_artifact`` nor ``FalkorLtmAdapter.by_artifact`` filters by ``state``
+        — by design: both are reverse-provenance lookups, and MTM/LTM are invalidate-don't-delete
+        substrates, so the point/node this very call just ``expire``-d is STILL physically present
+        and STILL carries ``artifact_ref``. Counting it would make the deleted memory answer its
+        own reference-count question, short-circuit this GC and leave the body on disk forever —
+        measured exactly that way against real Qdrant + a real FS tree before this filter existed
+        (``tests/surface/test_facade_artifact_delete_real_int.py``; the unit suite could not see
+        it because every case there put the item in LTM only, so the MTM arm returned ``[]`` by
+        construction). Filtering here rather than inside the adapters keeps ``by_artifact`` a
+        faithful reverse-provenance lookup for its other callers; this method is the one place
+        that wants "still LIVE references", not "all references"."""
+
+        def _live(refs: Sequence[MemoryItem]) -> bool:
+            return any(ref.state is MemoryState.ACTIVE for ref in refs)
+
+        mtm_by_artifact = getattr(self._container.mtm, "by_artifact", None)
+        if mtm_by_artifact is not None and _live(await mtm_by_artifact(ns, artifact_id)):
+            return
+        if mtm_by_artifact is None:
+            return  # cannot verify MTM's ref-count on this backend — do not guess, do not delete.
+        if _live(await self._container.ltm.by_artifact(ns, artifact_id)):
+            return
+        assert self._container.artifacts is not None  # noqa: S101 — mypy narrowing only; the
+        # caller (`delete()`) already checked this is not None before calling this method at all.
+        await self._container.artifacts.delete(ns, artifact_id)
 
     async def _publish(self, event: MemoryPromoted | MemoryDemoted) -> tuple[str, ...]:
         """Publish ONE lifecycle event onto the container's real bus (the SAME ``InprocBus``

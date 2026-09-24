@@ -303,9 +303,17 @@ class ArtifactFsSettings(BaseModel):
     content-addressed (git-object-store-shaped fan-out), genuinely persistent across process
     restarts. ``content_root`` is the ONE tunable (DEV-STANDARDS rule 3 — never hardcoded at
     the adapter); a test run points this at a throwaway scratch dir, same discipline as
-    :class:`ChromaSettings`/:class:`FaissSettings` above."""
+    :class:`ChromaSettings`/:class:`FaissSettings` above.
 
-    content_root: str = "./.mu_data/artifacts"
+    **FAULT-HUNT-0924.md F4c:** the default used to be CWD-relative (``"./.mu_data/artifacts"``),
+    so it scattered a fresh, un-enumerable tree of plaintext memory content under every directory
+    a process was ever launched from (measured: ten such trees under one project checkout alone).
+    Deterministic + user-scoped now, mirroring ``SqliteOutbox``'s own ``~/.memory-universe/...``
+    default — one root per machine, independent of CWD. Existing on-disk trees at the OLD default
+    are not migrated by this change (a data-location migration, tracked separately, not a code
+    fix)."""
+
+    content_root: str = "~/.memory-universe/artifacts"
 
 
 class StorageSettings(BaseModel):
