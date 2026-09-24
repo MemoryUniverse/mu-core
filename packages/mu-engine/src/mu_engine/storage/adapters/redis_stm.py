@@ -218,31 +218,91 @@ class RedisStmAdapter:
         limit: int,
         caller_identity_set: CallerIdentitySet | None = None,
     ) -> list[Scored[MemoryItem]]:
-        recency = RedisMapper.recency_key(ns)
-        ids = await self._redis.zrevrange(recency, 0, max(0, limit - 1))
+        out = await self._scan_index(
+            RedisMapper.recency_key(ns),
+            ns,
+            limit=limit,
+            channel=RecallChannel.STM_FLOOR,
+            is_floor=True,
+        )
+        return authorized_window(
+            out, ns=ns, caller_identity_set=caller_identity_set, operation="stm.recent"
+        )
+
+    async def _scan_index(
+        self,
+        index_key: str,
+        ns: Namespace,
+        *,
+        limit: int,
+        channel: RecallChannel,
+        is_floor: bool,
+    ) -> list[Scored[MemoryItem]]:
+        """The ZREVRANGE-then-hydrate-then-self-heal shape :meth:`_recent_impl` and
+        :meth:`_demoted_impl` (AD-250 fix, ADR 0061) both need, over WHICHEVER namespace-scoped
+        ZSET the caller names — factored out so the two indices share one implementation rather
+        than two copies of the same loop (DEV-STANDARDS rule 6, DRY)."""
+        ids = await self._redis.zrevrange(index_key, 0, max(0, limit - 1))
         out: list[Scored[MemoryItem]] = []
         for rank, raw in enumerate(ids):
             memory_id = _as_str(raw)
-            # ``_get_impl``, NOT the public ``get``: the window is authorized ONCE, by
-            # ``authorized_window`` below. Hydrating through the public verb would apply Model-A
-            # twice and — because this loop's ``None`` branch means "TTL-expired, self-heal" — a
-            # DENIAL would be indistinguishable from an expiry and would ``ZREM`` the row out of
-            # the recency index. An authorization decision that DELETES the data it denies is a
-            # far worse defect than the one being fixed; it also raised on the SHARED plane,
+            # ``_get_impl``, NOT the public ``get``: the window is authorized ONCE, by the
+            # caller's own ``authorized_window`` pass. Hydrating through the public verb would
+            # apply Model-A twice and — because this loop's ``None`` branch means "TTL-expired,
+            # self-heal" — a DENIAL would be indistinguishable from an expiry and would ``ZREM``
+            # the row out of the index. An authorization decision that DELETES the data it denies
+            # is a far worse defect than the one being fixed; it also raised on the SHARED plane,
             # because this internal read has no caller to pass. One authorization point per public
             # verb, and the primitive underneath it stays a primitive.
             item = await self._get_impl(ns, memory_id)
             if item is None:
-                # a TTL-expired member still lingering in the ZSET — drop it, self-heal.
-                await self._redis.zrem(recency, memory_id)
+                # a TTL-expired member still lingering in the index — drop it, self-heal.
+                await self._redis.zrem(index_key, memory_id)
                 continue
-            out.append(
-                Scored(
-                    item=item, score=1.0, channel=RecallChannel.STM_FLOOR, rank=rank, is_floor=True
-                )
-            )
+            out.append(Scored(item=item, score=1.0, channel=channel, rank=rank, is_floor=is_floor))
+        return out
+
+    async def put_demoted(self, item: MemoryItem, *, ttl_s: int, at: datetime) -> str:
+        """The demotion write-ahead verb (AD-250 fix, ADR 0061 — ``ports.py``'s own docstring has
+        the full rationale)."""
+        return await self._retry(self._put_demoted_impl)(item, ttl_s=ttl_s, at=at)
+
+    async def _put_demoted_impl(self, item: MemoryItem, *, ttl_s: int, at: datetime) -> str:
+        row = self._mapper.to_store(item)
+        row = row.model_copy(update={"ttl_s": ttl_s})
+        demoted = RedisMapper.demoted_key(item.namespace)
+        # ONE atomic transaction, the same discipline `_put_impl` uses: SET payload + ZADD the
+        # DEMOTED index (never `recency` — a demoted row does not compete for the fresh-capture
+        # floor's bounded slots, see `demoted_key`'s own docstring) + EXPIRE apply together.
+        # Deliberately NO write-time content-hash dedup here (`_bump_if_duplicate` is an
+        # INGEST-time concern over fresh captures — a demotion write-ahead copy is a tier-down
+        # move of an item that already has a stable id, never a new capture to dedup against).
+        pipe = self._redis.pipeline(transaction=True)
+        pipe.set(row.key, row.blob, ex=ttl_s)
+        pipe.zadd(demoted, {item.id: at.timestamp()})
+        pipe.expire(demoted, ttl_s)
+        await pipe.execute()
+        return item.id
+
+    async def demoted(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        """The demoted-item channel (AD-250 fix, ADR 0061 — ``ports.py``'s own docstring has the
+        full rationale). Same Model-A authorization contract as :meth:`recent` (AD-128): ignored
+        on PRIVATE, REQUIRED on SHARED."""
+        out = await self._scan_index(
+            RedisMapper.demoted_key(ns),
+            ns,
+            limit=limit,
+            channel=RecallChannel.STM_DEMOTED,
+            is_floor=False,  # never eligible for `_protected_floor_ids` — competes on relevance.
+        )
         return authorized_window(
-            out, ns=ns, caller_identity_set=caller_identity_set, operation="stm.recent"
+            out, ns=ns, caller_identity_set=caller_identity_set, operation="stm.demoted"
         )
 
     async def enumerate_page(
@@ -357,7 +417,45 @@ class RedisStmAdapter:
         pipe = self._redis.pipeline(transaction=True)
         pipe.delete(RedisMapper.memory_key(ns, memory_id))
         pipe.zrem(RedisMapper.recency_key(ns), memory_id)
+        # AD-250 fix (ADR 0061): also strip the DEMOTED index — a `ZREM` on a member/key that was
+        # never there is a harmless no-op, and `evict` has no way to know (nor should it need to
+        # care) which of the two indices a given id currently lives in. Without this, evicting a
+        # rolled-back demotion write-ahead copy (`DemotionService._rollback_after_failed_remove`,
+        # which now writes via `put_demoted`) would leave a dangling id in the demoted ZSET
+        # pointing at a key that no longer exists — self-healed on the next `demoted()` read
+        # either way, but there is no reason to leave the debris for that read to clean up.
+        pipe.zrem(RedisMapper.demoted_key(ns), memory_id)
         await pipe.execute()
+
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        """The read-stat write-back a genuine recall hit performs (AD-250 fix, ADR 0061 —
+        ``ports.py``'s own docstring has the full rationale)."""
+        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+
+    async def _reinforce_impl(
+        self, ns: Namespace, memory_id: str, *, at: datetime
+    ) -> MemoryItem | None:
+        # Read-modify-write over the SAME `_get_impl` primitive `_recent_impl`/`get` already use
+        # (never the public `get`: an internal maintenance call has no caller to authorize
+        # against, and this is called only over ids a caller's OWN prior, already-authorized read
+        # just returned).
+        key = RedisMapper.memory_key(ns, memory_id)
+        blob = await self._redis.get(key)
+        if blob is None:
+            return None  # expired/evicted in the window between the caller's read and this call.
+        current = self._mapper.from_store(RedisRecord(key=key, ttl_s=None, blob=_as_str(blob)))
+        reinforced = current.model_copy(
+            update={"access_count": current.access_count + 1, "updated_at": at}
+        )
+        # KEEPTTL: a recall must never reset a demoted item's `demoted_stm_ttl_s` retention clock
+        # back to a fresh one (the same discipline `_set_pinned_impl` already uses, for the same
+        # reason — a read-stat write-back is not a re-capture). Deliberately does NOT touch
+        # either recency index's score: `access_count` is what feeds `SalienceStrategy._usage`
+        # (the rescue gate's only upward term) — the DEMOTED channel's own discoverability does
+        # not depend on recency ordering the way the fresh-capture floor does (`demoted_key`'s
+        # docstring), so there is nothing here that needs re-scoring.
+        await self._redis.set(key, reinforced.model_dump_json(), keepttl=True)
+        return reinforced
 
 
 def _as_str(value: str | bytes) -> str:

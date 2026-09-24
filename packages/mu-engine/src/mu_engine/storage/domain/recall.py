@@ -39,6 +39,13 @@ class RecallChannel(StrEnum):
     """Which channel produced a scored item (spec §1.1 line 68)."""
 
     STM_FLOOR = "stm_floor"
+    # AD-250 fix (ADR 0061): the demoted-item channel (`StmTierRepository.demoted`) — a
+    # DISTINCT value from `STM_FLOOR` for the same reason `MTM_HYBRID` is distinct from
+    # `MTM_DENSE`/`MTM_SPARSE`: store-level provenance proves which physical index actually
+    # produced a hit. `ranker._channel_label` folds both `stm_*` values to "stm" for fusion —
+    # ONE channel to the `FusionStrategy`, exactly as §1.1 requires — and neither is ever
+    # `is_floor`-eligible for `_protected_floor_ids` (only `STM_FLOOR`'s own candidate pool is).
+    STM_DEMOTED = "stm_demoted"
     MTM_DENSE = "mtm_dense"
     MTM_SPARSE = "mtm_sparse"
     # The INTRA-MTM dense⊕sparse fused list (mtm-retrieval-design.md §1.1): one Qdrant

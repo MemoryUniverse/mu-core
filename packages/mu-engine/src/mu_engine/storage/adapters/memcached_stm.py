@@ -24,6 +24,8 @@ backend-agnostic by construction, spec §5).
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 import aiomcache
 
@@ -77,11 +79,29 @@ class MemcachedStmAdapter:
         return entries, cas_token
 
     async def _update_recency(self, ns: Namespace, memory_id: str, ts: float | None) -> None:
-        return await self._retry(self._update_recency_impl)(ns, memory_id, ts)
-
-    async def _update_recency_impl(self, ns: Namespace, memory_id: str, ts: float | None) -> None:
-        """CAS read-modify-write of the per-namespace recency list; ``ts=None`` removes the id."""
         key = RedisMapper.recency_key(ns).encode("utf-8")
+        await self._update_index(key, memory_id, ts, ttl_s=self._default_ttl_s)
+
+    async def _update_demoted(
+        self, ns: Namespace, memory_id: str, ts: float | None, *, ttl_s: int
+    ) -> None:
+        """AD-250 fix (ADR 0061): the demoted-index twin of :meth:`_update_recency`, over its
+        OWN CAS-guarded list key (``RedisMapper.demoted_key``) — see that key's own docstring
+        for why a demoted item needs a list separate from the fresh-capture recency one."""
+        key = RedisMapper.demoted_key(ns).encode("utf-8")
+        await self._update_index(key, memory_id, ts, ttl_s=ttl_s)
+
+    async def _update_index(
+        self, key: bytes, memory_id: str, ts: float | None, *, ttl_s: int
+    ) -> None:
+        return await self._retry(self._update_index_impl)(key, memory_id, ts, ttl_s=ttl_s)
+
+    async def _update_index_impl(
+        self, key: bytes, memory_id: str, ts: float | None, *, ttl_s: int
+    ) -> None:
+        """CAS read-modify-write of the list at ``key``; ``ts=None`` removes the id. Shared by
+        the recency list and the demoted list (AD-250 fix, ADR 0061) — the SAME CAS shape over
+        WHICHEVER namespace-scoped list key the caller names (DEV-STANDARDS rule 6, DRY)."""
         for _attempt in range(self._cas_max_attempts):
             entries, cas_token = await self._read_recency(key)
             entries = [(mid, t) for mid, t in entries if mid != memory_id]
@@ -91,15 +111,15 @@ class MemcachedStmAdapter:
             entries = entries[: self._recency_cap]
             new_raw = json.dumps(entries).encode("utf-8")
             ok = (
-                await self._mc.add(key, new_raw, exptime=self._default_ttl_s)
+                await self._mc.add(key, new_raw, exptime=ttl_s)
                 if cas_token is None
-                else await self._mc.cas(key, new_raw, cas_token, exptime=self._default_ttl_s)
+                else await self._mc.cas(key, new_raw, cas_token, exptime=ttl_s)
             )
             if ok:
                 return
         raise TierRepositoryUnavailableError(
-            f"memcached recency CAS failed after {self._cas_max_attempts} attempts "
-            "(sustained write contention) — D6 recency floor unavailable"
+            f"memcached index CAS failed after {self._cas_max_attempts} attempts "
+            "(sustained write contention) — D6 recency/demoted floor unavailable"
         )
 
     async def put(self, item: MemoryItem, *, ttl_s: int | None = None) -> str:
@@ -164,26 +184,84 @@ class MemcachedStmAdapter:
         caller_identity_set: CallerIdentitySet | None = None,
     ) -> list[Scored[MemoryItem]]:
         key = RedisMapper.recency_key(ns).encode("utf-8")
+        out = await self._scan_index(
+            key,
+            ns,
+            limit=limit,
+            channel=RecallChannel.STM_FLOOR,
+            is_floor=True,
+            self_heal=self._update_recency,
+        )
+        return authorized_window(
+            out, ns=ns, caller_identity_set=caller_identity_set, operation="stm.recent"
+        )
+
+    async def _scan_index(
+        self,
+        key: bytes,
+        ns: Namespace,
+        *,
+        limit: int,
+        channel: RecallChannel,
+        is_floor: bool,
+        self_heal: Callable[[Namespace, str, None], Awaitable[None]],
+    ) -> list[Scored[MemoryItem]]:
+        """The read-then-hydrate-then-self-heal shape :meth:`_recent_impl` and
+        :meth:`_demoted_impl` (AD-250 fix, ADR 0061) both need, over WHICHEVER namespace-scoped
+        list key the caller names — factored out so the two indices share one implementation
+        (DEV-STANDARDS rule 6, DRY)."""
         entries, _ = await self._read_recency(key)
         out: list[Scored[MemoryItem]] = []
         for rank, (memory_id, _ts) in enumerate(entries[: max(0, limit)]):
-            # ``_get_impl``, NOT the public ``get`` — the window is authorized ONCE, below.
-            # Hydrating through the public verb would apply Model-A twice and, since this loop
-            # reads ``None`` as "TTL-expired, self-heal", a DENIAL would EVICT the row from the
-            # recency list. Same reasoning, same fix, as the Redis adapter.
+            # ``_get_impl``, NOT the public ``get`` — the window is authorized ONCE, by the
+            # caller's own ``authorized_window`` pass. Hydrating through the public verb would
+            # apply Model-A twice and, since this loop reads ``None`` as "TTL-expired, self-heal",
+            # a DENIAL would EVICT the row from the index. Same reasoning, same fix, as the Redis
+            # adapter.
             item = await self._get_impl(ns, memory_id)
             if item is None:
-                # TTL-expired member still lingering in the recency list — self-heal, same as
-                # the Redis adapter's ZSET pruning.
-                await self._update_recency(ns, memory_id, None)
+                # TTL-expired member still lingering in the list — self-heal, same as the Redis
+                # adapter's ZSET pruning.
+                await self_heal(ns, memory_id, None)
                 continue
-            out.append(
-                Scored(
-                    item=item, score=1.0, channel=RecallChannel.STM_FLOOR, rank=rank, is_floor=True
-                )
-            )
+            out.append(Scored(item=item, score=1.0, channel=channel, rank=rank, is_floor=is_floor))
+        return out
+
+    async def put_demoted(self, item: MemoryItem, *, ttl_s: int, at: datetime) -> str:
+        """The demotion write-ahead verb (AD-250 fix, ADR 0061 — ``ports.py``'s own docstring has
+        the full rationale)."""
+        return await self._retry(self._put_demoted_impl)(item, ttl_s=ttl_s, at=at)
+
+    async def _put_demoted_impl(self, item: MemoryItem, *, ttl_s: int, at: datetime) -> str:
+        row = self._mapper.to_store(item)
+        await self._mc.set(row.key.encode("utf-8"), row.blob.encode("utf-8"), exptime=ttl_s)
+        await self._update_demoted(item.namespace, item.id, at.timestamp(), ttl_s=ttl_s)
+        return item.id
+
+    async def demoted(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        """The demoted-item channel (AD-250 fix, ADR 0061 — ``ports.py``'s own docstring has the
+        full rationale)."""
+        key = RedisMapper.demoted_key(ns).encode("utf-8")
+
+        async def _self_heal(ns_: Namespace, memory_id: str, _ts: None) -> None:
+            await self._update_demoted(ns_, memory_id, None, ttl_s=self._default_ttl_s)
+
+        out = await self._scan_index(
+            key,
+            ns,
+            limit=limit,
+            channel=RecallChannel.STM_DEMOTED,
+            is_floor=False,
+            self_heal=_self_heal,
+        )
         return authorized_window(
-            out, ns=ns, caller_identity_set=caller_identity_set, operation="stm.recent"
+            out, ns=ns, caller_identity_set=caller_identity_set, operation="stm.demoted"
         )
 
     async def evict(self, ns: Namespace, memory_id: str) -> None:
@@ -193,3 +271,46 @@ class MemcachedStmAdapter:
         key = RedisMapper.memory_key(ns, memory_id).encode("utf-8")
         await self._mc.delete(key)
         await self._update_recency(ns, memory_id, None)
+        # AD-250 fix (ADR 0061): also strip the DEMOTED list — see `RedisStmAdapter._evict_impl`'s
+        # identical comment for why (removing an id absent from a list is a harmless no-op here).
+        await self._update_demoted(ns, memory_id, None, ttl_s=self._default_ttl_s)
+
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        """The read-stat write-back (AD-250 fix, ADR 0061 — ``ports.py``'s own docstring has the
+        full rationale). CAS read-modify-write over the SAME row primitive ``put``/``get`` use —
+        parity with ``_update_index_impl``'s own CAS loop, for the SAME concurrency reason.
+
+        Memcached exposes no ``KEEPTTL``/remaining-TTL-read primitive (D6, module docstring: "dev
+        only has Memcached"), so unlike the Redis/Valkey leg this cannot preserve the row's exact
+        REMAINING ttl — it re-stamps this adapter's own configured ``default_ttl_s`` instead
+        (the same ``effective_ttl_s`` fallback ``_put_impl`` already uses when no override is
+        given). Documented, not silently approximated: this is a real behavioural gap on a
+        dev-only backend, not the production (Redis/Valkey) path this fix is proven against."""
+        return await self._retry(self._reinforce_impl)(ns, memory_id, at=at)
+
+    async def _reinforce_impl(
+        self, ns: Namespace, memory_id: str, *, at: datetime
+    ) -> MemoryItem | None:
+        key = RedisMapper.memory_key(ns, memory_id).encode("utf-8")
+        for _attempt in range(self._cas_max_attempts):
+            raw, cas_token = await self._mc.gets(key)
+            if raw is None or cas_token is None:
+                # `cas_token is None` alongside a live `raw` is not a real memcached outcome
+                # (`gets` always pairs a hit with a token), but the stub types it as possible —
+                # treated the same as a miss: self-heal, never call `cas` with a token type it
+                # cannot accept.
+                return None  # expired/evicted between the caller's read and this call.
+            current = self._mapper.from_store(
+                RedisRecord(key=key.decode("utf-8"), ttl_s=None, blob=raw.decode("utf-8"))
+            )
+            reinforced = current.model_copy(
+                update={"access_count": current.access_count + 1, "updated_at": at}
+            )
+            new_blob = reinforced.model_dump_json().encode("utf-8")
+            ok = await self._mc.cas(key, new_blob, cas_token, exptime=self._default_ttl_s)
+            if ok:
+                return reinforced
+        raise TierRepositoryUnavailableError(
+            f"memcached reinforce CAS failed after {self._cas_max_attempts} attempts "
+            "(sustained write contention) — D6 read-stat write-back unavailable"
+        )

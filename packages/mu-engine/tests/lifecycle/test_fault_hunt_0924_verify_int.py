@@ -39,7 +39,6 @@ from mu_engine.pipelines.distill import DistillPipeline
 from mu_engine.platform.adapters.bus_inproc import InprocBus
 from mu_engine.platform.clock import FrozenClock
 from mu_engine.providers._contracts import EmbeddingPort
-from mu_engine.services.recall.dto import RecallSettings
 from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
 from mu_engine.storage.adapters.qdrant_mtm import QdrantMtmAdapter
 from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
@@ -224,6 +223,15 @@ async def test_the_recall_rescue_now_actually_re_promotes_a_demoted_memory(
 
     MUTATION CHECK (run, red): set `promote_stm_mtm` back to 0.7 in `lifecycle/settings.py` —
     `rescued` is no longer in MTM and the first assertion fails.
+
+    **What this test does NOT prove (AD-250, ADR 0061 — see the closure note above this
+    function).** "The user recalls it again" below is a manual `access_count` poke via
+    `stm.put()`, not a genuine query — at the time this test was written, nothing in the
+    codebase EVER wrote `access_count` back from a real recall for any STM/MTM item, so a poke
+    was the only way to exercise this gate at all. `StmTierRepository.reinforce` (AD-250) now
+    makes that write-back real; `test_ad_250_demoted_recall_rescue_int.py`'s second test proves
+    THIS SAME gate firing after ``usage_cap`` genuine ``ThreeChannelRecallRanker.rank()`` calls,
+    with no manual poke anywhere in it.
     """
     ns = make_ns(session="verify-rescue")
     now = _T0 + timedelta(days=3)
@@ -385,79 +393,27 @@ async def qdrant_points_for(mtm: QdrantMtmAdapter, ns: Namespace, memory_id: str
 
 # =================================================================================================
 # F1, the half ADR 0054 did NOT close — surviving is not the same as being findable
+#
+# CLOSED 2026-09-24 (AD-250, ADR 0061). This section used to hold
+# `test_a_demoted_memory_survives_but_is_invisible_to_the_stm_recall_floor`, a test that asserted
+# a LIVE GAP by design and named its own removal condition verbatim: "AD-250 appears FIXED — the
+# demoted memory is now reachable through the STM floor. If that is deliberate, delete this test
+# and close AD-250." The fix landed is NOT "reachable through the STM floor" — `DemotionService`
+# now writes the write-ahead copy through `StmTierRepository.put_demoted`, into its OWN
+# discoverability index (`RedisMapper.demoted_key`, `stm:demoted`, never `stm:recency`), so the
+# item was never going to be found back in that specific test's `stm.recent()` window again
+# either way; its CONTROL assertion (`demoted.id in {s.item.id for s in stm.recent(...)}` right
+# after demotion) would now fail structurally, not just its final "the gap" assertion. That is the
+# intended shape (FAULT-HUNT-0924 F1's own alternative (a)/(b) framing: a demoted item is
+# conceptually its own small, cold-ish sub-tier, not a member of "what was just said" — giving it
+# a separate channel rather than fighting the ordinary floor's bounded width for a slot). The
+# replacement proof lives in `test_ad_250_demoted_recall_rescue_int.py` (same directory): it
+# demotes a memory, advances the store past where the OLD design's window would have dropped it,
+# shows a real `ThreeChannelRecallRanker.rank()` call still finds it via the new `demoted`
+# channel, confirms the real Valkey row's `access_count` genuinely rises on that hit
+# (`StmTierRepository.reinforce` — itself a second, independent AD-250 fix: nothing had EVER
+# written `access_count` back on any STM/MTM recall, demoted or not), and then runs
+# `PromotionService.sweep_stm_to_mtm` for real to show the rescue this file's sibling test
+# (`test_the_recall_rescue_now_actually_re_promotes_a_demoted_memory`, immediately above) gates
+# on can ACTUALLY be reached by a genuine query, not only by a manual `access_count` poke.
 # =================================================================================================
-@pytest.mark.integration
-async def test_a_demoted_memory_survives_but_is_invisible_to_the_stm_recall_floor(
-    mtm: QdrantMtmAdapter,
-    ltm: FalkorLtmAdapter,
-    make_stm: Callable[..., ValkeyStmAdapter],
-    embedder: EmbeddingPort,
-    make_ns: Callable[..., Namespace],
-    make_item: Callable[..., MemoryItem],
-) -> None:
-    """**This test asserts a LIVE GAP, not a fix** (AD-250). ADR 0054 stopped the demoted copy
-    being deleted after an hour; it did not make the surviving copy reachable.
-
-    STM's ONLY channel into recall is the recency floor — `RecallRanker` calls
-    `StmTierRepository.recent(ns, limit=recency_floor_limit)` (`recall/ranker.py:262,276`;
-    `recency_floor_limit` defaults to 10, `recall/dto.py:166`), and `recent` is
-    `ZREVRANGE {ns}:stm:recency 0 limit-1` (`redis_stm.py:222`) over a ZSET whose score is
-    `item.created_at` (`redis_stm.py:119`) — NOT the demotion instant. A demoted memory therefore
-    re-enters the floor at its ORIGINAL age, underneath every newer turn. FAULT-HUNT-0924 F1
-    named this ("the STM recency ZSET is scored by item.created_at ... so a demoted memory enters
-    the recency floor at its original age, underneath every genuinely recent turn"); ADR 0054
-    changed neither line.
-
-    Its MTM point is deleted by then, so the semantic channel cannot return it either, and LTM
-    holds it only if DISTILL already extracted a fact. So for a default-importance memory the
-    recall-rescue ADR 0034 describes — "a re-recalled fact's raised access_count rescues it" —
-    still has no way to fire: nothing can re-recall it in order to raise the count.
-
-    The two halves below are a MATCHED PAIR, which is the only reason the first one means
-    anything: same demoted item, same store, same `limit`; the ONLY variable is how many newer
-    turns sit above it.
-    """
-    ns = make_ns(session="verify-floor")
-    now = _T0 + timedelta(days=5)
-    clock = FrozenClock(now)
-    stm = make_stm()
-    settings = LifecycleSettings()
-    floor_limit = RecallSettings().recency_floor_limit
-    bus = InprocBus()
-    await bus.start()
-    try:
-        manager = _manager(
-            stm=stm, mtm=mtm, ltm=ltm, embedder=embedder, clock=clock, bus=bus, settings=settings
-        )
-        demoted = await _mtm_item(
-            make_item,
-            mtm,
-            ns,
-            "the deploy window is Friday 16:00",
-            importance=0.70,
-            access_count=0,
-            created_at=_T0,
-        )
-        await manager.sweep_namespace_now(ns)
-        assert await stm.get(ns, demoted.id) is not None  # it survived (F1's fix)
-
-        # CONTROL: with fewer newer turns than the floor width, the survivor IS in the window.
-        for i in range(floor_limit - 2):
-            await stm.put(make_item(ns, f"newer turn {i}", created_at=now + timedelta(minutes=i)))
-        window = await stm.recent(ns, limit=floor_limit)
-        assert demoted.id in {
-            s.item.id for s in window
-        }, "control failed: the survivor is not even reachable in an near-empty window"
-
-        # THE GAP: one ordinary session's worth of newer turns pushes it out, permanently.
-        for i in range(floor_limit):
-            await stm.put(
-                make_item(ns, f"later turn {i}", created_at=now + timedelta(hours=1, minutes=i))
-            )
-        window = await stm.recent(ns, limit=floor_limit)
-        assert demoted.id not in {s.item.id for s in window}, (
-            "AD-250 appears FIXED — the demoted memory is now reachable through the STM floor. "
-            "If that is deliberate, delete this test and close AD-250."
-        )
-    finally:
-        await bus.close()

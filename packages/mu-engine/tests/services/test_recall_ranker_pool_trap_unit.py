@@ -86,6 +86,13 @@ class _EmptyStm:
     ) -> list[Scored[object]]:
         return []
 
+    async def demoted(
+        self, ns: Namespace, *, limit: int, caller_identity_set: frozenset[str] | None = None
+    ) -> list[Scored[object]]:
+        """AD-250 fix (ADR 0061): `ThreeChannelRecallRanker.rank` now calls this unconditionally
+        alongside `recent` — this fake needed it to keep working at all."""
+        return []
+
 
 def _build(
     settings: RecallSettings,

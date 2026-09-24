@@ -21,6 +21,7 @@ pins storage-vocabulary DTOs there — pure wire shapes both planes must agree o
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Protocol, TypeVar
 
 from mu_contracts.domain.model.recall import CallerIdentitySet
@@ -152,6 +153,84 @@ class StmTierRepository(Protocol):
         ...
 
     async def evict(self, ns: Namespace, memory_id: str) -> None: ...
+
+    async def put_demoted(self, item: MemoryItem, *, ttl_s: int, at: datetime) -> str:
+        """The demotion write-ahead verb (AD-250 fix, ADR 0061).
+
+        `FAULT-HUNT-0924.md` F1 named it and ADR 0058's verify pass proved it: raising the
+        demoted copy's TTL (ADR 0054) fixed WHEN it disappears, not WHETHER anything could ever
+        find it again. `DemotionService`'s write-ahead copy used to go through :meth:`put`,
+        landing in the SAME recency ZSET a fresh capture uses, scored by `item.created_at` — the
+        item's ORIGINAL age, not the demotion instant. A demoted memory was demoted precisely
+        for being old/unused, so it re-entered the recency floor underneath every genuinely new
+        turn and dropped out of `recent(limit=recency_floor_limit)` (default 10) as soon as ten
+        newer STM writes existed in that session — almost immediately. Its MTM point is already
+        gone by then, so nothing could ever re-recall it to raise `access_count`, so the
+        recall-rescue ADR 0034 describes had a reachable GATE (`promote_stm_mtm`) and no
+        reachable TRIGGER.
+
+        This is the fix: a demoted item gets its OWN discoverability index
+        (:meth:`demoted`/``RedisMapper.demoted_key``), scored by ``at`` (the DEMOTION instant,
+        never `item.created_at`), that a fresh capture can never push it out of — because fresh
+        captures never enter this index. It is conceptually the "cold, still-in-KV" sub-tier the
+        fault hunt itself named: not a member of "what was just said" (never `is_floor`-eligible
+        — `ports.py`'s `recent` docstring's protection guarantee is untouched), but still a real,
+        relevance-competing STM-channel candidate (`ThreeChannelRecallRanker.rank` fuses it in
+        at `weight_stm`, the SAME discount an ordinary floor candidate gets). `ttl_s` is REQUIRED
+        (never a silent capture-buffer default — this verb has exactly one caller and it always
+        knows its own retention window, `LifecycleSettings.demoted_stm_ttl_s`)."""
+        ...
+
+    async def demoted(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: CallerIdentitySet | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        """The demoted-item channel (AD-250 fix, ADR 0061) — :meth:`put_demoted`'s read side,
+        newest-demoted-first, at most ``limit`` rows. Same Model-A contract as :meth:`recent`
+        (AD-128): ``caller_identity_set`` is ignored on PRIVATE (own-partition key authorizes),
+        REQUIRED on SHARED (a missing set raises
+        :class:`~mu_contracts.domain.errors.CallerIdentitySetRequiredError`; a denied row is
+        excluded, never included unstamped)."""
+        ...
+
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        """The read-stat write-back a genuine recall hit performs (AD-250 fix, ADR 0061).
+
+        `recall-service-design.md` §5.1/line 609 has always CLAIMED this: *"the only mutation
+        [recall] can cause is the read-stat write-back the stores already do idempotently on
+        read"* — cited against specific file:lines that, on inspection, implemented no such
+        thing for any ``StmTierRepository`` adapter: nothing ever incremented ``access_count`` on
+        a recall hit, for ANY item, demoted or not (the only place ``access_count`` was ever
+        written in this engine was ``DistillPipeline``'s identical-content LTM reconciliation, a
+        DISTILL-time event, never a recall one). So the ADR 0034 / ``DemotionService`` rescue
+        narrative — "a re-recalled item's raised ``access_count`` rescues it" — had no real
+        trigger, even for an item :meth:`recent`/:meth:`demoted` could genuinely see. This method
+        is that trigger, implemented for real: called by
+        :class:`~mu_engine.services.recall.ranker.ThreeChannelRecallRanker` once per DISTINCT
+        STM-channel (either index) item that actually made it into a returned ``RecallResult``.
+
+        Increments ``access_count`` by 1 and refreshes ``updated_at`` to ``at`` — MUST leave
+        ``item.created_at`` untouched (the field :meth:`~mu_engine.lifecycle.salience.
+        SalienceStrategy._recency` reads; this is a read-STAT write-back, not a re-capture) and
+        MUST preserve the row's REMAINING ttl (a recall must never reset a demoted item's
+        ``demoted_stm_ttl_s`` retention clock back to a fresh one — the store-level analogue of
+        ``KEEPTTL``, the same discipline :meth:`set_pinned` already uses for the same reason).
+        Deliberately does NOT touch either discoverability index's score — :meth:`demoted`'s own
+        window does not shrink from unrelated fresh-capture activity the way :meth:`recent`'s
+        does (``put_demoted``'s docstring), so there is nothing here that needs re-scoring to
+        stay reachable.
+
+        ``None`` if ``memory_id`` is absent (already TTL-expired, evicted, or never existed) — a
+        no-op, never a raise: the caller passes only ids ITS OWN prior read just returned, so an
+        absence here means the row expired in the narrow window between that read and this write,
+        which is exactly the race :meth:`recent`'s own self-heal branch already treats as
+        ordinary. Best-effort by contract — a caller MUST NOT let a failure here fail the read it
+        is reinforcing (the same "enhancement, not a named channel" degrade discipline
+        ``ranker.py``'s neighbour expansion already uses)."""
+        ...
 
 
 class MtmTierRepository(Protocol):

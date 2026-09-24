@@ -164,6 +164,17 @@ class RecallSettings(BaseModel):
     strategy: str = "rrf_3channel_v1"  # recall_registry key (§1.3)
     rrf_k: int = Field(default=60, ge=1)  # RRF smoothing constant (fusion.py default)
     recency_floor_limit: int = Field(default=10, ge=0)  # STM floor CANDIDATE pool width (§1.3)
+    # AD-250 fix (ADR 0061): the demoted-item channel's OWN pool width — a SEPARATE knob from
+    # `recency_floor_limit` above, because the two channels read SEPARATE indices
+    # (`StmTierRepository.demoted` vs `recent`, `put_demoted`'s docstring has the full
+    # mechanism). A demoted write-ahead copy no longer competes with fresh captures for the
+    # ordinary floor's slots, so this bounds how many of THIS namespace's currently-demoted rows
+    # (a much smaller, more slowly-growing population than every STM write ever) are eligible to
+    # compete in the RRF fuse per query. Defaulted to the SAME width as `recency_floor_limit` —
+    # no measurement has yet compared a wider or narrower demoted pool against it; widen this if
+    # a namespace routinely holds more than 10 live demoted items and a real query needs to reach
+    # past the newest 10 of them. Env override: `MU_RECALL__DEMOTED_FLOOR_LIMIT`.
+    demoted_floor_limit: int = Field(default=10, ge=0)
     # Bug fix (data-quality assessment §3.1/#1, 2026-07-31): the floor candidate pool used to be
     # merged in FRONT of the fused MTM/LTM tail UNCONDITIONALLY, and defaulted to the SAME width as
     # the result `limit` (10==10) — so on any session with >= `limit` STM items, the floor consumed
@@ -349,6 +360,24 @@ class RecallSettings(BaseModel):
     # override: ``MU_RECALL__CROSS_TIER_DEDUP=false`` reverts to the pre-fix behavior (duplicates
     # allowed through) for A/B comparison (DEV-STANDARDS rule 3).
     cross_tier_dedup: bool = Field(default=True)
+
+    # AD-250 fix (ADR 0061, `docs/tracking/FAULT-HUNT-0924.md` §1 F1's still-open half): the
+    # read-stat write-back `recall-service-design.md` §5.1/line 609 has always claimed happens
+    # ("the only mutation [recall] can cause is the read-stat write-back the stores already do
+    # idempotently on read") but, until this fix, no `StmTierRepository` adapter actually
+    # implemented for any item — `access_count` never rose from a genuine recall, so the ADR 0034
+    # rescue (`DemotionService`'s own docstring: "a re-recalled item's raised access_count
+    # rescues it") had no real trigger even for an item the new demoted channel could see.
+    # `ThreeChannelRecallRanker.rank` now calls `StmTierRepository.reinforce` once per DISTINCT
+    # STM-channel item (ordinary floor OR demoted) that survives into the returned
+    # `RecallResult` — bumping `access_count` (feeds `SalienceStrategy._usage`, the ONLY upward
+    # term the forgetting-curve gates ever see). Default ON — this closes a real defect, not an
+    # optional enhancement. Env override: `MU_RECALL__REINFORCE_ON_RECALL=false` for a
+    # read-replica/latency-sensitive deployment that wants recall to stay a pure read (the
+    # pre-fix behaviour for the ORDINARY floor: never wrong, merely un-rescuable — but for the
+    # DEMOTED channel this also means the rescue trigger this whole fix exists for goes dark, so
+    # turning it off is a real, named tradeoff, not a free knob).
+    reinforce_on_recall: bool = Field(default=True)
 
     # S1b — read-time neighbour expansion (TRACE-0923.md §7/§6.2/§5.1, ADR pending in
     # `docs/decisions/`). §5.1's own finding: 32.5% of failures return a turn within ±1 of the

@@ -42,6 +42,21 @@ class RedisMapper:
         return f"{_KEY_PREFIX}/{ns.to_prefix()}:stm:recency"
 
     @staticmethod
+    def demoted_key(ns: Namespace) -> str:
+        """AD-250 fix (ADR 0061): a namespace-scoped index of currently-resident DEMOTED STM
+        rows, SEPARATE from :meth:`recency_key`. A demoted MTM->STM write-ahead copy
+        (:class:`~mu_engine.lifecycle.demotion.DemotionService`) is a fundamentally different
+        thing from a fresh capture — it was demoted precisely for LOW recency/usage, so sharing
+        the ordinary recency ZSET's bounded, newest-`recency_floor_limit`-only window means it is
+        pushed out by every genuinely new turn in the session almost immediately (FAULT-HUNT-0924
+        F1 / AD-250: "the STM recency ZSET is scored by item.created_at ... a demoted memory
+        enters the recency floor at its original age, underneath every genuinely recent turn").
+        A demoted item is conceptually its own small, slowly-growing population — a COLD-ish
+        sub-tier still living in the KV store, not a member of "what was just said" — so it gets
+        its OWN discoverability index instead of competing for the fresh-capture floor's slots."""
+        return f"{_KEY_PREFIX}/{ns.to_prefix()}:stm:demoted"
+
+    @staticmethod
     def content_hash_key(ns: Namespace) -> str:
         """D4 write-time dedup index (conformance D-8): a namespace-scoped Redis HASH mapping
         ``content_hash -> memory_id`` (one field per distinct content seen in this partition's STM

@@ -24,6 +24,19 @@ Channel behaviour pinned to §1.3:
     query-relevant MTM/LTM channels never surfaced a single item — every ``recall()`` in that
     session returned the identical, query-blind, insertion-order list (verbatim repro:
     ``docs/tracking/DATA-QUALITY-ASSESSMENT.md`` §3.1).
+  * **STM demoted (AD-250 fix, ADR 0061, NEW)** — ``demoted(ns, limit)``, a SEPARATE channel from
+    the STM floor above, over its OWN discoverability index (``StmTierRepository.put_demoted``'s
+    own docstring has the full mechanism). A demoted MTM->STM write-ahead copy used to land in
+    the SAME bounded recency floor a fresh capture uses, scored by ``item.created_at`` — its
+    ORIGINAL age, not the demotion instant — so it re-entered the floor underneath every
+    genuinely new turn and dropped out of the window almost immediately, with its MTM point
+    already gone: nothing could ever re-recall it to raise ``access_count``, so the ADR 0034
+    rescue had a reachable GATE (``promote_stm_mtm``) and no reachable TRIGGER (FAULT-HUNT-0924
+    F1 / AD-250, ADR 0058's verify pass). This channel fuses in at the SAME ``weight_stm``
+    discount as the ordinary floor, is NEVER ``is_floor``-eligible (a demoted item is not "just
+    said" — it competes on relevance alone), and a genuine hit is what
+    :meth:`ThreeChannelRecallRanker._reinforce_stm_hits` (below) uses to actually raise
+    ``access_count`` toward the rescue gate.
   * **MTM dense** — ``semantic(ns, query_vec, ...)`` with the Model-A ``authorized_ids`` +
     ``state='active'`` predicate compiled server-side BEFORE top-k (adapter §3.2). Never pads.
   * **LTM graph (bi-temporal)** — ``graph_recall`` returns only ``m.state='active'`` facts whose
@@ -103,6 +116,8 @@ import math
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+import structlog
+
 from mu_contracts.domain.errors import CallerIdentitySetRequiredError, StoreUnavailableError
 from mu_contracts.domain.events import DegradeReason
 from mu_contracts.domain.model.recall import CallerIdentitySet, Vector
@@ -118,10 +133,12 @@ from mu_engine.services.recall.fusion import FusionStrategy, dedup_by_content_ha
 from mu_engine.services.recall.rerank_gate import AdaptiveRerankGate
 from mu_engine.storage.domain.memory import MemoryItem
 from mu_engine.storage.domain.namespace import Namespace, Visibility
-from mu_engine.storage.domain.recall import RecallChannel, Scored, SparseQuery
+from mu_engine.storage.domain.recall import Scored, SparseQuery
 from mu_engine.storage.ports import LtmTierRepository, MtmTierRepository, StmTierRepository
 
 __all__ = ["RecallRanker", "StmScoringConfigError", "ThreeChannelRecallRanker"]
+
+_log = structlog.get_logger("mu_engine.services.recall.ranker")
 
 
 class StmScoringConfigError(ValueError):
@@ -260,6 +277,7 @@ class ThreeChannelRecallRanker:
 
         pool = self._effective_pool(limit)
         floor_limit = self._settings.recency_floor_limit
+        demoted_limit = self._settings.demoted_floor_limit
 
         # Channels run concurrently under a STRUCTURED-CONCURRENCY TaskGroup (DEV-STANDARDS rule 1):
         # the LTM arm owns its own degrade (``_ltm_channel`` returns a named tuple, never raises),
@@ -274,6 +292,18 @@ class ThreeChannelRecallRanker:
                     # MTM and LTM arms below. Until the port could express it, this ONE arm ran
                     # unauthorized on the SHARED plane and served a non-member the room's items.
                     self._stm.recent(ns, limit=floor_limit, caller_identity_set=caller_identity_set)
+                    if channels.stm
+                    else _empty_scored()
+                )
+                demoted_t = tg.create_task(
+                    # AD-250 fix (ADR 0061): the demoted-item channel — a demoted write-ahead
+                    # copy lives in its OWN index (`put_demoted`'s docstring), never the ordinary
+                    # recency floor above, so it needs its own fetch. Runs whenever the STM floor
+                    # does (it is conceptually part of "the STM tier", just a different index) —
+                    # `dto.py`'s `demoted_floor_limit` docstring has the full rationale.
+                    self._stm.demoted(
+                        ns, limit=demoted_limit, caller_identity_set=caller_identity_set
+                    )
                     if channels.stm
                     else _empty_scored()
                 )
@@ -299,6 +329,7 @@ class ThreeChannelRecallRanker:
             raise eg.exceptions[0] from None
 
         floor = floor_t.result()
+        demoted_hits = demoted_t.result()
         mtm_hits = mtm_t.result()
         ltm_hits, ltm_degraded = ltm_t.result()
 
@@ -308,6 +339,10 @@ class ThreeChannelRecallRanker:
         # relevance (embed cosine / lexical overlap / recency no-op). This is what makes the STM
         # channel's RRF rank (below) reflect the QUERY, not just insertion order.
         floor_scored = await self._score_stm(floor, query, query_vec)
+        # AD-250 fix (ADR 0061): the SAME relevance scorer, applied to the demoted-channel pool —
+        # `_score_stm` scores by CONTENT relevance, which is generic to any STM-sourced candidate
+        # list, not specific to the recency floor despite the method's name.
+        demoted_scored = await self._score_stm(demoted_hits, query, query_vec)
 
         # Fuse STM ⊕ MTM ⊕ LTM by tier-stable id; a recency rank, a cosine score, and a graph-hop
         # count fuse by RANK only (§1.3 "one fuse implementation"). BUG FIX (§3.1/#1): the STM
@@ -317,10 +352,26 @@ class ThreeChannelRecallRanker:
         # channel (by RELEVANCE rank since D1, not recency rank); only a small, bounded prefix is
         # still unconditionally protected below.
         settings = self._settings
+        # AD-250 fix (ADR 0061): `demoted_scored` joins the fuse as a FOURTH channel, at the SAME
+        # `weight_stm` discount an ordinary floor candidate gets — it is still "the STM tier",
+        # just a different index (`demoted_floor_limit`'s own docstring). Its list AND its
+        # weight are OMITTED from the fuse entirely when it is empty (the common case — most
+        # namespaces have zero currently-demoted items), rather than passed as an always-present
+        # fourth weight slot: `reciprocal_rank_fusion` normalizes by `sum(weights)`, so an EMPTY
+        # channel that still occupies a weight slot silently shrinks every OTHER channel's
+        # effective share (measured: 1.0/3 -> 1.0/4 at equal weights, a ~25% cut to MTM's
+        # contribution on EVERY query, for a channel contributing zero candidates to any of
+        # them) — a real, unmeasured ranking-quality regression this fix has no business making
+        # for the overwhelming majority of recalls that touch no demoted item at all.
+        channel_results: list[Sequence[Scored[MemoryItem]]] = [floor_scored, mtm_hits, ltm_hits]
+        channel_weights = [settings.weight_stm, settings.weight_mtm, settings.weight_ltm]
+        if demoted_scored:
+            channel_results.append(demoted_scored)
+            channel_weights.append(settings.weight_stm)
         fused_pairs = self._fusion.fuse(
-            [floor_scored, mtm_hits, ltm_hits],
+            channel_results,
             id_of=lambda s: s.item.id,
-            weights=[settings.weight_stm, settings.weight_mtm, settings.weight_ltm],
+            weights=channel_weights,
             k=settings.rrf_k,
         )
         # `is_floor` from the adapter marks EVERY STM candidate (Scored.is_floor=True on the whole
@@ -414,6 +465,14 @@ class ThreeChannelRecallRanker:
                 floor_pool_size=len(floor_scored),
                 caller_identity_set=caller_identity_set,
             )
+
+        # AD-250 fix (ADR 0061): the read-stat write-back — runs LAST, over the FINAL `items`
+        # (a genuine recall hit is "this made it into what the caller actually got back", not
+        # merely "was a channel candidate"), so this never reinforces a fused-out or
+        # rerank-pruned STM row. `dto.py`'s `reinforce_on_recall` docstring has the full
+        # rationale.
+        if self._settings.reinforce_on_recall:
+            await self._reinforce_stm_hits(ns, items)
 
         ran = RecallChannels(
             stm=channels.stm,
@@ -782,6 +841,43 @@ class ThreeChannelRecallRanker:
             )
         return [*items, *extras]
 
+    async def _reinforce_stm_hits(self, ns: Namespace, items: list[RecallItemView]) -> None:
+        """AD-250 fix (ADR 0061): the read-stat write-back a genuine recall hit performs.
+
+        Fires :meth:`~mu_engine.storage.ports.StmTierRepository.reinforce` once per DISTINCT
+        STM-channel id in the FINAL result (``channel == "stm"`` — both the ordinary recency
+        floor AND the new demoted channel fold to this label, `_channel_label`'s own comment — a
+        protected floor member, a fused-in ordinary/demoted row, and a cost-a-slot/free-riding
+        neighbour are ALL genuinely STM-sourced rows and all count; a ``dict`` keyed by id below
+        de-dupes a row that appears more than once in ``items`` so it is reinforced exactly once
+        per call even if it occupies two slots). Concurrent (``asyncio.gather``), never
+        serialised — the point is a bounded, small number of independent writes, not a chain.
+
+        Best-effort by design (this docstring's own contract, ``ports.py``'s ``reinforce``
+        docstring): a store outage here degrades to NO reinforcement for this call, exactly like
+        every other enhancement in this module (``_expand_neighbors``'s own graceful-degradation
+        contract) — it must never fail, or even delay past its own writes, the read it is
+        reinforcing. Only ``StoreUnavailableError`` is swallowed (logged); anything else is a
+        programming bug and is left to raise — catching it here would hide a real defect behind
+        "best effort"."""
+        ids = list({v.memory_id for v in items if v.channel == "stm"})
+        if not ids:
+            return
+        at = self._clock.now()
+
+        async def _one(memory_id: str) -> None:
+            try:
+                await self._stm.reinforce(ns, memory_id, at=at)
+            except StoreUnavailableError as exc:
+                _log.warning(
+                    "recall.reinforce_unavailable",
+                    ns=ns.to_prefix(),
+                    memory_id=memory_id,
+                    error=str(exc),
+                )
+
+        await asyncio.gather(*(_one(mid) for mid in ids))
+
 
 def _narrow_after_expansion(
     items: list[RecallItemView], *, limit: int, neighbor_rescue_budget: int
@@ -883,7 +979,11 @@ async def _ltm_ok(hits: list[Scored[MemoryItem]]) -> tuple[list[Scored[MemoryIte
 def _channel_label(scored: Scored[MemoryItem]) -> str:
     if scored.channel.value.startswith("ltm"):
         return "ltm"
-    if scored.channel is RecallChannel.STM_FLOOR:
+    # AD-250 fix (ADR 0061): `.value.startswith("stm")`, not an `is RecallChannel.STM_FLOOR`
+    # identity check — `RecallChannel.STM_DEMOTED` (the new demoted-item channel) is a DISTINCT
+    # enum member for store-level provenance (its own docstring), but both fold to ONE channel
+    # here, exactly as `MTM_HYBRID` already folds into "mtm" alongside `MTM_DENSE`/`MTM_SPARSE`.
+    if scored.channel.value.startswith("stm"):
         return "stm"
     return "mtm"
 

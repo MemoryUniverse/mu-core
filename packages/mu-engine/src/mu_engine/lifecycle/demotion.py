@@ -22,13 +22,32 @@ this service is the FIRST real emitter of: every demotion this module performs p
 ``to_state`` is explicitly ``ACTIVE`` (the item is still alive, just moved tier), never the
 ``ARCHIVED`` default that every pre-existing (archival-only) call site keeps using unchanged.
 
-**Rescue (ADR 0034 "the deliberate feedback loop").** A re-recalled item's raised
-``access_count`` (recall bumps it back, e.g. ``distill.py:373``) raises ``use(m)`` and
-therefore ``S(m)`` on the next :meth:`DemotionService.demote` pass; an item whose recomputed
-score is ``>= demote_mtm`` is skipped entirely (zero writes to either store) — it simply never
-leaves MTM. This is the whole rescue mechanic: it is a property of re-evaluating
-:class:`SalienceStrategy` fresh every sweep tick, not a separate promotion call this module
-makes.
+**Rescue (ADR 0034 "the deliberate feedback loop") — pre-demotion half.** A re-recalled MTM
+item's raised ``access_count`` (AD-250 fix, ADR 0061: genuinely written now by
+:meth:`~mu_engine.storage.ports.StmTierRepository.reinforce`, called on every hit
+:class:`~mu_engine.services.recall.ranker.ThreeChannelRecallRanker` returns — NOT, as this
+docstring used to claim, ``distill.py:373``, which is a DISTILL-time identical-content
+reconciliation on an LTM fact, never a recall-time write-back for any MTM/STM item) raises
+``use(m)`` and therefore ``S(m)`` on the next :meth:`DemotionService.demote` pass; an item whose
+recomputed score is ``>= demote_mtm`` is skipped entirely (zero writes to either store) — it
+simply never leaves MTM. This is the pre-demotion half of the rescue mechanic: a property of
+re-evaluating :class:`SalienceStrategy` fresh every sweep tick, not a separate promotion call
+this module makes.
+
+**Rescue — POST-demotion half (AD-250, ADR 0061).** Once an item HAS demoted, this pre-demotion
+mechanic no longer applies (there is nothing left in MTM to re-evaluate) — the write-ahead STM
+copy's own path back is :attr:`~mu_engine.lifecycle.settings.LifecycleSettings.promote_stm_mtm`
+via :class:`~mu_engine.lifecycle.promotion.PromotionService`. That gate was made arithmetically
+reachable by ADR 0054 (0.7 -> 0.45), but a verify pass (ADR 0058) proved it had NO reachable
+TRIGGER: the write-ahead copy used to land in the SAME bounded recency floor a fresh capture
+uses, scored by ``item.created_at`` — its ORIGINAL age, not the demotion instant — so it
+re-entered the floor underneath every newer turn and dropped out of visibility almost
+immediately, with its MTM point already gone, and nothing could ever re-recall it to raise
+``access_count``. :meth:`_demote_one` now writes the copy via
+:meth:`~mu_engine.storage.ports.StmTierRepository.put_demoted` — its OWN discoverability index,
+which a fresh capture can never crowd it out of — so a real query CAN find it, and
+:meth:`~mu_engine.storage.ports.StmTierRepository.reinforce` on that hit is what actually raises
+``access_count`` toward ``promote_stm_mtm``.
 
 **Clock-injected (spec §19 Rule 1).** Every ``now`` this module could need comes from the
 injected ``Clock`` via :meth:`SalienceStrategy.score` — this module makes no
@@ -278,7 +297,26 @@ class DemotionService:
         # MTM; silently inheriting the fresh-capture TTL gave it a silent ~1-hour-from-demotion
         # horizon with no event, no tombstone, no state flip (FAULT-HUNT-0924.md §1 F1). The
         # horizon is now this one deliberate, documented, configurable knob.
-        await self._stm.put(stm_copy, ttl_s=self._settings.demoted_stm_ttl_s)
+        #
+        # AD-250 fix (ADR 0061): `put_demoted`, NEVER `put`. The verify pass that closed the F1/F5
+        # lanes above proved the 30-day TTL fix alone still left a demoted item PERMANENTLY
+        # invisible: `put()` would have scored this copy in the ORDINARY recency ZSET by
+        # `item.created_at` — the item's ORIGINAL age, not the demotion instant — so it re-entered
+        # the recency floor underneath every genuinely new turn and dropped out of
+        # `recent(limit=recency_floor_limit)` (default 10) as soon as ten newer STM writes existed
+        # in that session, almost immediately. Its MTM point is already gone by then, so nothing
+        # could ever re-recall it to raise `access_count` — the recall-rescue this docstring
+        # describes above had a reachable GATE (`promote_stm_mtm=0.45`) and no reachable TRIGGER.
+        # `put_demoted` instead scores this copy in its OWN discoverability index
+        # (`StmTierRepository.demoted`, `ports.py`'s docstring has the full rationale) — one a
+        # fresh capture can never push it out of, because fresh captures never enter it.
+        # `ThreeChannelRecallRanker.rank` fuses that channel in at `weight_stm` and calls the new
+        # `StmTierRepository.reinforce` (the read-stat write-back) on every genuine hit, so a real
+        # query CAN now raise this item's `access_count` — closing the loop this docstring's
+        # "Rescue" section always claimed but, until now, never actually reached.
+        await self._stm.put_demoted(
+            stm_copy, ttl_s=self._settings.demoted_stm_ttl_s, at=self._clock.now()
+        )
 
         # Step 2: commit — remove the MTM point. The injected port owns its own retry/backoff
         # (DEV-STANDARDS rule 7 — a cross-cutting concern is the ADAPTER's decorator, e.g.

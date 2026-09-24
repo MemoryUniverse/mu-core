@@ -78,6 +78,33 @@ class _FakeStm:
     async def evict(self, ns: Namespace, memory_id: str) -> None:  # pragma: no cover
         self._items = [i for i in self._items if i.id != memory_id]
 
+    async def demoted(
+        self,
+        ns: Namespace,
+        *,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+    ) -> list[Scored[MemoryItem]]:
+        """AD-250 fix (ADR 0061): this fake models an ordinary (never-demoted) session, so the
+        demoted channel is always empty — `ThreeChannelRecallRanker.rank` calls this
+        unconditionally now, so the fake needed it to keep working at all."""
+        return []
+
+    async def reinforce(self, ns: Namespace, memory_id: str, *, at: datetime) -> MemoryItem | None:
+        """AD-250 fix (ADR 0061): a real, functioning fake of the read-stat write-back — bumps
+        `access_count` in place, exactly like the shipped adapters, so a test asserting on it
+        (rather than merely on call-count) can. `ThreeChannelRecallRanker.rank` calls this
+        unconditionally for every STM-channel hit in its final result (`RecallSettings.
+        reinforce_on_recall` defaults True), so this fake needed it to keep working at all."""
+        for i, item in enumerate(self._items):
+            if item.id == memory_id:
+                reinforced = item.model_copy(
+                    update={"access_count": item.access_count + 1, "updated_at": at}
+                )
+                self._items[i] = reinforced
+                return reinforced
+        return None
+
 
 class _FakeMtm:
     """Returns a caller-supplied ranked hit list for a given query vector — a stand-in for real

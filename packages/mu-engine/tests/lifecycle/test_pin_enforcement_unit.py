@@ -92,6 +92,12 @@ class _StmSpy:
         # spy doesn't model TTLs, only which ids were written.
         self.put_calls.append(item.id)
 
+    async def put_demoted(self, item: MemoryItem, *, ttl_s: int, at: datetime) -> None:
+        # AD-250 fix (ADR 0061): DemotionService's write-ahead verb, not `put` — this spy still
+        # only tracks WHICH ids were written, same list `put` used.
+        del ttl_s, at
+        self.put_calls.append(item.id)
+
 
 class _MtmRemoveSpy:
     def __init__(self) -> None:

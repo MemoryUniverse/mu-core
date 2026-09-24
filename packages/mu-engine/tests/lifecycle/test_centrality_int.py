@@ -319,6 +319,12 @@ class _FakeStm:
         # fake sink doesn't model TTLs, only which ids were written.
         self.put_ids.append(item.id)
 
+    async def put_demoted(self, item: MemoryItem, *, ttl_s: int, at: datetime) -> None:
+        # AD-250 fix (ADR 0061): DemotionService's write-ahead verb, not `put` — this fake sink
+        # still only models WHICH ids were written, same tracking list as `put` used.
+        del ttl_s, at
+        self.put_ids.append(item.id)
+
     async def evict(self, ns: Namespace, memory_id: str) -> None:
         self.put_ids.remove(memory_id)
 
