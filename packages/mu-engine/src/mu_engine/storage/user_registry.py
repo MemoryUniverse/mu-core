@@ -1,5 +1,5 @@
 """``UserPrefixRegistryPort`` — the durable, cross-namespace user-prefix enumeration capability
-(PROTOTYPE-DEBT-0924.md §2 D5, AD-268, ADR 0071).
+(PROTOTYPE-DEBT-0924.md §2 D5, AD-268, ADR 0075).
 
 **Why this is its own narrow Protocol, not a method on ``StmTierRepository``.** Same discipline as
 ``storage/tier_capabilities.py``'s ``TierEnumerationPort``/``TierPinPort`` (see that module's own

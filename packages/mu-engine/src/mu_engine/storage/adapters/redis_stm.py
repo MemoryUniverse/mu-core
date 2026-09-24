@@ -96,7 +96,7 @@ class RedisStmAdapter:
         return await self._retry(self._put_impl)(item, ttl_s=ttl_s)
 
     async def _put_impl(self, item: MemoryItem, *, ttl_s: int | None = None) -> str:
-        # AD-268 fix (ADR 0071, PROTOTYPE-DEBT-0924.md D5): register this namespace's
+        # AD-268 fix (ADR 0075, PROTOTYPE-DEBT-0924.md D5): register this namespace's
         # session-truncated UserPrefix in the durable, cross-namespace registry on EVERY write
         # (dedup-hit included — a bump is still evidence this user is active), so a restarted
         # daemon can rediscover it. Deliberately best-effort and OUTSIDE the payload's atomic

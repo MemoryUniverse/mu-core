@@ -67,7 +67,7 @@ class RedisMapper:
 
     @staticmethod
     def user_registry_key() -> str:
-        """AD-268 fix (ADR 0071) — the durable, **cross-namespace** user-prefix registry.
+        """AD-268 fix (ADR 0075) — the durable, **cross-namespace** user-prefix registry.
 
         Deliberately the ONLY key in this class with no ``ns.to_prefix()`` component: every other
         key here is scoped INSIDE one tenant's partition (the whole point of ``mu/{to_prefix}:…``),

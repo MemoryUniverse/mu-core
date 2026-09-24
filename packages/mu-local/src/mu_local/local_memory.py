@@ -554,7 +554,7 @@ class LocalMemory:
 
     @property
     def user_registry(self) -> UserPrefixRegistryPort | None:
-        """AD-268 fix (ADR 0071, PROTOTYPE-DEBT-0924.md D5) — THIS instance's durable,
+        """AD-268 fix (ADR 0075, PROTOTYPE-DEBT-0924.md D5) — THIS instance's durable,
         cross-namespace user-prefix registry, or ``None`` when the bound STM backend does not
         satisfy :class:`~mu_engine.storage.user_registry.UserPrefixRegistryPort` (the in-process
         ``memory_stm`` test/degrade adapter has no durable substrate to register a namespace

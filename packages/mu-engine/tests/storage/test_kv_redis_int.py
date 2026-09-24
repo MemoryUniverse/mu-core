@@ -203,7 +203,7 @@ async def test_write_time_dedup_toggle_off_allows_duplicates(
 
 
 # =====================================================================================
-# AD-268 (ADR 0071, PROTOTYPE-DEBT-0924.md D5) — the durable, cross-namespace user-prefix
+# AD-268 (ADR 0075, PROTOTYPE-DEBT-0924.md D5) — the durable, cross-namespace user-prefix
 # registry. Proves the adapter half of the fix against REAL Redis/Valkey: a namespace that has
 # never fired a bus event is still durably discoverable, which is exactly the gap
 # ``MaintenanceLoop``'s own probe measured (``active_user_count 0`` after a restart).
