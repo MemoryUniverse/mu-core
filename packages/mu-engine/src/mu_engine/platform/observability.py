@@ -93,8 +93,9 @@ _CREDENTIAL_TOKENS = (
 
 # Value-shape patterns for the credential formats a developer terminal session actually contains:
 # provider keys, JWTs, cloud access keys, personal access tokens, private key blocks, connection
-# strings with an inline password, bearer/basic auth headers. Matched with `.search` (the value may
-# be embedded in a longer string, e.g. a `Bearer <token>` header or a `scheme://user:pass@host` URL).
+# strings with an inline password, bearer/basic auth headers. Matched with `.search` (the value
+# may be embedded in a longer string, e.g. a `Bearer <token>` header or a `scheme://user:pass@host`
+# URL).
 _CREDENTIAL_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
     ("openai_key", re.compile(r"sk-[A-Za-z0-9]{20,}")),
