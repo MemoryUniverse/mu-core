@@ -20,7 +20,7 @@ from mu_contracts.domain.model.recall import Vector
 from mu_engine.platform.clock import FrozenClock
 from mu_engine.providers._contracts import RerankHit
 from mu_engine.services.recall.dto import RecallChannels, RecallItemView, RecallSettings
-from mu_engine.services.recall.fusion import ReciprocalRankFusion
+from mu_engine.services.recall.fusion import ReciprocalRankFusion, reciprocal_rank_fusion
 from mu_engine.services.recall.ranker import ThreeChannelRecallRanker, _narrow_after_expansion
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, MemoryState, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -2218,3 +2218,118 @@ async def test_a_graph_backend_without_reinforce_does_not_break_recall() -> None
     ids = await _rank(ranker, list(query_vec))  # must not raise
 
     assert target.id in ids
+
+
+# =================================================================================================
+# AD-273 — the per-channel RRF constant (`RecallSettings.rrf_k_ltm`, `fusion.py`'s optional `ks`).
+#
+# ADR 0069/AD-273 shipped this lever and used it to run six `gold_in_context` arms whose NEGATIVE
+# result ("no `k_ltm` both wins slots and helps") is now the settled answer on the graph tier. That
+# conclusion is only worth anything if the lever was genuinely live: a silently-ignored `ks` would
+# have produced arms A-C's "0 ltm items" for a reason that has nothing to do with fusion, and the
+# whole experiment would be an artifact. It shipped with ZERO tests (verified by grep: no test in
+# any repo referenced `rrf_k_ltm`, and no fusion test passed `ks=`). These four are that test.
+# =================================================================================================
+def test_rrf_k_ltm_ships_inert() -> None:
+    """Literal guard on the shipped default, the AD-273 twin of
+    ``test_shipped_default_ltm_protect_limit_is_zero``: every measured non-``None`` value cost
+    4-7 `gold_in_context` queries, so the mechanism ships built and turned OFF."""
+    assert RecallSettings().rrf_k_ltm is None
+
+
+def test_ks_none_is_byte_identical_to_the_shared_k() -> None:
+    """``ks=None`` — what every call site predating AD-273 still passes, ``RecallService``'s own
+    private/shared federation fuse included — must reproduce the shared-``k`` arithmetic EXACTLY,
+    not approximately. Equal floats, not `pytest.approx`: the claim in `fusion.py`'s docstring is
+    "BYTE-IDENTICAL", and anything weaker would let a rounding change ride in unnoticed."""
+    channels = [["a", "b"], ["b", "c"]]
+    weights = [1.0, 0.1]
+    without = reciprocal_rank_fusion(channels, key=lambda s: s, weights=weights, k=60)
+    with_none = reciprocal_rank_fusion(channels, key=lambda s: s, weights=weights, k=60, ks=None)
+    explicit_shared = reciprocal_rank_fusion(
+        channels, key=lambda s: s, weights=weights, k=60, ks=[60, 60]
+    )
+    assert without == with_none
+    assert without == explicit_shared
+
+
+def test_a_per_channel_k_changes_only_its_own_channels_decay() -> None:
+    """The arithmetic AD-273's whole experiment rests on, asserted directly: dropping ONE
+    channel's ``k`` raises that channel's rank-0 contribution by exactly ``k_shared+1`` over
+    ``k_channel+1`` and leaves every OTHER channel's score untouched.
+
+    MUTATION CHECK (run, red both ways): revert `fusion.py`'s ``channel_k = ks[idx] if ks is not
+    None else k`` to ``channel_k = k`` and this test fails on the first assertion ("the per-channel
+    k did nothing") — the ``ks`` parameter would be accepted, validated for length, and silently
+    ignored, which is the exact shape that would have invalidated ADR 0069's six eval arms."""
+    channels = [["mtm-only"], ["ltm-only"]]
+    weights = [1.0, 0.1]
+    shared = dict(reciprocal_rank_fusion(channels, key=lambda s: s, weights=weights, k=60))
+    per_channel = dict(
+        reciprocal_rank_fusion(channels, key=lambda s: s, weights=weights, k=60, ks=[60, 5])
+    )
+
+    assert (
+        per_channel["ltm-only"] > shared["ltm-only"]
+    ), "the per-channel k did nothing — `ks` was accepted and ignored"
+    # exact, not approximate: (0.1/1.1) * 1/6  vs  (0.1/1.1) * 1/61
+    assert per_channel["ltm-only"] == pytest.approx(shared["ltm-only"] * 61 / 6)
+    assert (
+        per_channel["mtm-only"] == shared["mtm-only"]
+    ), "lowering the LTM channel's k moved a channel it has no business touching"
+
+
+@pytest.mark.asyncio
+async def test_rrf_k_ltm_lets_the_ltm_seed_take_a_slot_the_shared_k_denies_it() -> None:
+    """END TO END through the ranker, which is where AD-273's eval arms actually ran: the SAME
+    scenario as ``test_default_settings_rank_the_relevant_mtm_hit_ahead_of_query_blind_ltm_noise``
+    (a query-blind LTM candidate at LTM rank 0 vs the genuinely relevant MTM hit at MTM rank 3),
+    run twice — once at the shipped default and once at ``rrf_k_ltm=5``, the exact arm ADR 0069
+    measured as "wins 383/383 slots".
+
+    At the shipped weights (0.1/1.0/0.1, normalized 1/12 : 10/12 : 1/12) the arithmetic is
+    ``(1/12)/(60+1) = 0.001366`` for the LTM seed against ``(10/12)/(60+3+1) = 0.013021`` for the
+    relevant MTM hit — the seed loses, which is the structural exclusion four passes have
+    measured. At ``rrf_k_ltm=5`` it is ``(1/12)/(5+1) = 0.013889`` and the seed WINS the top slot,
+    which is why arms D/E/F cost 4-7 queries of `gold_in_context`.
+
+    **This is the test that makes ADR 0069's negative result trustworthy**: it proves the knob was
+    live, so arms A-C's "0 ltm items" is a real measurement of the arithmetic and not a
+    silently-dropped parameter. MUTATION CHECK (run, red): drop `ranker.py`'s ``channel_ks`` list
+    (pass no ``ks=`` to ``self._fusion.fuse``) and the second half fails — the LTM seed stays
+    buried at ``rrf_k_ltm=5``, i.e. the setting the eval harness was varying would have changed
+    nothing at all."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    query_vec = (0.9, 0.1)
+    decoys = [_item(f"unrelated MTM decoy #{n}", tier=MemoryTier.MTM, at=base) for n in range(3)]
+    target = _item("Ada's flight to Denver is on Thursday", tier=MemoryTier.MTM, at=base)
+    noise = _item("Let me know if you need anything", tier=MemoryTier.LTM, at=base)
+
+    async def _order(settings: RecallSettings) -> list[str]:
+        ranker = _build_ranker(
+            stm_items=[],
+            mtm_hits_by_query={query_vec: [*decoys, target]},
+            ltm_hits=[noise],
+            settings=settings,
+        )
+        result = await ranker.rank(
+            _NS,
+            "irrelevant-this-phase",
+            list(query_vec),
+            limit=10,
+            channels=RecallChannels(),
+            caller_identity_set=frozenset[str](),
+        )
+        return [it.memory_id for it in result.items]
+
+    shipped = await _order(RecallSettings(stm_scoring="recency"))
+    assert shipped.index(target.id) < shipped.index(noise.id), (
+        "baseline half: at the shipped default the query-blind LTM seed must stay behind the "
+        "relevant MTM hit"
+    )
+
+    lowered = await _order(RecallSettings(stm_scoring="recency", rrf_k_ltm=5))
+    assert lowered.index(noise.id) < lowered.index(target.id), (
+        "rrf_k_ltm=5 did NOT change the ranking — the per-channel k never reached fusion, so "
+        "ADR 0069's six eval arms were varying a setting with no effect"
+    )
