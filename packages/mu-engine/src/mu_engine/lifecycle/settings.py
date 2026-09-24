@@ -196,7 +196,35 @@ class LifecycleSettings(BaseModel):
     pre_ttl_scan_interval_s: int = Field(default=120, ge=1)
 
     # --- promotion gates (§7b) ---
-    promote_stm_mtm: float = Field(default=0.7, ge=0.0, le=1.0)
+    # FAULT-HUNT-0924 F1 fix (ADR 0054): the ONLY way a demoted item ever returns to MTM is by
+    # re-crossing THIS gate from STM (there is no separate "un-demote" verb — DemotionService's
+    # own pre-demotion rescue, `score >= demote_mtm`, is a different mechanism that only ever
+    # prevents a still-in-MTM item from demoting in the first place). The achievable ceiling for
+    # an item the gate has ALREADY demoted, re-scored after a full recall-driven usage rescue
+    # (`use` raised from whatever it was to `usage_cap`), is bounded by
+    # `demote_mtm + w_usage` = 0.3 + 0.2 = 0.5 (probe: FAULT-HUNT-0924.md §1 F1 — measured
+    # EXACTLY 0.5000 at the demotion instant for every importance, because a demotion candidate's
+    # score-without-usage sits right at `demote_mtm` by construction). The shipped 0.7 default put
+    # the gate 0.2 ABOVE that ceiling — arithmetically unreachable for 100% of demoted items,
+    # regardless of how many times they were re-recalled. 0.45 sits with real margin under the 0.5
+    # ceiling (crossable by an item demoted moderately below the gate, not only a borderline one)
+    # while still requiring genuine re-engagement: one recall alone only raises `access_count` by
+    # 1, adding `w_usage/usage_cap` = 0.02 to the score with the shipped `usage_cap=10` — nowhere
+    # near enough on its own, so "rescued" still means "recalled repeatedly," not "recalled once."
+    # This does not touch `w_recency`/`w_usage`/`w_importance` (pinned, literal-tested elsewhere)
+    # — only where the SAME score is compared against for THIS gate. Lowering it also makes the
+    # ordinary (non-rescue) STM->MTM backstop somewhat more permissive; that is intentional and
+    # bounded by DemotionService's own forgetting curve on the other side (ADR 0034's "MTM growth
+    # is bounded by demotion, not by starving promotion").
+    #
+    # 0.45, not 0.5 (the theoretical ceiling) or lower: it must ALSO stay far enough above
+    # `demote_mtm` (0.3) that `SalienceSettings.w_centrality` (0.10, the A4 structural-salience
+    # blend share) cannot, on its own, carry an item across this gate — the stated A4 design
+    # invariant (`test_the_whole_span_of_the_term_cannot_carry_an_item_across_the_gates`) is that
+    # centrality adjusts rank and never overrides the other terms; a gap <= w_centrality would
+    # quietly violate that for this one gate. 0.45 leaves a 0.15 margin above `demote_mtm`
+    # (> 0.10) while staying under the 0.5 rescue ceiling.
+    promote_stm_mtm: float = Field(default=0.45, ge=0.0, le=1.0)
     promote_mtm_ltm: float = Field(default=0.9, ge=0.0, le=1.0)
     promote_min_age_h: float = Field(default=24.0, ge=0.0)
     pre_ttl_window_s: int = Field(default=300, ge=1)  # last-chance salience rescue before STM TTL
@@ -205,6 +233,22 @@ class LifecycleSettings(BaseModel):
     demote_mtm: float = Field(default=0.3, ge=0.0, le=1.0)
     demotion_enabled: bool = True
     ltm_demotion_enabled: bool = False  # RESERVED (§10)
+
+    # FAULT-HUNT-0924 F1 fix (ADR 0054): the TTL stamped on the write-ahead STM copy
+    # `DemotionService._demote_one` writes when an MTM point demotes. This is DELIBERATELY a
+    # separate knob from `IngestSettings.stm_ttl_s` (the fresh-capture buffer TTL, 3600s) — before
+    # this fix `DemotionService` had no TTL override at all and silently inherited that same
+    # 3600s "unprocessed capture" TTL for a memory that had already survived days in MTM, giving
+    # every demoted memory a hard, silent, ~1-hour-from-demotion horizon (measured: importance
+    # 0.5 -> demotable after 1.74 real days, then dead again ~1h after that — a cliff, not a
+    # policy). A demoted memory is not scratch space; it is a real memory the forgetting curve
+    # de-prioritized, and it deserves real time for `promote_stm_mtm`'s re-crossing (above) or the
+    # `pre_ttl_scan_interval_s` rescue scan to actually catch it. Default: 30 days — long enough
+    # that a demoted-and-never-touched-again memory is a deliberate, documented, CONFIGURABLE
+    # retention decision instead of an emergent one-hour accident; short enough that a namespace's
+    # STM tier does not grow unbounded with cold copies (Valkey TTL is still the eventual floor,
+    # per ADR 0034 "the TTL becomes a floor, not the decision-maker").
+    demoted_stm_ttl_s: int = Field(default=2_592_000, ge=1)
 
     # --- quarantine (RESERVED §10) ---
     quarantine_ttl_d: int = Field(default=7, ge=0)

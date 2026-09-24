@@ -21,6 +21,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from qdrant_client import AsyncQdrantClient
+from redis.asyncio import Redis
 
 from mu_contracts.domain.events import DomainEvent, MemoryDemoted
 from mu_contracts.domain.model.memory import State
@@ -34,6 +35,7 @@ from mu_engine.storage.adapters.valkey_stm import ValkeyStmAdapter
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace
 from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
+from mu_engine.storage.mappers.redis_mapper import RedisMapper
 
 pytestmark = pytest.mark.integration
 
@@ -130,6 +132,75 @@ async def test_demotion_removes_the_real_mtm_point_via_the_shared_port(
     assert event.tier is ContractTier.MTM
     assert event.to_tier is ContractTier.STM
     assert event.to_state is State.ACTIVE  # never the archival-only default
+
+
+async def test_demoted_item_gets_the_configurable_demoted_ttl_not_the_capture_buffer_ttl(
+    make_ns: Callable[..., Namespace],
+    valkey_client: Redis,
+    mtm: QdrantMtmAdapter,
+    qdrant_client: AsyncQdrantClient,
+) -> None:
+    """FAULT-HUNT-0924 F1 fix (ADR 0054): the write-ahead STM copy's REAL Redis TTL must be
+    ``LifecycleSettings.demoted_stm_ttl_s`` — never the mapper's own capture-buffer default
+    (``RedisMapper.default_ttl_s``, mirroring ``IngestSettings.stm_ttl_s``, 3600s). Before this
+    fix ``DemotionService`` called ``self._stm.put(stm_copy)`` with no TTL override at all, so a
+    demoted memory silently inherited whatever the STM adapter's own construction-time default
+    was — a memory that had already survived days in MTM got a fresh ~1-hour clock and vanished
+    with no event, no tombstone, no state flip (FAULT-HUNT-0924.md §1 F1). This asserts the REAL
+    Redis ``TTL`` on the write-ahead key, not merely that ``put`` was called — the mutation check
+    for this test is deleting the ``ttl_s=self._settings.demoted_stm_ttl_s`` keyword in
+    ``demotion.py``'s call to ``self._stm.put`` and watching this go red (the copy would then get
+    whatever ``ValkeyStmAdapter``'s ``default_ttl_s`` construction default is — a short,
+    ingest-buffer-shaped TTL, not the long, deliberate demotion TTL)."""
+    ns = make_ns()
+    short_capture_ttl_s = 5  # the STM adapter's OWN construction-time default — deliberately
+    #                          tiny and DIFFERENT from demoted_stm_ttl_s, so a test that silently
+    #                          fell back to it would fail loudly rather than by coincidence agree.
+    stm = ValkeyStmAdapter(valkey_client, mapper=RedisMapper(default_ttl_s=short_capture_ttl_s))
+    item = MemoryItem(
+        content="old, low-salience fact about to demote",
+        kind=MemoryKind.PROPOSITION,
+        namespace=ns,
+        owner_id=ns.user,
+        workspace_id=ns.workspace,
+        session_id=ns.session,
+        tier=MemoryTier.MTM,
+        importance_score=0.1,
+        access_count=0,
+        created_at=_EPOCH,
+        embedding=[0.1] * _DIM,
+        embedding_model="test-fixture",
+    )
+    await mtm.upsert(item)
+
+    demoted_ttl_s = 999_999  # deliberately far from both the 3600s ingest default AND the 5s
+    #                          short_capture_ttl_s above, so a match against EITHER wrong value
+    #                          would fail this assertion, not just a match against the default.
+    settings = LifecycleSettings(demoted_stm_ttl_s=demoted_ttl_s)
+    service = DemotionService(
+        stm=stm,
+        mtm_remove=mtm,
+        salience=SalienceStrategy(SalienceSettings()),
+        settings=settings,
+        clock=FrozenClock(_EPOCH + timedelta(hours=200)),  # far past -> below demote_mtm
+    )
+
+    report = await service.demote(ns, [item])
+    assert report.demoted == 1
+
+    key = RedisMapper.memory_key(ns, item.id)
+    real_ttl_s = await valkey_client.ttl(key)
+    assert real_ttl_s > short_capture_ttl_s + 60, (
+        "the write-ahead copy must NOT carry the STM adapter's own short capture-buffer default"
+    )
+    # Redis TTL counts down in real time between the SET and this read — allow a few seconds of
+    # slack rather than asserting exact equality against a wall-clock-dependent countdown.
+    assert demoted_ttl_s - 30 <= real_ttl_s <= demoted_ttl_s
+    # cleanup: this test's deliberately long TTL (~11.5 days) would otherwise outlive every other
+    # fixture's own housekeeping on the shared mu-dev-cache instance.
+    await valkey_client.delete(
+        key, RedisMapper.recency_key(ns), RedisMapper.content_hash_key(ns)
+    )
 
 
 async def test_rescued_item_leaves_the_real_mtm_point_untouched_via_the_real_port(

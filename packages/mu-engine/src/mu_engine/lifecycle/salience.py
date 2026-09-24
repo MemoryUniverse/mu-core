@@ -123,6 +123,46 @@ class SalienceStrategy:
         blended = (1.0 - s.w_centrality) * base + s.w_centrality * cen
         return min(max(blended, 0.0), 1.0)
 
+    def score_for_ltm_gate(self, item: MemoryItem, *, clock: Clock) -> float:
+        """The periodic MTM->LTM gate's own score (FAULT-HUNT-0924 F2 fix, ADR 0054) — usage +
+        importance ONLY, renormalized to sum to 1, with recency DROPPED for this decision (same
+        move ``rel`` already got off the whole sweep, ADR 0034/spec §6: a term this gate does not
+        need is dropped and the rest renormalized, never silently left to distort the gate).
+
+        **Why.** ``PromotionService._select_mtm_ltm_survivors`` already requires
+        ``age > promote_min_age_h`` (24h) as its own, separate maturity floor. Also comparing
+        ``promote_mtm_ltm`` (0.9) against the general three-term :meth:`score` — which BAKES IN
+        the same Ebbinghaus recency decay, same 24h half-life — double-counts age through two
+        independent mechanisms that fight each other: past the age floor, ``rec`` is BY
+        CONSTRUCTION ``< 0.5``, capping the achievable general score at
+        ``w_recency*0.5 + w_usage + w_importance = 0.75`` forever — strictly, permanently below
+        0.9. Measured (FAULT-HUNT-0924.md §1 F2): max S over the WHOLE
+        ``(age>24h, importance<=1.0, access_count<=60)`` grid at shipped defaults = 0.75,
+        survivors = 0. What this gate actually wants (its own §7b wording) is "important enough
+        to consolidate," not "recently touched enough" — recency is exactly the wrong signal to
+        re-apply on top of an already-enforced age floor. Dropping it here restores the intended
+        [0, 1] reachable range: ``promote_mtm_ltm=0.9`` is genuinely crossable by an old,
+        important, well-used MTM fact once more, without touching ``w_recency``/``w_usage``/
+        ``w_importance`` (pinned, literal-tested) or this gate's own age floor.
+
+        Never used for STM<->MTM promotion or MTM->STM demotion — only the MTM->LTM periodic
+        gate, which is the one place age is ALREADY a separate, explicit precondition."""
+        s = self._settings
+        denom = s.w_usage + s.w_importance
+        # Both weights are `ge=0` by construction (SalienceSettings); a pathological all-zero
+        # configuration has no usage/importance signal left to gate on at all — degrade to 0
+        # rather than a ZeroDivisionError (DEV-STANDARDS rule 8: no silent crash on a config
+        # extreme nothing here can repair).
+        if denom <= 0:
+            base = 0.0
+        else:
+            base = (s.w_usage * self._usage(item) + s.w_importance * item.importance_score) / denom
+        cen = self._centrality.centrality_for(item) if self._centrality is not None else None
+        if cen is None:
+            return base
+        blended = (1.0 - s.w_centrality) * base + s.w_centrality * cen
+        return min(max(blended, 0.0), 1.0)
+
     def _recency(self, item: MemoryItem, now: datetime) -> float:
         """rec(m) = exp(-ln2 * age_hours(m) / recency_half_life_h) — Ebbinghaus decay.
 

@@ -81,7 +81,8 @@ class _StmTier(_Tier):
         super().__init__()
         self.written: list[MemoryItem] = []
 
-    async def put(self, item: MemoryItem) -> None:
+    async def put(self, item: MemoryItem, *, ttl_s: int | None = None) -> None:
+        del ttl_s  # F1 fix (ADR 0054): StmTierRepository.put's new additive override
         self.written.append(item)
 
 

@@ -102,13 +102,15 @@ class MemcachedStmAdapter:
             "(sustained write contention) — D6 recency floor unavailable"
         )
 
-    async def put(self, item: MemoryItem) -> str:
-        return await self._retry(self._put_impl)(item)
+    async def put(self, item: MemoryItem, *, ttl_s: int | None = None) -> str:
+        return await self._retry(self._put_impl)(item, ttl_s=ttl_s)
 
-    async def _put_impl(self, item: MemoryItem) -> str:
+    async def _put_impl(self, item: MemoryItem, *, ttl_s: int | None = None) -> str:
         row = self._mapper.to_store(item)
+        effective_ttl_s = row.ttl_s if ttl_s is None else ttl_s  # F1 fix (ADR 0054): per-write
+        # TTL override (e.g. DemotionService's write-ahead copy) beats the mapper's default.
         await self._mc.set(
-            row.key.encode("utf-8"), row.blob.encode("utf-8"), exptime=row.ttl_s or 0
+            row.key.encode("utf-8"), row.blob.encode("utf-8"), exptime=effective_ttl_s or 0
         )
         await self._update_recency(item.namespace, item.id, item.created_at.timestamp())
         # NO write-time content-hash dedup on this adapter (D6 — memcached has no HASH primitive

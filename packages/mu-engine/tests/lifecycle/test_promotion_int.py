@@ -107,8 +107,11 @@ async def test_periodic_sweep_promotes_high_salience_stm_to_mtm(
 
     # importance=1.0, age=0 -> S = 0.5*rec(1) + 0.2*use(0) + 0.3*imp(1) = 0.8 >= promote_stm_mtm.
     salient = make_item(ns, "Ada likes tea", importance=1.0, created_at=_T0)
-    # importance=0.0, age=0 -> S = 0.5*rec(1) + 0 + 0 = 0.5 < promote_stm_mtm (0.7).
-    quiet = make_item(ns, "a trivial aside", importance=0.0, created_at=_T0)
+    # importance=0.0, age=6h -> rec = 2^(-6/24) ~= 0.841 -> S = 0.5*0.841 ~= 0.42.
+    # FAULT-HUNT-0924 F1 fix (ADR 0054): promote_stm_mtm moved 0.7 -> 0.45 (the recall-rescue
+    # ceiling fix), so age=0 (S=0.5) is no longer below the shipped gate — this item is aged 6h
+    # to stay genuinely below 0.45 rather than pinning a stale literal in the comment.
+    quiet = make_item(ns, "a trivial aside", importance=0.0, created_at=_T0 - timedelta(hours=6))
 
     report = await svc.sweep_stm_to_mtm(ns, [salient, quiet])
 
@@ -155,14 +158,21 @@ async def test_periodic_mtm_to_ltm_gate_respects_score_and_age(
     make_ns: Callable[..., Namespace],
     make_item: Callable[..., MemoryItem],
 ) -> None:
+    """FAULT-HUNT-0924 F2 fix (ADR 0054): runs at the SHIPPED ``SalienceSettings()``/
+    ``LifecycleSettings()`` defaults — NOT an artificially long ``recency_half_life_h`` (the
+    prior version of this test passed ``recency_half_life_h=100_000.0``, 4,167x the shipped 24h,
+    with a comment naming the exact reason the shipped gate can never fire without noticing it
+    was describing a live defect: a grid search over the WHOLE ``(age>24h, importance<=1.0,
+    access_count<=60)`` domain at shipped defaults found max achievable score 0.75 against a 0.9
+    gate — zero survivors, ever, for any item, at any age). At shipped defaults this test proves
+    the gate now fires — the mutation check is `git stash` this file's fix to `salience.py`/
+    `promotion.py` (reverting `_select_mtm_ltm_survivors` to the general `score()`) and watch
+    this go red, not an artificially long half-life papering over a dead gate."""
     ns = make_ns()
-    now = _T0 + timedelta(hours=48)
+    now = _T0 + timedelta(hours=200)
     clock = FrozenClock(now)
-    # A very long half-life isolates the AGE gate from the RECENCY component of the score (the
-    # two mechanisms are independent per spec §7b point 3: "S>=promote_mtm_ltm AND age>min_age");
-    # a short half-life would make S decay with age too, conflating both gates in one number.
-    salience = SalienceStrategy(SalienceSettings(recency_half_life_h=100_000.0, usage_cap=1))
-    settings = LifecycleSettings(promote_mtm_ltm=0.9, promote_min_age_h=24.0)
+    salience = SalienceStrategy(SalienceSettings())  # SHIPPED defaults: half_life=24h, cap=10
+    settings = LifecycleSettings()  # SHIPPED: promote_mtm_ltm=0.9, promote_min_age_h=24h
     svc = PromotionService(
         mtm=mtm,
         distill=DistillPipeline(ltm=ltm, mtm=mtm, clock=clock),
@@ -171,17 +181,20 @@ async def test_periodic_mtm_to_ltm_gate_respects_score_and_age(
         clock=clock,
     )
 
-    # S = 0.5*~1 + 0.2*1 + 0.3*1 ~= 1.0 for BOTH — only the age differs.
-    old_enough = make_item(
+    # Old, important, well-used — created_at=_T0 puts its age at 200h (>8 days). Under the OLD
+    # general `score()` this would be S = 0.5*rec(200h) + 0.2*1 + 0.3*1 ~= 0.5*0.00047 + 0.5 ~=
+    # 0.5002 << 0.9 (never fires, regardless of age). `score_for_ltm_gate` drops recency entirely
+    # for this decision: (0.2*1 + 0.3*1)/(0.2+0.3) = 1.0 >= 0.9 -> promotes.
+    old_and_well_used = make_item(
         ns,
         "Ada works at Acme",
         subject="Ada",
         predicate="works_at",
         obj="Acme",
         importance=1.0,
-        access_count=1,
+        access_count=10,  # usage_cap=10 -> use(m)=1.0
         tier=MemoryTier.MTM,
-        created_at=_T0,  # age = 48h > promote_min_age_h (24h)
+        created_at=_T0,  # age = 200h > promote_min_age_h (24h)
     )
     too_young = make_item(
         ns,
@@ -190,21 +203,37 @@ async def test_periodic_mtm_to_ltm_gate_respects_score_and_age(
         predicate="works_at",
         obj="Globex",
         importance=1.0,
-        access_count=1,
+        access_count=10,
         tier=MemoryTier.MTM,
         created_at=now - timedelta(hours=1),  # age = 1h <= promote_min_age_h (24h)
     )
+    unimportant_and_unused = make_item(
+        ns,
+        "Cy likes tea",
+        subject="Cy",
+        predicate="likes",
+        obj="tea",
+        importance=0.1,
+        access_count=0,
+        tier=MemoryTier.MTM,
+        created_at=_T0,  # old enough, but not salient enough to clear the gate
+    )
 
-    report = await svc.sweep_mtm_to_ltm(ns, [old_enough, too_young])
+    report = await svc.sweep_mtm_to_ltm(ns, [old_and_well_used, too_young, unimportant_and_unused])
 
     assert report.distilled is not None
     assert report.promoted_mtm_ltm == 1
     assert report.distilled.actions[0].subject == "Ada"
+    assert {mid for mid, _score in report.ltm_survivor_scores} == {old_and_well_used.id}
+    ((_mid, ltm_score),) = report.ltm_survivor_scores
+    assert ltm_score == pytest.approx(1.0)  # (0.2*1 + 0.3*1) / 0.5 — recency dropped entirely
 
     ada_facts = await ltm.graph_recall(ns, subject="Ada", limit=10)
     assert len(ada_facts) == 1
     bob_facts = await ltm.graph_recall(ns, subject="Bob", limit=10)
     assert bob_facts == []  # too young for the age gate -> never handed to DISTILL
+    cy_facts = await ltm.graph_recall(ns, subject="Cy", limit=10)
+    assert cy_facts == []  # old enough, but score_for_ltm_gate stays below promote_mtm_ltm
 
 
 # =================================================================================================

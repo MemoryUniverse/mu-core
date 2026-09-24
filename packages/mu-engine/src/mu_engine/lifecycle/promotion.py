@@ -180,6 +180,19 @@ class PromotionReport(BaseModel):
 
     outcomes: tuple[PromotionOutcome, ...] = ()
     distilled: DistillReport | None = None
+    #: FAULT-HUNT-0924 F2 fix (ADR 0054): the SOURCE MTM item ids + their ``score_for_ltm_gate``
+    #: value at selection time, populated ONLY by ``sweep_mtm_to_ltm``. Deliberately a SEPARATE
+    #: field from ``outcomes`` (not a new ``PromotionOutcomeKind`` member) — this class's own
+    #: docstring already states the MTM->LTM leg's verdicts are DISTILL's OWN
+    #: ``DistillActionKind``, never re-declared here; this records the GATE's selection score,
+    #: which is a different thing from a DISTILL verdict and DISTILL does not carry it (its
+    #: ``actions`` key on ``winner_id`` — for an unstructured item, a freshly minted proposition
+    #: id, never the source MTM item's own id). A caller that needs "which of MY candidates just
+    #: left MTM for LTM, and at what score" (e.g. ``MemoryLifecycleManager.sweep_namespace_now``,
+    #: to exclude that item from the same tick's demotion pass AND to record an honest — not
+    #: fabricated — score on its own explain trail) cannot recover either from ``distilled``
+    #: alone. Content-free (ids + floats only), mirroring every other DTO on this report.
+    ltm_survivor_scores: tuple[tuple[str, float], ...] = ()
 
     @property
     def promoted_stm_mtm(self) -> int:
@@ -284,7 +297,7 @@ class PromotionService:
         started = time.perf_counter()
         with self._tracer.span(_MTM_LTM_GATE_OP, attributes={"ns": ns.to_prefix()}):
             try:
-                survivors = self._select_mtm_ltm_survivors(window)
+                scored_survivors = self._select_mtm_ltm_survivors(window)
             except asyncio.CancelledError:
                 raise
             except BaseException:
@@ -302,24 +315,37 @@ class PromotionService:
             outcome="ok",
             tier="ltm",
             visibility=ns.visibility.value,
-            counts={"candidates": len(window), "survivors": len(survivors)},
+            counts={"candidates": len(window), "survivors": len(scored_survivors)},
         )
-        if not survivors:
+        if not scored_survivors:
             return PromotionReport()
+        survivors = [item for item, _score in scored_survivors]
         # DISTILL emits its OWN MemoryPromoted(frm=MTM, to=LTM, reason="distill") per winner
         # (distill.py:461-467); this module only meters that its gate handed survivors over.
         self._metrics.inc(
             _PROMOTION_METRIC, labels={"frm": "mtm", "to": "ltm"}, value=len(survivors)
         )
         distilled = await self._distill.distill(ns, survivors)
-        return PromotionReport(distilled=distilled)
+        return PromotionReport(
+            distilled=distilled,
+            ltm_survivor_scores=tuple((item.id, score) for item, score in scored_survivors),
+        )
 
-    def _select_mtm_ltm_survivors(self, window: Sequence[MemoryItem]) -> list[MemoryItem]:
+    def _select_mtm_ltm_survivors(
+        self, window: Sequence[MemoryItem]
+    ) -> list[tuple[MemoryItem, float]]:
         now = self._clock.now()
+        # FAULT-HUNT-0924 F2 fix (ADR 0054): `score_for_ltm_gate`, NOT the general `score` — see
+        # that method's docstring for why re-applying the recency-decayed general score on top of
+        # this gate's OWN `age > promote_min_age_h` floor made `promote_mtm_ltm` arithmetically
+        # unreachable (max achievable was 0.75 against a 0.9 gate, for every item, forever).
+        scored = (
+            (item, self._salience.score_for_ltm_gate(item, clock=self._clock)) for item in window
+        )
         return [
-            item
-            for item in window
-            if self._salience.score(item, clock=self._clock) >= self._settings.promote_mtm_ltm
+            (item, score)
+            for item, score in scored
+            if score >= self._settings.promote_mtm_ltm
             and _age_hours(item, now) > self._settings.promote_min_age_h
         ]
 
@@ -342,6 +368,43 @@ class PromotionService:
 
     def _remaining_ttl_s(self, item: MemoryItem, now: datetime) -> float:
         return self._ingest_settings.stm_ttl_s - _age_hours(item, now) * 3600.0
+
+    async def rescue_pre_ttl_now(self, ns: Namespace) -> PromotionReport:
+        """Self-fetching counterpart to :meth:`rescue_pre_ttl` (FAULT-HUNT-0924 F5 fix, ADR 0054)
+        — mirrors :meth:`promote_session`'s self-fetch shape (spec §7b point 2), but for the
+        narrow pre-TTL rescue leg ONLY: fetches THIS namespace's own STM window via the injected
+        ``StmTierRepository`` and hands it straight to :meth:`rescue_pre_ttl`.
+
+        This is the entry point a short, frequent cadence (``pre_ttl_scan_interval_s``, 120s
+        default) is meant to call — never :meth:`promote_session` and never
+        ``MemoryLifecycleManager.sweep_namespace_now``, both of which also run the full
+        session-boundary promotion pass, the ``scan_for_demotion`` enumeration and
+        ``RetentionService`` on every call. Before this method existed, mu-client's
+        ``MaintenanceLoop`` had no narrow verb to call and both its periodic loops called the
+        SAME full-sweep body — the F5 defect: a full promotion+demotion+retention sweep ran every
+        120s (720x/day) instead of once a day, and ``rescue_pre_ttl`` itself was never called by
+        anything in production at all.
+
+        **PRIVATE η only (AD-142), same refusal as** :meth:`promote_session`: a maintenance scan
+        serves no caller, so it has no honest ``caller_identity_set`` for the Model-A gate on
+        ``StmTierRepository.recent`` on a SHARED η. See :class:`SharedPlaneSweepUnsupportedError`.
+        """
+        if self._stm is None:
+            raise RuntimeError(
+                "rescue_pre_ttl_now requires an injected StmTierRepository (none was configured "
+                "on this PromotionService instance) — never a silent no-op (DEV-STANDARDS rule 8)."
+            )
+        if ns.visibility is Visibility.SHARED:
+            raise SharedPlaneSweepUnsupportedError(
+                "rescue_pre_ttl_now refuses a SHARED namespace: a lifecycle sweep serves no "
+                "caller, so it has no honest caller_identity_set for the Model-A gate on "
+                f"StmTierRepository.recent (AD-128). (namespace={ns.to_prefix()})"
+            )
+        window = [
+            scored.item
+            for scored in await self._stm.recent(ns, limit=self._settings.max_items_per_user_sweep)
+        ]
+        return await self.rescue_pre_ttl(ns, window)
 
     # ---- path (ii) — session-boundary consolidation --------------------------------------------
     async def promote_session(

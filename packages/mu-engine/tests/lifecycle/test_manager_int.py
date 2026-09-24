@@ -159,10 +159,12 @@ class _RecordingLease:
 
 
 class _SpyPromotionService:
-    """A minimal, REAL (not a ``Mock()``) stand-in satisfying exactly the ONE method this
-    manager calls (``promote_session``) — used for the PURE orchestration tests (lease ordering,
-    coalescing, mode-gate) where the point under test is this manager's own control flow, not
-    ``PromotionService``'s internals (those are S1-01's own, already-covered suite)."""
+    """A minimal, REAL (not a ``Mock()``) stand-in satisfying the methods
+    ``MemoryLifecycleManager.sweep_namespace_now`` calls unconditionally (``promote_session`` and,
+    since the FAULT-HUNT-0924 F2 fix, ``sweep_mtm_to_ltm``) — used for the PURE orchestration
+    tests (lease ordering, coalescing, mode-gate) where the point under test is this manager's own
+    control flow, not ``PromotionService``'s internals (those are S1-01's own, already-covered
+    suite)."""
 
     def __init__(self, log: list[str]) -> None:
         self._log = log
@@ -175,6 +177,20 @@ class _SpyPromotionService:
 
         class _Report:
             outcomes: tuple[object, ...] = ()
+
+        return _Report()
+
+    async def sweep_mtm_to_ltm(self, ns: Namespace, window: object) -> object:
+        """FAULT-HUNT-0924 F2 fix (ADR 0054): ``sweep_namespace_now`` now calls this
+        unconditionally whenever it has candidates — a no-survivor stand-in, since this class's
+        whole point is to isolate the manager's OWN orchestration (lease ordering, coalescing,
+        mode-gate) from ``PromotionService``'s internals (S1-01's own suite covers those)."""
+        del ns, window
+        self._log.append("sweep_mtm_to_ltm")
+
+        class _Report:
+            distilled: object | None = None
+            ltm_survivor_scores: tuple[tuple[str, float], ...] = ()
 
         return _Report()
 

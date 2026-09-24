@@ -17,7 +17,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from mu_engine.lifecycle.salience import SalienceStrategy
-from mu_engine.lifecycle.settings import SalienceSettings
+from mu_engine.lifecycle.settings import LifecycleSettings, SalienceSettings
 from mu_engine.platform.clock import FrozenClock
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, Polarity
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -160,3 +160,66 @@ def test_no_wall_clock_call_only_injected_clock_is_used() -> None:
     score = strategy.score(ancient, clock=FrozenClock(pinned_instant))
 
     assert score == pytest.approx(strategy.score(ancient, clock=FrozenClock(pinned_instant)))
+
+
+# =================================================================================================
+# FAULT-HUNT-0924 F2 fix (ADR 0054) — score_for_ltm_gate: recency dropped, usage+importance
+# renormalized. See salience.py's own docstring on the method for the full arithmetic rationale.
+# =================================================================================================
+def test_score_for_ltm_gate_drops_recency_at_shipped_defaults() -> None:
+    """The whole point of the fix: an OLD item (age far past the 24h half-life, so `rec` is
+    negligible) with max usage+importance must still score 1.0 on the LTM gate — the general
+    `score()` cannot, by construction, at shipped defaults (mirrors the FAULT-HUNT-0924 probe:
+    max general score for age>24h is capped at 0.75, forever, regardless of usage/importance)."""
+    settings = SalienceSettings()  # shipped: w=(0.5, 0.2, 0.3), half_life=24h, usage_cap=10
+    strategy = SalienceStrategy(settings)
+    ancient = _item(importance_score=1.0, access_count=10, created_at=_EPOCH)
+    clock = FrozenClock(_EPOCH + timedelta(days=30))  # 720h — recency is essentially 0
+
+    ltm_gate_score = strategy.score_for_ltm_gate(ancient, clock=clock)
+    general_score = strategy.score(ancient, clock=clock)
+
+    assert ltm_gate_score == pytest.approx(1.0)
+    assert general_score < 0.75  # the F2 defect this fix exists to route around
+    assert ltm_gate_score >= LifecycleSettings().promote_mtm_ltm  # actually crosses the gate
+    assert general_score < LifecycleSettings().promote_mtm_ltm  # the old scorer never would
+
+
+def test_score_for_ltm_gate_ignores_clock_entirely() -> None:
+    """No recency term at all -> the SAME item scores identically at any instant (unlike the
+    general `score()`, which strictly decreases with age, AC-0.2)."""
+    settings = SalienceSettings()
+    strategy = SalienceStrategy(settings)
+    item = _item(importance_score=0.6, access_count=4, created_at=_EPOCH)
+
+    soon = strategy.score_for_ltm_gate(item, clock=FrozenClock(_EPOCH + timedelta(hours=1)))
+    late = strategy.score_for_ltm_gate(item, clock=FrozenClock(_EPOCH + timedelta(days=400)))
+
+    expected = (settings.w_usage * 0.4 + settings.w_importance * 0.6) / (
+        settings.w_usage + settings.w_importance
+    )
+    assert soon == late == pytest.approx(expected)
+
+
+def test_score_for_ltm_gate_low_usage_and_importance_stays_below_gate() -> None:
+    """A genuinely unremarkable item (low importance, never recalled) must NOT be rescuable by
+    this gate just because it is old — dropping recency must not turn into "age alone promotes.\""""
+    settings = SalienceSettings()
+    strategy = SalienceStrategy(settings)
+    unremarkable = _item(importance_score=0.1, access_count=0, created_at=_EPOCH)
+    late_clock = FrozenClock(_EPOCH + timedelta(days=90))
+
+    score = strategy.score_for_ltm_gate(unremarkable, clock=late_clock)
+
+    assert score < LifecycleSettings().promote_mtm_ltm
+    assert score == pytest.approx(0.06)  # (w_usage*0 + w_importance*0.1) / (w_usage+w_importance)
+
+
+def test_score_for_ltm_gate_bounded_in_unit_interval() -> None:
+    settings = SalienceSettings()
+    strategy = SalienceStrategy(settings)
+    item = _item(importance_score=1.0, access_count=10_000, created_at=_EPOCH)
+
+    score = strategy.score_for_ltm_gate(item, clock=FrozenClock(_EPOCH + timedelta(days=1000)))
+
+    assert 0.0 <= score <= 1.0 + 1e-9

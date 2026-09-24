@@ -68,7 +68,7 @@ SM = TypeVar("SM", bound=StoreModel)
 class StmTierRepository(Protocol):
     """KV / STM tier (``storage-pluggable §1``). Recency floor + TTL + chash dedup."""
 
-    async def put(self, item: MemoryItem) -> str:
+    async def put(self, item: MemoryItem, *, ttl_s: int | None = None) -> str:
         """Write ``item``, returning the RESIDENT memory id (add() return-idempotency fix,
         DATA-QUALITY-REASSESSMENT §3 "add() idempotency" / the D4 report).
 
@@ -79,7 +79,16 @@ class StmTierRepository(Protocol):
         whichever row is now physically resident under ``item.content_hash`` in this namespace, so
         a caller (``WriteStmStage``) can re-stamp its own id onto the SAME identity the store
         actually kept, instead of minting+returning an id the store never held (CANONICAL §7.1
-        id-stability applied to the dedup path)."""
+        id-stability applied to the dedup path).
+
+        ``ttl_s`` (FAULT-HUNT-0924 F1 fix, ADR 0054): an explicit TTL override for THIS write,
+        replacing whatever default the adapter's own mapper/construction-time setting would
+        otherwise stamp (e.g. ``RedisMapper.default_ttl_s``). ``None`` (every pre-existing caller)
+        preserves the adapter's prior default byte-for-byte — this parameter is purely additive.
+        The one caller that passes it today is ``DemotionService``'s write-ahead STM copy
+        (``LifecycleSettings.demoted_stm_ttl_s``): a demoted memory is not a fresh, unprocessed
+        capture, so it must not silently inherit the capture-buffer TTL (``IngestSettings.
+        stm_ttl_s``) a real ingest write uses."""
         ...
 
     async def get(

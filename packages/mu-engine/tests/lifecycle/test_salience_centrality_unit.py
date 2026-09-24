@@ -23,7 +23,7 @@ from pydantic import ValidationError
 
 from mu_engine.lifecycle.centrality import CentralityIndex, CentralitySettings
 from mu_engine.lifecycle.salience import SalienceStrategy
-from mu_engine.lifecycle.settings import SalienceSettings
+from mu_engine.lifecycle.settings import LifecycleSettings, SalienceSettings
 from mu_engine.platform.clock import FrozenClock
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, Polarity
 from mu_engine.storage.domain.namespace import Namespace, Visibility
@@ -124,15 +124,21 @@ def test_centrality_is_the_smallest_weight_in_the_vector() -> None:
 
 
 def test_the_whole_span_of_the_term_cannot_carry_an_item_across_the_gates() -> None:
-    """The stated design bound: cen=0 to cen=1 moves S by at most ``w_centrality``, which is far
-    less than the 0.4 between ``demote_mtm`` (0.3) and ``promote_stm_mtm`` (0.7). Structural
-    position adjusts rank; it never overrides recency or importance."""
+    """The stated design bound: cen=0 to cen=1 moves S by at most ``w_centrality``, which must
+    stay smaller than the gap between ``demote_mtm`` and ``promote_stm_mtm`` (a hardcoded 0.4 here
+    would be stale documentation, not a check: FAULT-HUNT-0924 F1 fix, ADR 0054, narrowed that gap
+    from 0.3->0.7 to 0.3->0.45 specifically so this invariant would still need checking rather
+    than being true by a wide margin) — read BOTH gates from ``LifecycleSettings`` so this stays a
+    live guard against the two ever drifting close enough for centrality alone to cross the gate,
+    not a comment repeating a number nothing re-derives. Structural position adjusts rank; it
+    never overrides recency or importance."""
     s = SalienceSettings()
+    gate_gap = LifecycleSettings().promote_stm_mtm - LifecycleSettings().demote_mtm
     at_zero = _score_at(SalienceStrategy(s, centrality=_FixedLookup(0.0)), use=0.4, imp=0.4)
     at_one = _score_at(SalienceStrategy(s, centrality=_FixedLookup(1.0)), use=0.4, imp=0.4)
 
     assert at_one - at_zero == pytest.approx(s.w_centrality)
-    assert at_one - at_zero < 0.4
+    assert at_one - at_zero < gate_gap
 
 
 def test_the_sum_to_one_invariant_is_documented_as_unenforced_at_construction() -> None:

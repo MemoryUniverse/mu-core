@@ -42,7 +42,13 @@ def test_lifecycle_settings_constructs_with_spec_defaults() -> None:
     # MAJOR 4 fix — decoupled pre-TTL rescue cadence.
     assert settings.pre_ttl_scan_interval_s == 120
 
-    assert settings.promote_stm_mtm == pytest.approx(0.7)
+    # FAULT-HUNT-0924 F1 fix (ADR 0054): 0.45, not the old 0.7 — see settings.py's field
+    # docstring for the exact arithmetic (the achievable post-rescue ceiling for an already-
+    # demoted item is `demote_mtm + w_usage` = 0.5; 0.7 made the ADR-0034 recall rescue
+    # unreachable for 100% of demoted items, verified by FAULT-HUNT-0924.md's grid probe. 0.45,
+    # not 0.5, to stay above `demote_mtm + w_centrality` so the A4 blend term alone still cannot
+    # cross this gate — see test_salience_centrality_unit.py's own check of that invariant).
+    assert settings.promote_stm_mtm == pytest.approx(0.45)
     assert settings.promote_mtm_ltm == pytest.approx(0.9)
     assert settings.promote_min_age_h == pytest.approx(24.0)
     assert settings.pre_ttl_window_s == 300
@@ -50,6 +56,10 @@ def test_lifecycle_settings_constructs_with_spec_defaults() -> None:
     assert settings.demote_mtm == pytest.approx(0.3)
     assert settings.demotion_enabled is True
     assert settings.ltm_demotion_enabled is False
+    # FAULT-HUNT-0924 F1 fix (ADR 0054): a demoted memory's write-ahead STM copy gets its OWN,
+    # deliberately long, configurable TTL — never the capture-buffer `IngestSettings.stm_ttl_s`
+    # (3600s) a fresh ingest write uses.
+    assert settings.demoted_stm_ttl_s == 2_592_000
 
     assert settings.quarantine_ttl_d == 7
 

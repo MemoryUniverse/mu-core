@@ -119,7 +119,7 @@ class InMemoryStmAdapter:
         for mid in expired:
             self._evict_locked(part, mid)
 
-    async def put(self, item: MemoryItem) -> str:
+    async def put(self, item: MemoryItem, *, ttl_s: int | None = None) -> str:
         async with self._lock:
             part = self._partition(item.namespace)
             now = datetime.now(UTC)
@@ -135,13 +135,13 @@ class InMemoryStmAdapter:
 
             # re-put of an existing id: drop its stale recency entry first (id-stability, no fork).
             self._evict_locked(part, item.id)
-            # `None` means "no TTL" (never expires); `0` is a valid (immediate-expiry) TTL —
-            # must check `is not None`, not truthiness, so `default_ttl_s=0` isn't misread as
-            # "no TTL" (0 is falsy but semantically distinct from None here).
+            # F1 fix (ADR 0054): an explicit per-write `ttl_s` (e.g. DemotionService's write-ahead
+            # copy) overrides `self._default_ttl_s` for THIS write only — `None` for both means
+            # "no TTL" (never expires); `sentinel is not None` distinguishes that from a valid
+            # `0` (immediate-expiry) TTL either one could legitimately carry.
+            effective_ttl_s = self._default_ttl_s if ttl_s is None else ttl_s
             expires_at = (
-                now + timedelta(seconds=self._default_ttl_s)
-                if self._default_ttl_s is not None
-                else None
+                now + timedelta(seconds=effective_ttl_s) if effective_ttl_s is not None else None
             )
             part.items[item.id] = (item, expires_at)
             part.recency.add((-item.created_at.timestamp(), item.id))

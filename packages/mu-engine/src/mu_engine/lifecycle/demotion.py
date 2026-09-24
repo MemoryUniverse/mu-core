@@ -272,8 +272,13 @@ class DemotionService:
         stm_copy.tier = MemoryTier.STM
         stm_copy.updated_at = self._clock.now()
 
-        # Step 1: write-ahead — STM gets the copy before MTM loses its point.
-        await self._stm.put(stm_copy)
+        # Step 1: write-ahead — STM gets the copy before MTM loses its point. FAULT-HUNT-0924 F1
+        # fix (ADR 0054): explicit `demoted_stm_ttl_s`, NEVER the store's own capture-buffer
+        # default (`IngestSettings.stm_ttl_s`, 3600s) — a demoted memory already survived days in
+        # MTM; silently inheriting the fresh-capture TTL gave it a silent ~1-hour-from-demotion
+        # horizon with no event, no tombstone, no state flip (FAULT-HUNT-0924.md §1 F1). The
+        # horizon is now this one deliberate, documented, configurable knob.
+        await self._stm.put(stm_copy, ttl_s=self._settings.demoted_stm_ttl_s)
 
         # Step 2: commit — remove the MTM point. The injected port owns its own retry/backoff
         # (DEV-STANDARDS rule 7 — a cross-cutting concern is the ADAPTER's decorator, e.g.

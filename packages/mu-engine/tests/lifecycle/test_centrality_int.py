@@ -314,7 +314,9 @@ class _FakeStm:
     def __init__(self) -> None:
         self.put_ids: list[str] = []
 
-    async def put(self, item: MemoryItem) -> None:
+    async def put(self, item: MemoryItem, *, ttl_s: int | None = None) -> None:
+        del ttl_s  # F1 fix (ADR 0054): StmTierRepository.put's new additive override — this
+        # fake sink doesn't model TTLs, only which ids were written.
         self.put_ids.append(item.id)
 
     async def evict(self, ns: Namespace, memory_id: str) -> None:

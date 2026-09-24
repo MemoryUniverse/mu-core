@@ -661,15 +661,73 @@ class MemoryLifecycleManager:
                 ns, limit=self._settings.max_items_per_user_sweep
             )
         if candidates:
-            demo_report = await self._demotion.demote(ns, candidates)
-            for demo_outcome in demo_report.outcomes:
-                if demo_outcome.demoted:
-                    self._record_explain(
-                        ns, demo_outcome.memory_id, TransitionKind.DEMOTE, demo_outcome.score
-                    )
+            # FAULT-HUNT-0924 F2 fix (ADR 0054): the periodic MTM->LTM gate (path iii, spec §7b)
+            # had NO production caller at all — this manager's sweep only ever drove promotion's
+            # session-boundary leg (above) and demotion, never `PromotionService.
+            # sweep_mtm_to_ltm`. Fed the SAME enumeration `scan_for_demotion` already gathers
+            # (that method enumerates every ACTIVE MTM point regardless of its generic-sounding
+            # name — see its own docstring) rather than a second scan, so an item the LTM gate
+            # promotes and an item the demotion gate would otherwise have demoted are decided from
+            # one consistent snapshot, never two racing reads of the tier.
+            ltm_report = await self._promotion.sweep_mtm_to_ltm(ns, candidates)
+            promoted_to_ltm = {source_id for source_id, _score in ltm_report.ltm_survivor_scores}
+            for source_id, score in ltm_report.ltm_survivor_scores:
+                self._record_explain(ns, source_id, TransitionKind.PROMOTE, score)
+            # An item this tick just promoted to LTM is never ALSO handed to the demotion gate in
+            # the same pass — it already left the "still just an MTM working copy" population this
+            # tick decided about; re-evaluating it for demotion here would be redundant at best and
+            # a same-tick promote/demote race against DISTILL's own MTM-side bookkeeping at worst.
+            demotion_candidates = [c for c in candidates if c.id not in promoted_to_ltm]
+            if demotion_candidates:
+                demo_report = await self._demotion.demote(ns, demotion_candidates)
+                for demo_outcome in demo_report.outcomes:
+                    if demo_outcome.demoted:
+                        self._record_explain(
+                            ns, demo_outcome.memory_id, TransitionKind.DEMOTE, demo_outcome.score
+                        )
 
         if self._retention is not None:
             await self._retention.sweep(ns, clock=self._clock)
+
+    async def rescue_pre_ttl_now(self, ns: Namespace) -> None:
+        """Narrow pre-TTL rescue entry point (FAULT-HUNT-0924 F5 fix, ADR 0054; spec §7b
+        AC-1.3a) — drives ONLY ``PromotionService.rescue_pre_ttl_now``, never the session-boundary
+        promotion leg, the MTM enumeration/demotion leg or retention that
+        :meth:`sweep_namespace_now` also runs. This is the method a SHORT, FREQUENT cadence
+        (``pre_ttl_scan_interval_s``, 120s default) is meant to call every tick — see
+        :meth:`rescue_pre_ttl_user` for the ``UserPrefix``-keyed, lease-protected wrapper the
+        daemon's ``MaintenanceLoop`` actually calls."""
+        report = await self._promotion.rescue_pre_ttl_now(ns)
+        for outcome in report.outcomes:
+            if outcome.kind is PromotionOutcomeKind.STM_TO_MTM:
+                self._record_explain(ns, outcome.memory_id, TransitionKind.PROMOTE, outcome.score)
+
+    async def rescue_pre_ttl_user(self, prefix: UserPrefix) -> JobHandle:
+        """The ``LifecycleManagerPort``-shaped, ``UserPrefix``-keyed entry point
+        :class:`~mu_client.daemon.maintenance.MaintenanceLoop`'s ``_pre_ttl_loop`` calls every
+        ``pre_ttl_scan_interval_s`` (FAULT-HUNT-0924 F5 fix, ADR 0054) — the narrow sibling of
+        :meth:`sweep_user`, which the pre-TTL loop used to call INSTEAD (the F5 defect: both of
+        ``MaintenanceLoop``'s periodic loops called the same full-sweep body, so the whole
+        promotion + up-to-``max_items_per_user_sweep``-point demotion scroll + retention sweep ran
+        every 120s — 720x/day — instead of once a day).
+
+        Runs under the SAME per-prefix lease :meth:`sweep_user` acquires (:meth:`_run_under_lease`)
+        so a concurrent full sweep for this prefix cannot race this rescue's STM writes. Unlike
+        :meth:`sweep_user`, this is a direct best-effort call, never routed through the durable
+        ``LifecycleWorkflowRunnerPort`` queue: a missed rescue tick is caught by the next one two
+        minutes later (spec §7b's own composed invariant, ``pre_ttl_scan_interval_s <=
+        pre_ttl_window_s / 2``, guarantees >=2 scan hits per rescue window), so durable-queue
+        redelivery would only add latency, never correctness, to an already self-healing cadence.
+        """
+        job_id = str(uuid.uuid4())
+        submitted_at = self._clock.now()
+
+        async def _body() -> None:
+            for ns in tuple(self._active_namespaces.get(prefix, ())):
+                await self.rescue_pre_ttl_now(ns)
+
+        await self._run_under_lease(prefix, _body)
+        return JobHandle(job_id=job_id, submitted_at=submitted_at)
 
     async def promote_session_now(self, ns: Namespace, *, force: bool = False) -> None:
         """PreCompact promote-before-delete entry point (additive public method,

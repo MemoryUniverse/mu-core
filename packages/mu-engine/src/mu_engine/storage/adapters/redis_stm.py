@@ -91,11 +91,18 @@ class RedisStmAdapter:
         self._retry = retry_io(timeout_s=store_io_timeout_s)
         self._stm_dedup_enabled = stm_dedup_enabled
 
-    async def put(self, item: MemoryItem) -> str:
-        return await self._retry(self._put_impl)(item)
+    async def put(self, item: MemoryItem, *, ttl_s: int | None = None) -> str:
+        return await self._retry(self._put_impl)(item, ttl_s=ttl_s)
 
-    async def _put_impl(self, item: MemoryItem) -> str:
+    async def _put_impl(self, item: MemoryItem, *, ttl_s: int | None = None) -> str:
         row = self._mapper.to_store(item)
+        if ttl_s is not None:
+            # F1 fix (ADR 0054): explicit per-write TTL override — e.g. DemotionService's
+            # write-ahead copy uses `demoted_stm_ttl_s` instead of the mapper's capture-buffer
+            # default. Applied to `row` itself so every downstream use of `row.ttl_s` (the SET
+            # below, the recency/chash EXPIREs, and a dedup-hit bump on the WINNER row) is
+            # consistent with the override — never two different TTLs for the same write.
+            row = row.model_copy(update={"ttl_s": ttl_s})
         recency = RedisMapper.recency_key(item.namespace)
 
         if self._stm_dedup_enabled:
