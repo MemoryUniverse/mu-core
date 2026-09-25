@@ -43,7 +43,10 @@ def to_canonical_recall_result(result: EngineRecallResult) -> CanonicalRecallRes
     implementation detail of the recall service's private/shared-arm merge, not part of the
     surface a caller reads"). ``turn_seq``/``is_neighbor`` (AD-233's fix) ARE forwarded — see this
     module's own docstring for why the previous three-way duplication let that go unfixed at two
-    of three call sites the first time a field was added."""
+    of three call sites the first time a field was added. ``valid_at``/``valid_at_inferred``
+    (AD-308) are forwarded too, for the SAME reason this module exists: there being only ONE
+    mapping is what makes adding a field here enough — no second/third call site left silently
+    dropping it."""
     return CanonicalRecallResult(
         namespace=result.namespace,
         items=[
@@ -58,6 +61,8 @@ def to_canonical_recall_result(result: EngineRecallResult) -> CanonicalRecallRes
                 artifact_ref=item.artifact_ref,
                 turn_seq=item.turn_seq,
                 is_neighbor=item.is_neighbor,
+                valid_at=item.valid_at,  # AD-308
+                valid_at_inferred=item.valid_at_inferred,
             )
             for item in result.items
         ],
