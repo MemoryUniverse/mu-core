@@ -1,0 +1,90 @@
+# mu-dev rerank — the local cross-encoder rerank endpoint `RerankGate`/`ModelRouter.rerank` have
+# always targeted (`providers/shipped_settings.py:88-90`: `local_embed_rerank_api_base =
+# http://127.0.0.1:8080/v1`, `local_rerank_model = BAAI/bge-reranker-v2-m3`) — configured since
+# ADR 0010/0023, NEVER PROVISIONED (AD-298, ADR 0080 — corrected from a first-draft "ADR 0078"
+# citation this file shipped with: that number was independently claimed by the concurrent
+# ADR-0050 vector-backend lane before this row landed, exactly the collision the register's own
+# NEXT-AD allocation rule exists to prevent; re-checked against both the register and every
+# worktree's docs/decisions/ before taking 0080). This is the missing provisioning: Infinity
+# (michaelf34/infinity), the exact runtime `research-litellm-fit-and-ops.md:30` and
+# `model-layer-spec.md:69,387` name — chosen over reusing the ollama SLM container (docker-
+# compose.slm.yml) because ollama's OpenAI-compatible server has no `/rerank` handler at all
+# (verified: ollama serves `/v1/chat/completions` and `/v1/embeddings`, never a Cohere-shaped
+# rerank route) — a cross-encoder reranker is a structurally different model head from a causal
+# LM, so no amount of SLM config reaches it. Infinity's `/rerank` is BYTE-COMPATIBLE with what
+# litellm's `hosted_vllm` rerank transform sends and expects, verified against the actual
+# installed litellm source before this file was written (CODE-ADOPTION-METHODOLOGY rule 1):
+#   - request:  litellm `HostedVLLMRerankConfig.transform_rerank_request` posts
+#               `{"model","query","documents","top_n"?}` to `{api_base}/rerank`
+#               (litellm/llms/hosted_vllm/rerank/transformation.py:127-148)
+#   - route:    with `local_embed_rerank_api_base=http://127.0.0.1:8080/v1`, `get_complete_url`
+#               appends `/rerank` -> `http://127.0.0.1:8080/v1/rerank` (same file:40-55) — so
+#               Infinity must be launched with `--url-prefix /v1` (infinity_emb's default prefix
+#               is "", i.e. bare `/rerank`) for the route to line up with NO catalog/settings edit.
+#   - response: Infinity's `ReRankResult.to_rerank_response` returns
+#               `{"results":[{"index","relevance_score"}], "usage":{"total_tokens"}}`
+#               (infinity_emb/fastapi_schemas/pymodels.py:241-266) — exactly the shape litellm's
+#               `_transform_response` reads (same transformation.py:176-216). Zero adapter code
+#               needed on the mu-core side; this compose file is the whole gap.
+#
+#   standalone test:  docker compose -f docker-compose.rerank.yml up -d
+#   wire probe:       curl -s http://127.0.0.1:8080/health
+#   rerank probe:     curl -s http://127.0.0.1:8080/v1/rerank -H 'content-type: application/json' \
+#                        -d '{"model":"BAAI/bge-reranker-v2-m3","query":"q","documents":["a","b"]}'
+#   stop:             docker compose -f docker-compose.rerank.yml down
+#
+# CPU-only, like the SLM container next to it (`mu-dev-vm` has no GPU — see the `deploy:` comment
+# below). DEDICATED mu-dev-rerank ONLY. NEVER touches milvus/gcmem (root CLAUDE.md rule 6).
+
+name: mu-dev-rerank
+
+services:
+  rerank:
+    image: michaelf34/infinity:latest
+    container_name: mu-dev-rerank
+    restart: unless-stopped  # must survive a VM restart the way the stores do (AD-298 lane
+      # brief, item 1) — measured live 2026-09-25: every OTHER mu-dev-* store container (e.g.
+      # `mu-dev-qdrant`) carries `unless-stopped` (`docker inspect --format
+      # '{{.HostConfig.RestartPolicy.Name}}'`), so its absence here was a real gap, not a
+      # stylistic omission: without it, this container would come back after `docker start`
+      # only if something remembers to run it by hand, exactly the "wired but never actually
+      # there" failure this whole lane exists to close on the model-call side.
+    command:
+      - v2
+      - --model-id
+      - BAAI/bge-reranker-v2-m3
+      - --port
+      - "8080"
+      - --url-prefix
+      - /v1
+      - --batch-size
+      - "32"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - mu-dev-rerank-data:/app/.cache
+    # NO GPU reservation: `mu-dev-vm` is an e2-standard-8 with no accelerator attached (verified
+    # `gcloud compute instances describe --format='value(guestAccelerators)'` -> empty, and no
+    # `nvidia-smi`/nvidia runtime on the box). docker-compose.slm.yml's identical-looking
+    # `deploy.resources.reservations.devices` block is DEAD on this host too (its running
+    # container has `HostConfig.DeviceRequests == null` — Compose silently dropped it at create
+    # time) — but asking for the same block here made Docker Compose v5.4.0 attach a REAL device
+    # request that then failed hard: `docker start mu-dev-rerank` ->
+    # "could not select device driver \"nvidia\" with capabilities: [[gpu]]" (verified live,
+    # 2026-09-24). Infinity runs the cross-encoder on CPU here, same as the SLM already does.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      # start_period was 30s and is WRONG, verified live: this pass restarted the (already
+      # weights-cached) container and watched `docker inspect` go start->unhealthy — the
+      # multi-batch-size warmup sweep (`select_model.py:99`, sizes 1..32) that runs before
+      # "Application startup complete" took well over 3 minutes on this CPU-only box, even
+      # warm-cache, not the "first pull" case the original 30s was sized for. 240s covers the
+      # observed warmup with headroom without masking a real hang past that (retries=18 *
+      # interval=10s = another 180s of grace after the window before `unhealthy` fires).
+      start_period: 240s
+
+volumes:
+  mu-dev-rerank-data:
