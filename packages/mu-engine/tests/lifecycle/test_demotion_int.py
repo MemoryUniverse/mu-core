@@ -30,6 +30,7 @@ import contextlib
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -111,16 +112,19 @@ async def stm(valkey_client: Redis, ns: Namespace) -> AsyncIterator[ValkeyStmAda
 
 
 @pytest_asyncio.fixture
-async def qdrant_client(settings: Settings, uid: str) -> AsyncIterator[AsyncQdrantClient]:
+async def qdrant_client(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[AsyncQdrantClient]:
+    # AD-295: `uid in coll.name` never matched — the collection name is
+    # `mu_mtm__{tenant_partition_digest(org, workspace)}__{visibility}__{dim}`, a DIGEST, not a
+    # `uid` substring. Real cleanup now happens in the shared `tenant_store_cleanup` root-conftest
+    # fixture; registering the (org, workspace) this file's `ns` fixture builds is enough.
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     client = AsyncQdrantClient(url=settings.storage.vector.url)
     try:
         await client.get_collections()  # fail-loud probe; BLOCKED (never faked) if qdrant is down
         yield client
     finally:
-        for coll in (await client.get_collections()).collections:
-            if uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await client.delete_collection(coll.name)
         await client.close()
 
 

@@ -35,3 +35,6 @@ graphify-out/
 .serena/
 .claude/
 .tools-venv/
+
+# per-lane git worktrees — never committed
+.worktrees/

@@ -22,6 +22,7 @@ import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from falkordb.asyncio import FalkorDB
@@ -100,26 +101,14 @@ def _duplicate_pair(ns: Namespace, text: str) -> tuple[MemoryItem, MemoryItem]:
     return stm_item, ltm_item
 
 
-async def _teardown_stores(
-    settings: Settings,
-    redis_client: Redis,
-    qdrant_client: AsyncQdrantClient,
-    falkor_db: FalkorDB,
-    *,
-    uid: str,
-) -> None:
+async def _teardown_redis(redis_client: Redis, *, uid: str) -> None:
+    """The Redis leg alone — Qdrant/FalkorDB teardown moved to the shared `tenant_store_cleanup`
+    root-conftest fixture (AD-295): both are keyed on `tenant_partition_digest(org, workspace)`,
+    not the `uid` substring, so this file's own `uid in coll.name` / `uid in name` sweep never
+    matched either (identical defect to the sibling suites AD-295 was written against)."""
     keys = [k async for k in redis_client.scan_iter(match=f"*{uid}*".encode())]
     if keys:
         await redis_client.delete(*keys)
-    for coll in (await qdrant_client.get_collections()).collections:
-        if uid in coll.name:
-            with contextlib.suppress(Exception):
-                await qdrant_client.delete_collection(coll.name)
-    for g in await falkor_db.list_graphs():
-        name = g.decode() if isinstance(g, bytes) else g
-        if uid in name:
-            with contextlib.suppress(Exception):
-                await falkor_db.select_graph(name).delete()
 
 
 # ============================================================================================
@@ -128,8 +117,9 @@ async def _teardown_stores(
 
 
 async def _rank_with(
-    *, settings: Settings, uid: str, cross_tier_dedup: bool
+    *, settings: Settings, uid: str, cross_tier_dedup: bool, tenant_store_cleanup: Any
 ) -> tuple[list[str], MemoryItem, MemoryItem]:
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     redis_client: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=True)
     qdrant_client = AsyncQdrantClient(url=settings.storage.vector.url)
     falkor_db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
@@ -167,7 +157,7 @@ async def _rank_with(
         )
         return [it.content for it in result.items if it.content == text], stm_item, ltm_item
     finally:
-        await _teardown_stores(settings, redis_client, qdrant_client, falkor_db, uid=uid)
+        await _teardown_redis(redis_client, uid=uid)
         await redis_client.aclose()
         await qdrant_client.close()
         with contextlib.suppress(Exception):
@@ -175,10 +165,10 @@ async def _rank_with(
 
 
 async def test_ranker_dedups_a_cross_tier_content_hash_duplicate(
-    settings: Settings, uid: str
+    settings: Settings, uid: str, tenant_store_cleanup: Any
 ) -> None:
     matches, stm_item, ltm_item = await _rank_with(
-        settings=settings, uid=uid, cross_tier_dedup=True
+        settings=settings, uid=uid, cross_tier_dedup=True, tenant_store_cleanup=tenant_store_cleanup
     )
     assert len(matches) == 1, (
         f"content_hash={stm_item.content_hash} shared by STM id={stm_item.id} and "
@@ -187,10 +177,13 @@ async def test_ranker_dedups_a_cross_tier_content_hash_duplicate(
 
 
 async def test_ranker_toggle_off_lets_the_cross_tier_duplicate_through(
-    settings: Settings, uid: str
+    settings: Settings, uid: str, tenant_store_cleanup: Any
 ) -> None:
     matches, _stm_item, _ltm_item = await _rank_with(
-        settings=settings, uid=uid, cross_tier_dedup=False
+        settings=settings,
+        uid=uid,
+        cross_tier_dedup=False,
+        tenant_store_cleanup=tenant_store_cleanup,
     )
     assert len(matches) == 2, "toggle off must allow the STM+LTM duplicate through (pre-fix parity)"
 
@@ -215,8 +208,9 @@ async def _eventually(read: Callable[[], Awaitable[ContextView]]) -> ContextView
 
 
 async def _build_context_with_stm_ltm_duplicate(
-    *, settings: Settings, uid: str, cross_tier_dedup: bool
+    *, settings: Settings, uid: str, cross_tier_dedup: bool, tenant_store_cleanup: Any
 ) -> str:
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     engine_settings = EngineSettings(recall=RecallSettings(cross_tier_dedup=cross_tier_dedup))
     container = LocalContainer(
         StorageSettings(), settings=settings, engine_settings=engine_settings
@@ -272,23 +266,34 @@ async def _build_context_with_stm_ltm_duplicate(
 
 
 async def test_build_context_collapses_the_stm_ltm_duplicate_to_one_line(
-    settings: Settings, uid: str, redis_client: Redis, qdrant_client: AsyncQdrantClient
+    settings: Settings,
+    uid: str,
+    redis_client: Redis,
+    qdrant_client: AsyncQdrantClient,
+    tenant_store_cleanup: Any,
 ) -> None:
     falkor_db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
     try:
         text = await _build_context_with_stm_ltm_duplicate(
-            settings=settings, uid=uid, cross_tier_dedup=True
+            settings=settings,
+            uid=uid,
+            cross_tier_dedup=True,
+            tenant_store_cleanup=tenant_store_cleanup,
         )
         lines = [ln for ln in text.splitlines() if "Ada drinks black coffee" in ln]
         assert len(lines) == 1, f"cross-tier duplicate not collapsed in build_context: {text!r}"
     finally:
-        await _teardown_stores(settings, redis_client, qdrant_client, falkor_db, uid=uid)
+        await _teardown_redis(redis_client, uid=uid)
         with contextlib.suppress(Exception):
             await falkor_db.connection.aclose()
 
 
 async def test_build_context_toggle_off_is_masked_by_the_federation_dedup(
-    settings: Settings, uid: str, redis_client: Redis, qdrant_client: AsyncQdrantClient
+    settings: Settings,
+    uid: str,
+    redis_client: Redis,
+    qdrant_client: AsyncQdrantClient,
+    tenant_store_cleanup: Any,
 ) -> None:
     """HONEST finding, not the naive "toggle off -> 2 lines" expectation: at the FULL
     ``SurfaceFacade.build_context`` level, ``RecallService.recall`` ALREADY runs the
@@ -311,7 +316,10 @@ async def test_build_context_toggle_off_is_masked_by_the_federation_dedup(
     falkor_db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
     try:
         text = await _build_context_with_stm_ltm_duplicate(
-            settings=settings, uid=uid, cross_tier_dedup=False
+            settings=settings,
+            uid=uid,
+            cross_tier_dedup=False,
+            tenant_store_cleanup=tenant_store_cleanup,
         )
         lines = [ln for ln in text.splitlines() if "Ada drinks black coffee" in ln]
         assert len(lines) == 1, (
@@ -319,6 +327,6 @@ async def test_build_context_toggle_off_is_masked_by_the_federation_dedup(
             f"per-arm toggle off (see docstring): {text!r}"
         )
     finally:
-        await _teardown_stores(settings, redis_client, qdrant_client, falkor_db, uid=uid)
+        await _teardown_redis(redis_client, uid=uid)
         with contextlib.suppress(Exception):
             await falkor_db.connection.aclose()

@@ -31,6 +31,7 @@ import contextlib
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -98,50 +99,22 @@ def _ns(uid: str, user: str, session: str = "s1") -> Namespace:
     )
 
 
-#: Every namespace any test in this file can create — the teardown's ONLY reliable handle on the
-#: derived store names. ``collection_name``/``graph_name_for`` HASH the namespace
-#: (``mu_mtm__<hash>__private__<dim>``), so the ``uid in name`` substring convention the sibling
-#: suites use silently matches nothing for qdrant and falkordb and leaves a collection behind on
-#: every run. Verified against the live stores; reported, and fixed here for this file's own
-#: fixtures rather than left to accumulate.
+#: Every ``_ns(uid, ...)`` this file constructs shares ONE (org, workspace) — only ``user``/
+#: ``session`` vary across ``_TEST_USERS``/``_TEST_SESSIONS`` below — and ``collection_name``/
+#: ``graph_name_for`` key their physical name on ``tenant_partition_digest(org, workspace)``
+#: alone (visibility/dim/user/session do not enter the digest), so ONE
+#: ``tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")`` (the shared root
+#: `conftest.py` fixture, AD-295) covers every namespace this file can create. This file used to
+#: hand-enumerate ``_all_namespaces(uid)`` x every dim to build an exact `wanted_collections` set
+#: for the same reason every sibling suite's plain ``uid in name`` substring match fails: the
+#: name is a DIGEST. That enumeration is now redundant with the shared fixture and removed.
 _TEST_USERS = ("u1", "u2", "u3")
 _TEST_SESSIONS = ("s1", "sA", "sB")
 
 
-def _all_namespaces(uid: str) -> tuple[Namespace, ...]:
-    return tuple(_ns(uid, user, session) for user in _TEST_USERS for session in _TEST_SESSIONS)
-
-
-async def _teardown(settings: Settings, uid: str) -> None:
-    """Drop every qdrant collection / falkordb graph / redis key this run's unique ``uid``
-    created — resolved through the SAME name derivations the adapters use, never by substring."""
-    wanted_collections = {
-        collection_name(ns, dim) for ns in _all_namespaces(uid) for dim in (8, 384, 768, 1024)
-    }
-    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name or coll.name in wanted_collections:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
-    finally:
-        await qdrant.close()
-
-    wanted_graphs = {
-        FalkorLtmAdapter.graph_name_for(None, ns)  # type: ignore[arg-type]
-        for ns in _all_namespaces(uid)
-    }
-    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
-    try:
-        for g in await db.list_graphs():
-            name = g.decode() if isinstance(g, bytes) else g
-            if uid in name or name in wanted_graphs:
-                with contextlib.suppress(Exception):
-                    await db.select_graph(name).delete()
-    finally:
-        with contextlib.suppress(Exception):
-            await db.connection.aclose()
-
+async def _teardown_redis(settings: Settings, uid: str) -> None:
+    """The Redis leg alone — Qdrant/FalkorDB teardown moved to the shared `tenant_store_cleanup`
+    root-conftest fixture (AD-295)."""
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
         keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]
@@ -216,12 +189,15 @@ async def _ltm_in_store(settings: Settings, ns: Namespace) -> int:
 
 
 @pytest_asyncio.fixture
-async def container(settings: Settings, uid: str) -> AsyncIterator[LocalContainer]:
+async def container(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalContainer]:
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     built = LocalContainer(StorageSettings(), settings=settings, lifecycle=_lifecycle())
     try:
         yield built
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await built.close()
 
 
@@ -398,7 +374,7 @@ async def test_the_cache_is_one_per_container_and_survives_repeat_factory_calls(
 
 # =============================================== the FIRST-REVIEW blockers, against real stores ==
 async def test_a_restarted_process_never_claims_a_cardinality_it_cannot_have(
-    settings: Settings, uid: str
+    settings: Settings, uid: str, tenant_store_cleanup: Any
 ) -> None:
     """**The AD-24 blocker, pinned where it was found: a second container over the SAME stores.**
 
@@ -412,6 +388,7 @@ async def test_a_restarted_process_never_claims_a_cardinality_it_cannot_have(
     test is that measurement, kept: the counts may be a DELTA, the badge must say so, and nothing
     on the wire may read as a cardinality.
     """
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     first = LocalContainer(StorageSettings(), settings=settings, lifecycle=_lifecycle())
     ns = _ns(uid, "u1")
     try:
@@ -457,18 +434,19 @@ async def test_a_restarted_process_never_claims_a_cardinality_it_cannot_have(
         assert after.counts_observed_since is not None
         assert after.counts_observed_since > seeded.counts_observed_since  # type: ignore[operator]
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await second.close()
 
 
 async def test_an_unattended_removal_sweep_never_flips_a_restarted_process_off_unobserved(
-    settings: Settings, uid: str
+    settings: Settings, uid: str, tenant_store_cleanup: Any
 ) -> None:
     """``MemoryGarbageCollected``/``MemorySuperseded``/``MemoryQuarantined`` fire from retention
     and distill with NO user action. The first cut created a bucket for each, so an unattended
     sweep over a restarted daemon turned the honest ``UNOBSERVED`` into a confident ``(0,0,0)`` —
     the claim *"this user has nothing"* — for a user whose stores are full. Published here on the
     container's REAL bus, not a hand-built cache."""
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     container = LocalContainer(StorageSettings(), settings=settings, lifecycle=_lifecycle())
     ns = _ns(uid, "u1")
     try:
@@ -489,7 +467,7 @@ async def test_an_unattended_removal_sweep_never_flips_a_restarted_process_off_u
         )
         assert container.tier_counts.tracked_prefixes == 0
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await container.close()
 
 

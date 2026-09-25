@@ -176,18 +176,34 @@ def engine_server_token() -> str:
 @pytest.fixture(scope="session")
 def engine_up() -> None:
     """Verifies (never brings up) the `make up` precondition — a real `GET /health` against the
-    real container, fails loud with the exact remediation command if unreachable."""
+    real container.
+
+    SKIPS (never fails) when the stack is absent, AD-297: `vm_test.sh mu-core` — the sanctioned
+    runner (root `CLAUDE.md` rule 13) — never provisions the `make up` stack this tier needs, and
+    that precondition being unmet is routine there (last measured 2026-09-25), not a signal about
+    this tree. A `pytest.fail` here makes an UNCONFIGURED dependency indistinguishable from a REAL
+    regression: both non-zero-exit `vm_test.sh`, so CI cannot gate on this tier and a genuine
+    Stage-F break hides in 14 lines of standing noise. `pytest.skip` is the sanctioned BLOCKED
+    pattern this repo already uses for exactly this shape (DEV-STANDARDS "if a real dependency
+    isn't up... the test is BLOCKED (reported), never faked" — see e.g.
+    `mu-local/tests/test_lifecycle_gate_int.py`'s own `pytest.skip(f"BLOCKED — ...")` calls): loud
+    in the report (a SKIPPED line naming the exact remediation, not silence) without corrupting
+    the exit code a real failure needs. Provisioning the stack in the harness instead was
+    considered and deliberately NOT done here — `make up`'s `docker compose up -d --build` has
+    previously consumed 21 GB and dropped the VM's SSH session (root `CLAUDE.md` rule 14); AD-297
+    records this as the remaining option if the tier's absence needs to become fail-loud again."""
     try:
         response = httpx.get(f"{ENGINE_BASE_URL}/health", timeout=5.0)
     except httpx.TransportError as exc:
-        pytest.fail(
-            f"Stage F precondition not met: {ENGINE_BASE_URL}/health unreachable ({exc!r}). Run "
-            f"`make up` from {ENGINE_SERVER_PACKAGE_DIR} before this suite."
+        pytest.skip(
+            f"BLOCKED — Stage F stack not provisioned: {ENGINE_BASE_URL}/health unreachable "
+            f"({exc!r}). Run `make up` from {ENGINE_SERVER_PACKAGE_DIR} to exercise this tier "
+            "(AD-297)."
         )
     if response.status_code != 200:
-        pytest.fail(
-            f"Stage F precondition not met: {ENGINE_BASE_URL}/health returned "
-            f"{response.status_code} ({response.text}) — the stack is up but not healthy."
+        pytest.skip(
+            f"BLOCKED — Stage F stack not healthy: {ENGINE_BASE_URL}/health returned "
+            f"{response.status_code} ({response.text}) (AD-297)."
         )
 
 

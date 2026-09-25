@@ -28,14 +28,12 @@ actually reads it from the environment.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import uuid
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
-from falkordb.asyncio import FalkorDB
-from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
@@ -79,29 +77,11 @@ def _clean_engine_settings_env() -> Iterator[None]:
     get_engine_settings.cache_clear()
 
 
-async def _teardown_stores(settings: Settings, uid: str) -> None:
-    """Same drop-by-uid pattern as ``test_local_roundtrip_int.py``'s ``_teardown`` — real
-    Valkey/Qdrant/FalkorDB isolation by unique ``uid``-scoped workspace/namespace."""
-    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
-    finally:
-        await qdrant.close()
-
-    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
-    try:
-        for g in await db.list_graphs():
-            name = g.decode() if isinstance(g, bytes) else g
-            if uid in name:
-                with contextlib.suppress(Exception):
-                    await db.select_graph(name).delete()
-    finally:
-        with contextlib.suppress(Exception):
-            await db.connection.aclose()
-
+async def _teardown_redis(settings: Settings, uid: str) -> None:
+    """The Redis leg alone — Qdrant/FalkorDB teardown moved to the shared `tenant_store_cleanup`
+    root-conftest fixture (AD-295): both are keyed on a digest, not the `uid` substring, so a
+    per-file hand-rolled sweep here never matched. Redis keys ARE addressed by the raw namespace,
+    so this leg was already correct and stays local."""
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
         keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]
@@ -151,12 +131,16 @@ async def _seed_and_recall(settings: Settings, uid: str) -> list[str]:
         await mem.aclose()
 
 
-async def test_recall_weight_mtm_override_changes_result_membership(settings: Settings) -> None:
+async def test_recall_weight_mtm_override_changes_result_membership(
+    settings: Settings, tenant_store_cleanup: Any
+) -> None:
     """The composed-behavior proof C1 requires: `MU_RECALL__WEIGHT_MTM` actually reaches
     `ThreeChannelRecallRanker`/`ReciprocalRankFusion.fuse` through `LocalContainer` ->
     `RecallService`, not a bare `RecallSettings()`."""
     uid_default = uuid.uuid4().hex[:10]
     uid_zeroed = uuid.uuid4().hex[:10]
+    tenant_store_cleanup.register(org=f"org{uid_default}", workspace=f"ws{uid_default}")
+    tenant_store_cleanup.register(org=f"org{uid_zeroed}", workspace=f"ws{uid_zeroed}")
     try:
         # STALE-PREMISE FIX. This test's whole design is "`_TARGET` has exactly ONE edge — its
         # rank-1 MTM relevance — so zeroing `weight_mtm` must drop it." That premise silently
@@ -199,16 +183,19 @@ async def test_recall_weight_mtm_override_changes_result_membership(settings: Se
             f"relevance-only fact is still present: {override_contents!r}"
         )
     finally:
-        await _teardown_stores(settings, uid_default)
-        await _teardown_stores(settings, uid_zeroed)
+        await _teardown_redis(settings, uid_default)
+        await _teardown_redis(settings, uid_zeroed)
 
 
-async def test_ingest_importance_promote_override_changes_promotion(settings: Settings) -> None:
+async def test_ingest_importance_promote_override_changes_promotion(
+    settings: Settings, tenant_store_cleanup: Any
+) -> None:
     """The composed-behavior proof C1 requires for the OTHER Group-A knob: `MU_INGEST__
     IMPORTANCE_PROMOTE` actually reaches `DeterministicPromoteStage` through `LocalContainer` ->
     `IngestService`, which previously received NO `settings=` at all (bare `IngestSettings()`
     fallback, `services/ingest.py:96`)."""
     uid = uuid.uuid4().hex[:10]
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     ns = Namespace(
         org=f"org{uid}",
         workspace=f"ws{uid}",
@@ -266,4 +253,4 @@ async def test_ingest_importance_promote_override_changes_promotion(settings: Se
             f"got {override_result.tiers_written!r}"
         )
     finally:
-        await _teardown_stores(settings, uid)
+        await _teardown_redis(settings, uid)

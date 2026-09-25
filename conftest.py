@@ -28,6 +28,11 @@ cannot have it. Nothing about test SEMANTICS changes — the only cost is recomp
 from __future__ import annotations
 
 import sys
+from collections.abc import AsyncIterator
+from typing import Any
+
+import pytest
+import pytest_asyncio
 
 sys.dont_write_bytecode = True
 
@@ -72,3 +77,127 @@ def pytest_cmdline_main(config: object) -> int | None:
 
 
 # --- END VM-ONLY TEST GUARD ---
+
+
+# --- BEGIN SHARED INTEGRATION STORE TEARDOWN (AD-295) ---
+#
+# AD-295 (2026-09-25): 15 integration files across mu-engine and mu-local hand-rolled a
+# `_teardown(settings, uid)` that swept Qdrant collections (and, it turns out, FalkorDB graphs —
+# see below) with `if uid in coll.name`. Both physical names are keyed on
+# `tenant_partition_digest(org, workspace)`, a SHA-256 digest
+# (`mu_engine.storage.mappers.tenancy`) — `mu_mtm__{digest}__{visibility}__{dim}` for Qdrant
+# (`qdrant_mapper.collection_name`, AD-1/AD-2) and `mu_g__{digest}__shared` /
+# `mu_g__{digest}__u_{user}` for FalkorDB (`falkor_ltm.py::graph_name_for`, AD-8). A digest never
+# contains the random `uid` substring the test built its org/workspace from, so `uid in name`
+# NEVER matched, in ANY of the 15 files — confirmed live: 293 accumulated Qdrant collections
+# (924 MB) eventually took the store down with a `RocksDB IO error`, reported as 50 unrelated-
+# looking product-test failures.
+#
+# Two files (`test_ad266_stat_fields_on_real_stores_int.py`,
+# `test_ad267_credential_guard_live_path_int.py`) were hand-fixed for the Qdrant half only, by
+# computing `collection_name(ns, 0).removesuffix("0")` as a delete-prefix. That is the CORRECT
+# formula but was re-typed per file — exactly the copy-paste that produced the original bug. This
+# fixture is the single shared home for it, for BOTH stores, so a new integration file calls
+# `register(org, workspace)` once and cannot forget the rest, and an existing file can delete its
+# own copy instead of re-typing it a 16th time.
+#
+# NOTE — a second, previously unreported instance of the SAME bug: every one of the 15 files'
+# FalkorDB teardown ALSO reads `if uid in name`, and `graph_name_for` has been digest-keyed since
+# AD-8 (2026-08-27) — so FalkorDB graphs from these tests have never been deleted either. It has
+# not (yet) produced a visible failure the way Qdrant did, but it is the identical defect and is
+# fixed here too rather than left for a future AD-295.
+@pytest.fixture
+def uid() -> str:
+    """Per-test random id used to build an isolated (org, workspace) tenant. Kept as ONE canonical
+    definition — most of the 15 files below redefined this identically."""
+    import uuid as _uuid
+
+    return _uuid.uuid4().hex[:12]
+
+
+class TenantRegistry:
+    """Handed to a test by the `tenant_store_cleanup` fixture; `register` each tenant it creates."""
+
+    def __init__(self) -> None:
+        self._pairs: list[tuple[str, str]] = []
+
+    def register(self, *, org: str, workspace: str) -> None:
+        self._pairs.append((org, workspace))
+
+    def pairs(self) -> list[tuple[str, str]]:
+        return list(self._pairs)
+
+
+@pytest_asyncio.fixture
+async def tenant_store_cleanup(settings: Any) -> AsyncIterator[TenantRegistry]:
+    """Register every (org, workspace) tenant an integration test creates; on teardown, delete the
+    REAL Qdrant collections and FalkorDB graphs those tenants own, by their DIGEST-based physical
+    name (see module note above) rather than by a `uid` substring, which can never match.
+
+    Usage — replaces a file's own `_teardown`/`_teardown_stores` helper and its `finally: await
+    _teardown(...)` call:
+
+        async def mem(settings, uid, tenant_store_cleanup):
+            tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
+            memory = LocalMemory(workspace=f"ws{uid}", namespace=f"org{uid}", settings=settings)
+            try:
+                yield memory
+            finally:
+                await memory.aclose()
+            # no manual store teardown — this fixture's own finalizer runs after `mem`'s and
+            # sweeps every (org, workspace) pair registered above.
+
+    A test with more than one tenant (e.g. an `env_uid` variant) calls `register` once per pair.
+    """
+    import contextlib
+
+    from mu_contracts.domain.model.memory import Namespace, Visibility
+    from mu_engine.storage.mappers.tenancy import tenant_partition_digest
+
+    registry = TenantRegistry()
+    yield registry
+
+    pairs = registry.pairs()
+    if not pairs:
+        return
+
+    mtm_prefixes: set[str] = set()
+    graph_digests: set[str] = set()
+    for org, workspace in pairs:
+        probe_ns = Namespace(
+            org=org, workspace=workspace, user="_", session="_", visibility=Visibility.PRIVATE
+        )
+        digest = tenant_partition_digest(probe_ns)
+        # visibility/dim vary per write; the digest is the whole tenant partition, so a prefix on
+        # `mu_mtm__{digest}__` (no visibility/dim suffix) catches every collection this tenant owns.
+        mtm_prefixes.add(f"mu_mtm__{digest}__")
+        graph_digests.add(digest)
+
+    with contextlib.suppress(Exception):
+        from qdrant_client import AsyncQdrantClient
+
+        qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
+        try:
+            for coll in (await qdrant.get_collections()).collections:
+                if any(coll.name.startswith(p) for p in mtm_prefixes):
+                    with contextlib.suppress(Exception):
+                        await qdrant.delete_collection(coll.name)
+        finally:
+            await qdrant.close()
+
+    with contextlib.suppress(Exception):
+        from falkordb.asyncio import FalkorDB
+
+        db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
+        try:
+            for g in await db.list_graphs():
+                name = g.decode() if isinstance(g, bytes) else g
+                if any(d in name for d in graph_digests):
+                    with contextlib.suppress(Exception):
+                        await db.select_graph(name).delete()
+        finally:
+            with contextlib.suppress(Exception):
+                await db.connection.aclose()
+
+
+# --- END SHARED INTEGRATION STORE TEARDOWN (AD-295) ---

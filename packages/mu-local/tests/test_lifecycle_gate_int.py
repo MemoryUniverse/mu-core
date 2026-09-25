@@ -26,13 +26,11 @@ pass.
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
-from falkordb.asyncio import FalkorDB
-from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
@@ -51,29 +49,11 @@ _USER = "u1"
 _SESSION = "s1"
 
 
-async def _teardown(settings: Settings, uid: str) -> None:
-    """Same isolation-teardown convention as ``test_local_roundtrip_int.py``: drop every
-    qdrant collection / falkordb graph / redis key this run's unique ``uid`` created."""
-    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
-    finally:
-        await qdrant.close()
-
-    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
-    try:
-        for g in await db.list_graphs():
-            name = g.decode() if isinstance(g, bytes) else g
-            if uid in name:
-                with contextlib.suppress(Exception):
-                    await db.select_graph(name).delete()
-    finally:
-        with contextlib.suppress(Exception):
-            await db.connection.aclose()
-
+async def _teardown_redis(settings: Settings, uid: str) -> None:
+    """The Redis leg alone — Qdrant/FalkorDB teardown moved to the shared `tenant_store_cleanup`
+    root-conftest fixture (AD-295): both are keyed on a digest, not the `uid` substring, so a
+    per-file hand-rolled sweep here never matched. Redis keys ARE addressed by the raw namespace,
+    so this leg was already correct and stays local."""
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
         keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]
@@ -96,9 +76,12 @@ def _manual_lifecycle() -> LifecycleSettings:
 
 
 @pytest_asyncio.fixture
-async def managed_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def managed_mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
     """A LocalMemory whose namespace resolves to MANAGED — the manual ``consolidate()`` verb must
     be refused loud (ADR 0031)."""
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     memory = LocalMemory(
         workspace=f"ws{uid}",
         namespace=f"org{uid}",
@@ -108,14 +91,17 @@ async def managed_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory
     try:
         yield memory
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
 
 @pytest_asyncio.fixture
-async def manual_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def manual_mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
     """A LocalMemory whose namespace resolves to MANUAL (the mu-local composition-root default,
     ``composition.py`` §7b — no daemon exists yet to run an auto sweep in MANAGED's place)."""
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     memory = LocalMemory(
         workspace=f"ws{uid}",
         namespace=f"org{uid}",
@@ -125,7 +111,7 @@ async def manual_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]
     try:
         yield memory
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
 
@@ -170,18 +156,21 @@ async def test_manual_mode_consolidate_still_works(manual_mem: LocalMemory) -> N
     assert report.added >= 2
 
 
-async def test_default_container_mode_is_manual_not_managed(settings: Settings, uid: str) -> None:
+async def test_default_container_mode_is_manual_not_managed(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> None:
     """Composition-root default check: a bare ``LocalMemory()`` (no ``lifecycle=`` override) must
     stay MANUAL — mu-local ships no auto sweep in this Stage, so a bare ``ManagerModeSettings()``
     MANAGED default would silently break every daemonless ``consolidate()`` caller
     (``composition.py``'s (7b) narrowing note)."""
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     memory = LocalMemory(workspace=f"ws{uid}", namespace=f"org{uid}", settings=settings)
     try:
         await memory.add("Ada lives in Paris", user=_USER, session=_SESSION)
         report = await memory.consolidate(user=_USER, session=_SESSION)  # must NOT raise
         assert report.facts_extracted >= 1
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
 
@@ -237,7 +226,7 @@ async def test_build_lifecycle_manager_shares_the_same_distill_pipeline(
 
 
 async def test_build_lifecycle_manager_get_state_matches_real_store_counts(
-    settings: Settings, uid: str
+    settings: Settings, uid: str, tenant_store_cleanup: Any
 ) -> None:
     """S1-05 acceptance item 4: real container, real data, real ``get_state()`` — stm/mtm/ltm
     counts on the returned ``LifecycleStateView`` must match what actually landed in redis/qdrant/
@@ -273,6 +262,7 @@ async def test_build_lifecycle_manager_get_state_matches_real_store_counts(
     non-zero counts, equality against raw redis/qdrant/falkordb clients, a second real user proving
     η, the restart case, an unattended-sweep case and a pinned known-divergence case. This one is
     left as the S1-05 acceptance item it always was."""
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     container = LocalContainer(StorageSettings(), settings=settings, lifecycle=_manual_lifecycle())
     try:
         try:
@@ -313,5 +303,5 @@ async def test_build_lifecycle_manager_get_state_matches_real_store_counts(
         assert state.counts_basis is CountsBasis.EVENT_DELTA
         assert state.counts_observed_since is not None
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await container.close()

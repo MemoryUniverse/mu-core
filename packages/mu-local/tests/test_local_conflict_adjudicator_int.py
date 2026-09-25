@@ -17,14 +17,12 @@ verbatim (same composition root, same env-probed guard).
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import pytest_asyncio
-from falkordb.asyncio import FalkorDB
-from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
@@ -43,27 +41,11 @@ _SESSION = "s1"
 pytestmark = pytest.mark.integration
 
 
-async def _teardown(settings: Settings, uid: str) -> None:
-    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
-    finally:
-        await qdrant.close()
-
-    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
-    try:
-        for g in await db.list_graphs():
-            name = g.decode() if isinstance(g, bytes) else g
-            if uid in name:
-                with contextlib.suppress(Exception):
-                    await db.select_graph(name).delete()
-    finally:
-        with contextlib.suppress(Exception):
-            await db.connection.aclose()
-
+async def _teardown_redis(settings: Settings, uid: str) -> None:
+    """The Redis leg alone — Qdrant/FalkorDB teardown moved to the shared `tenant_store_cleanup`
+    root-conftest fixture (AD-295): both are keyed on a digest, not the `uid` substring, so a
+    per-file hand-rolled sweep here never matched. Redis keys ARE addressed by the raw namespace,
+    so this leg was already correct and stays local."""
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
         keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]
@@ -74,7 +56,10 @@ async def _teardown(settings: Settings, uid: str) -> None:
 
 
 @pytest_asyncio.fixture
-async def slm_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def slm_mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
+    tenant_store_cleanup.register(org=f"orgconf{uid}", workspace=f"wsconf{uid}")
     profile = ModelProfileSettings(
         base_url=_SLM_CFG.base_url,
         model=_SLM_CFG.model,
@@ -90,17 +75,20 @@ async def slm_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
     try:
         yield memory
     finally:
-        await _teardown(settings, f"conf{uid}")
+        await _teardown_redis(settings, f"conf{uid}")
         await memory.aclose()
 
 
 @pytest_asyncio.fixture
-async def heuristic_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def heuristic_mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
+    tenant_store_cleanup.register(org=f"orghconf{uid}", workspace=f"wshconf{uid}")
     memory = LocalMemory(workspace=f"wshconf{uid}", namespace=f"orghconf{uid}", settings=settings)
     try:
         yield memory
     finally:
-        await _teardown(settings, f"hconf{uid}")
+        await _teardown_redis(settings, f"hconf{uid}")
         await memory.aclose()
 
 

@@ -57,8 +57,6 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
-from falkordb.asyncio import FalkorDB
-from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from structlog.testing import capture_logs
 
@@ -79,7 +77,6 @@ from mu_engine.platform.observability import (
     build_tracer,
 )
 from mu_engine.storage.domain.namespace import Namespace, Visibility
-from mu_engine.storage.mappers.qdrant_mapper import collection_name
 from mu_engine.storage.mappers.redis_mapper import RedisMapper
 from mu_local import LocalMemory
 
@@ -264,12 +261,15 @@ def tap(monkeypatch: pytest.MonkeyPatch) -> _Recorded:
 
 
 @pytest_asyncio.fixture
-async def mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     memory = LocalMemory(workspace=f"ws{uid}", namespace=f"org{uid}", settings=settings)
     try:
         yield memory
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
 
@@ -283,33 +283,11 @@ def _ns(uid: str) -> Namespace:
     )
 
 
-async def _teardown(settings: Settings, uid: str) -> None:
-    # The MTM collection name is `mu_mtm__{digest(org, workspace)}__{visibility}__{dim}` — a
-    # DIGEST, so the `uid in coll.name` match every other integration file in this repo uses
-    # NEVER FIRES and every run leaks its collections (AD-295: 293 live collections took Qdrant
-    # down with a RocksDB IO error mid-suite on 2026-09-25). Delete by this η's own digest prefix
-    # instead; the partition is unique to this test because org/workspace carry `uid`.
-    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    try:
-        prefix = collection_name(_ns(uid), 0).removesuffix("0")
-        for coll in (await qdrant.get_collections()).collections:
-            if coll.name.startswith(prefix) or uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
-    finally:
-        await qdrant.close()
-
-    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
-    try:
-        for g in await db.list_graphs():
-            name = g.decode() if isinstance(g, bytes) else g
-            if uid in name:
-                with contextlib.suppress(Exception):
-                    await db.select_graph(name).delete()
-    finally:
-        with contextlib.suppress(Exception):
-            await db.connection.aclose()
-
+async def _teardown_redis(settings: Settings, uid: str) -> None:
+    """The Redis leg alone — Qdrant/FalkorDB teardown moved to the shared `tenant_store_cleanup`
+    root-conftest fixture (AD-295): both are keyed on a digest, not the `uid` substring, so a
+    per-file hand-rolled sweep here never matched. Redis keys ARE addressed by the raw namespace,
+    so this leg was already correct and stays local."""
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
         keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]
@@ -326,9 +304,10 @@ def _captured_logs() -> Iterator[list[MutableMapping[str, Any]]]:
 
 
 async def test_a_credential_bearing_capture_reaches_no_observability_sink(
-    tap: _Recorded, settings: Settings, uid: str
+    tap: _Recorded, settings: Settings, uid: str, tenant_store_cleanup: Any
 ) -> None:
     """Q1 — the real verbs, over real stores, with a real credential-bearing turn."""
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     memory = LocalMemory(workspace=f"ws{uid}", namespace=f"org{uid}", settings=settings)
     try:
         with _captured_logs() as logs:
@@ -339,7 +318,7 @@ async def test_a_credential_bearing_capture_reaches_no_observability_sink(
             await memory.recall("what was the api key?", user=_USER, session=_SESSION)
             await memory.consolidate(user=_USER, session=_SESSION)
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
     assert tap.rows, (

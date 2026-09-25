@@ -28,13 +28,11 @@ isolates the fix under test to the promote stage's η-scoping rather than incide
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
-from falkordb.asyncio import FalkorDB
-from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
@@ -55,39 +53,24 @@ _OBJECT = "2027-01-01"
 
 
 @pytest_asyncio.fixture
-async def mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
     """A LocalMemory bound to a unique workspace/org so its η partition is isolated from other
-    concurrent test runs; teardown drops every qdrant collection / falkordb graph / redis key the
-    run created (identical discipline to ``test_local_roundtrip_int.py``)."""
+    concurrent test runs; teardown drops every qdrant collection / falkordb graph (shared
+    `tenant_store_cleanup` fixture, AD-295) / redis key the run created."""
+    tenant_store_cleanup.register(org=f"orgns{uid}", workspace=f"wsns{uid}")
     memory = LocalMemory(workspace=f"wsns{uid}", namespace=f"orgns{uid}", settings=settings)
     try:
         yield memory
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
 
-async def _teardown(settings: Settings, uid: str) -> None:
-    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
-    finally:
-        await qdrant.close()
-
-    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
-    try:
-        for g in await db.list_graphs():
-            name = g.decode() if isinstance(g, bytes) else g
-            if uid in name:
-                with contextlib.suppress(Exception):
-                    await db.select_graph(name).delete()
-    finally:
-        with contextlib.suppress(Exception):
-            await db.connection.aclose()
-
+async def _teardown_redis(settings: Settings, uid: str) -> None:
+    """The Redis leg alone — Qdrant/FalkorDB teardown moved to the shared `tenant_store_cleanup`
+    root-conftest fixture (AD-295): both are keyed on a digest, not the `uid` substring."""
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
         keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]

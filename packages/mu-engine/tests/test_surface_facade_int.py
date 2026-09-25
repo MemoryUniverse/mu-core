@@ -30,7 +30,6 @@ test_local_roundtrip_int.py``).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
@@ -39,8 +38,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
-from falkordb.asyncio import FalkorDB
-from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
@@ -545,43 +542,27 @@ async def container(settings: Settings) -> AsyncIterator[LocalContainer]:
 
 
 @pytest_asyncio.fixture
-async def mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
     """A LocalMemory bound to the SAME (workspace, org) the ``container``-backed facade under
     test uses (module-level ``_WORKSPACE``/``_ORG``, tagged with ``uid`` so parallel test runs
     don't collide) — the shared η partition proving the parity claim above."""
+    tenant_store_cleanup.register(org=f"{_ORG}{uid}", workspace=f"{_WORKSPACE}{uid}")
     memory = LocalMemory(
         workspace=f"{_WORKSPACE}{uid}", namespace=f"{_ORG}{uid}", settings=settings
     )
     try:
         yield memory
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
 
-async def _teardown(settings: Settings, uid: str) -> None:
-    """PORT of ``mu-local/tests/test_local_roundtrip_int.py``'s ``_teardown`` (duplicated, not
-    imported — test-tree-local helper in a package this test file has no import access to)."""
-    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
-    finally:
-        await qdrant.close()
-
-    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
-    try:
-        for g in await db.list_graphs():
-            name = g.decode() if isinstance(g, bytes) else g
-            if uid in name:
-                with contextlib.suppress(Exception):
-                    await db.select_graph(name).delete()
-    finally:
-        with contextlib.suppress(Exception):
-            await db.connection.aclose()
-
+async def _teardown_redis(settings: Settings, uid: str) -> None:
+    """The Redis leg alone — Qdrant/FalkorDB teardown moved to the shared `tenant_store_cleanup`
+    root-conftest fixture (AD-295): both are keyed on a digest, not the `uid` substring, so this
+    file's OWN prior port of the sibling `_teardown` never matched either."""
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
         keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]
@@ -650,7 +631,7 @@ async def test_facade_write_is_readable_through_local_memory(
 
 @pytest.mark.integration
 async def test_facade_add_assigns_turn_seq_via_the_centralised_ingest_fallback(
-    container: LocalContainer, uid: str
+    container: LocalContainer, uid: str, tenant_store_cleanup: Any
 ) -> None:
     """AD-234 blocker 2 (TRACE-0923.md §7/§6.2): ``SurfaceFacade.add`` was one of the two ingest
     paths that left ``MemoryItem.turn_seq`` permanently ``None`` — it never assigned one itself
@@ -663,6 +644,7 @@ async def test_facade_add_assigns_turn_seq_via_the_centralised_ingest_fallback(
     ``turn_seq`` is engine-internal (not on the wire-versioned ``MemoryResponse`` — this facade's
     own ``get()`` docstring), so this reaches into ``container.stm`` directly, the same way that
     mu-local test reaches into ``memory._container.stm``."""
+    tenant_store_cleanup.register(org=f"{_ORG}{uid}", workspace=f"{_WORKSPACE}{uid}")
     ns = Namespace(
         org=f"{_ORG}{uid}",
         workspace=f"{_WORKSPACE}{uid}",

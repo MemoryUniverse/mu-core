@@ -38,17 +38,15 @@ nothing and proves the model path actually produces a profile and a non-empty br
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import pytest_asyncio
-from falkordb.asyncio import FalkorDB
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
 from mu_contracts.config import Settings
@@ -127,8 +125,11 @@ _SLM_REASON = (
 
 
 @pytest_asyncio.fixture
-async def persona_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def persona_mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
     """A `LocalMemory` whose `LocalContainer` composes persona — i.e. one with a model profile."""
+    tenant_store_cleanup.register(org=f"orgp{uid}", workspace=f"wsp{uid}")
     profile = ModelProfileSettings(
         base_url=_SLM_CFG.base_url,
         model=_SLM_CFG.model,
@@ -144,43 +145,27 @@ async def persona_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory
     try:
         yield memory
     finally:
-        await _teardown(settings, f"p{uid}")
+        await _teardown_redis(settings, f"p{uid}")
         await memory.aclose()
 
 
 @pytest_asyncio.fixture
-async def modelless_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def modelless_mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
     """The zero-model default — the ABSENCE half of the composition rule."""
+    tenant_store_cleanup.register(org=f"orgn{uid}", workspace=f"wsn{uid}")
     memory = LocalMemory(workspace=f"wsn{uid}", namespace=f"orgn{uid}", settings=settings)
     try:
         yield memory
     finally:
-        await _teardown(settings, f"n{uid}")
+        await _teardown_redis(settings, f"n{uid}")
         await memory.aclose()
 
 
-async def _teardown(settings: Settings, uid: str) -> None:
-    """Drop every qdrant collection / falkordb graph / redis key this run created (rule 14)."""
-    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
-    finally:
-        await qdrant.close()
-
-    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
-    try:
-        for g in await db.list_graphs():
-            name = g.decode() if isinstance(g, bytes) else g
-            if uid in name:
-                with contextlib.suppress(Exception):
-                    await db.select_graph(name).delete()
-    finally:
-        with contextlib.suppress(Exception):
-            await db.connection.aclose()
-
+async def _teardown_redis(settings: Settings, uid: str) -> None:
+    """The Redis leg alone — Qdrant/FalkorDB teardown moved to the shared `tenant_store_cleanup`
+    root-conftest fixture (AD-295): both are keyed on a digest, not the `uid` substring."""
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
         keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]

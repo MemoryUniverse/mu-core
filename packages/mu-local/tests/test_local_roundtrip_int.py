@@ -20,13 +20,12 @@ If a container is down the test RAISES (BLOCKED, never faked).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 
 import pytest
 import pytest_asyncio
-from falkordb.asyncio import FalkorDB
 from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 
@@ -49,38 +48,24 @@ _SESSION = "s1"
 
 
 @pytest_asyncio.fixture
-async def mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
     """A LocalMemory bound to a unique workspace/org so its η partition is isolated; teardown drops
-    every qdrant collection / falkordb graph / redis key the run created."""
+    every qdrant collection / falkordb graph (via the shared `tenant_store_cleanup` fixture, AD-295
+    — digest-keyed, not `uid`-substring-keyed) / redis key the run created."""
+    tenant_store_cleanup.register(org=f"org{uid}", workspace=f"ws{uid}")
     memory = LocalMemory(workspace=f"ws{uid}", namespace=f"org{uid}", settings=settings)
     try:
         yield memory
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
 
-async def _teardown(settings: Settings, uid: str) -> None:
-    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
-    try:
-        for coll in (await qdrant.get_collections()).collections:
-            if uid in coll.name:
-                with contextlib.suppress(Exception):
-                    await qdrant.delete_collection(coll.name)
-    finally:
-        await qdrant.close()
-
-    db = FalkorDB(host=settings.storage.graph.host, port=settings.storage.graph.port)
-    try:
-        for g in await db.list_graphs():
-            name = g.decode() if isinstance(g, bytes) else g
-            if uid in name:
-                with contextlib.suppress(Exception):
-                    await db.select_graph(name).delete()
-    finally:
-        with contextlib.suppress(Exception):
-            await db.connection.aclose()
-
+async def _teardown_redis(settings: Settings, uid: str) -> None:
+    """The Redis leg alone: keys are addressed by the raw namespace, so a `uid` substring match
+    (unlike Qdrant/FalkorDB's digest-keyed names) actually works — AD-295 left this leg as is."""
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
         keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]
@@ -189,7 +174,7 @@ async def test_add_gates_promotion_on_importance_not_unconditionally(mem: LocalM
 
 
 async def test_add_importance_promote_threshold_is_env_overridable(
-    settings: Settings, uid: str
+    settings: Settings, uid: str, tenant_store_cleanup: Any
 ) -> None:
     """``MU_INGEST__IMPORTANCE_PROMOTE`` (Rank 1's env-wired ``EngineSettings.ingest``, threaded
     into ``IngestService``/``DeterministicPromoteStage`` by ``mu_local.composition.LocalContainer``
@@ -199,6 +184,7 @@ async def test_add_importance_promote_threshold_is_env_overridable(
     get_engine_settings.cache_clear()
     os.environ["MU_INGEST__IMPORTANCE_PROMOTE"] = "0.2"
     env_uid = f"{uid}env"
+    tenant_store_cleanup.register(org=f"org{env_uid}", workspace=f"ws{env_uid}")
     try:
         memory = LocalMemory(workspace=f"ws{env_uid}", namespace=f"org{env_uid}", settings=settings)
         try:
@@ -215,7 +201,7 @@ async def test_add_importance_promote_threshold_is_env_overridable(
     finally:
         del os.environ["MU_INGEST__IMPORTANCE_PROMOTE"]
         get_engine_settings.cache_clear()
-        await _teardown(settings, env_uid)
+        await _teardown_redis(settings, env_uid)
 
 
 async def test_add_returns_canonical_receipt_with_namespace_and_events(
