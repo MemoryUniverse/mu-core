@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from mu_engine.platform.observability import CredentialPolicy
+
 __all__ = ["IngestSettings"]
 
 
@@ -34,3 +36,13 @@ class IngestSettings(BaseModel, frozen=True):
     # override: ``MU_INGEST__STM_DEDUP=false`` reverts to the old always-fork-a-new-entry
     # behavior (DEV-STANDARDS rule 3 — a toggle, never a silent unconditional change).
     stm_dedup: bool = Field(default=True)
+
+    # AD-294 — the owner's policy for a credential a user dictates into captured text, applied
+    # once, centrally, in `IngestService.remember` (the one method every ingest path in this tree
+    # already funnels through — `LocalMemory.add`, `SurfaceFacade.add`, mu-server's
+    # `SharedMemoryService.add` alike, same precedent as this class's own `_ensure_turn_seq`
+    # centralisation). Reuses the AD-267 credential-shape catalog (`platform/observability.py`),
+    # never a second matcher. Default REDACT — the sane default per AD-294: a user saying "my key
+    # is X, remember I use Anthropic" keeps the useful half. Env: `MU_INGEST__CREDENTIAL_POLICY`
+    # (`redact` | `refuse` | `mark`).
+    credential_policy: CredentialPolicy = Field(default=CredentialPolicy.REDACT)

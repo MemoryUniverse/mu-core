@@ -27,20 +27,32 @@ questions by running:
 3. **Does the refusal itself leak?** Inverting rule 3 by naming the rejected value in the error is
    the classic own-goal of a redaction guard. The raised message and everything structlog emits
    during the refusal are scanned for the value and for any 12-character fragment of it.
-4. **Where does the credential legitimately still go?** It is stored as memory CONTENT, in the
-   clear, in Valkey. That is not a regression and not an oversight: ``S1-local-daemon-host-
-   integration-design.md:1338`` defers it explicitly — *"a redaction pass on ``RawActivity.text``
-   before ``remember`` is a follow-up"*. The current behaviour is asserted here so the follow-up
-   flips a RED test rather than quietly changing an unobserved one, and so nobody reads ADR 0071
-   as meaning MU refuses to store a secret.
+4. **Where does the credential end up in the CAPTURE half — AD-294, this lane, FLIPPED here.**
+   Until now it was stored as memory CONTENT, in the clear, in Valkey: not a regression, an
+   explicitly deferred boundary (``S1-local-daemon-host-integration-design.md:1338``, "a
+   redaction pass on ``RawActivity.text`` before ``remember`` is a follow-up"). AD-294 IS that
+   follow-up. ``test_the_credential_is_redacted_from_stored_memory_content_by_default`` now
+   asserts the opposite of what it asserted before (renamed from
+   ``test_the_credential_is_still_stored_as_memory_content`` — this file's own history is the
+   record of the flip); ``test_refuse_policy_drops_the_credential_bearing_turn`` and
+   ``test_mark_policy_stores_verbatim_and_flags_the_memory`` cover the other two legs of the
+   owner's three-way ``CredentialPolicy`` choice (``services/settings.py::IngestSettings.
+   credential_policy``, default ``REDACT``).
 
-MUTATION CHECK (run, red, restored — captured in ADR 0077 §1):
+MUTATION CHECK (run, red, restored — captured in ADR 0077 §1, extended for AD-294 in ADR 0078):
   * ``observability.py::sanitize_label_value``: delete the ``_credential_shape_match`` arm ->
     ``test_the_live_sinks_...`` goes red on the ``note``-keyed value for all three sinks.
   * ``sanitize_labels``: delete the ``_credential_shaped_key`` arm -> the same test goes red on the
     ``api_key``-keyed leg.
   * make the refusal message include the value -> ``test_the_refusal_never_repeats_the_value``
     goes red; nothing else moves.
+  * ``services/ingest.py::IngestService.remember``: delete the
+    ``self._apply_credential_policy(activity)`` call -> Q4 goes red (the credential is back in the
+    raw Valkey blob, unredacted, unflagged) and ``test_mark_policy_...``/
+    ``test_refuse_policy_...`` go red too (the policy is never consulted at all).
+  * ``platform/observability.py::redact_credentials``: change the REFUSE arm to return instead of
+    raise -> ``test_refuse_policy_drops_the_credential_bearing_turn`` goes red (content lands in
+    Valkey after all).
 
 REAL ``mu-dev-cache`` + ``mu-dev-qdrant`` + ``mu-dev-falkordb``, ZERO mocks. Run on the VM (root
 ``CLAUDE.md`` rule 13):
@@ -70,12 +82,16 @@ from mu_contracts.ports.observability import (
     TurnTraceEvent,
     TurnTraceScope,
 )
+from mu_engine.config import EngineSettings
 from mu_engine.platform.observability import (
+    CredentialInTextRejectedError,
+    CredentialPolicy,
     TraceScope,
     build_audit,
     build_metrics,
     build_tracer,
 )
+from mu_engine.services.settings import IngestSettings
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.mappers.redis_mapper import RedisMapper
 from mu_local import LocalMemory
@@ -273,6 +289,19 @@ async def mem(
         await memory.aclose()
 
 
+def _memory_with_policy(*, settings: Settings, uid: str, policy: CredentialPolicy) -> LocalMemory:
+    """AD-294 — a ``LocalMemory`` wired to a NON-default ``credential_policy``, via the
+    ``engine_settings`` injection seam (``LocalMemory.__init__``'s own docstring) rather than an
+    ``os.environ`` mutation + ``get_engine_settings.cache_clear()`` dance that would leak across
+    whatever else shares this test process."""
+    return LocalMemory(
+        workspace=f"ws{uid}",
+        namespace=f"org{uid}",
+        settings=settings,
+        engine_settings=EngineSettings(ingest=IngestSettings(credential_policy=policy)),
+    )
+
+
 def _ns(uid: str) -> Namespace:
     return Namespace(
         org=f"org{uid}",
@@ -370,25 +399,114 @@ async def test_the_refusal_never_repeats_the_value(mem: LocalMemory) -> None:
     )
 
 
-async def test_the_credential_is_still_stored_as_memory_content(
-    mem: LocalMemory, settings: Settings, uid: str
-) -> None:
-    """Q4 — the boundary of what AD-267 fixed, asserted rather than assumed.
-
-    ``S1-local-daemon-host-integration-design.md:1338`` defers capture-time redaction ("a redaction
-    pass on ``RawActivity.text`` before ``remember`` is a follow-up"). Until that lands, a secret a
-    user dictates IS remembered verbatim on the user's own device. This test exists so that fact is
-    a visible, deliberate contract: whoever implements the redaction pass will find this test red
-    and will have to decide, on purpose, that it should be."""
-    receipt = await mem.add(_CAPTURED_TURN, user=_USER, session=_SESSION, importance_score=0.9)
+async def _redis_row(settings: Settings, uid: str, memory_id: str) -> dict[str, Any]:
     redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
     try:
-        blob = await redis.get(RedisMapper.memory_key(_ns(uid), receipt.memory_id))
+        blob = await redis.get(RedisMapper.memory_key(_ns(uid), memory_id))
     finally:
         await redis.aclose()
     assert blob is not None
-    row = json.loads(blob)
-    assert _FAKE_ANTHROPIC in row["content"], (
-        "capture-time redaction appears to have landed — that is good news, and this test plus "
-        "S1-local-daemon-host-integration-design.md:1338 both need updating on purpose"
-    )
+    row: dict[str, Any] = json.loads(blob)
+    return row
+
+
+async def _qdrant_payload(settings: Settings, uid: str) -> list[dict[str, Any]]:
+    """Every point payload in this η's MTM collection (empty if nothing promoted)."""
+    qdrant = AsyncQdrantClient(url=settings.storage.vector.url)
+    try:
+        prefix = collection_name(_ns(uid), 0).removesuffix("0")
+        names = [
+            c.name
+            for c in (await qdrant.get_collections()).collections
+            if c.name.startswith(prefix)
+        ]
+        payloads: list[dict[str, Any]] = []
+        for name in names:
+            points, _ = await qdrant.scroll(name, limit=100, with_payload=True)
+            payloads.extend(p.payload or {} for p in points)
+        return payloads
+    finally:
+        await qdrant.close()
+
+
+async def test_the_credential_is_redacted_from_stored_memory_content_by_default(
+    mem: LocalMemory, settings: Settings, uid: str
+) -> None:
+    """Q4 (AD-294; was ``test_the_credential_is_still_stored_as_memory_content``, AD-267/ADR
+    0071's own DEFERRED boundary) — FLIPPED, on purpose, by this lane.
+
+    ``S1-local-daemon-host-integration-design.md:1338`` deferred capture-time redaction ("a
+    redaction pass on ``RawActivity.text`` before ``remember`` is a follow-up"); AD-294 is that
+    follow-up. ``mem`` (the ``mem`` fixture) carries NO explicit ``credential_policy`` — this
+    proves the DEFAULT is ``REDACT``, not merely that redaction exists when asked for.
+
+    Asserts all four places AD-294's task named: the raw Valkey blob (``content``), the raw Qdrant
+    MTM payload (already content-free by construction — ``qdrant_mapper.py`` never wrote
+    ``content``, only ``content_hash``; verified here as a regression guard, not a fix), and —
+    the POSITIVE half — that the surrounding, non-secret memory survives intact and legible."""
+    receipt = await mem.add(_CAPTURED_TURN, user=_USER, session=_SESSION, importance_score=0.9)
+
+    row = await _redis_row(settings, uid, receipt.memory_id)
+    _assert_clean(row["content"], where="the raw Valkey blob")
+    assert row["credential_shaped"] is True, "the row was matched but not flagged"
+    # The surrounding memory is the whole point of REDACT over REFUSE (AD-294): the non-secret
+    # half of the turn must still be there and still legible.
+    for surviving in ("github", "gitlab", "slack", "google", "database is at"):
+        assert surviving in row["content"], f"REDACT lost non-secret content: {surviving!r}"
+    assert (
+        "[REDACTED:anthropic_key]" in row["content"]
+    ), "a typed, content-free placeholder must replace the match — not a bare deletion"
+
+    # importance_score=0.9 >= IngestSettings.importance_promote (default 0.6): this ALSO promoted
+    # to MTM. Qdrant never stored raw content to begin with (content_hash only) — confirmed live,
+    # not assumed, so a future change that starts writing full text to the payload trips this.
+    payloads = await _qdrant_payload(settings, uid)
+    assert payloads, "importance 0.9 should have promoted to MTM — nothing to check is a bug"
+    _assert_clean(json.dumps(payloads, default=repr), where="the raw Qdrant payload")
+
+
+async def test_refuse_policy_drops_the_credential_bearing_turn(
+    settings: Settings, uid: str
+) -> None:
+    """AD-294 — ``CredentialPolicy.REFUSE``: the whole turn is dropped, loudly, before any store
+    write; the refusal itself must not repeat the value (rule 3, same discipline Q3 proves for the
+    observability guard)."""
+    memory = _memory_with_policy(settings=settings, uid=uid, policy=CredentialPolicy.REFUSE)
+    try:
+        with _captured_logs() as logs:
+            with pytest.raises(CredentialInTextRejectedError, match="anthropic_key") as excinfo:
+                await memory.add(_CAPTURED_TURN, user=_USER, session=_SESSION, importance_score=0.9)
+        _assert_clean(str(excinfo.value), where="the REFUSE exception message")
+        _assert_clean(json.dumps(logs, default=repr), where="a structlog row during REFUSE")
+    finally:
+        await _teardown(settings, uid)
+        await memory.aclose()
+
+    # Nothing this η wrote reached Valkey — REFUSE happens before WriteStmStage ever runs.
+    redis: Redis = Redis.from_url(settings.storage.cache.url, decode_responses=False)
+    try:
+        keys = [k async for k in redis.scan_iter(match=f"*{uid}*".encode())]
+    finally:
+        await redis.aclose()
+    assert keys == [], f"REFUSE should have written nothing; found {keys!r}"
+
+
+async def test_mark_policy_stores_verbatim_and_flags_the_memory(
+    settings: Settings, uid: str
+) -> None:
+    """AD-294 — ``CredentialPolicy.MARK``: the owner's third choice. Content is kept EXACTLY as
+    dictated (unlike REDACT) and the row is flagged ``credential_shaped=True`` (content-free —
+    the flag never carries the value) so it can be found/audited later, exactly as the policy's
+    own docstring promises."""
+    memory = _memory_with_policy(settings=settings, uid=uid, policy=CredentialPolicy.MARK)
+    try:
+        receipt = await memory.add(
+            _CAPTURED_TURN, user=_USER, session=_SESSION, importance_score=0.9
+        )
+        row = await _redis_row(settings, uid, receipt.memory_id)
+    finally:
+        await _teardown(settings, uid)
+        await memory.aclose()
+
+    assert row["content"] == _CAPTURED_TURN, "MARK must keep content byte-for-byte, unlike REDACT"
+    assert row["credential_shaped"] is True

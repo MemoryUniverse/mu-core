@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Mapping
+from enum import StrEnum
 from types import TracebackType
 from typing import Protocol, runtime_checkable
 
@@ -33,15 +34,19 @@ from mu_contracts.ports.observability import (
 from mu_engine.platform.settings import ObservabilitySettings
 
 __all__ = [
+    "CredentialInTextRejectedError",
+    "CredentialPolicy",
     "DurableAuditSink",
     "NoopAuditLog",
     "NoopMetricSink",
     "NoopTracer",
+    "RedactionOutcome",
     "SafeTraceFields",
     "TraceScope",
     "build_audit",
     "build_metrics",
     "build_tracer",
+    "redact_credentials",
     "sanitize_label_value",
     "sanitize_labels",
 ]
@@ -128,6 +133,84 @@ def _credential_shape_match(value: str) -> str | None:
         if pattern.search(value):
             return shape
     return None
+
+
+# ── AD-294: capture-time redaction — the SAME catalog, a second call site ──────────────────────
+# AD-267/ADR 0071 closed the OBSERVABILITY half (a credential can never reach a span/metric/audit
+# row). It deliberately left the CAPTURE half untouched (`S1-local-daemon-host-integration-
+# design.md:1338`): a credential a user dictates is still stored as memory CONTENT, verbatim, in
+# the clear. This is that follow-up. It reuses `_CREDENTIAL_VALUE_PATTERNS` — the exact catalog
+# `_credential_shape_match`/`sanitize_label_value` already match against — rather than a second,
+# independently-maintained pattern set that could silently drift from the observability guard.
+class CredentialPolicy(StrEnum):
+    """The owner's choice of what happens when captured text is credential-shaped (AD-294). One
+    setting, three behaviours — no hardcoded default a caller cannot see or change.
+
+    * ``REDACT`` (default): each matched span is replaced with a typed, content-free placeholder
+      (``[REDACTED:<shape>]``) and the SURROUNDING memory is kept. Cost: the literal secret is
+      gone — if the human genuinely needed MU to recall the raw value later (rare, and arguably
+      never the intent of "remember I use Anthropic"), it cannot.
+    * ``REFUSE``: the whole turn is dropped before it reaches any store — loudly (raises
+      :class:`CredentialInTextRejectedError`; never silently swallowed). Cost: the useful,
+      non-secret half of the turn (the "remember I use Anthropic" half) is lost with it.
+    * ``MARK``: content is stored completely unredacted, exactly as dictated, with the memory
+      flagged ``credential_shaped=True`` (content-free — the flag never carries the value) so it
+      can be found/audited later. Cost: the literal secret IS durably stored in the clear on the
+      user's own device — this policy exists for a caller who has decided that is acceptable
+      (e.g. a personal, single-user, disk-encrypted install) and wants visibility, not opacity.
+    """
+
+    REDACT = "redact"
+    REFUSE = "refuse"
+    MARK = "mark"
+
+
+class CredentialInTextRejectedError(ValueError):
+    """Raised by :func:`redact_credentials` under :class:`CredentialPolicy.REFUSE` when the text
+    is credential-shaped. Rule 3: the message never repeats the value — only the fixed shape
+    name(s) matched, the same discipline :func:`sanitize_label_value` already uses."""
+
+
+class RedactionOutcome(BaseModel):
+    """Result of running :func:`redact_credentials` over one piece of captured text."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: The text to actually persist. Under REDACT, matched spans are replaced; under MARK and the
+    #: no-match case, this is the original text unchanged (REFUSE never returns — it raises).
+    text: str
+    #: Fixed shape names only (``_CREDENTIAL_VALUE_PATTERNS`` keys) — never positions, never the
+    #: matched substring. Empty when nothing matched.
+    matched_shapes: tuple[str, ...] = ()
+
+    @property
+    def credential_shaped(self) -> bool:
+        return bool(self.matched_shapes)
+
+
+def redact_credentials(
+    text: str, *, policy: CredentialPolicy = CredentialPolicy.REDACT
+) -> RedactionOutcome:
+    """Apply ``policy`` to one piece of captured text, matching against the SAME
+    ``_CREDENTIAL_VALUE_PATTERNS`` catalog the observability guard uses (AD-267) — never a second
+    matcher. Pure function, no I/O, no logging (a caller that logs its own outcome must log only
+    ``matched_shapes``, never ``text``, to hold rule 3)."""
+    matched: list[str] = []
+    redacted = text
+    for shape, pattern in _CREDENTIAL_VALUE_PATTERNS:
+        if pattern.search(redacted):
+            matched.append(shape)
+            if policy is CredentialPolicy.REDACT:
+                redacted = pattern.sub(f"[REDACTED:{shape}]", redacted)
+    if not matched:
+        return RedactionOutcome(text=text)
+    if policy is CredentialPolicy.REFUSE:
+        raise CredentialInTextRejectedError(
+            "credential-shaped text rejected (matched: " + ", ".join(sorted(set(matched))) + ")"
+        )
+    if policy is CredentialPolicy.MARK:
+        return RedactionOutcome(text=text, matched_shapes=tuple(matched))
+    return RedactionOutcome(text=redacted, matched_shapes=tuple(matched))
 
 
 def sanitize_label_value(value: str) -> str:

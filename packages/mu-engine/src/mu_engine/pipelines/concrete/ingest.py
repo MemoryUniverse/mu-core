@@ -111,6 +111,12 @@ class IngestActivity(BaseModel):
 
     owner_id: str | None = None  # defaults to the η principal when omitted
 
+    # AD-294: set by `IngestService.remember` (never by a caller — the field exists so the flag
+    # can ride the SAME frozen object into `_build_memory_item` below) when `text` was
+    # credential-shaped under `CredentialPolicy.MARK`/`REDACT`. Content-free: a boolean, never the
+    # matched value. `False` for every pre-existing caller/test — additive, backward-compatible.
+    credential_shaped: bool = False
+
     #: Model-A stamp for a SHARED write — the EXPLODED principal ids permitted to read this item
     #: (CANONICAL §7.4: *"It is STAMPED at write/sync time from the session participant set +
     #: materialized ACL rows"*; this is that write-time stamp, and the recall filter's only input).
@@ -222,6 +228,7 @@ def _build_memory_item(
         object_kind=object_kind,
         polarity=activity.polarity,
         artifact_ref=artifact_ref,
+        credential_shaped=activity.credential_shaped,  # AD-294 — content-free flag only
         **kwargs,
     )
 
