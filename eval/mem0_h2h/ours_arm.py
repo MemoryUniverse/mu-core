@@ -65,16 +65,48 @@ async def sweep_one_arm(
     # EXACTLY as `mu_eval/answer_quality.py:538-540` renders it for a real run — `- {date}: {body}`
     # — so the arm that goes into the comparison is the arm this harness already measures, not a
     # second rendering that could drift from it.
+    #
+    # AD-308 follow-up (team-lead review): `stamp = turn_date.get(...)` below is a HARNESS-SIDE
+    # cheat — it re-matches each hit's body text back against the LoCoMo corpus's OWN known
+    # session dates, a capability that exists nowhere in the shipped product (confirmed by reading
+    # `mu-client`'s real context renderer, which has no date logic at all). The 77.3%/81.8%
+    # temporal-reasoning numbers in HEAD-TO-HEAD-RESULT.md were produced with this rejoin. Now
+    # that AD-308 threads `MemoryItem.valid_at` through to `RecallItemView.valid_at` for real, this
+    # export builds BOTH variants from the SAME `recall()` call (no extra store round trip, no
+    # re-ingest) so the two are exactly paired: `context` (unchanged, the harness rejoin — kept for
+    # backward compatibility with any other consumer of this export) and `context_product` (dates
+    # ONLY from `item.valid_at`, i.e. what the shipped product actually knows; undated when it does
+    # not). `product_dated_items`/`items` on each row let a reader see the coverage gap directly
+    # rather than infer it.
     export_limit = int(os.environ.get("H2H_EXPORT_LIMIT", "0"))
     contexts: list[dict[str, Any]] = []
 
     turn_date = {t.dia_id: t.session_date for t in conversation.turns}
 
+    # AD-308 follow-up: does the product's OWN date-recovery (this pass's extraction fix) do
+    # anything when the pipeline that actually calls it (MTM->LTM distill) is exercised, rather
+    # than left unconditionally empty the way every prior baseline/answer-quality run left it
+    # (`mu_eval/corpus.py`'s own docstring: "every prior baseline ... had an UNCONDITIONALLY
+    # EMPTY graph")? Off by default (byte-identical to every prior run of this script);
+    # `H2H_CONSOLIDATE=1` opts in.
+    consolidate = os.environ.get("H2H_CONSOLIDATE", "0") == "1"
+
     async with local_memory_for(conversation, run_id=run_id) as opaque:
         memory: Any = opaque
         index, report = await ingest_conversation(
-            memory, conversation, user=user, session=session, importance=importance
+            memory,
+            conversation,
+            user=user,
+            session=session,
+            importance=importance,
+            consolidate=consolidate,
         )
+        if consolidate:
+            emit(
+                f"  [{label}] consolidate: facts_extracted={report.facts_extracted} "
+                f"ltm_added={report.ltm_added} ltm_superseded={report.ltm_superseded} "
+                f"ltm_noop={report.ltm_noop} consolidate_seconds={report.consolidate_seconds:.1f}"
+            )
         visible = await _await_index(
             memory, conversation.turns[0].text[:120], user=user, session=session
         )
@@ -92,10 +124,21 @@ async def sweep_one_arm(
                 bucket["scored"] += 1
                 if limit == export_limit:
                     lines = []
+                    product_lines = []
+                    product_dated = 0
                     for item in result.items:
                         dia = index.resolve(item.content)
                         stamp = turn_date.get(dia[0], "") if dia else ""
                         lines.append(f"- {stamp}: {item.content}" if stamp else f"- {item.content}")
+                        # AD-308: the PRODUCT'S OWN signal — `RecallItemView.valid_at`, threaded
+                        # end to end by this pass's engine fix — nothing corpus-side. A `None`
+                        # (never extracted/inferred for this item) renders undated, honestly.
+                        product_valid_at = getattr(item, "valid_at", None)
+                        if product_valid_at is not None:
+                            product_dated += 1
+                            product_lines.append(f"- {product_valid_at.date()}: {item.content}")
+                        else:
+                            product_lines.append(f"- {item.content}")
                     contexts.append(
                         {
                             "query_id": query.query_id,
@@ -104,7 +147,10 @@ async def sweep_one_arm(
                             "category": query.category,
                             "gold": sorted(gold),
                             "context": "\n".join(lines) or "(no memories retrieved)",
+                            "context_product": "\n".join(product_lines)
+                            or "(no memories retrieved)",
                             "items": len(result.items),
+                            "product_dated_items": product_dated,
                             "gold_in_context": bool(present),
                         }
                     )
