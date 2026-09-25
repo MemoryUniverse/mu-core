@@ -606,12 +606,13 @@ class DistillPipeline:
             if item.subject and item.predicate and item.object:
                 out.append(self._promote_structured(item, now))
             else:
-                # `now=item.created_at`: the extractor's `now` param is accepted only "for
-                # signature symmetry with the port" (services/extract.py's `decompose_to_spo`
-                # docstring — "dates come only from the text itself", never read in the body), so
-                # threading this message's OWN real timestamp here instead of the shared window
-                # `now` is a no-op for today's deterministic heuristic but is the honest per-item
-                # reference instant for any future extractor that DOES resolve relative dates.
+                # `now=item.created_at`: AD-308 made the extractor's `now` param a REAL anchor —
+                # `decompose_to_spo` resolves a RELATIVE clause ("two months ago", "last Tuesday")
+                # against it (`services/extract.py::_resolve_relative_temporal`) — so threading
+                # THIS message's own real capture instant here, rather than the shared window
+                # `now` every other item in the batch would otherwise collide on, is what keeps
+                # "she adopted a dog four years ago" resolving relative to the turn that SAID it
+                # instead of relative to whenever the distill sweep happened to run.
                 facts = await self._extractor.extract(item.content, now=item.created_at)
                 out.extend(self._fact_to_item(ns, item, f) for f in facts)
         return out
