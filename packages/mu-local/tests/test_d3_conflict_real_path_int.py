@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -50,7 +51,6 @@ from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_local import LocalMemory
 from mu_local.config import ModelProfileSettings, StorageSettings
 
-from .test_local_conflict_adjudicator_int import _teardown
 from .test_local_llm_slm_int import _SLM_CFG, _SLM_UP
 
 pytestmark = [
@@ -66,13 +66,19 @@ pytestmark = [
 
 
 @pytest_asyncio.fixture
-async def slm_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def slm_mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
     profile = ModelProfileSettings(
         base_url=_SLM_CFG.base_url,
         model=_SLM_CFG.model,
         max_tokens=_SLM_CFG.max_tokens,
         temperature=_SLM_CFG.temperature,
     )
+    # AD-295: this test's stores are torn down by the shared `tenant_store_cleanup`
+    # fixture, which matches on the real collection digest. The local `_teardown` it
+    # used to import matched on a raw uid substring and never once fired.
+    tenant_store_cleanup.register(org=f"orgd3{uid}", workspace=f"wsd3{uid}")
     memory = LocalMemory(
         StorageSettings(llm=profile),
         workspace=f"wsd3{uid}",
@@ -82,7 +88,6 @@ async def slm_mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
     try:
         yield memory
     finally:
-        await _teardown(settings, f"d3{uid}")
         await memory.aclose()
 
 

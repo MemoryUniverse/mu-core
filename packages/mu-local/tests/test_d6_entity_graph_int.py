@@ -23,6 +23,7 @@ payload — confirmed live in ``ARCHITECTURE-CONFORMANCE.md`` (Lens B). This pro
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -35,8 +36,6 @@ from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.mappers.qdrant_mapper import collection_name, point_id
 from mu_local import LocalMemory
 
-from .test_local_roundtrip_int import _teardown
-
 pytestmark = pytest.mark.integration
 
 _USER = "u1"
@@ -44,16 +43,21 @@ _SESSION = "s1"
 
 
 @pytest_asyncio.fixture
-async def mem(settings: Settings, uid: str) -> AsyncIterator[LocalMemory]:
+async def mem(
+    settings: Settings, uid: str, tenant_store_cleanup: Any
+) -> AsyncIterator[LocalMemory]:
     """Heuristic mode (no LLM profile) — the SAME deterministic ``HeuristicSpoExtractor`` every
     other DISTILL/consolidate real-path test in this repo exercises; entity/edge materialization
     is orthogonal to WHICH extractor produced the fact (D3's real-SLM proof already covers the
     LLM-adjudication surface, separately)."""
+    # AD-295: this test's stores are torn down by the shared `tenant_store_cleanup`
+    # fixture, which matches on the real collection digest. The local `_teardown` it
+    # used to import matched on a raw uid substring and never once fired.
+    tenant_store_cleanup.register(org=f"orgd6{uid}", workspace=f"wsd6{uid}")
     memory = LocalMemory(workspace=f"wsd6{uid}", namespace=f"orgd6{uid}", settings=settings)
     try:
         yield memory
     finally:
-        await _teardown(settings, f"d6{uid}")
         await memory.aclose()
 
 
