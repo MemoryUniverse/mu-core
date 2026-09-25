@@ -111,6 +111,8 @@ from mu_local.errors import LlmNotConfiguredError
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a hard import-time cycle.
     from mu_engine.lifecycle.manager import MemoryLifecycleManager, WarmRecallCacheServicePort
+    from mu_engine.services.conflict.inbox import ConflictInboxProjector
+    from mu_engine.services.conflict.resolution import ConflictResolutionService
     from mu_engine.services.health.service import MemoryHealthService
     from mu_engine.services.pin.service import PinService
 
@@ -565,6 +567,27 @@ class LocalMemory:
         bound is counted with one bounded ``enumerate`` page). Same accessor rationale as
         :attr:`health`."""
         return self._container.pin
+
+    @property
+    def conflict_inbox(self) -> ConflictInboxProjector:
+        """THIS instance's conflict-inbox read projector (``LocalContainer.conflict_inbox``,
+        AD-300). Unlike :attr:`health`/:attr:`pin`, never ``None``: it reads
+        ``ConflictRecordRepository`` directly rather than the tier router's ``enumerate``, so it
+        answers on every binding. Same accessor rationale as :attr:`health` — a host (mu-client's
+        daemon IPC, CLI, MCP server) reaches the service the composition root already built rather
+        than re-constructing one, which would open a SECOND, independently-consistent view over
+        the SAME conflict records (DEV-STANDARDS rule 9)."""
+        return self._container.conflict_inbox
+
+    @property
+    def conflict_resolution(self) -> ConflictResolutionService:
+        """THIS instance's conflict-resolution WRITE service
+        (``LocalContainer.conflict_resolution``, AD-300 — built at AD-269, exposed here). Accepts
+        a human's decision, validates the FSM
+        edge, records the durable intent and enqueues it for ``ResolveConflictStage`` — it never
+        applies a resolution itself (see the class's own docstring). Never ``None``: it holds no
+        tier-router dependency at all. Same accessor rationale as :attr:`health`."""
+        return self._container.conflict_resolution
 
     @property
     def user_registry(self) -> UserPrefixRegistryPort | None:
