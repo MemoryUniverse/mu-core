@@ -397,17 +397,36 @@ _WEEKDAY_INDEX: dict[str, int] = {
     "sunday": 6,
 }
 
-# "(about) two months ago" / "(about) a year ago" — count is a digit or the indefinite article.
+# Spelled-out counts LoCoMo-style dialogue actually uses ("two months ago", "three years ago") —
+# closed, deliberately small (conversational recall rarely spells out past twelve).
+_WORD_NUMBER: dict[str, int] = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+# "(about) two months ago" / "(about) a year ago" / "(about) 3 days ago" — count is the
+# indefinite article, a digit, or a spelled-out number (`_WORD_NUMBER`).
 _RELATIVE_AGO = re.compile(
-    r"\s+(?:about\s+)?(a|an|\d+)\s+(day|week|month|year)s?\s+ago\.?\s*$",
+    r"\s+(?:about\s+)?(a|an|\d+|"
+    + "|".join(_WORD_NUMBER)
+    + r")\s+(day|week|month|year)s?\s+ago\.?\s*$",
     re.IGNORECASE,
 )
 # Bare relative day words — never behind a preposition ("in yesterday" is not English).
 _RELATIVE_BARE = re.compile(r"\s+(yesterday|today|tomorrow)\.?\s*$", re.IGNORECASE)
 # "last Tuesday" / "next Friday".
 _RELATIVE_WEEKDAY = re.compile(
-    r"\s+(last|next)\s+"
-    r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\.?\s*$",
+    r"\s+(last|next)\s+" r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\.?\s*$",
     re.IGNORECASE,
 )
 # "last week" / "next month" / "last year".
@@ -440,7 +459,13 @@ def _resolve_relative_temporal(original: str, *, now: datetime) -> tuple[str, da
     """
     m = _RELATIVE_AGO.search(original)
     if m:
-        count = 1 if m.group(1).lower() in ("a", "an") else int(m.group(1))
+        raw_count = m.group(1).lower()
+        if raw_count in ("a", "an"):
+            count = 1
+        elif raw_count in _WORD_NUMBER:
+            count = _WORD_NUMBER[raw_count]
+        else:
+            count = int(raw_count)
         unit_days = _RELATIVE_UNIT_DAYS[m.group(2).lower()]
         return original[: m.start()], now - timedelta(days=count * unit_days)
 
