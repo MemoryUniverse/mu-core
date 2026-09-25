@@ -709,8 +709,22 @@ class RecallSettings(BaseModel):
     # (`shipped_settings.py:88-90`) and NO compose file in this repo provisions a rerank service, so
     # the group is unavailable on every dev box, every CI runner, every eval run and every
     # FULL-LOCAL install. A default of `True` therefore bought nothing anywhere and cost 4.7 s per
-    # recall everywhere. Flip this back the moment a reranker is actually deployed, and re-measure
-    # the SLO in the same pass.
+    # recall everywhere.
+    #
+    # UPDATED 2026-09-25 (AD-298 / AD-301). The endpoint is now provisioned and durable
+    # (`docker-compose.rerank.yml`, `unless-stopped`, tunneled by `vm_reup.sh`) and the model
+    # genuinely runs: 9.893 of 10 returned items carry a real `rerank_score` across 150 live
+    # recalls, and stopping the container reproduces the exact pre-AD-298 failure. With the gate
+    # made reorder-only it is worth **+6.67pp** of gold_in_context.
+    #
+    # **It stays OFF for COST, not for quality** — that is the whole difference from the note
+    # above. Measured on real recalls: p50 3870 ms and p95 4848 ms against a documented
+    # `recall_e2e_rerank` budget of p95 <= 150 ms (observability-design.md:150) — **~26x over**.
+    # Cross-encoder inference over 20 candidates on CPU is the cost; nothing in the gate itself is
+    # slow. Turning this on is therefore blocked on making the inference affordable (a GPU, a
+    # smaller cross-encoder, fewer candidates, or moving the rerank off the response path the way
+    # enrichment already is), not on tuning the gate. Re-measure the SLO in the same pass that
+    # changes it.
     rerank_enabled: bool = Field(default=False)
 
     # HYBRID MTM — dense ⊕ sparse inside the MTM channel (mtm-retrieval-design.md §1.2/§1.3,
@@ -784,12 +798,26 @@ class RecallSettings(BaseModel):
     # `adaptive_rerank_gate` floor rule): the top-scored candidate in the pool must clear this
     # before ANY candidate in the pool is trusted — below it, the whole gate is empty and the
     # caller falls back to the pre-rerank order (HippoRAG-style, `rerank_gate.py`'s own docstring).
-    rerank_min_score: float = Field(default=0.5, ge=0.0, le=1.0)
+    # MEASURED 2026-09-25 (AD-301, ADR 0081), conv-26, n=150, paired, width-controlled, $0:
+    #     gate OFF                        72.00%  gold_in_context
+    #     gate ON at 0.5/0.5 (was shipped) 64.00%  (-8.00pp, 6.2x the +/-1.3pp floor)
+    #     gate ON as REORDER-ONLY          78.67%  (+6.67pp, 5.1x the floor)
+    # **The reranker helps; the CUTOFF was what hurt.** A direct probe scores a plainly relevant
+    # document at 0.431 — under the old 0.5 floor — while genuinely weak documents sit near 1e-5,
+    # so the floor pruned correct answers and kept nothing useful out. Worse, `_merge_floor` then
+    # backfilled the window from the UNSCORED tail beyond `rerank_pool_size`: rows fusion had
+    # ranked WORSE than the head items just pruned. The gate was promoting fusion's rejects over
+    # fusion's keepers.
+    # Defaults are therefore reorder-only: the model reorders what fusion already chose and
+    # removes nothing. A cutoff can be reintroduced when it is calibrated against this model's
+    # actual score distribution rather than a plausible-looking constant.
+    rerank_min_score: float = Field(default=0.0, ge=0.0, le=1.0)
     # ADR 0023 Decision 2 (recall-service-design.md:264): "top_fraction is nondecreasing in the
     # cutoff -> 0.5 is the LOOSER, safer-for-recall setting, not the aggressive one" — a candidate
     # survives if its score is within this fraction of the pool's own top score
     # (`cutoff = max(min_score, top_score * top_fraction)`, `adaptive_rerank_gate`'s own algebra).
-    rerank_top_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
+    # 0.0 for the same reason as `rerank_min_score` above: reorder, never prune. See AD-301.
+    rerank_top_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     # ADR 0010's mem0-defect fix (recall-service-design.md:202): the rerank gate must see a pool
     # WIDER than the final `limit` or there is nothing left for it to prune. Independent of
     # `channel_pool_size`/`channel_pool_multiplier` (the per-CHANNEL fetch width,
