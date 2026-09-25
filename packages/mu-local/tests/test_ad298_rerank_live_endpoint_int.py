@@ -133,9 +133,9 @@ async def test_adaptive_gate_attaches_a_real_rerank_score_through_the_live_route
         # If the endpoint had silently degraded (fallback path), the gate returns the pool
         # UNCHANGED with every rerank_score left None (its own "recall.rerank_unavailable"
         # branch) — the exact failure mode AD-298 exists to catch ("wired but never run").
-        assert survivor_ids != {"m1", "m2", "m3"} or any(v is not None for v in scored.values()), (
-            "gate returned the full, unscored pool — looks like the model-unavailable fallback"
-        )
+        assert survivor_ids != {"m1", "m2", "m3"} or any(
+            v is not None for v in scored.values()
+        ), "gate returned the full, unscored pool — looks like the model-unavailable fallback"
         # The real cross-encoder score for the exact-match sentence clears the adaptive floor
         # (min_score=0.5) and survives; the two off-topic/partial-match docs score low enough
         # (verified directly against the endpoint: ~1.7e-5 and ~0.19) to be pruned by the SAME
