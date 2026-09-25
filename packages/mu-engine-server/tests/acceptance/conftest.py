@@ -12,8 +12,10 @@ build-plan §7's own instruction is "bring `make up` up ONCE, run all criteria, 
 so this suite deliberately does NOT bring the stack up/down itself (a per-test `make up`/`down`
 would defeat the point of a single consolidated release-gate run, and would race two test files
 that both tried to own the stack lifecycle). `engine_up` below only VERIFIES the precondition —
-fails loud with a clear message if the stack is not already reachable, rather than silently
-skipping (DEV-STANDARDS rule 8: no silent skip of a release-gate criterion).
+and (AD-297) SKIPS with a named, exact-remediation message if the stack is not already reachable,
+rather than either erroring in a way indistinguishable from a real regression or skipping silently
+(DEV-STANDARDS rule 8: no silent skip of a release-gate criterion — "silent" means unreported, not
+"never skip"; see `engine_up`'s own docstring below for why fail-loud was the wrong shape here).
 
 **One documented exception — `engine_restore_guard` below.** F2a (`test_f2a_crash_replay.py`)
 owns a real `docker kill` of the running container as its own test body (see that file's own
