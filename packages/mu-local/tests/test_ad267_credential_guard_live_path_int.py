@@ -69,6 +69,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+from qdrant_client import AsyncQdrantClient
 from redis.asyncio import Redis
 from structlog.testing import capture_logs
 
@@ -93,6 +94,7 @@ from mu_engine.platform.observability import (
 )
 from mu_engine.services.settings import IngestSettings
 from mu_engine.storage.domain.namespace import Namespace, Visibility
+from mu_engine.storage.mappers.qdrant_mapper import collection_name
 from mu_engine.storage.mappers.redis_mapper import RedisMapper
 from mu_local import LocalMemory
 
@@ -479,7 +481,7 @@ async def test_refuse_policy_drops_the_credential_bearing_turn(
         _assert_clean(str(excinfo.value), where="the REFUSE exception message")
         _assert_clean(json.dumps(logs, default=repr), where="a structlog row during REFUSE")
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
     # Nothing this η wrote reached Valkey — REFUSE happens before WriteStmStage ever runs.
@@ -505,7 +507,7 @@ async def test_mark_policy_stores_verbatim_and_flags_the_memory(
         )
         row = await _redis_row(settings, uid, receipt.memory_id)
     finally:
-        await _teardown(settings, uid)
+        await _teardown_redis(settings, uid)
         await memory.aclose()
 
     assert row["content"] == _CAPTURED_TURN, "MARK must keep content byte-for-byte, unlike REDACT"
