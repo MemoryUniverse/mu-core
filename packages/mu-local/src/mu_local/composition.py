@@ -110,6 +110,7 @@ from mu_engine.providers.settings import (
     default_local_catalog,
 )
 from mu_engine.providers.sparse_encoder import build_sparse_encoder
+from mu_engine.services.conflict.inbox import ConflictInboxProjector
 from mu_engine.services.conflict.policy_resolver import ConflictPolicyResolver
 from mu_engine.services.conflict.ports import (
     InMemoryMemoryConflictPolicyStore,
@@ -657,6 +658,26 @@ class LocalContainer:
             bus=self._bus,
             namespace_policies=self._namespace_conflict_policies,
             memory_policies=self._memory_conflict_policies,
+        )
+        # AD-300 (conflict-resolution-async-design.md §5): the READ half of the manual surface.
+        # `conflict_resolution` (above) is the WRITE half — accept a decision, enqueue it, never
+        # apply it — and until now nothing on FULL-LOCAL could answer "what conflicts are open,
+        # and what are both sides of one?" at all, so the AD-269 apply path had no read surface to
+        # pair with it. Always built (unlike `self.health`/`self.pin` above): the inbox reads
+        # `self._conflict_records` directly, never the tier router's `enumerate`, so a binding
+        # with `cannot_enumerate` gaps still answers this. No `ConflictMemberHydrator` is wired —
+        # none has been built in mu-core yet (`services/conflict/ports.py`'s
+        # `ConflictMemberHydrator` is a bare `Protocol`) — so every member renders with
+        # `content=""` rather than the failing container refusing to build the projector at all,
+        # matching the projector's own docstring, which calls
+        # this the intended degrade ("a user who can see 'two of your facts disagree' is better
+        # served than one who sees an error"). REPORTED, not fixed here: a real hydrator (STM/
+        # MTM/LTM read-by-id) is engine-internal work outside this lane (mu-client CLI/IPC/MCP
+        # surface only) — see ARCHITECTURE-DELTAS.md AD-300.
+        self.conflict_inbox: ConflictInboxProjector = ConflictInboxProjector(
+            records=self._conflict_records,
+            clock=self._clock,
+            bus=self._bus,
         )
 
         self.conflict_adjudicator: ConflictAdjudicator | None = None
