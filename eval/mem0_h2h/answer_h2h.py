@@ -12,9 +12,19 @@ their extractor dropped — unmeasured.
 
 Answer quality has no such asymmetry. Each system hands its own retrieved context to the SAME
 answering model, under the SAME prompt (mem0's own `ANSWER_PROMPT`, ported verbatim in
-`mu_eval/judge.py`), graded by the SAME judge (MemOS's official `locomo_grader` accuracy prompt,
-also a verbatim port). Only the retrieval differs. That is the comparison the owner asked for and
-it is the metric mem0 itself publishes against.
+`mu_eval/judge.py`), graded by the SAME judge. Only the retrieval differs. That is the comparison
+the owner asked for and it is the metric mem0 itself publishes against.
+
+WHICH GRADER (AD-304 — this defaulted wrong once, and the artifact then said so falsely)
+----------------------------------------------------------------------------------------
+The default is now `JUDGE_SYSTEM_PROMPT` / `judge_prompt()` — the verbatim LoCoMo rubric, which is
+mem0's own `ACCURACY_PROMPT` character-for-character bar one apostrophe
+(`other_repos/mem0/evaluation/metrics/llm_judge.py:12-36`). The 2026-09-25 run instead used
+`COMPACT_JUDGE_SYSTEM_PROMPT` / `compact_judge_prompt()`, a rewrite whose ONLY reason to exist is
+Azure Foundry Ministral-3B's 400-token-total request ceiling — on `gpt-5`, which has no such
+ceiling. It graded every arm ~8-9 points low. The compact variant now requires `--compact-judge`,
+which exists for a Ministral-3B run and nothing else, and the artifact records which grader ran
+instead of asserting a prompt that was not used.
 
 CONTROLS THIS SCRIPT ENFORCES RATHER THAN ASSUMES
 -------------------------------------------------
@@ -49,8 +59,10 @@ from mu_eval.answer_quality import (  # noqa: E402
 )
 from mu_eval.judge import (  # noqa: E402
     COMPACT_JUDGE_SYSTEM_PROMPT,
+    JUDGE_SYSTEM_PROMPT,
     answer_prompt,
     compact_judge_prompt,
+    judge_prompt,
     parse_judgement,
 )
 from mu_eval.locomo import CATEGORY_NAMES  # noqa: E402
@@ -156,7 +168,10 @@ async def score_arm(
     concurrency: int,
     answer_max_tokens: int,
     judge_max_tokens: int,
+    compact_judge: bool = False,
 ) -> dict[str, Any]:
+    judge_system = COMPACT_JUDGE_SYSTEM_PROMPT if compact_judge else JUDGE_SYSTEM_PROMPT
+    build_judge_prompt = compact_judge_prompt if compact_judge else judge_prompt
     semaphore = asyncio.Semaphore(concurrency)
     graded: list[dict[str, Any]] = []
     done = 0
@@ -178,8 +193,8 @@ async def score_arm(
             )
             verdict = await _complete_with_retry(
                 chat,
-                system=COMPACT_JUDGE_SYSTEM_PROMPT,
-                user=compact_judge_prompt(
+                system=judge_system,
+                user=build_judge_prompt(
                     question=row["question"],
                     gold_answer=row["gold_answer"],
                     response=answer.content or "",
@@ -262,6 +277,13 @@ async def main() -> int:
     parser.add_argument("--answer-max-tokens", type=int, default=900)
     parser.add_argument("--judge-max-tokens", type=int, default=500)
     parser.add_argument("--limit-rows", type=int, default=0)
+    parser.add_argument(
+        "--compact-judge",
+        action="store_true",
+        help="grade with the Ministral-3B 400-token-ceiling rewrite instead of the verbatim "
+        "LoCoMo rubric. Only correct when the judge model actually has that ceiling; on any "
+        "frontier model it grades ~8-9 points low (AD-304).",
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("MU_EVAL_API_KEY")
@@ -309,6 +331,7 @@ async def main() -> int:
                     concurrency=args.concurrency,
                     answer_max_tokens=args.answer_max_tokens,
                     judge_max_tokens=args.judge_max_tokens,
+                    compact_judge=args.compact_judge,
                 )
             )
     finally:
@@ -319,7 +342,11 @@ async def main() -> int:
             "requested_model": args.model,
             "served_models_read_from_response": served,
             "answer_prompt": "mem0 ANSWER_PROMPT (verbatim port, mu_eval/judge.py)",
-            "judge_prompt": "MemOS locomo_grader compact accuracy prompt (verbatim port)",
+            "judge_prompt": (
+                "COMPACT Ministral-3B judge rewrite (mu_eval/judge.py) — NOT the official rubric"
+                if args.compact_judge
+                else "LoCoMo accuracy rubric, verbatim port (mu_eval/judge.py judge_prompt)"
+            ),
             "usage": budget.snapshot(),
             "arms": results,
         }
