@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -358,6 +358,137 @@ def _parse_temporal(raw: str) -> datetime:
     return datetime.fromisoformat(raw).replace(tzinfo=UTC)
 
 
+# ---------------------------------------------------------------------------------------------
+# AD-308: RELATIVE temporal clause -> world-time ``valid_at``, resolved against the per-item
+# capture instant ``now`` (threaded in from ``pipelines/distill.py::_collect_facts``'s
+# ``source.created_at`` — see that call site's own "SAME-BATCH CHRONOLOGY" docstring, which
+# already anchors on this reasoning: "the honest per-item reference instant for any future
+# extractor that DOES resolve relative dates").
+#
+# Before this, ``_TEMPORAL_TAIL`` only matched an ABSOLUTE ISO date or bare year behind an
+# explicit preposition ("in 2028", "since 2023-05-07"); a bare "yesterday", "two months ago", or
+# "last Tuesday" matched NOTHING and fell through to the LOUD ``recorded_at`` fallback
+# (``distill.py:626-630``, ``DegradeReason.DATE_EXTRACTION_FALLBACK``) — silently discarding the
+# world-time truth LoCoMo-style dialogue states constantly ("She adopted a dog four years ago.").
+#
+# Graphiti resolves the SAME class of expression with an LLM call carrying a
+# ``reference_timestamp`` in the prompt (other_repos/graphiti/graphiti_core/utils/maintenance/
+# temporal_operations.py:33-49 ``extract_edge_dates``; the instruction text at
+# prompts/extract_edge_dates.py:66 says almost exactly this module's job: "determine the dates if
+# only the relative time is mentioned (eg 10 years ago, 2 mins ago) based on the provided
+# reference timestamp"). That LLM call is NOT ported here — the MVP default extraction path
+# (``ExtractionSettings``/``DistillSettings.use_llm_extractor=False``, ``distill.py:148``) makes
+# NO model call at all, and porting Graphiti's mechanism verbatim would put one on every sentence
+# ever captured. This is instead a FREE, zero-latency, deterministic approximation covering the
+# closed vocabulary LoCoMo-style conversational dialogue actually uses (measured against
+# ``other_repos/locomo``'s own gold temporal-category questions): bare "yesterday"/"today"/
+# "tomorrow", "<N> <day|week|month|year>(s) ago", "last/next <weekday>", "last/next
+# <week|month|year>". Anything outside that vocabulary is left unmatched — ``valid_at`` stays
+# ``None`` and the pipeline's existing LOUD fallback fires exactly as it already does for any
+# other unparsed date; this module never guesses.
+_RELATIVE_UNIT_DAYS: dict[str, int] = {"day": 1, "week": 7, "month": 30, "year": 365}
+_WEEKDAY_INDEX: dict[str, int] = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+# Spelled-out counts LoCoMo-style dialogue actually uses ("two months ago", "three years ago") —
+# closed, deliberately small (conversational recall rarely spells out past twelve).
+_WORD_NUMBER: dict[str, int] = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+# "(about) two months ago" / "(about) a year ago" / "(about) 3 days ago" — count is the
+# indefinite article, a digit, or a spelled-out number (`_WORD_NUMBER`).
+_RELATIVE_AGO = re.compile(
+    r"\s+(?:about\s+)?(a|an|\d+|"
+    + "|".join(_WORD_NUMBER)
+    + r")\s+(day|week|month|year)s?\s+ago\.?\s*$",
+    re.IGNORECASE,
+)
+# Bare relative day words — never behind a preposition ("in yesterday" is not English).
+_RELATIVE_BARE = re.compile(r"\s+(yesterday|today|tomorrow)\.?\s*$", re.IGNORECASE)
+# "last Tuesday" / "next Friday".
+_RELATIVE_WEEKDAY = re.compile(
+    r"\s+(last|next)\s+" r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\.?\s*$",
+    re.IGNORECASE,
+)
+# "last week" / "next month" / "last year".
+_RELATIVE_UNIT = re.compile(r"\s+(last|next)\s+(week|month|year)\.?\s*$", re.IGNORECASE)
+
+
+def _shift_to_weekday(now: datetime, target: int, *, forward: bool) -> datetime:
+    """The most recent PAST occurrence of weekday ``target`` (Mon=0..Sun=6) relative to ``now``
+    when ``forward=False`` ("last <weekday>"), or the nearest FUTURE one when ``forward=True``
+    ("next <weekday>") — at midnight, mirroring ``_parse_temporal``'s own "date-only -> midnight"
+    floor for a bare year. ``now`` itself never counts as its own "last"/"next": English usage
+    ("last Tuesday", said on a Tuesday) means the PRIOR week's, never today, so a same-weekday hit
+    always shifts a full 7 days rather than 0.
+    """
+    base = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if forward:
+        days = (target - base.weekday()) % 7 or 7
+        return base + timedelta(days=days)
+    days = (base.weekday() - target) % 7 or 7
+    return base - timedelta(days=days)
+
+
+def _resolve_relative_temporal(original: str, *, now: datetime) -> tuple[str, datetime | None]:
+    """Strip a trailing RELATIVE temporal clause from ``original`` and resolve it against
+    ``now``. Returns ``(body_with_clause_removed, valid_at)`` — on no match, returns
+    ``(original, None)`` unchanged so the caller's existing ABSOLUTE-date attempt
+    (``_TEMPORAL_TAIL``) still gets a turn at the same trailing-clause position; the two clause
+    vocabularies are disjoint (a relative clause is never also a valid absolute one) so only one
+    can ever fire per sentence.
+    """
+    m = _RELATIVE_AGO.search(original)
+    if m:
+        raw_count = m.group(1).lower()
+        if raw_count in ("a", "an"):
+            count = 1
+        elif raw_count in _WORD_NUMBER:
+            count = _WORD_NUMBER[raw_count]
+        else:
+            count = int(raw_count)
+        unit_days = _RELATIVE_UNIT_DAYS[m.group(2).lower()]
+        return original[: m.start()], now - timedelta(days=count * unit_days)
+
+    m = _RELATIVE_BARE.search(original)
+    if m:
+        offset = {"yesterday": -1, "today": 0, "tomorrow": 1}[m.group(1).lower()]
+        return original[: m.start()], now + timedelta(days=offset)
+
+    m = _RELATIVE_WEEKDAY.search(original)
+    if m:
+        direction = m.group(1).lower()
+        target = _WEEKDAY_INDEX[m.group(2).lower()]
+        return original[: m.start()], _shift_to_weekday(now, target, forward=direction == "next")
+
+    m = _RELATIVE_UNIT.search(original)
+    if m:
+        direction = m.group(1).lower()
+        delta = timedelta(days=_RELATIVE_UNIT_DAYS[m.group(2).lower()])
+        return original[: m.start()], now + delta if direction == "next" else now - delta
+
+    return original, None
+
+
 def _clean_object(tokens: list[str], *, settings: ExtractionSettings) -> str:
     """D5-quick object cleanup (methodology item 2): iteratively strip a leading article,
     filler word (``settings.filler_words`` — e.g. a leftover "named"), preposition
@@ -604,22 +735,31 @@ def _match_change_clause(
 
 
 def _decompose_sentence(
-    sentence: str, *, base_offset: int, full_text: str, settings: ExtractionSettings
+    sentence: str, *, base_offset: int, full_text: str, settings: ExtractionSettings, now: datetime
 ) -> ExtractedFact | None:
     original = sentence.strip()
     if not original:
         return None
 
     # (1) pull a trailing temporal clause off the tail before matching (keeps date out of object).
+    # RELATIVE first (AD-308: "two months ago", "last Tuesday" — resolved against `now`, the
+    # per-item capture instant), then ABSOLUTE (`_TEMPORAL_TAIL`, an explicit ISO date/year) — the
+    # two clause vocabularies are disjoint so trying both costs nothing on the common case where
+    # neither matches, and whichever one matches strips the SAME trailing-clause position.
     valid_at: datetime | None = None
-    m = _TEMPORAL_TAIL.search(original)
     body = original
-    if m:
-        try:
-            valid_at = _parse_temporal(m.group(1))
-            body = original[: m.start()].strip()
-        except ValueError:
-            valid_at = None  # unparseable -> leave for the pipeline's LOUD recorded_at fallback
+    stripped, relative_valid_at = _resolve_relative_temporal(original, now=now)
+    if relative_valid_at is not None:
+        valid_at = relative_valid_at
+        body = stripped.strip()
+    else:
+        m = _TEMPORAL_TAIL.search(original)
+        if m:
+            try:
+                valid_at = _parse_temporal(m.group(1))
+                body = original[: m.start()].strip()
+            except ValueError:
+                valid_at = None  # unparseable -> pipeline's LOUD recorded_at fallback
 
     # (1.5) D5-quick: strip filler words (e.g. "named") from the body BEFORE any pattern is
     # tried, so "Ada's sister is named Mira" reads as "Ada's sister is Mira" everywhere below.
@@ -769,9 +909,11 @@ def decompose_to_spo(
     documented pattern set: value-change clause (D5-
     quick) → possessive-attribute → copula(±negation, incl. "became"/"becomes") →
     prepositional-verb → transitive-verb. Anything that matches no pattern is dropped (honest:
-    this is a heuristic, not a parser). ``now`` is accepted for signature symmetry with the
-    port; dates come only from the text itself. ``min_tokens``/``settings`` are DI-threaded from
-    :class:`ExtractionSettings` by :class:`HeuristicSpoExtractor`/:class:`LlmFactExtractor`
+    this is a heuristic, not a parser). ``now`` anchors any RELATIVE temporal clause found in the
+    text (AD-308: "yesterday", "two months ago", "last Tuesday" — see
+    ``_resolve_relative_temporal``); an ABSOLUTE date/year in the text ("since 2023") still comes
+    only from the text itself, unaffected by ``now``. ``min_tokens``/``settings`` are DI-threaded
+    from :class:`ExtractionSettings` by :class:`HeuristicSpoExtractor`/:class:`LlmFactExtractor`
     (never a bare literal here); a bare call (e.g. from a unit test) gets
     ``ExtractionSettings()``'s sane defaults.
     """
@@ -786,7 +928,7 @@ def decompose_to_spo(
         if chunk:
             if len(chunk.split()) >= min_tokens:
                 fact = _decompose_sentence(
-                    chunk, base_offset=offset, full_text=text, settings=settings
+                    chunk, base_offset=offset, full_text=text, settings=settings, now=now
                 )
                 if fact is not None:
                     facts.append(fact)
