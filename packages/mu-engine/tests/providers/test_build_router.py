@@ -38,6 +38,7 @@ class _Resolver:
         return self.SECRET
 
 
+@pytest.mark.needs_local_model
 def test_build_wires_embedder_and_resolves_task_groups(
     minilm_catalog: ModelCatalogSettings, default_models: ModelSettings
 ) -> None:
@@ -53,6 +54,7 @@ def test_build_wires_embedder_and_resolves_task_groups(
     assert tm.group_for(Task.CLASSIFY) == "gpt-4.1-mini"
 
 
+@pytest.mark.needs_local_model
 async def test_router_implements_both_canonical_ports(
     minilm_catalog: ModelCatalogSettings, default_models: ModelSettings
 ) -> None:
@@ -99,6 +101,7 @@ def test_unknown_embed_backend_fails_loud() -> None:
         build_model_router(models=ModelSettings(), catalog=catalog)
 
 
+@pytest.mark.needs_local_model
 def test_credential_hygiene_key_not_in_repr_or_events(
     minilm_catalog: ModelCatalogSettings, default_models: ModelSettings
 ) -> None:
@@ -118,6 +121,7 @@ def test_credential_hygiene_key_not_in_repr_or_events(
     assert all(_Resolver.SECRET not in (e.detail or "") for e in emitter.events)
 
 
+@pytest.mark.needs_local_model
 def test_two_plane_same_class_different_catalog(default_models: ModelSettings) -> None:
     """Spec §8 test 10 — LocalContainer registers a warm mu-local order-1 deployment;
     SharedContainer registers cloud (order-2), empty warm_local. Same class, diff catalog."""

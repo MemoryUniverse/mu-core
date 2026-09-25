@@ -201,3 +201,45 @@ async def tenant_store_cleanup(settings: Any) -> AsyncIterator[TenantRegistry]:
 
 
 # --- END SHARED INTEGRATION STORE TEARDOWN (AD-295) ---
+
+# ---------------------------------------------------------------------- real local model gate
+_MINILM_REPO = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def minilm_is_cached() -> bool:
+    """True when the real MiniLM weights are already in this machine's HF cache.
+
+    The provider tests force `HF_HUB_OFFLINE` on the assumption the weights are present, which
+    holds on a developer box and on the VM and is FALSE on a fresh CI runner. That is why
+    `pytest (everything that does not need a real store)` has been red with
+    `OSError: We couldn't connect to 'https://huggingface.co'` on every run — first 12 tests,
+    now 14. The workflow's own comment records the symptom and not the cause.
+
+    A test whose dependency is absent is UNCONFIGURED, not failing, and must never be
+    indistinguishable from a real regression — the principle AD-297 applied to the Stage-F tier.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(_MINILM_REPO, local_files_only=True)
+    except Exception:
+        return False
+    return True
+
+
+def pytest_collection_modifyitems(config: object, items: list) -> None:  # type: ignore[type-arg]
+    """Skip `needs_local_model` tests when the weights are not cached, with the fix named."""
+    import pytest as _pytest
+
+    if minilm_is_cached():
+        return
+    skip = _pytest.mark.skip(
+        reason=(
+            f"the real {_MINILM_REPO} weights are not in this machine's HF cache; "
+            "warm it once with `huggingface-cli download " + _MINILM_REPO + "` "
+            "(unconfigured, not a regression)"
+        )
+    )
+    for item in items:
+        if "needs_local_model" in item.keywords:
+            item.add_marker(skip)

@@ -337,6 +337,7 @@ def test_a_keyless_local_row_compiles_with_no_api_key_at_all(keyless: None) -> N
 # ---------------------------------------------------------------------------------------------
 # D. the router itself
 # ---------------------------------------------------------------------------------------------
+@pytest.mark.needs_local_model
 def test_build_plane_router_constructs_a_real_router_with_zero_credentials(
     keyless: None,
 ) -> None:

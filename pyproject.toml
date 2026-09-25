@@ -130,4 +130,5 @@ addopts = "-ra --strict-markers --strict-config --import-mode=importlib"
 markers = [
     "unit: isolated logic; mocks permitted (DEV-STANDARDS: mocks ONLY in pure unit tests).",
     "integration: real running mu-dev-* containers, ZERO mocks (DEV-STANDARDS: non-negotiable).",
+    "needs_local_model: loads the real local MiniLM weights; skipped when the HF cache is cold.",
 ]

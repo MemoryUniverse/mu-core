@@ -166,6 +166,7 @@ def test_a_keyless_profile_declares_no_credential_ref_at_all() -> None:
     assert provider.credential_ref is None
 
 
+@pytest.mark.needs_local_model
 async def test_the_local_endpoint_never_receives_the_operators_cloud_key(
     listener: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
