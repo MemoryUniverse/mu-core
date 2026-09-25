@@ -108,9 +108,41 @@ async def test_gate_scores_and_prunes_via_reranker() -> None:
     out = await gate.apply([a, b, c], "denver flight")
 
     ids = [v.memory_id for v in out]
-    assert ids == ["a", "b"], "c (0.1) is below the adaptive cutoff and must be pruned"
-    assert {v.memory_id: v.rerank_score for v in out} == {"a": 0.9, "b": 0.6}
+    assert ids == ["a", "b", "c"], (
+        "AD-302: c (0.1) fails the adaptive cutoff and is demoted, not dropped — it is still a "
+        "member of the fused pool and must remain available to `_merge_floor`'s positional slice"
+    )
+    assert {v.memory_id: v.rerank_score for v in out} == {"a": 0.9, "b": 0.6, "c": None}, (
+        "the surviving pair carry their real rerank_score; the pruned member's is None — the SAME "
+        "'gate did not confirm this hit' state an unscored tail item already carries"
+    )
     assert reranker.calls == [("denver flight", ("x", "y", "z"))]
+
+
+@pytest.mark.asyncio
+async def test_ad302_pruned_head_item_outranks_unscored_tail() -> None:
+    """AD-301's measured defect, reproduced directly: with the shipped-shape gate (tight cutoff),
+    a candidate the model scored and PRUNED must still sit ahead of the unscored tail in the
+    returned order, because it was fusion-ranked above the tail before rerank ever ran. Before
+    AD-302's fix, `reranked_head` held only the gate's survivor(s) and the pruned member vanished
+    entirely, so `_merge_floor`'s positional `natural[:limit]` slice backfilled from `tail` —
+    candidates the fusion step had already ranked WORSE than the one just pruned."""
+    a, b = _view("a", "x"), _view("b", "y")  # sent to the model, one survives, one is pruned
+    tail_item = _view("t0", "t0")  # beyond `pool_size`, never scored, fusion-ranked below both
+    reranker = _FakeReranker([0.9, 0.2])  # b clears neither the 0.5 floor
+    gate = AdaptiveRerankGate(reranker, min_score=0.5, top_fraction=0.5, pool_size=2)
+
+    out = await gate.apply([a, b, tail_item], "query")
+
+    ids = [v.memory_id for v in out]
+    assert ids == [
+        "a",
+        "b",
+        "t0",
+    ], "pruned-but-scored 'b' must precede the unscored tail 't0', not be replaced by it"
+    assert out[0].rerank_score == 0.9
+    assert out[1].rerank_score is None
+    assert out[2].rerank_score is None
 
 
 @pytest.mark.asyncio
