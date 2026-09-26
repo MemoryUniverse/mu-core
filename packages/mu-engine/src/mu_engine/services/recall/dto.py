@@ -912,7 +912,12 @@ class RecallSettings(BaseModel):
     # Flip once a paired, matched-width `gold_in_context` sweep (the owner's own request: "measure
     # the two changes separately and together") reports the number — not before. Env override:
     # `MU_RECALL__DYNAMIC_CHANNEL_BUDGET=true`.
-    dynamic_channel_budget: bool = Field(default=False)
+    # AD-328 — DEFAULT ON, measured free. Same session, limit=20, conv-26: p50 313.7ms -> 223.2ms
+    # (**-29%**) with `gold_in_context` identical to the digit (117/150 both arms). At limit=10
+    # it is neutral (107/150, 188 -> 203ms). A starved channel's unused width is real waste: it
+    # buys slots that return nothing while a saturated channel is truncated. Redistributing costs
+    # nothing and returns the same rows sooner.
+    dynamic_channel_budget: bool = Field(default=True)
     # A single channel's reallocated width is capped at `baseline_width * this value` — a latency
     # safety valve independent of how much OTHER channels' starvation frees: a widened ANN/graph
     # fetch costs real time, and this bounds the worst case regardless of how skewed one query's
@@ -1019,7 +1024,20 @@ class RecallSettings(BaseModel):
     # ACCURACY-PLAN-0831.md §1.4) — this bounds how many of the already-fused, best-first
     # candidates are sent to the cross-encoder in ONE batched forward pass, priced against the
     # `recall_e2e_rerank` p95 budget (`language-analysis-server.md`: <=20 pairs ~15-40ms).
-    rerank_pool_size: int = Field(default=20, ge=1)
+    # AD-328 — RAISED 20 -> 40, MEASURED. At `rerank_pool_size == limit` the gate is a
+    # mathematical NO-OP: it reorders exactly the items that were all going to be returned, so
+    # membership cannot change and `gold_in_context` cannot move. Measured at limit=20, conv-26,
+    # 150 queries, one session: pool 20 -> 117/150 (identical to rerank OFF, p50 3389ms wasted);
+    # pool 40 -> **122/150 (81.33%, the best retrieval ever measured here)**, p50 6148ms; pool 60
+    # -> 122/150 again at p50 8978ms, so 40 is the SATURATION POINT, not a guess.
+    # This is the same defect ADR 0010 identified in mem0 (they pass one `limit` to both the vector
+    # search and the reranker's top_k) reached from the other side — by widening `limit` to the pool
+    # rather than by narrowing the pool to `limit`.
+    # **The +3.33pp of retrieval does NOT convert to answer quality**: judged on the 100 shared
+    # rows with mem0's verbatim ACCURACY_PROMPT, 73/100 vs the 72/100 baseline — +1 row, INSIDE the
+    # +/-1.3pt judge floor, and the only category that moved was temporal (18->19/22). Gold is in
+    # context for 80 of those 100 and we answer 73: retrieval presence is no longer the bottleneck.
+    rerank_pool_size: int = Field(default=40, ge=1)
 
     @model_validator(mode="after")
     def _validate_derived_width_range(self) -> RecallSettings:
