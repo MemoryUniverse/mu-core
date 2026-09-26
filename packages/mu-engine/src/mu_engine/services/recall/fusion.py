@@ -96,9 +96,17 @@ def reciprocal_rank_fusion(
     # `-scores[eid]` keeps the primary DESC-by-score order; `eid` (the memory id, content-
     # independent and stable for a given item) is the deterministic secondary key that breaks any
     # tie the same way on every call, on every process, regardless of channel presentation order.
-    # RE-VERIFIED (AD-318): re-running the same 150-row set twice now returns byte-identical item
-    # sets (0/150 differ, was 30/150); `gold_in_context` unchanged at the pre-fix value — this only
-    # reorders which NON-gold candidate wins a coin-flip, never which candidates are gold.
+    # CORRECTION (AD-322 / ADR 0097): AD-318's own re-verification claim above this line — "0/150
+    # differ, was 30/150" — was RE-RUN with a mutated-out control and did NOT reproduce: 24/150 item
+    # sets still differ WITH this tie-break, 23/150 WITHOUT it (same session, same VM). This fix is
+    # unit-level CONFIRMED (mutation-tested: reverting the sort key fails 2 of 3
+    # `test_recall_fusion_tiebreak_unit.py` cases) but it does NOT make end-to-end recall
+    # deterministic — the residual nondeterminism is upstream of fusion (most plausibly ANN
+    # candidate order in the vector channel; not yet verified). `gold_in_context` is unaffected in
+    # every arm (79.33%, 14 repetitions across 6 configs) — the swap is always among non-gold
+    # candidates — so keep the tie-break (it is correct and harmless) but do not read it, or any
+    # comment written before this correction, as a determinism fix. See ADR 0097 and
+    # `docs/tracking/ARCHITECTURE-DELTAS.md` AD-322 for the full measurement.
     ordered = sorted(scores, key=lambda eid: (-scores[eid], eid))
     return [(elements[eid], scores[eid]) for eid in ordered]
 
