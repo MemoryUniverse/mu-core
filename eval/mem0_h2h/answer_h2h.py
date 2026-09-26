@@ -45,7 +45,6 @@ import asyncio
 import json
 import os
 import sys
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -360,7 +359,6 @@ async def main() -> int:
             )
         if len(served) > 1:
             emit(f"  !! MORE THAN ONE SERVED MODEL: {served} — the arms are not comparable")
-        emit("categories:", Counter())
     return 0
 
 
