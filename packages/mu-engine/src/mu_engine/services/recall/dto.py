@@ -632,6 +632,31 @@ class RecallSettings(BaseModel):
     # never a silent recency fallback (§5 "re-raise loud, not a silent partial").
     stm_scoring: Literal["embed", "lexical", "recency"] = "embed"
 
+    # AD-320 (2026-09-26) — CANDIDATE DEFAULT, NOT FLIPPED: this field composes with ``limit``
+    # (above, `RecallQuery.limit` — always overrides the derived width) into the ONE live lever
+    # this pass measured, because the STM floor (`recency_floor_limit`, default 10) leaves only
+    # ~7 real fusion slots at the shipped derived width — `channel_pool_size`/`channel_pool_
+    # multiplier` above are a MEASURED DEAD lever for this (AD-306, ADR 0084: 20->80 moved
+    # 0.7233->0.7333 `gold_in_context`, inside a 0.0067 noise floor, for +61% search latency — do
+    # NOT touch `channel_pool_size` to chase this). Two candidates, both already independently
+    # selectable with NO code change (this comment documents the selection, it does not add one):
+    #   * SHIPPED DEFAULT — this field's default ("embed") + `derive_limit_from_budget=True`
+    #     (i.e. no explicit `RecallQuery.limit`): ~72.7% `gold_in_context` @ derived limit=10,
+    #     conv-26 n=150.
+    #   * WIDENED-LEXICAL — explicit `RecallQuery.limit=20` + `MU_RECALL__STM_SCORING=lexical`:
+    #     ~79.3% `gold_in_context`, ~119ms search p50 (vs the embed-scoring path's slower STM
+    #     re-embed cost), 1427 tokens, conv-26 n=150.
+    # **This engine does NOT pick between them here.** `gold_in_context` is ORDER-BLIND (it only
+    # asks "is a gold item anywhere in the window", never where) and therefore cannot see a
+    # reordering that HURTS the answering model reading the rendered list — exactly the blind spot
+    # that let a 10.67pp ONNX reranker regression hide behind a 25% speed win (AD-301/ADR 0081).
+    # The Measure phase (answer-quality run, not `gold_in_context` alone) is the one that decides
+    # whether WIDENED-LEXICAL ships, by setting both of the above at the composition root/eval
+    # harness boundary — never by changing this field's default. If a future lane lands AD-313's
+    # STM-vector-reuse ("dense-with-reused-vectors": embed scoring's relevance signal without its
+    # re-embedding cost — see the AD-319 delta for why that did NOT land this pass), it becomes a
+    # THIRD candidate at this same selection point, not a replacement for either of the two above.
+
     # D-4 multi-hop LTM traversal arm (ARCHITECTURE-CONFORMANCE.md "LTM graph arm thin";
     # CONFIG-AND-DATA-FIX-PLAN.md PART 2 D6): bounds how many entity-edge hops
     # ``ThreeChannelRecallRanker``'s LTM channel walks (``GraphStorePort.traverse_entities``) to
