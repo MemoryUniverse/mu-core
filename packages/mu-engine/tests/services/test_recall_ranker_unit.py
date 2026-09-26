@@ -24,6 +24,7 @@ from mu_engine.providers._contracts import RerankHit
 from mu_engine.services.recall.dto import RecallChannels, RecallItemView, RecallSettings
 from mu_engine.services.recall.fusion import ReciprocalRankFusion, reciprocal_rank_fusion
 from mu_engine.services.recall.ranker import ThreeChannelRecallRanker, _narrow_after_expansion
+from mu_engine.storage.domain.entity import EntityResolution
 from mu_engine.storage.domain.memory import MemoryItem, MemoryKind, MemoryState, MemoryTier
 from mu_engine.storage.domain.namespace import Namespace, Visibility
 from mu_engine.storage.domain.recall import RecallChannel, Scored
@@ -1295,6 +1296,182 @@ async def test_ltm_entity_seed_pool_zero_reproduces_token_only_seed_exactly() ->
     )
 
     assert ltm.seed_entity_uids_seen is None
+
+
+class _ResolveEntityLtm(_EmptyLtm):
+    """AD-327 — a fake ``resolve_entity`` keyed by EXACT phrase (casefolded), standing in for
+    ``FalkorLtmAdapter._resolve_entity_impl``'s own deterministic exact/alias match. Every call
+    is recorded (``resolve_calls``) so a test can assert the candidate PHRASES
+    ``_resolve_query_entity_uids`` actually tried, not just the uids it kept. ``traverse_entities``
+    only returns ``self._traversal_hit_for_uid``'s configured hit when its OWN uid appears in
+    ``seed_entity_uids`` — the same "query-conditional, silent otherwise" shape the real adapter's
+    ``if not memory_hop: return []`` gives, so a test can prove a seed uid is what MADE a hit
+    reachable, not merely that it was computed."""
+
+    def __init__(
+        self,
+        *,
+        resolutions: dict[str, EntityResolution],
+        traversal_hit_for_uid: tuple[str, MemoryItem] | None = None,
+    ) -> None:
+        self._resolutions = resolutions
+        self._traversal_hit_for_uid = traversal_hit_for_uid
+        self.resolve_calls: list[str] = []
+
+    async def resolve_entity(self, ns: Namespace, name: str) -> EntityResolution:  # type: ignore[override]
+        self.resolve_calls.append(name)
+        return self._resolutions.get(
+            name.strip().casefold(),
+            EntityResolution(canonical_name=name.strip().casefold(), entity_uid=None),
+        )
+
+    async def traverse_entities(
+        self,
+        ns: Namespace,
+        *,
+        query: str,
+        max_hops: int,
+        limit: int,
+        caller_identity_set: frozenset[str] | None = None,
+        seed_entity_uids: object = None,
+    ) -> list[Scored[MemoryItem]]:
+        if self._traversal_hit_for_uid is None:
+            return []
+        uid, item = self._traversal_hit_for_uid
+        seeds = seed_entity_uids if isinstance(seed_entity_uids, Sequence) else ()
+        if uid not in seeds:
+            return []
+        return [Scored(item=item, score=2.0, channel=RecallChannel.LTM_GRAPH, rank=0)]
+
+
+@pytest.mark.asyncio
+async def test_resolve_query_entity_uids_finds_a_multiword_phrase_a_token_frontier_cannot() -> None:
+    """AD-327 mechanism proof: ``resolve_entity``'s own multi-word ``canonical_name`` ("q3
+    report") is invisible to a single-token frontier (``"q3"`` and ``"report"`` separately never
+    equal the full phrase) — this is the exact gap ``RecallSettings.ltm_query_entity_seed``'s
+    docstring names. ``ltm_query_entity_seed=20`` covers every 1..3-word window this short query
+    produces (12 total), so the cap is not itself the thing under test here."""
+    ltm = _ResolveEntityLtm(
+        resolutions={
+            "q3 report": EntityResolution(canonical_name="q3 report", entity_uid="ent_q3_report")
+        }
+    )
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({}),  # type: ignore[arg-type]
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(
+            stm_scoring="recency", ltm_query_entity_seed=20, ltm_query_entity_seed_max_ngram=3
+        ),
+        clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+    )
+
+    uids = await ranker._resolve_query_entity_uids(_NS, "who owns the Q3 report?")
+
+    assert uids == ["ent_q3_report"], f"expected the multi-word phrase to resolve; got {uids!r}"
+    assert (
+        "Q3 report" in ltm.resolve_calls
+    ), f"expected the 2-word window to be tried as a candidate phrase; tried {ltm.resolve_calls!r}"
+
+
+@pytest.mark.asyncio
+async def test_ltm_query_entity_seed_zero_never_calls_resolve_entity() -> None:
+    """Shipped default (``ltm_query_entity_seed=0``): the mechanism must be fully inert — never
+    even a store round trip — identically to ``ltm_entity_seed_pool=0``'s own inertness test
+    above."""
+    assert RecallSettings().ltm_query_entity_seed == 0, "precondition: shipped default is off"
+    ltm = _ResolveEntityLtm(resolutions={})
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({}),  # type: ignore[arg-type]
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency"),
+        clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+    )
+
+    uids = await ranker._resolve_query_entity_uids(_NS, "who owns the Q3 report?")
+
+    assert uids == []
+    assert ltm.resolve_calls == [], "must not call resolve_entity at all when the seed is off"
+
+
+@pytest.mark.asyncio
+async def test_ltm_query_entity_seed_wins_a_recall_slot_a_token_frontier_would_miss() -> None:
+    """**The acceptance test**: an LTM-sourced item wins a recall slot on a real query, seeded
+    ONLY by the real ``resolve_entity`` resolving a multi-word phrase the existing token frontier
+    cannot express.
+
+    Proves the mechanism end to end through ``ThreeChannelRecallRanker.rank()`` (not the private
+    seed method alone): the flat seed and MTM channel are both EMPTY, so the only way
+    "the Q3 report is late" can appear in the final result is via
+    ``traverse_entities``'s ``seed_entity_uids`` carrying ``ent_q3_report`` — which only happens
+    when ``ltm_query_entity_seed`` resolves the query's own "Q3 report" phrase. Mutation check:
+    flip ``ltm_query_entity_seed`` back to the shipped default (``0``) and this test fails with
+    the item absent from ``items`` — the exact "fails without the seed" acceptance bar."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    late_report = _item("the Q3 report is late", tier=MemoryTier.LTM, at=base)
+    ltm = _ResolveEntityLtm(
+        resolutions={
+            "q3 report": EntityResolution(canonical_name="q3 report", entity_uid="ent_q3_report")
+        },
+        traversal_hit_for_uid=("ent_q3_report", late_report),
+    )
+    settings = RecallSettings(
+        stm_scoring="recency",
+        ltm_flat_seed=False,  # AD-279 selective mode — isolates the resolve_entity seed's own win
+        ltm_query_entity_seed=20,
+        ltm_query_entity_seed_max_ngram=3,
+    )
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({}),  # type: ignore[arg-type]
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=settings,
+        clock=FrozenClock(base),
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "is the Q3 report done yet?",
+        [1.0, 0.0],
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=None,
+    )
+
+    ids = [s.memory_id for s in result.items]
+    assert late_report.id in ids, (
+        "the resolve_entity-seeded LTM item must win a recall slot; "
+        f"got items={[s.content for s in result.items]!r}"
+    )
+
+    # Mutation check, inline: with the seed off (shipped default), the SAME traversal fake never
+    # sees the uid it needs and the item must NOT appear — proving this test actually depends on
+    # the new seed rather than passing for an unrelated reason.
+    off_ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({}),  # type: ignore[arg-type]
+        ltm=ltm,  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(stm_scoring="recency", ltm_flat_seed=False),  # seed OFF
+        clock=FrozenClock(base),
+    )
+    off_result = await off_ranker.rank(
+        _NS,
+        "is the Q3 report done yet?",
+        [1.0, 0.0],
+        limit=10,
+        channels=RecallChannels(),
+        caller_identity_set=None,
+    )
+    off_ids = [s.memory_id for s in off_result.items]
+    assert late_report.id not in off_ids, (
+        "precondition of the acceptance test: WITHOUT the resolve_entity seed the same query "
+        "must NOT surface the item — otherwise this isn't proving the seed did anything"
+    )
 
 
 class _ContentScoredReranker:
