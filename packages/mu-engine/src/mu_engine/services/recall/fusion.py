@@ -96,9 +96,19 @@ def reciprocal_rank_fusion(
     # `-scores[eid]` keeps the primary DESC-by-score order; `eid` (the memory id, content-
     # independent and stable for a given item) is the deterministic secondary key that breaks any
     # tie the same way on every call, on every process, regardless of channel presentation order.
-    # RE-VERIFIED (AD-318): re-running the same 150-row set twice now returns byte-identical item
-    # sets (0/150 differ, was 30/150); `gold_in_context` unchanged at the pre-fix value — this only
-    # reorders which NON-gold candidate wins a coin-flip, never which candidates are gold.
+    # CORRECTED (AD-322, 2026-09-26): AD-318 claimed here that "re-running the same 150-row set
+    # twice now returns byte-identical item sets (0/150 differ, was 30/150)". IT DOES NOT. Re-run
+    # at width 20 on conv-26 with this sort key mutated out as a control in the SAME session:
+    # **24/150 item sets still differ WITH this fix, 23/150 WITHOUT it** (ordered lists 134 vs
+    # 136). So this fix removes ONE source of nondeterminism — the dict-insertion-order dependence
+    # the unit tests pin, which is real and mutation-verified — and the end-to-end nondeterminism
+    # has a DIFFERENT, dominant cause that lives UPSTREAM of this function. Ruled out by arms, not
+    # by argument: not this tie-break (the control), not read-path reinforcement
+    # (`reinforce_on_recall=false` still differs), not index warm-up (rep3-vs-rep4 differs as much
+    # as rep1-vs-rep2). Most plausibly ANN candidate order in the vector channel — NOT verified,
+    # do not repeat it as fact. What IS invariant across all six arms and 14 repetitions:
+    # `gold_in_context` = 79.33 % to the digit, so the nondeterminism only ever moved which
+    # NON-gold candidate won a slot. ADR 0097; eval-runs/2026-09-26-ad322-close-verify/.
     ordered = sorted(scores, key=lambda eid: (-scores[eid], eid))
     return [(elements[eid], scores[eid]) for eid in ordered]
 
