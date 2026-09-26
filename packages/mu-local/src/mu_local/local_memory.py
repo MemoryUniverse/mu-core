@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final
 
 from mu_contracts.contracts.defaults import DEFAULT_CONSOLIDATE_LIMIT
@@ -218,6 +219,14 @@ class LocalMemory:
         # ``DeterministicPromoteStage``'s ``importance >= IngestSettings.importance_promote`` check
         # (``mu-engine/pipelines/concrete/ingest.py:230``) — never hardcoded to force a promote.
         importance_score: float | None = None,
+        # AD-312 (2026-09-26) — canonical ``AddRequest.occurred_at`` (that field's own docstring
+        # has the full rationale): the WORLD-TIME this activity actually occurred, asserted by
+        # the caller (a backdated import, a benchmark harness replaying dated content). ``None``
+        # (every pre-AD-312 caller) is byte-identical to prior behaviour — threads straight
+        # through to ``IngestActivity.occurred_at``, which ``_build_memory_item``
+        # (``pipelines/concrete/ingest.py``) uses as the anchor for in-text relative-date
+        # resolution, falling back to it directly as ``valid_at`` when no in-text date resolves.
+        occurred_at: datetime | None = None,
         # Phase 1.5 subagent partition (AGENT-INTEGRATION-AUDIT-AND-PLAN.md §6; agent.py). When a
         # capture is attributed to a Claude Code SUBAGENT, ``agent_type`` is its name (Task tool
         # ``subagent_type``). Threading it here resolves a STABLE, deterministic
@@ -289,6 +298,7 @@ class LocalMemory:
                 text=message["content"],
                 importance=importance,
                 turn_seq=next_turn_seq,
+                occurred_at=occurred_at,
             )
             next_turn_seq += 1
             last = await self._container.ingest.remember(activity)

@@ -1316,9 +1316,27 @@ class _ContentScoredReranker:
 @pytest.mark.asyncio
 async def test_reranker_prunes_a_low_relevance_mtm_candidate_end_to_end() -> None:
     """ACCURACY-PLAN-0831.md item 6, wired end-to-end: an MTM distractor that ranked ahead of the
-    genuinely relevant hit on raw RRF position is pruned once the reranker scores it low, and the
-    surviving item carries its real ``rerank_score`` (previously always ``None`` — the gate had no
-    caller)."""
+    genuinely relevant hit on raw RRF position is scored low by the reranker and DEMOTED behind
+    it, and the surviving item carries its real ``rerank_score`` (previously always ``None`` — the
+    gate had no caller).
+
+    **AD-302 amendment.** This test originally asserted the distractor was absent from
+    ``result.items`` entirely. That was an artifact of the fixture, not a documented contract:
+    with only two total candidates and ``limit=10`` there is nothing else to fill the window, so
+    "pruned" here only ever meant "unconditionally dropped" because the pre-AD-302 gate dropped
+    every candidate the cutoff failed, full stop — see ``rerank_gate.py``'s own module docstring,
+    which never claims pruning is guaranteed eviction, only that the gate "can narrow th[e] pool".
+    AD-301 measured that literal drop-then-backfill-from-the-unscored-tail behaviour as the actual
+    defect (`ARCHITECTURE-DELTAS.md` AD-301: "`_merge_floor` backfills the window from the
+    UNSCORED TAIL — candidates fusion ranked WORSE than the head items just pruned"), and AD-302
+    fixes it: a pruned head candidate is demoted below every surviving (scored) item but keeps
+    competing for a slot ahead of the unscored tail, since it was fusion-ranked above that tail
+    before rerank ever ran. With only two total candidates there is no tail and no third candidate
+    to lose a slot to, so the distractor legitimately reaches the window here — correctly LAST,
+    correctly unscored (`rerank_score is None`, the same "gate did not confirm this hit" state an
+    unscored tail item already carries), never masquerading as a confirmed relevant hit. The
+    property this test guards — real competition still excludes it — is covered separately by
+    ``test_reranker_pruned_candidate_still_loses_to_real_competition`` below."""
     base = datetime(2026, 7, 31, tzinfo=UTC)
     relevant = _item("Ada's flight to Denver is Thursday", tier=MemoryTier.MTM, at=base)
     distractor = _item("chatter about the weather", tier=MemoryTier.MTM, at=base)
@@ -1349,10 +1367,65 @@ async def test_reranker_prunes_a_low_relevance_mtm_candidate_end_to_end() -> Non
     )
 
     ids = [it.memory_id for it in result.items]
-    assert distractor.id not in ids, "below the adaptive cutoff (0.1 < 0.5) — must be pruned"
-    assert relevant.id in ids
+    assert ids[0] == relevant.id, "the genuinely relevant hit must lead"
+    assert ids[-1] == distractor.id, "the pruned distractor is demoted to last, not evicted"
     relevant_view = next(it for it in result.items if it.memory_id == relevant.id)
     assert relevant_view.rerank_score == 0.9
+    distractor_view = next(it for it in result.items if it.memory_id == distractor.id)
+    assert (
+        distractor_view.rerank_score is None
+    ), "demoted, not a confirmed low-relevance score — the same unscored state a tail item carries"
+
+
+@pytest.mark.asyncio
+async def test_reranker_pruned_candidate_still_loses_to_real_competition() -> None:
+    """AD-302's counterpart to the test above: when genuine competition exists for the window's
+    slots — enough OTHER candidates that the pruned distractor is no longer needed to fill it —
+    the distractor still loses its slot. AD-302 only stops a pruned head candidate from being
+    leapfrogged by the WORSE unscored tail; it does not resurrect a candidate real competition
+    would already have excluded on fused rank alone once the window is genuinely full."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    relevant = _item("Ada's flight to Denver is Thursday", tier=MemoryTier.MTM, at=base)
+    distractor = _item("chatter about the weather", tier=MemoryTier.MTM, at=base)
+    fillers = [
+        _item(f"Ada also mentioned item {i} about the Denver trip", tier=MemoryTier.MTM, at=base)
+        for i in range(9)
+    ]
+    query_vec = [0.5, 0.5]
+    # Fillers score well ABOVE the 0.5 floor too — real competition, not just default-zero noise
+    # that would be pruned right alongside the distractor and lose the point of this test.
+    reranker = _ContentScoredReranker(
+        {relevant.content: 0.9, distractor.content: 0.1} | {f.content: 0.6 for f in fillers}
+    )
+    ranker = ThreeChannelRecallRanker(
+        stm=_FakeStm([]),  # type: ignore[arg-type]
+        mtm=_FakeMtm({tuple(query_vec): [distractor, relevant, *fillers]}),  # type: ignore[arg-type]
+        ltm=_EmptyLtm(),  # type: ignore[arg-type]
+        fusion=ReciprocalRankFusion(),
+        settings=RecallSettings(
+            stm_scoring="recency",
+            rerank_enabled=True,
+            rerank_min_score=0.5,
+            rerank_top_fraction=0.5,
+        ),
+        clock=FrozenClock(datetime(2026, 7, 31, tzinfo=UTC)),
+        reranker=reranker,
+    )
+
+    result = await ranker.rank(
+        _NS,
+        "when is Ada's flight",
+        query_vec,
+        limit=10,  # exactly 10 non-distractor candidates exist -> genuinely no room left
+        channels=RecallChannels(),
+        caller_identity_set=frozenset[str](),
+    )
+
+    ids = [it.memory_id for it in result.items]
+    assert (
+        distractor.id not in ids
+    ), "10 better-or-equal candidates fill the window; it loses fairly"
+    assert relevant.id in ids
 
 
 @pytest.mark.asyncio

@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
 from typing import Any, NoReturn, Protocol
 
 from mu_contracts.contracts.memory import MemoryResponse
@@ -275,6 +276,11 @@ class SurfaceFacade:
         # ``importance >= IngestSettings.importance_promote`` gate
         # (``mu-engine/pipelines/concrete/ingest.py:230``).
         importance_score: float | None = None,
+        # AD-312 (2026-09-26): mirrors ``LocalMemory.add``'s identical new parameter and the
+        # canonical ``AddRequest.occurred_at`` (that field's own docstring has the full
+        # rationale) — the WORLD-TIME this activity actually occurred, asserted by the caller.
+        # ``None`` (every pre-AD-312 caller) is byte-identical to prior behaviour.
+        occurred_at: datetime | None = None,
     ) -> MemoryWriteResult:
         """Ingest one activity (STM durable -> deterministic STM->MTM promote, GATED on importance
         — REMEDIATION Rank 2 / conformance A6 fix). Mirrors ``LocalMemory.add`` (``mu-local/
@@ -303,6 +309,7 @@ class SurfaceFacade:
                 kind="user_message",
                 text=message["content"],
                 importance=importance,
+                occurred_at=occurred_at,
             )
             last = await self._container.ingest.remember(activity)
         if last is None:  # empty message list — fail loud, never a silent no-op

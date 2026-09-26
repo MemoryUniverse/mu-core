@@ -53,6 +53,7 @@ from mu_engine.pipelines.base import BaseStage, PipelineContext, StageOutcome, S
 from mu_engine.pipelines.errors import StageExecutionError
 from mu_engine.pipelines.ledger import StageLedger
 from mu_engine.providers._contracts import EmbeddingPort
+from mu_engine.services.extract import extract_valid_at
 from mu_engine.services.settings import IngestSettings
 from mu_engine.storage.domain.artifact import ArtifactKind, ContextArtifact
 from mu_engine.storage.domain.memory import (
@@ -102,6 +103,15 @@ class IngestActivity(BaseModel):
     importance: float = Field(default=0.5, ge=0.0, le=1.0)
     promote: bool = False
     source: MemorySource = MemorySource.USER
+
+    # AD-312 (2026-09-26, canonical `AddRequest.occurred_at` — that field's own docstring has the
+    # full rationale): the WORLD-TIME this activity actually occurred, asserted by the caller.
+    # `None` (every pre-AD-312 caller) is byte-identical to prior behaviour — `_build_memory_item`
+    # below falls back to the real ingest instant (`at`) as the anchor for in-text date
+    # resolution, exactly as it already did. Distinct from `created_at`/`updated_at` (transaction
+    # time — the real ingest wall-clock, NEVER overridden by this field, so STM recency ordering
+    # is untouched): this is `valid_at`'s signal, not a second `created_at`.
+    occurred_at: datetime | None = None
 
     subject: str | None = None
     predicate: str | None = None
@@ -219,6 +229,35 @@ def _build_memory_item(
         session_id=ns.session,
         created_at=at,
         updated_at=at,
+        # AD-308 follow-up (team-lead review, 2026-09-26): the ONE mint point for a captured
+        # MemoryItem (CANONICAL §7.1) is the right place for the temporal signal a raw capture's
+        # OWN text states ("...yesterday", "...on 8 May, 2023") to survive at all — before this,
+        # `valid_at` stayed unset for every STM/MTM item unconditionally (date resolution only
+        # ever ran during MTM->LTM DISTILL, which AD-310/311 measured never wins a recall slot).
+        # `extract_valid_at` (`services/extract.py`) is LLM-free (this stage's own module
+        # docstring: "NO LLM on this path") and never alters `content` — only a NEW, additive
+        # field. `DeterministicPromoteStage`'s STM->MTM promotion is a `model_copy` that carries
+        # this field forward unchanged (`ingest.py:_execute` below), so the date reaches the tier
+        # that actually serves recall slots without any change to promotion itself.
+        #
+        # AD-312: `activity.occurred_at` (when the caller asserts it — a backdated import, a
+        # benchmark harness replaying dated content) is the anchor `extract_valid_at` resolves a
+        # RELATIVE clause against ("yesterday" means nothing without knowing what day "today"
+        # was) — falling back to the real ingest instant `at` exactly as before when the caller
+        # asserts nothing (byte-identical to pre-AD-312 behaviour). When no in-text clause
+        # resolves AT ALL but the caller DID assert `occurred_at`, that assertion is itself the
+        # best available world-time signal for this item — mem0's own harness stamps every
+        # memory with the session's real date the same way (`add.py:83`); this is that same
+        # capability, minus the OSS-vs-platform split their own library has (`Memory.add`'s own
+        # docstring: "Platform-only … Not supported in OSS").
+        valid_at=(
+            extract_valid_at(activity.text, now=activity.occurred_at or at) or activity.occurred_at
+        ),
+        # AD-316: the RAW value, kept SEPARATE from the (possibly-resolved) `valid_at` above —
+        # `MemoryItem.occurred_at`'s own docstring has the full "why" (double-count risk when a
+        # renderer shows a resolved date beside unmodified relative-phrase content). `None` when
+        # the caller asserted nothing, byte-identical to pre-AD-316 behaviour.
+        occurred_at=activity.occurred_at,
         importance_score=activity.importance,
         source=activity.source,
         turn_seq=activity.turn_seq,

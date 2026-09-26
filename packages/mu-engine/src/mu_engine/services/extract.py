@@ -39,6 +39,7 @@ __all__ = [
     "HeuristicSpoExtractor",
     "LlmFactExtractor",
     "decompose_to_spo",
+    "extract_valid_at",
 ]
 
 
@@ -414,23 +415,37 @@ _WORD_NUMBER: dict[str, int] = {
     "twelve": 12,
 }
 
+# AD-308 capture-time follow-up: a temporal clause in real dialogue is often followed by trailing
+# commentary rather than sitting at the literal end of the sentence — "I went to a LGBTQ support
+# group yesterday and it was so powerful" (real LoCoMo text; caught by the VM run of
+# `test_ingest_valid_at_unit.py`, not assumed). A bare `\.?\s*$` anchor matches NONE of that real
+# dialogue. `_CLAUSE_END` (a lookahead, so it never consumes/captures the trailing text — callers
+# still only use `m.start()`) accepts end-of-string, a following `,`/`;`/`.`, OR a following
+# coordinating " and " — the three places English actually closes a clause. Deliberately NOT
+# widened further (no bare " but"/" so" etc.): each addition is a DIFFERENT risk of swallowing
+# unrelated trailing content into what looks like "the sentence ended here", and these three are
+# the ones a real gold-set sentence has needed so far.
+_CLAUSE_END = r"(?=\.?\s*$|\s*[,;]|\s+and\b)"
+
 # "(about) two months ago" / "(about) a year ago" / "(about) 3 days ago" — count is the
 # indefinite article, a digit, or a spelled-out number (`_WORD_NUMBER`).
 _RELATIVE_AGO = re.compile(
     r"\s+(?:about\s+)?(a|an|\d+|"
     + "|".join(_WORD_NUMBER)
-    + r")\s+(day|week|month|year)s?\s+ago\.?\s*$",
+    + r")\s+(day|week|month|year)s?\s+ago"
+    + _CLAUSE_END,
     re.IGNORECASE,
 )
 # Bare relative day words — never behind a preposition ("in yesterday" is not English).
-_RELATIVE_BARE = re.compile(r"\s+(yesterday|today|tomorrow)\.?\s*$", re.IGNORECASE)
+_RELATIVE_BARE = re.compile(r"\s+(yesterday|today|tomorrow)" + _CLAUSE_END, re.IGNORECASE)
 # "last Tuesday" / "next Friday".
 _RELATIVE_WEEKDAY = re.compile(
-    r"\s+(last|next)\s+" r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\.?\s*$",
+    r"\s+(last|next)\s+"
+    r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)" + _CLAUSE_END,
     re.IGNORECASE,
 )
 # "last week" / "next month" / "last year".
-_RELATIVE_UNIT = re.compile(r"\s+(last|next)\s+(week|month|year)\.?\s*$", re.IGNORECASE)
+_RELATIVE_UNIT = re.compile(r"\s+(last|next)\s+(week|month|year)" + _CLAUSE_END, re.IGNORECASE)
 
 
 def _shift_to_weekday(now: datetime, target: int, *, forward: bool) -> datetime:
@@ -734,6 +749,76 @@ def _match_change_clause(
     )
 
 
+def _trailing_temporal_clause(sentence: str, *, now: datetime) -> tuple[str, datetime | None]:
+    """Pull a trailing temporal clause off ``sentence`` and resolve it, RELATIVE first (AD-308:
+    "two months ago", "last Tuesday" — resolved against ``now``, the per-item capture instant),
+    then ABSOLUTE (``_TEMPORAL_TAIL``, an explicit ISO date/year) — the two clause vocabularies
+    are disjoint so trying both costs nothing on the common case where neither matches, and
+    whichever one matches strips the SAME trailing-clause position. Returns
+    ``(body_with_clause_removed, valid_at)``; ``valid_at`` is ``None`` (and ``body`` is
+    ``sentence`` unchanged) when nothing resolves — never a guess.
+
+    Factored out of :func:`_decompose_sentence` (AD-308 follow-up) so
+    :func:`extract_valid_at` — the CAPTURE-time date signal, independent of SPO decomposition —
+    reuses the identical resolution logic rather than a second, driftable copy (DEV-STANDARDS
+    rule 6, DRY).
+    """
+    valid_at: datetime | None = None
+    body = sentence
+    stripped, relative_valid_at = _resolve_relative_temporal(sentence, now=now)
+    if relative_valid_at is not None:
+        valid_at = relative_valid_at
+        body = stripped.strip()
+    else:
+        m = _TEMPORAL_TAIL.search(sentence)
+        if m:
+            try:
+                valid_at = _parse_temporal(m.group(1))
+                body = sentence[: m.start()].strip()
+            except ValueError:
+                valid_at = None  # unparseable -> caller's own LOUD fallback, never a guess
+    return body, valid_at
+
+
+def extract_valid_at(text: str, *, now: datetime) -> datetime | None:
+    """The CAPTURE-time date signal: scan ``text`` sentence by sentence for a resolvable temporal
+    clause (the SAME resolver :func:`decompose_to_spo` uses for an extracted FACT's ``valid_at``)
+    and return the FIRST one found, or ``None`` if none resolves — never a guess, matching
+    :func:`_trailing_temporal_clause`'s own "no fallback" discipline.
+
+    AD-308 follow-up (team-lead review, 2026-09-26): ``decompose_to_spo``'s temporal resolution
+    only ever ran during MTM->LTM DISTILL (``pipelines/distill.py``'s ``_collect_facts``), which
+    every eval run on record leaves unconditionally empty (`mu_eval/corpus.py`'s own docstring)
+    and which, even when exercised, never wins a recall slot (AD-310/AD-311: 0 of 3,000 items).
+    **STM/MTM verbatim captures — where essentially all of this engine's answers actually come
+    from — never got a `valid_at` at all, fallback included**: `pipelines/concrete/ingest.py::
+    _build_memory_item` (the ONE mint point for a captured `MemoryItem`, CANONICAL §7.1) sets
+    `created_at`/`updated_at` and nothing temporal. This function is the capture-time counterpart:
+    called from `_build_memory_item` (this module's own docstring update, `ingest.py`), it runs
+    over the RAW captured text — no SPO decomposition, content is never altered, `content` keeps
+    its content_hash identity — so a plain capture like "I went to a LGBTQ support group
+    yesterday and it was so powerful." gets a resolved `valid_at` even though it never becomes an
+    LTM fact. `DeterministicPromoteStage`'s STM->MTM promotion is a `model_copy` that preserves
+    every field including this one (`ingest.py:506-515`), so the date survives onto the MTM item
+    a temporal recall actually serves.
+
+    Deliberately does NOT fall back to `now`/`created_at` the way `distill.py`'s LOUD fallback
+    does for a PROMOTED fact: that fallback exists because the bi-temporal GRAPH tier's own design
+    wants every node to carry a stamped world-time. A raw capture's `valid_at` is optional by
+    design (`MemoryItem.valid_at: datetime | None = None`), and stamping today's wall-clock date
+    onto the ~80%+ of captures that state no date at all would inject a WRONG, misleading date
+    into most captured content — worse than the honest `None` this function returns instead.
+    """
+    for raw in re.split(r"[.;?!\n]", text):
+        chunk = raw.strip()
+        if not chunk:
+            continue
+        _, valid_at = _trailing_temporal_clause(chunk, now=now)
+        if valid_at is not None:
+            return valid_at
+    return None
+
+
 def _decompose_sentence(
     sentence: str, *, base_offset: int, full_text: str, settings: ExtractionSettings, now: datetime
 ) -> ExtractedFact | None:
@@ -742,24 +827,7 @@ def _decompose_sentence(
         return None
 
     # (1) pull a trailing temporal clause off the tail before matching (keeps date out of object).
-    # RELATIVE first (AD-308: "two months ago", "last Tuesday" — resolved against `now`, the
-    # per-item capture instant), then ABSOLUTE (`_TEMPORAL_TAIL`, an explicit ISO date/year) — the
-    # two clause vocabularies are disjoint so trying both costs nothing on the common case where
-    # neither matches, and whichever one matches strips the SAME trailing-clause position.
-    valid_at: datetime | None = None
-    body = original
-    stripped, relative_valid_at = _resolve_relative_temporal(original, now=now)
-    if relative_valid_at is not None:
-        valid_at = relative_valid_at
-        body = stripped.strip()
-    else:
-        m = _TEMPORAL_TAIL.search(original)
-        if m:
-            try:
-                valid_at = _parse_temporal(m.group(1))
-                body = original[: m.start()].strip()
-            except ValueError:
-                valid_at = None  # unparseable -> pipeline's LOUD recorded_at fallback
+    body, valid_at = _trailing_temporal_clause(original, now=now)
 
     # (1.5) D5-quick: strip filler words (e.g. "named") from the body BEFORE any pattern is
     # tried, so "Ada's sister is named Mira" reads as "Ada's sister is Mira" everywhere below.

@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict
 
@@ -184,6 +185,16 @@ async def ingest_conversation(
     turns: Sequence[Turn] | None = None,
     consolidate: bool = False,
     consolidate_limit: int | None = None,
+    # AD-312 (2026-09-26), additive and default-off: a caller-supplied ``Turn -> datetime | None``
+    # resolver, threaded to ``LocalMemory.add``'s own new ``occurred_at`` parameter (the PUBLIC
+    # verb — this is not a private hook; every real caller of ``add()`` can pass the same thing).
+    # ``None`` (every pre-AD-312 caller, unaffected) reproduces the exact PRE-EXISTING behaviour:
+    # no ``occurred_at`` is passed, so ``valid_at`` is only ever recovered from a turn's own text
+    # (AD-308) or left unset. This is what lets `eval/mem0_h2h/ours_arm.py` pass LoCoMo's real
+    # per-turn `session_date` through the PUBLIC API path, mirroring mem0's own harness
+    # (`add.py:83` stamps every memory with the session's real date) — the eval reaches the
+    # capability through the identical verb a real caller would use, never a shortcut.
+    occurred_at_of: Callable[[Turn], datetime | None] | None = None,
 ) -> tuple[TurnIndex, IngestReport]:
     """Write every turn through ``LocalMemory.add`` and build the gold-label join index.
 
@@ -216,7 +227,11 @@ async def ingest_conversation(
     for turn in selected:
         index.add(turn)
         result = await memory.add(  # type: ignore[attr-defined]
-            turn.ingest_text, user=user, session=session, importance_score=importance
+            turn.ingest_text,
+            user=user,
+            session=session,
+            importance_score=importance,
+            occurred_at=occurred_at_of(turn) if occurred_at_of is not None else None,
         )
         written += 1
         if getattr(result, "promoted", False):

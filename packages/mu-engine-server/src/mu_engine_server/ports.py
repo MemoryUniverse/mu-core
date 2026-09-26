@@ -30,6 +30,7 @@ resolve, since ``mu_engine.lifecycle.manager`` has no route-shaped ``profile``/`
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Protocol
 
 from mu_contracts.contracts.memory import MemoryResponse
@@ -64,6 +65,12 @@ class MemorySurfacePort(Protocol):
         # absent from this protocol, so the route could not pass it without a type error — which
         # is why the route silently dropped it and no wire caller could ever reach MTM.
         importance_score: float | None = None,
+        # AD-312 (2026-09-26): canonical `AddRequest.occurred_at` (that field's own docstring has
+        # the full rationale) — mirrors `importance_score`'s own precedent exactly, added to this
+        # Protocol in the SAME change that adds it to `SurfaceFacade.add`, so the "absent from the
+        # protocol -> route drops it silently" gap this file's own comment documents cannot recur
+        # for this field.
+        occurred_at: datetime | None = None,
     ) -> MemoryWriteResult: ...
 
     async def recall(

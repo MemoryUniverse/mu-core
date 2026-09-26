@@ -201,4 +201,18 @@ class AdaptiveRerankGate:
             return list(pool)
 
         reranked_head = [item.model_copy(update={"rerank_score": score}) for item, score in gated]
-        return [*reranked_head, *tail]
+        # AD-302 — a candidate the gate PRUNES (scored, but below the adaptive cutoff) is still a
+        # member of `head`: it was fusion-ranked ABOVE every item in `tail` (fused-RRF best-first
+        # order, this module's own "Pool width vs. limit" docstring), so it must not be dropped
+        # from the returned pool entirely. AD-301 measured exactly this defect by running: the
+        # shipped gate keeps ~1 scored survivor per query and `_merge_floor` (`ranker.py`) fills
+        # the rest of the window by POSITIONAL SLICE (`natural[:limit]`, not a score re-sort) from
+        # whatever this method returns next — which, before this fix, was `tail`: candidates
+        # fusion ranked WORSE than the ones just pruned. Kept here, demoted below every surviving
+        # (scored) item but ahead of `tail`, with `rerank_score` left `None` — the SAME "gate did
+        # not confirm this hit" state `tail` already carries (`dto.py`'s field docstring: "never a
+        # third state"), so `_relevance_scores`'s fused_score fallback treats a pruned-but-retained
+        # head item exactly like an unscored one, not like a confirmed low-relevance hit.
+        gated_ids = {item.memory_id for item, _ in gated}
+        pruned_head = [item for item in head if item.memory_id not in gated_ids]
+        return [*reranked_head, *pruned_head, *tail]

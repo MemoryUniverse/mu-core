@@ -144,6 +144,14 @@ class RecallItemView(BaseModel):
     # caller rendering the date into an answer-context prompt needs this to avoid presenting an
     # inferred transaction time as if it were an asserted world-time fact.
     valid_at_inferred: bool = False
+    # AD-316: `MemoryItem.occurred_at` forwarded unchanged — the RAW capture instant the caller
+    # asserted (AD-312), kept separate from `valid_at` because `valid_at` may be a RESOLVED date
+    # (a relative in-text clause shifted against this anchor) while `content` still carries that
+    # same relative phrase unmodified. A caller rendering BOTH a date prefix AND the original
+    # content should prefer THIS field over `valid_at` to avoid a reader re-applying the relative
+    # offset on top of an already-resolved date (AD-315's 7/8-row diagnostic). `None` when the
+    # underlying `MemoryItem.occurred_at` is itself unset.
+    occurred_at: datetime | None = None
 
 
 class RecallResult(BaseModel):

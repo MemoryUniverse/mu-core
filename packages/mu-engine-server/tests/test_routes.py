@@ -77,15 +77,22 @@ class _FakeFacade:
         user: str,
         session: str | None,
         importance_score: float | None = None,
+        occurred_at: datetime | None = None,
     ) -> MemoryWriteResult:
-        # `importance_score` is RECORDED, not ignored: the route used to drop this canonical
-        # AddRequest field, so no wire caller could clear the promote gate and reach MTM. Keeping
-        # it in `calls` lets the pass-through be asserted, not assumed.
+        # `importance_score`/`occurred_at` are RECORDED, not ignored: the route used to drop the
+        # canonical AddRequest's `importance_score` field the same way (see the regression test
+        # below), so no wire caller could clear the promote gate and reach MTM. Keeping both in
+        # `calls` lets the pass-through be asserted, not assumed — AD-312's own precedent.
         self.calls.append(
             (
                 "add",
                 (content,),
-                {"user": user, "session": session, "importance_score": importance_score},
+                {
+                    "user": user,
+                    "session": session,
+                    "importance_score": importance_score,
+                    "occurred_at": occurred_at,
+                },
             )
         )
         if self.add_raises is not None:
@@ -257,7 +264,12 @@ def test_add_memory_returns_write_result() -> None:
         (
             "add",
             ("Ada lives in Paris",),
-            {"user": _USER, "session": _SESSION, "importance_score": None},
+            {
+                "user": _USER,
+                "session": _SESSION,
+                "importance_score": None,
+                "occurred_at": None,
+            },
         )
     ]
 
@@ -269,7 +281,12 @@ def test_add_memory_defaults_user_and_session() -> None:
     resp = client.post("/memories", json={"content": "hi"})
 
     assert resp.status_code == 201
-    assert facade.calls[0][2] == {"user": "default", "session": None, "importance_score": None}
+    assert facade.calls[0][2] == {
+        "user": "default",
+        "session": None,
+        "importance_score": None,
+        "occurred_at": None,
+    }
 
 
 def test_add_memory_passes_importance_score_through_to_the_facade() -> None:
@@ -286,6 +303,21 @@ def test_add_memory_passes_importance_score_through_to_the_facade() -> None:
 
     assert resp.status_code == 201
     assert facade.calls[0][2]["importance_score"] == 0.95
+
+
+def test_add_memory_passes_occurred_at_through_to_the_facade() -> None:
+    """AD-312, same regression shape as `importance_score` above: `occurred_at` was ADDED to
+    `MemorySurfacePort.add`'s Protocol in the same change as `SurfaceFacade.add`'s own new
+    parameter (`ports.py`'s own docstring names the exact prior bug this pattern avoids) — this
+    test is the route-level proof the wire body actually reaches it."""
+    facade = _FakeFacade()
+    client = _client(facade)
+    occurred_at = datetime(2023, 5, 7, tzinfo=UTC)
+
+    resp = client.post("/memories", json={"content": "hi", "occurred_at": occurred_at.isoformat()})
+
+    assert resp.status_code == 201
+    assert facade.calls[0][2]["occurred_at"] == occurred_at
 
 
 def test_add_memory_value_error_maps_to_400() -> None:
