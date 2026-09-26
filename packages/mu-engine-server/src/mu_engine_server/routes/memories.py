@@ -106,6 +106,7 @@ async def add_memory(
         user=user,
         session=body.session,
         importance_score=body.importance_score,
+        occurred_at=body.occurred_at,  # AD-312 — see AddRequest.occurred_at's own docstring
     )
 
 

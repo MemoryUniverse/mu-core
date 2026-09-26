@@ -104,6 +104,15 @@ class IngestActivity(BaseModel):
     promote: bool = False
     source: MemorySource = MemorySource.USER
 
+    # AD-312 (2026-09-26, canonical `AddRequest.occurred_at` — that field's own docstring has the
+    # full rationale): the WORLD-TIME this activity actually occurred, asserted by the caller.
+    # `None` (every pre-AD-312 caller) is byte-identical to prior behaviour — `_build_memory_item`
+    # below falls back to the real ingest instant (`at`) as the anchor for in-text date
+    # resolution, exactly as it already did. Distinct from `created_at`/`updated_at` (transaction
+    # time — the real ingest wall-clock, NEVER overridden by this field, so STM recency ordering
+    # is untouched): this is `valid_at`'s signal, not a second `created_at`.
+    occurred_at: datetime | None = None
+
     subject: str | None = None
     predicate: str | None = None
     object: str | None = None
@@ -230,7 +239,20 @@ def _build_memory_item(
         # field. `DeterministicPromoteStage`'s STM->MTM promotion is a `model_copy` that carries
         # this field forward unchanged (`ingest.py:_execute` below), so the date reaches the tier
         # that actually serves recall slots without any change to promotion itself.
-        valid_at=extract_valid_at(activity.text, now=at),
+        #
+        # AD-312: `activity.occurred_at` (when the caller asserts it — a backdated import, a
+        # benchmark harness replaying dated content) is the anchor `extract_valid_at` resolves a
+        # RELATIVE clause against ("yesterday" means nothing without knowing what day "today"
+        # was) — falling back to the real ingest instant `at` exactly as before when the caller
+        # asserts nothing (byte-identical to pre-AD-312 behaviour). When no in-text clause
+        # resolves AT ALL but the caller DID assert `occurred_at`, that assertion is itself the
+        # best available world-time signal for this item — mem0's own harness stamps every
+        # memory with the session's real date the same way (`add.py:83`); this is that same
+        # capability, minus the OSS-vs-platform split their own library has (`Memory.add`'s own
+        # docstring: "Platform-only … Not supported in OSS").
+        valid_at=(
+            extract_valid_at(activity.text, now=activity.occurred_at or at) or activity.occurred_at
+        ),
         importance_score=activity.importance,
         source=activity.source,
         turn_seq=activity.turn_seq,

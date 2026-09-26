@@ -28,16 +28,36 @@ import statistics
 import sys
 import time
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.environ.get("H2H_EVAL_DIR", str(Path(__file__).resolve().parent.parent)))
 
+from dateutil import parser as _dateutil_parser
 from mu_eval.corpus import ingest_conversation, local_memory_for
-from mu_eval.locomo import load_locomo
+from mu_eval.locomo import Turn, load_locomo
 from mu_eval.runner import _await_index, gold_ids_present
 
 from mem0_h2h import emit
+
+
+def _turn_occurred_at(turn: Turn) -> datetime | None:
+    """AD-312: LoCoMo's own `session_date` ("1:56 pm on 8 May, 2023") parsed into a real,
+    UTC-aware `datetime` — the true world-time the turn was said, exactly what mem0's own harness
+    stamps onto every memory it ingests (`add.py:83`). Reached only through the PUBLIC
+    `LocalMemory.add(occurred_at=...)` parameter (`corpus.py::ingest_conversation`'s own
+    `occurred_at_of` seam) — no private hook, no harness-side content rewrite; the wire caller
+    could pass the identical value. Returns `None` (not a guess) on any unparsed/empty date —
+    `corpus.py` already treats `None` as "no assertion" exactly like a real caller omitting it.
+    """
+    if not turn.session_date.strip():
+        return None
+    try:
+        parsed = _dateutil_parser.parse(turn.session_date)
+    except (ValueError, OverflowError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 async def sweep_one_arm(
@@ -91,6 +111,13 @@ async def sweep_one_arm(
     # `H2H_CONSOLIDATE=1` opts in.
     consolidate = os.environ.get("H2H_CONSOLIDATE", "0") == "1"
 
+    # AD-312: LoCoMo's own real per-turn dates, threaded through the PUBLIC `LocalMemory.add(
+    # occurred_at=...)` path (not a harness-side rewrite of what the model reads — see
+    # `_turn_occurred_at`'s own docstring). Off by default (byte-identical to every prior run of
+    # this script, including AD-308/310's own product_only measurement); `H2H_OCCURRED_AT=1`
+    # opts in.
+    use_occurred_at = os.environ.get("H2H_OCCURRED_AT", "0") == "1"
+
     async with local_memory_for(conversation, run_id=run_id) as opaque:
         memory: Any = opaque
         index, report = await ingest_conversation(
@@ -100,6 +127,7 @@ async def sweep_one_arm(
             session=session,
             importance=importance,
             consolidate=consolidate,
+            occurred_at_of=_turn_occurred_at if use_occurred_at else None,
         )
         if consolidate:
             emit(

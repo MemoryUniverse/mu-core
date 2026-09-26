@@ -139,6 +139,7 @@ consumer tomorrow).
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -236,6 +237,19 @@ class AddRequest(BaseModel):
     importance_score: float | None = Field(default=None, ge=0.0, le=1.0)
     idempotency_key: str | None = None  # see module docstring — HEADER on the wire, not body
     metadata: dict[str, str] | None = None
+    # AD-312 (2026-09-26): WORLD-TIME this activity actually occurred, asserted by the caller —
+    # distinct from `created_at` (transaction time, always the real ingest instant, never
+    # overridden by this field). DEV-STANDARDS' bi-temporal mandate already requires `valid_at`
+    # on the record; before this field, the capture surface had no way for a caller who KNOWS
+    # when something happened (a backdated import, a historical migration, a benchmark harness
+    # replaying dated content) to assert it — the engine could only ever infer a date from the
+    # TEXT (`services/extract.py::extract_valid_at`) or fall back to ingestion time. `None`
+    # (every existing caller) is BYTE-IDENTICAL to today's behaviour: an in-text date still wins
+    # when present, this field is only consulted as the fallback anchor/value
+    # (`pipelines/concrete/ingest.py::_build_memory_item`). Design: `capture-spec.md` §4.1's
+    # `RawActivity.occurred_at` already specifies this EXACT concept for live host capture; this
+    # is the same signal, made optional and available on the explicit-caller `add()` path too.
+    occurred_at: datetime | None = None
 
 
 class RecallRequest(BaseModel):
