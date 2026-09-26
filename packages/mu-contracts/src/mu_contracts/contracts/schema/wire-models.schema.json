@@ -88,6 +88,19 @@
           "default": null,
           "title": "Object"
         },
+        "occurred_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Occurred At"
+        },
         "predicate": {
           "anyOf": [
             {
@@ -1131,6 +1144,19 @@
           "title": "Memory Id",
           "type": "string"
         },
+        "occurred_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Occurred At"
+        },
         "rerank_score": {
           "anyOf": [
             {
@@ -1157,6 +1183,24 @@
           ],
           "default": null,
           "title": "Turn Seq"
+        },
+        "valid_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Valid At"
+        },
+        "valid_at_inferred": {
+          "default": false,
+          "title": "Valid At Inferred",
+          "type": "boolean"
         }
       },
       "required": [
