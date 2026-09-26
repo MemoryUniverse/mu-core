@@ -48,6 +48,7 @@ uv run --no-sync lint-imports
 uv run --no-sync mypy packages/mu-contracts/src packages/mu-engine/src \
                        packages/mu-local/src packages/mu-engine-server/src
 uv run --no-sync pytest -m "not integration"
+uv run --no-sync pytest eval/tests -m "not integration"
 ```
 
 `--no-sync` matters. Without it `uv run` re-resolves the environment and can hand you a *different*
@@ -69,6 +70,7 @@ committed:
 | boundaries | `lint-imports` | `Contracts: 5 kept, 0 broken.` (280 files, 1741 dependencies) |
 | types | `mypy --strict` (4 src roots) | `Success: no issues found in 238 source files` (~4 min) |
 | tests | `pytest -m "not integration"` | `1546 passed, 1 skipped, 274 deselected` (~60 s) |
+| eval unit tests | `pytest eval/tests -m "not integration"` | `179 passed, 4 deselected` (~25 s) |
 | packaging | `uv build --all-packages` | 4 sdists + 4 wheels |
 
 The five import-linter contracts are the load-bearing ones — they are how the package split stays
@@ -92,6 +94,18 @@ machine with those containers up. They run on the project's dev VM. If you are w
 storage adapters and cannot run them, say so in the PR and a maintainer will run them for you.
 They are not skipped because they are optional; they are skipped because a GitHub runner is the
 wrong machine.
+
+**`eval/tests` runs as its OWN step, not folded into `testpaths` above.** It is not in
+`[tool.pytest.ini_options] testpaths`, on purpose: `eval/tests/test_harness_join_int.py` is a real
+`integration` test (it ingests through `LocalMemory.add` and recalls against live
+Valkey/Qdrant/FalkorDB — see its own module docstring), and merging the directory into the same
+collection as the four package trees would put a store-dependent test one step edit away from
+running in a job that provisions no stores. The dedicated `pytest (eval harness — unit tests)` step
+runs `eval/tests -m "not integration"` on its own, and a second step
+(`pytest (eval harness — the excluded integration test still exists)`) collect-only asserts the
+excluded test still exists and is still matched by the marker — so a rename, a deleted file or a
+dropped `pytestmark` shows up as a CI failure instead of a quiet "N ran" that no longer means what
+it used to.
 
 **The `acceptance` dependency group.** One acceptance test (F1, portability parity) drives the
 public Python SDK against the containerized engine-server and needs the sibling `mu-sdk-python`

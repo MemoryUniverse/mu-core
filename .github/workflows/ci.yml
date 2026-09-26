@@ -317,6 +317,102 @@ jobs:
               )
           PY
 
+      # `eval/tests` (AD-309's 7 + AD-313's 9 harness-instrument unit tests, 17 files in total) is
+      # NOT in `testpaths` above, so none of it was ever collected by the step before this one —
+      # 16 tests silently uncollected reads exactly like the module that "vanished" that step's own
+      # FLOOR check exists to catch, except nothing was there to catch it: an absent testpath is not
+      # a shrinking suite, it is a suite that was never whole.
+      #
+      # NOT fixed by adding `eval/tests` to `testpaths` itself. That merges it into the SAME
+      # collection + run as the four package trees above, and `eval/tests/test_harness_join_int.py`
+      # is `pytest.mark.integration` — a REAL integration test (ingests through `LocalMemory.add`
+      # and recalls against live Valkey/Qdrant/FalkorDB, see its own module docstring). Pulling it
+      # into a job that provisions no stores turns the merged step red, or (worse, if the marker
+      # filter is ever loosened for the merged run) green while silently skipping the one join test
+      # the harness depends on. A separate, explicitly-pathed step keeps the two tiers apart the
+      # same way `testpaths` already keeps `integration` out of the step above — the unit tests
+      # gate here, the integration test never enters a job with no stores to talk to.
+      - name: pytest (eval harness — unit tests)
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: |
+          uv run --no-sync pytest eval/tests -m "not integration" \
+            -p no:cacheprovider --junit-xml=pytest-eval-unit.xml
+          python3 - <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          # Floor, not exact — same idiom as the container-free tier above. 179 ran when this was
+          # written (183 collected in eval/tests, 4 deselected: test_harness_join_int.py's four
+          # `integration`-marked tests).
+          FLOOR = 170
+
+          root = ET.parse("pytest-eval-unit.xml").getroot()
+          suites = root.findall("testsuite") or [root]
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          errors = sum(int(s.get("errors", 0)) for s in suites)
+          failures = sum(int(s.get("failures", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          ran = tests - skipped
+          sys.stdout.write(
+              f"eval/tests unit tier: {ran} test(s) RAN "
+              f"({tests} collected, {skipped} skipped, {failures} failed, {errors} errored)\n"
+          )
+          if errors:
+              sys.exit(
+                  f"{errors} COLLECTION/SETUP ERROR(S) in eval/tests. A module that cannot be "
+                  "imported is not a test that passed — fix the import; never delete the module."
+              )
+          if ran < FLOOR:
+              sys.exit(
+                  f"ONLY {ran} test(s) RAN in eval/tests, floor is {FLOOR}. AD-309 and AD-313 added "
+                  "these tests specifically to be CI-gated — find what stopped being collected "
+                  "rather than lowering the floor."
+              )
+          PY
+
+      # The other half of the same gate, run the way a marker filter can silently rot: prove
+      # `-m "not integration"` above is actually EXCLUDING `test_harness_join_int.py` on purpose,
+      # not just failing to find it. A rename, a deleted file or a dropped `pytestmark` would each
+      # make the step above pass with the SAME "green, N ran" line while quietly no longer
+      # exercising the exclusion at all — indistinguishable from correct without this check.
+      - name: pytest (eval harness — the excluded integration test still exists)
+        if: ${{ !cancelled() }}
+        working-directory: mu-core
+        run: |
+          # `--collect-only` never populates the JUnit `tests` count in this pytest version (it
+          # reports `tests="0"` unconditionally) — verified against 8.4.2, the version this
+          # workflow pins — so this reads the "N/M tests collected (K deselected)" summary line
+          # pytest prints instead of the XML report the other steps use.
+          uv run --no-sync pytest eval/tests -m integration \
+            -p no:cacheprovider --collect-only -q | tee pytest-eval-integration-collect.txt
+          python3 - <<'PY'
+          import re
+          import sys
+
+          # Exact, not a floor: this file has had four `integration` tests since AD-309/AD-313
+          # landed it, and collect-only never runs a single one against a real store — a count
+          # that moves means the file changed and this line should move with it, deliberately.
+          EXPECTED = 4
+
+          text = open("pytest-eval-integration-collect.txt").read()
+          m = re.search(r"^(\d+)/\d+ tests collected", text, re.MULTILINE)
+          selected = int(m.group(1)) if m else 0
+          sys.stdout.write(f"eval/tests integration tier: {selected} test(s) collected (0 run)\n")
+          if selected == 0:
+              sys.exit(
+                  "ZERO `integration`-marked tests collected in eval/tests. The step above's "
+                  "'-m not integration' exclusion is then excluding nothing, and eval/tests would "
+                  "be reported fully CI-gated while its one real-store join test silently is not."
+              )
+          if selected != EXPECTED:
+              sys.exit(
+                  f"{selected} `integration`-marked test(s) collected in eval/tests, expected "
+                  f"{EXPECTED}. Update EXPECTED here to match test_harness_join_int.py — a "
+                  "collection count that quietly drifts is exactly what this step exists to catch."
+              )
+          PY
+
   build:
     name: build (sdist + wheel)
     runs-on: ubuntu-latest
