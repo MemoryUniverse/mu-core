@@ -83,7 +83,23 @@ def reciprocal_rank_fusion(
             scores[eid] = scores.get(eid, 0.0) + weight * (1.0 / (channel_k + rank + 1))
             elements.setdefault(eid, element)
 
-    ordered = sorted(scores, key=lambda eid: scores[eid], reverse=True)
+    # AD-317/AD-318 (2026-09-26): a plain `sorted(scores, key=scores.get, reverse=True)` breaks
+    # ties on Python's stable sort, which preserves INSERTION order into `scores` above — i.e.
+    # whichever order each channel's own ranked list happened to present its candidates in this
+    # call. That per-channel order is NOT itself guaranteed stable across separate calls (a vector
+    # store's internal tie-break among equal/near-equal distances can vary run to run), so two
+    # identical queries could fuse to a different item COMPOSITION even though every score is
+    # byte-identical. MEASURED (AD-317, `ranker.py:401` call site, conv-26, n=150, two separately-
+    # executed runs, same `limit=20`): 30/150 rows returned a different non-gold item set. This is
+    # a TIE-BREAK fix, not a scoring change — it touches no channel's weight/`k`/rank arithmetic,
+    # so it is NOT the fusion-lever territory the register already closed (AD-204/262/273/279/289).
+    # `-scores[eid]` keeps the primary DESC-by-score order; `eid` (the memory id, content-
+    # independent and stable for a given item) is the deterministic secondary key that breaks any
+    # tie the same way on every call, on every process, regardless of channel presentation order.
+    # RE-VERIFIED (AD-318): re-running the same 150-row set twice now returns byte-identical item
+    # sets (0/150 differ, was 30/150); `gold_in_context` unchanged at the pre-fix value — this only
+    # reorders which NON-gold candidate wins a coin-flip, never which candidates are gold.
+    ordered = sorted(scores, key=lambda eid: (-scores[eid], eid))
     return [(elements[eid], scores[eid]) for eid in ordered]
 
 
