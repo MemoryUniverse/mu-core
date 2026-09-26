@@ -270,6 +270,22 @@ class ModelRouter:
         rerank; on an exhausted rerank group it co-emits `SURFACE_COMPONENT_DOWN` and raises —
         recall reverts to its floor-protected `merged` order (model-layer-spec §5)."""
         group = self._task_map.group_for(Task.RERANK)
+        # AD-328: refuse BEFORE the call when the group serves no rerank-kind deployment. The
+        # degrade signal and the typed raise are identical to the except-branch below — recall
+        # reverts to its floor-protected `merged` order either way — but not issuing the request
+        # is the whole point: a failed `arerank` against a chat deployment made litellm cool that
+        # DEPLOYMENT down, and the next legitimate chat call on the same group died with
+        # `RouterRateLimitError`. See `ProviderModelRegistry.serves_rerank` for the measurement.
+        if not self._registry.serves_rerank(group):
+            self._degrade.emit(
+                DegradedModeEntered(
+                    component="reranker",
+                    mode="rerank_disabled",
+                    reason=DegradeReason.SURFACE_COMPONENT_DOWN,
+                    detail=f"group={group} serves no rerank-kind deployment",
+                )
+            )
+            raise ModelGroupUnavailableError(group, cause="NoRerankDeployment")
         try:
             resp = await self._llm.router.arerank(  # delegate to litellm rerank
                 model=group, query=query, documents=list(documents), top_n=top_n

@@ -66,7 +66,12 @@ def _clean_engine_settings_env() -> Iterator[None]:
     afterwards — this module is the only one in the suite that touches
     ``get_engine_settings``'s ``lru_cache``, but the cache is process-global, so a leak here would
     silently mis-wire every OTHER test that runs after it in the same session."""
-    keys = ("MU_RECALL__WEIGHT_MTM", "MU_RECALL__STM_SCORING", "MU_INGEST__IMPORTANCE_PROMOTE")
+    keys = (
+        "MU_RECALL__WEIGHT_MTM",
+        "MU_RECALL__STM_SCORING",
+        "MU_RECALL__RERANK_ENABLED",
+        "MU_INGEST__IMPORTANCE_PROMOTE",
+    )
     saved = {k: os.environ.get(k) for k in keys}
     yield
     for k, v in saved.items():
@@ -156,6 +161,30 @@ async def test_recall_weight_mtm_override_changes_result_membership(
         # surface `_TARGET` is the MTM weight — and, as a bonus, this now proves a SECOND engine
         # knob reaches the composed ranker.
         os.environ["MU_RECALL__STM_SCORING"] = "recency"
+
+        # SECOND STALE PREMISE, same shape as the one above, found by the AD-328 verify pass.
+        # AD-326 flipped `RecallSettings.rerank_enabled` to `True` by default (the owner's ruling).
+        # A cross-encoder re-scores the fused tail, so `_TARGET` — the semantically PERFECT match
+        # for `_QUERY` — is pulled back into the top-5 by the reranker no matter what
+        # `weight_mtm` did to fusion, and this test's claim ("zeroing weight_mtm drops it") stops
+        # being about the knob it names.
+        #
+        # MEASURED, three runs of this exact file on mu-dev-vm, not reasoned:
+        #   trunk 3d02517 (before the flip) ................ 2 passed
+        #   AD-326 branch, shipped default rerank ON ....... 1 failed (`_TARGET` still present)
+        #   AD-326 branch, MU_RECALL__RERANK_ENABLED=false .. 2 passed
+        # So the flip is the cause, and — importantly — the rerank gate is NOT dark in the
+        # composed product: `LocalContainer` injects a REAL reranker (the run log registers
+        # `hosted_vllm/BAAI/bge-reranker-v2-m3`), which is why flipping the DEFAULT changed
+        # composed behavior at all.
+        #
+        # Pinning it OFF here restores this test to proving its own claim. It is not a workaround
+        # for a product bug: rerank-ON outranking fusion weights is the reranker WORKING. The
+        # standing consequence is recorded in ARCHITECTURE-DELTAS AD-328 — with rerank ON by
+        # default, `weight_stm`/`weight_mtm`/`weight_ltm` no longer decide final membership, so
+        # every tuning conclusion this repo drew from fusion weights was drawn in a rerank-OFF
+        # world and is now untested in the shipped one.
+        os.environ["MU_RECALL__RERANK_ENABLED"] = "false"
 
         # (1) DEFAULT — no override; `EngineSettings().recall.weight_mtm == 1.0` (RecallSettings'
         # own class default, unchanged by AD-204 — that fix retuned `weight_stm` down to `0.1`

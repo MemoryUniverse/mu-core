@@ -21,6 +21,7 @@ from typing import Any
 from mu_engine.providers._contracts import ModelLayerError
 from mu_engine.providers.catalog import (
     ModelDeployment,
+    ModelKind,
     ProviderKind,
     ProviderRecord,
     Task,
@@ -94,6 +95,27 @@ class ProviderModelRegistry:
             self._providers[d.provider_key].is_local
             for d in self._group_deployments.get(model_group, [])
         )
+
+    def serves_rerank(self, model_group: str) -> bool:
+        """True iff some deployment in the group actually SERVES rerank (``ModelKind.RERANK``).
+
+        AD-328. The group→deployment table has always known each deployment's ``kind``; nothing
+        consulted it before a rerank call, so ``ModelRouter.rerank`` would happily send an
+        ``arerank`` to a CHAT deployment. That is reachable by configuration, not by accident: a
+        configured model profile pins EVERY task group — ``rerank_model`` included — to its single
+        chat deployment (``mu_local.composition._profile_models``, an invariant with its own test,
+        ``test_a_configured_profile_still_pins_every_task_to_its_one_deployment``), because the
+        profile catalog is ``CatalogSource.EMPTY`` and unpinning rerank makes composition fail loud
+        (MEASURED: ``RegistryError: task 'rerank' maps to model-group 'gpt-4.1-mini' which has no
+        deployment``). So the pin must stay and the CALL must not be made.
+
+        The damage was never the failed rerank — recall degrades cleanly on that
+        (``recall.rerank_unavailable``). It was litellm putting the *deployment* into cooldown
+        after the failure, which then took out the next legitimate CHAT call on that same group:
+        ``RouterRateLimitError: No deployments available ... model=mu-local-llm``. Harmless while
+        ``rerank_enabled`` defaulted False; AD-326 flipped it ON.
+        """
+        return any(d.kind is ModelKind.RERANK for d in self._group_deployments.get(model_group, []))
 
     def _order_for(self, dep: ModelDeployment) -> int:
         """Stamp the `order:` tier for a deployment from the L4 predicate (§2.4). A local
