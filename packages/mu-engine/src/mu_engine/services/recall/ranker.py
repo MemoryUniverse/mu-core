@@ -969,7 +969,7 @@ class ThreeChannelRecallRanker:
         # or the same neighbour could both compete here and free-ride there.
         if self._settings.neighbor_free_ride:
             return fused_views
-        anchors = [v for v in fused_views if v.turn_seq is not None]
+        anchors = self._expansion_anchors(fused_views)
         if not anchors:
             return fused_views
         by_turn_seq = await self._turn_seq_window(ns, caller_identity_set)
@@ -1027,6 +1027,28 @@ class ThreeChannelRecallRanker:
             )
             merged.insert(at, view)
         return merged
+
+    def _expansion_anchors(self, views: list[RecallItemView]) -> list[RecallItemView]:
+        """Which candidates may surface a neighbour — the ONE rule both expansion shapes share.
+
+        ``turn_seq is not None`` is the pre-existing, unchanged half (a row written before S1b, or
+        by a write path that assigns none, is never expanded and never read as ``turn_seq=0``).
+
+        ``RecallSettings.neighbor_expand_anchor_top_n`` (AD-330) is the new half: at ``0``, the
+        shipped default, this is byte-identical to the old ``[v for v in views if v.turn_seq is not
+        None]`` and every number already recorded against S1b keeps its meaning. Above ``0``, only
+        the first N views — the pool in the order it arrives here, i.e. AFTER
+        ``AdaptiveRerankGate.apply`` (see ``rank()``) — may contribute, so the expansion's cost
+        stops scaling with the window and starts scaling with a constant the operator sets.
+
+        **The slice is positional, not "the first N that carry a turn_seq".** A ``turn_seq=None``
+        row at position 0 consumes the budget rather than sliding it down the pool: the budget
+        prices "how deep into the ranking am I willing to trust a neighbour", and position is what
+        that trust is a function of. ``dto.py``'s own docstring for the field has the per-row
+        measurement this default and this choice come from."""
+        top_n = self._settings.neighbor_expand_anchor_top_n
+        candidates = views if top_n <= 0 else views[:top_n]
+        return [v for v in candidates if v.turn_seq is not None]
 
     async def _turn_seq_window(
         self, ns: Namespace, caller_identity_set: CallerIdentitySet | None
@@ -1109,7 +1131,7 @@ class ThreeChannelRecallRanker:
         Uses the SAME session-window lookup and STM-family neighbour score as the costs-a-slot
         mechanism (``_turn_seq_window``/``_neighbors_of``) — a free-riding neighbour is not a
         different KIND of candidate, only a differently-PLACED one."""
-        anchors = [v for v in items if v.turn_seq is not None]
+        anchors = self._expansion_anchors(items)
         if not anchors:
             return items
         by_turn_seq = await self._turn_seq_window(ns, caller_identity_set)

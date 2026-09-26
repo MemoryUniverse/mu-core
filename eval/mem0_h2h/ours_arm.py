@@ -219,6 +219,14 @@ async def sweep_one_arm(
             "channel_pool_size": cfg.channel_pool_size,
             "channel_pool_multiplier": getattr(cfg, "channel_pool_multiplier", None),
             "floor_protect_limit": cfg.floor_protect_limit,
+            # AD-330: S1b's three read-side knobs, so an artifact says which neighbour-expansion
+            # shape produced it instead of leaving a reader to trust the launch command. Read via
+            # `getattr` with the shipped defaults so an OLDER engine (no `neighbor_expand_anchor_
+            # top_n`) still exports, rather than crashing an arm over a provenance field.
+            "neighbor_expand_radius": cfg.neighbor_expand_radius,
+            "neighbor_expand_placement": cfg.neighbor_expand_placement,
+            "neighbor_expand_anchor_top_n": getattr(cfg, "neighbor_expand_anchor_top_n", 0),
+            "neighbor_free_ride": cfg.neighbor_free_ride,
         },
         "sample_id": conversation.sample_id,
         "corpus_turns": report.turns_written,

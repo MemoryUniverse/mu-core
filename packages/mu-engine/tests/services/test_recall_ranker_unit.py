@@ -1928,6 +1928,128 @@ async def test_s1b_after_anchor_placement_puts_the_neighbour_inside_the_window()
 
 
 # ---------------------------------------------------------------------------------------------
+# AD-330 — `RecallSettings.neighbor_expand_anchor_top_n`: WHICH candidates may surface a
+# neighbour. Every prior S1b arm expanded the whole pool and was rejected on measurement; the
+# per-row derivation in `dto.py`'s own docstring for the field says the cost/benefit is a function
+# of the anchor's RANK, so the budget is what makes the mechanism payable at a fixed window width.
+# ---------------------------------------------------------------------------------------------
+
+
+def _two_anchor_ranker(
+    *, top_n: int, free_ride: bool = False
+) -> tuple[ThreeChannelRecallRanker, dict[str, MemoryItem]]:
+    """One strongly-ranked anchor and one weakly-ranked anchor, each with a neighbour NO channel
+    ranks on its own (``recency_floor_limit=0`` keeps the STM channel silent, so a neighbour in the
+    result can only have come from expansion)."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    rows = {
+        "top_anchor": _item("Ada's flight is Thursday", tier=MemoryTier.MTM, at=base, turn_seq=5),
+        "top_neighbor": _item("...to Denver, she said", tier=MemoryTier.STM, at=base, turn_seq=6),
+        "weak_anchor": _item("a weakly-ranked aside", tier=MemoryTier.MTM, at=base, turn_seq=50),
+        "weak_neighbor": _item("the aside's own reply", tier=MemoryTier.STM, at=base, turn_seq=51),
+    }
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=[rows["top_neighbor"], rows["weak_neighbor"]],
+        mtm_hits_by_query={query_vec: [rows["top_anchor"], rows["weak_anchor"]]},
+        settings=RecallSettings(
+            neighbor_expand_radius=1,
+            neighbor_expand_placement="after_anchor",
+            neighbor_expand_anchor_top_n=top_n,
+            neighbor_free_ride=free_ride,
+            stm_scoring="recency",
+            floor_protect_limit=0,
+            recency_floor_limit=0,
+        ),
+    )
+    return ranker, rows
+
+
+@pytest.mark.asyncio
+async def test_ad330_anchor_budget_expands_only_the_top_ranked_candidate() -> None:
+    """THE MECHANISM. At ``neighbor_expand_anchor_top_n=1`` the pool's rank-1 candidate surfaces
+    its neighbour and the rank-2 candidate does NOT — that asymmetry is the whole feature, because
+    it is what turns "+14 gold rows for 54.5 inserted items" (the rejected unrestricted shape,
+    AD-232 arm H) into "+7 gold rows for 2.4" at the same window width."""
+    ranker, rows = _two_anchor_ranker(top_n=1)
+
+    ids = await _rank(ranker, [0.9, 0.1], limit=10)
+
+    assert rows["top_neighbor"].id in ids, (
+        "the rank-1 anchor's neighbour must still be expanded — the budget restricts WHICH "
+        f"anchors expand, it does not switch expansion off: {ids!r}"
+    )
+    assert rows["weak_neighbor"].id not in ids, (
+        "the rank-2 anchor's neighbour was expanded despite a top-1 anchor budget — the budget "
+        f"is not being applied: {ids!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ad330_anchor_budget_of_zero_is_the_unrestricted_shape_every_prior_arm_measured() -> (
+    None
+):
+    """The default (``0``) must be byte-identical to the pre-AD-330 behaviour, or every number
+    already recorded against S1b silently changes meaning. Same fixture, budget off: BOTH
+    neighbours appear."""
+    ranker, rows = _two_anchor_ranker(top_n=0)
+
+    ids = await _rank(ranker, [0.9, 0.1], limit=10)
+
+    assert (
+        rows["top_neighbor"].id in ids and rows["weak_neighbor"].id in ids
+    ), f"anchor_top_n=0 must expand every turn_seq-carrying candidate, unchanged: {ids!r}"
+
+
+@pytest.mark.asyncio
+async def test_ad330_anchor_budget_also_restricts_the_free_riding_shape() -> None:
+    """Shape A (``neighbor_free_ride``) attaches past ``limit`` instead of competing for a slot,
+    but it draws its anchors from the SAME rule (``_expansion_anchors``) — the 0924 verify pass's
+    matched-width control showed free-riding's gain was window width, so an unbudgeted Shape A is
+    exactly the arm that cannot pay. Budgeting it is the same one-line rule, and this pins it."""
+    ranker, rows = _two_anchor_ranker(top_n=1, free_ride=True)
+
+    ids = await _rank(ranker, [0.9, 0.1], limit=10)
+
+    assert rows["top_neighbor"].id in ids, f"free-riding attached nothing at all: {ids!r}"
+    assert (
+        rows["weak_neighbor"].id not in ids
+    ), f"the anchor budget was ignored by the free-riding shape: {ids!r}"
+
+
+@pytest.mark.asyncio
+async def test_ad330_anchor_budget_is_positional_a_turn_seq_none_row_consumes_it() -> None:
+    """The documented choice, pinned: the slice is over POSITIONS, not over "the first N rows that
+    happen to carry a ``turn_seq``". A legacy row at rank 1 spends the budget, so nothing expands
+    — the budget prices "how deep into the ranking do I trust a neighbour", and a row whose rank-1
+    position is occupied by content we cannot expand has no such trust to spend elsewhere."""
+    base = datetime(2026, 7, 31, tzinfo=UTC)
+    neighbor_item = _item("the reply", tier=MemoryTier.STM, at=base, turn_seq=6)
+    legacy_top = _item("a pre-S1b row, no turn_seq", tier=MemoryTier.MTM, at=base)
+    anchor = _item("an expandable rank-2 row", tier=MemoryTier.MTM, at=base, turn_seq=5)
+    query_vec = (0.9, 0.1)
+    ranker = _build_ranker(
+        stm_items=[neighbor_item],
+        mtm_hits_by_query={query_vec: [legacy_top, anchor]},
+        settings=RecallSettings(
+            neighbor_expand_radius=1,
+            neighbor_expand_placement="after_anchor",
+            neighbor_expand_anchor_top_n=1,
+            stm_scoring="recency",
+            floor_protect_limit=0,
+            recency_floor_limit=0,
+        ),
+    )
+
+    ids = await _rank(ranker, list(query_vec), limit=10)
+
+    assert ids == [legacy_top.id, anchor.id], (
+        "a turn_seq=None row at rank 1 must CONSUME the top-1 anchor budget — sliding the budget "
+        f"down to the next expandable row is a different (undocumented) policy: {ids!r}"
+    )
+
+
+# ---------------------------------------------------------------------------------------------
 # Shape A / Shape B — TRACE-0923.md follow-up, ARCHITECTURE-DELTAS.md AD-233's own amendment:
 # "the two live options are the free-riding insertion ... or a wider fetch narrowed after
 # expansion. Nothing else is left." `neighbor_free_ride` / `neighbor_expand_widen`.

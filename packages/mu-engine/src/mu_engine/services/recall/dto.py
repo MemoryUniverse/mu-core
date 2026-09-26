@@ -553,6 +553,42 @@ class RecallSettings(BaseModel):
     # `gold_in_context` on this sample. Default stays `"tail"` so every number already recorded
     # against S1b keeps its meaning; `MU_RECALL__NEIGHBOR_EXPAND_PLACEMENT=after_anchor`.
     neighbor_expand_placement: Literal["tail", "after_anchor"] = "tail"
+    # HOW MANY of the pool's top-ranked candidates may surface a neighbour at all. `0` (the
+    # default) means "every candidate that carries a `turn_seq`", which is the shape every prior
+    # S1b arm measured — and the shape every prior S1b arm REJECTED. The rejections were all
+    # measurements of the UNRESTRICTED shape, and their own arithmetic says why it cannot pay:
+    #   * AD-232 arm H — `"after_anchor"` at `limit=10`, unrestricted: **246/383 against 281**
+    #     shipped, with the STM/MTM slot share inverting. ADR 0053 §3's conclusion, verbatim:
+    #     "spending a ranked slot on a neighbour cannot pay, because only ~1 in 3 neighbours is
+    #     the gold." With ~10 anchors each contributing ±radius neighbours, the expansion asks for
+    #     MORE slots than the window has, so it does not spend a slot — it spends the window.
+    #   * AD-238/the 0924 verify pass — Shape A (`neighbor_free_ride`) after the federation-slice
+    #     fix scored 313/383 at 27.2 items/query, but the matched-width control (plain baseline at
+    #     `--limit 27`) scored **314** and ranked BETTER at 10: the gain was window width, not
+    #     neighbours.
+    # AD-330 re-derived the cost/benefit per row, at width 20, from the judged n=100 artifacts
+    # (`eval-runs/2026-09-26-ad328-rerank-pool-and-dynamic/p40_n100_product.json`, joined back to
+    # the corpus by the SAME `TurnIndex` body join `gold_in_context` uses — reproducing that
+    # metric's 80/100 exactly, 0 disagreements) and found the ratio is not a property of neighbour
+    # expansion, it is a property of WHERE the anchor sits:
+    #   * anchors = the whole window (the rejected shape): +14 gold rows for a mean **54.5** new
+    #     neighbours competing for a 20-slot window — unpayable, which is arm H's 246.
+    #   * anchors = the top **1** only, radius 2: `gold_in_context` **80 -> 87 (+7 pt)** at a mean
+    #     2.4 inserted items, and the fixed-width-20 simulation (insert behind the anchor, truncate
+    #     back to 20) loses **zero** rows: the displaced tail almost never carries gold (of the 80
+    #     rows whose gold is in the window, exactly 1 has it at rank >= 15).
+    #   * anchors = the top 2, radius 2: 80 -> 89 at a mean 4.9 inserted, 1 row lost.
+    # The mechanism is the LoCoMo dialogue pattern this whole feature was built for (`_expand_
+    # neighbors`'s own docstring: "the answer-bearing turn is usually a *reply* and the question's
+    # vocabulary lives one turn earlier") — and it is strongest exactly where the retriever is most
+    # confident, which is the half of the trade no unrestricted arm could see. Requires
+    # `neighbor_expand_radius > 0`; pairs with `neighbor_expand_placement="after_anchor"` (under
+    # `"tail"` a restricted neighbour is still truncated away — AD-231's own finding). Counted over
+    # the pool in its POST-rerank-gate order (`rank()` calls `_expand_neighbors` after
+    # `AdaptiveRerankGate.apply`), so "top 1" means the candidate the shipped pipeline actually
+    # ranks first, not the raw RRF leader. Env override:
+    # `MU_RECALL__NEIGHBOR_EXPAND_ANCHOR_TOP_N`.
+    neighbor_expand_anchor_top_n: int = Field(default=0, ge=0)
 
     # S1b — TWO FURTHER SHAPES (TRACE-0923.md follow-up, ADR 0053 "what would need to change
     # before this ships ON" §1/§2; ARCHITECTURE-DELTAS.md AD-233's own amendment: "the two live

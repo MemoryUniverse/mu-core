@@ -318,12 +318,22 @@ def _build(
 
 
 @pytest.mark.asyncio
-async def test_dynamic_channel_budget_off_by_default_never_refetches() -> None:
-    """LTM is starved (empty) and MTM is saturated (a 30-item pool against the default 20-wide
-    baseline) — exactly the shape reallocation is FOR — but the shipped default
-    (`dynamic_channel_budget=False`) must be byte-identical to before: one fetch per channel,
-    no second round trip, no widened width."""
-    settings = RecallSettings(stm_scoring="recency", channel_pool_size=20)
+async def test_dynamic_channel_budget_when_off_never_refetches() -> None:
+    """LTM is starved (empty) and MTM is saturated (a 30-item pool against a 20-wide baseline) —
+    exactly the shape reallocation is FOR — but with the feature OFF the path must be
+    byte-identical to before it existed: one fetch per channel, no second round trip, no widened
+    width.
+
+    **`dynamic_channel_budget=False` is now passed EXPLICITLY, and the test lost the words "by
+    default" (AD-330).** It asserted the shipped default was `False`; AD-329 (`e3a0a40`) flipped
+    that default to `True` on the owner's ruling and did not update this test, so the unit tier was
+    RED at that commit — verified by reading the default out of `e3a0a40` itself, not inferred. The
+    dark path still needs this coverage, so the fix pins the setting instead of deleting the test;
+    the shipped default's own value is pinned separately by
+    `test_the_shipped_default_is_dynamic_channel_budget_on`."""
+    settings = RecallSettings(
+        stm_scoring="recency", channel_pool_size=20, dynamic_channel_budget=False
+    )
     ranker, mtm, ltm = _build(mtm_pool_size=30, settings=settings)
 
     result = await ranker.rank(
@@ -335,9 +345,17 @@ async def test_dynamic_channel_budget_off_by_default_never_refetches() -> None:
         caller_identity_set=frozenset[str](),
     )
 
-    assert mtm.calls == [20], "dark by default: exactly one fetch, at the static baseline width"
+    assert mtm.calls == [20], "dark when off: exactly one fetch, at the static baseline width"
     assert ltm.calls == [20]
     assert len(result.items) == 10
+
+
+def test_the_shipped_default_is_dynamic_channel_budget_on() -> None:
+    """The default's VALUE, pinned on its own (AD-330). Nothing asserted it: the only test that
+    mentioned the default asserted the opposite one, so AD-329's flip turned that test red instead
+    of turning a default-pinning test green — and a red test is a much weaker signal than a green
+    one, because it reads as "somebody's work in progress"."""
+    assert RecallSettings().dynamic_channel_budget is True
 
 
 @pytest.mark.asyncio
