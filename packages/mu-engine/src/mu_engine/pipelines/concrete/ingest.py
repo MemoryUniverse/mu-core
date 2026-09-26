@@ -53,6 +53,7 @@ from mu_engine.pipelines.base import BaseStage, PipelineContext, StageOutcome, S
 from mu_engine.pipelines.errors import StageExecutionError
 from mu_engine.pipelines.ledger import StageLedger
 from mu_engine.providers._contracts import EmbeddingPort
+from mu_engine.services.extract import extract_valid_at
 from mu_engine.services.settings import IngestSettings
 from mu_engine.storage.domain.artifact import ArtifactKind, ContextArtifact
 from mu_engine.storage.domain.memory import (
@@ -219,6 +220,17 @@ def _build_memory_item(
         session_id=ns.session,
         created_at=at,
         updated_at=at,
+        # AD-308 follow-up (team-lead review, 2026-09-26): the ONE mint point for a captured
+        # MemoryItem (CANONICAL §7.1) is the right place for the temporal signal a raw capture's
+        # OWN text states ("...yesterday", "...on 8 May, 2023") to survive at all — before this,
+        # `valid_at` stayed unset for every STM/MTM item unconditionally (date resolution only
+        # ever ran during MTM->LTM DISTILL, which AD-310/311 measured never wins a recall slot).
+        # `extract_valid_at` (`services/extract.py`) is LLM-free (this stage's own module
+        # docstring: "NO LLM on this path") and never alters `content` — only a NEW, additive
+        # field. `DeterministicPromoteStage`'s STM->MTM promotion is a `model_copy` that carries
+        # this field forward unchanged (`ingest.py:_execute` below), so the date reaches the tier
+        # that actually serves recall slots without any change to promotion itself.
+        valid_at=extract_valid_at(activity.text, now=at),
         importance_score=activity.importance,
         source=activity.source,
         turn_seq=activity.turn_seq,
