@@ -119,7 +119,7 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 import structlog
@@ -349,6 +349,91 @@ class ThreeChannelRecallRanker:
         demoted_hits = demoted_t.result()
         mtm_hits = mtm_t.result()
         ltm_hits, ltm_degraded = ltm_t.result()
+
+        # DYNAMIC CHANNEL BUDGETS (`dto.py`'s own `dynamic_channel_budget` docstring has the full
+        # design — owner's second Lane-B ask). Runs BEFORE `_score_stm` deliberately: a refetched,
+        # wider floor must be scored exactly once, not scored, widened, and re-scored. Dark by
+        # default (`dynamic_channel_budget=False`) — this whole block is then a single dict build
+        # plus a no-op call, never a second store round trip, so every pre-existing test/caller is
+        # byte-identical unless it opts in.
+        if self._settings.dynamic_channel_budget and (channels.stm or channels.mtm or channels.ltm):
+            baseline_widths: dict[str, int] = {}
+            yields: dict[str, int] = {}
+            density: dict[str, float] = {}
+            if channels.stm:
+                baseline_widths["stm"] = floor_limit
+                yields["stm"] = len(floor)
+                density["stm"] = _tail_density(floor)
+            if channels.mtm:
+                baseline_widths["mtm"] = pool
+                yields["mtm"] = len(mtm_hits)
+                density["mtm"] = _tail_density(mtm_hits)
+            if channels.ltm:
+                baseline_widths["ltm"] = pool
+                yields["ltm"] = len(ltm_hits)
+                density["ltm"] = _tail_density(ltm_hits)
+            new_widths = _reallocate_channel_widths(
+                baseline_widths,
+                yields,
+                density=density,
+                max_multiplier=self._settings.dynamic_channel_budget_max_multiplier,
+            )
+            refetch = {ch: w for ch, w in new_widths.items() if w > baseline_widths[ch]}
+            if refetch:
+                _log.info(
+                    "recall.dynamic_channel_budget_refetch",
+                    baseline=baseline_widths,
+                    yields=yields,
+                    refetch=refetch,
+                )
+                try:
+                    async with asyncio.TaskGroup() as tg2:
+                        floor_t2 = (
+                            tg2.create_task(
+                                self._stm.recent(
+                                    ns,
+                                    limit=refetch["stm"],
+                                    caller_identity_set=caller_identity_set,
+                                )
+                            )
+                            if "stm" in refetch
+                            else None
+                        )
+                        mtm_t2 = (
+                            tg2.create_task(
+                                self._mtm.semantic(
+                                    ns,
+                                    query_vec,
+                                    limit=refetch["mtm"],
+                                    caller_identity_set=caller_identity_set,
+                                    sparse_query=sparse_query,
+                                )
+                            )
+                            if "mtm" in refetch
+                            else None
+                        )
+                        ltm_t2 = (
+                            # `mtm_seed=None`: the entity-seed harvest (`ltm_entity_seed_pool`) is
+                            # itself `0`/dark by default (dto.py's own docstring); a deployment
+                            # that turns BOTH that seed AND this reallocation on at once loses the
+                            # seed on a reallocated LTM refetch only — named here rather than
+                            # silently wired to a stale, already-resolved phase-1 task object.
+                            tg2.create_task(
+                                self._ltm_channel(
+                                    ns, refetch["ltm"], caller_identity_set, query, mtm_seed=None
+                                )
+                            )
+                            if "ltm" in refetch
+                            else None
+                        )
+                except* StoreUnavailableError as eg:
+                    raise eg.exceptions[0] from None
+                if floor_t2 is not None:
+                    floor = floor_t2.result()
+                if mtm_t2 is not None:
+                    mtm_hits = mtm_t2.result()
+                if ltm_t2 is not None:
+                    ltm_hits, ltm_degraded = ltm_t2.result()
 
         # D1 (§3.1 follow-up to 02fbed9): attach a REAL relevance score to every STM candidate
         # BEFORE fusion — `floor` arrives recency-ordered only (the adapter's ZREVRANGE order);
@@ -1336,6 +1421,129 @@ def _channel_label(scored: Scored[MemoryItem]) -> str:
     if scored.channel.value.startswith("stm"):
         return "stm"
     return "mtm"
+
+
+def _tail_density(results: Sequence[Scored[MemoryItem]]) -> float:
+    """Within-ONE-channel-only score signal for `_reallocate_channel_widths` below. `Scored.score`
+    is "channel-native and NOT cross-channel comparable" (`storage/domain/recall.py`'s own
+    docstring — the reason RRF fuses on rank, never raw score) — this function honours that by
+    comparing a channel's own top score to its own tail score, never one channel's score to
+    another's.
+
+    Returns the ratio of the WORST (last, since ``results`` is already best-first) score to the
+    BEST (first) score, clamped to ``[0.0, 1.0]``: close to ``1.0`` means the channel's scores are
+    still strong all the way to the end of its returned pool (real depth, worth a wider fetch);
+    close to ``0.0`` means they have already collapsed toward noise by the pool's own tail (more
+    width would mostly add weaker items, not more evidence).
+
+    ``1.0`` — the conservative "assume it is still worth its baseline share" default, never used
+    to PENALISE a channel this function cannot actually evaluate — for a pool with fewer than 2
+    items (no tail to compare) or a non-positive top score (LTM's flat, query-blind seed can
+    legitimately score at or near 0; nothing to divide by that means anything)."""
+    if len(results) < 2:
+        return 1.0
+    top = results[0].score
+    tail = results[-1].score
+    if top <= 0:
+        return 1.0
+    return max(0.0, min(1.0, tail / top))
+
+
+def _reallocate_channel_widths(
+    baseline: Mapping[str, int],
+    yields: Mapping[str, int],
+    *,
+    density: Mapping[str, float] | None = None,
+    max_multiplier: float = 3.0,
+) -> dict[str, int]:
+    """Pure per-channel fetch-width reallocation — `dto.py`'s `dynamic_channel_budget` docstring
+    has the full design and rationale; this is the mechanism it names. No I/O, no settings
+    object, trivial to unit-test/mutation-test in isolation from the store round trips that
+    surround its one call site (`rank()` above) — the same shape `width.py`'s
+    `derive_recall_limit` already uses for its own pure-arithmetic seam.
+
+    A channel is STARVED when ``yields[ch] < baseline[ch]`` — the store had fewer candidates than
+    the pool asked for, so asking again wider cannot produce anything new; its unused width
+    (``baseline[ch] - yields[ch]``) is freed unconditionally. A channel is SATURATED when
+    ``yields[ch] >= baseline[ch]`` — it filled every slot the pool offered, so it may have deeper
+    real candidates the fixed baseline never let it show. A channel with ``baseline[ch] == 0``
+    (the caller disabled it) is neither and is never touched.
+
+    Freed width is split across every saturated channel in proportion to
+    ``baseline[ch] * density.get(ch, 1.0)`` — a channel already trusted with a bigger pool, whose
+    own returned pool is still dense all the way to its own tail (`_tail_density` above), gets a
+    bigger share than an equally-saturated channel whose tail has already collapsed to noise.
+    ``density`` omitted (or a channel missing from it) defaults that channel's factor to ``1.0``
+    — plain baseline-share, the conservative fallback. If every saturated channel's weight is
+    zero (e.g. every density is exactly zero), the split falls back to an even share rather than
+    silently allocating nothing.
+
+    ``max_multiplier`` bounds one channel's new width at ``baseline[ch] * max_multiplier`` — a
+    latency safety valve independent of how much the starved channels freed; freed width past
+    every saturated channel's cap is left UNUSED, never carried elsewhere (round down, never
+    invent — the same conservative direction ``width.py``'s own docstring commits to on the
+    derived-limit side).
+
+    **What is, and is not, conserved.** The width-TO-FETCH entry this function returns for a
+    STARVED channel is left at its own baseline, unchanged — a starved channel already proved it
+    has nothing more to give, so it is simply never asked again (never re-fetched at a smaller
+    width either: shrinking its ask buys nothing when the caller has no plan to re-fetch it). So
+    ``sum(result.values())`` — the sum of raw WIDTH ENTRIES — can legitimately rise above
+    ``sum(baseline.values())`` once anything is redistributed; that is not a leak. The quantity
+    genuinely bounded, by construction, is how much any saturated channel is HANDED:
+    ``result[ch] - baseline[ch] <= freed`` for every saturated ``ch``, where ``freed`` is the sum
+    of what starved channels actually left unused — this function never invents width from
+    nothing. And because a starved channel's real YIELD (not its unchanged width entry) is what
+    actually reaches fusion, the total candidates fusion sees in the best case — a saturated
+    channel with enough true depth to fill its whole reallocated width — is exactly
+    ``sum(baseline)``: starved channels contribute their own (smaller) yield, and the width freed
+    by that shortfall is exactly what the saturated channel gains, no more. See ``ranker.py``'s
+    ``rank()`` call site and this feature's own wiring test,
+    ``test_dynamic_channel_budget_bounds_total_actual_candidates_fed_to_fusion``, for the
+    end-to-end version of this guarantee — the one that actually matters for keeping
+    `gold_in_context` comparable between the static and dynamic arms.
+
+    Deterministic: saturated channels are visited widest-baseline-first (ties broken by channel
+    name) so an indivisible integer remainder always lands on the channel with the most evidence,
+    not on whichever key happened to iterate last.
+
+    Returns the new width to fetch per channel — identical to ``baseline`` wherever nothing
+    changed (a starved or untouched channel, or a saturated one with no freed budget to receive):
+    the caller re-fetches ONLY a channel whose returned width is strictly greater than its
+    baseline.
+    """
+    freed = sum(
+        baseline[ch] - yields.get(ch, 0)
+        for ch in baseline
+        if baseline[ch] > 0 and yields.get(ch, 0) < baseline[ch]
+    )
+    saturated = {
+        ch: baseline[ch]
+        for ch in baseline
+        if baseline[ch] > 0 and yields.get(ch, 0) >= baseline[ch]
+    }
+    if freed <= 0 or not saturated:
+        return dict(baseline)
+
+    weights = {ch: baseline[ch] * (density or {}).get(ch, 1.0) for ch in saturated}
+    total_weight = sum(weights.values())
+    if total_weight <= 0:
+        # Every saturated channel's density collapsed to 0 — fall back to an even split rather
+        # than allocating nothing to channels that DID fill their pool.
+        weights = dict.fromkeys(saturated, 1.0)
+        total_weight = float(len(saturated))
+
+    ordered = sorted(saturated, key=lambda ch: (-saturated[ch], ch))
+    result = dict(baseline)
+    remaining = freed
+    for idx, ch in enumerate(ordered):
+        cap = max(0, int(baseline[ch] * max_multiplier) - baseline[ch])
+        is_last = idx == len(ordered) - 1
+        raw_share = remaining if is_last else int(freed * weights[ch] / total_weight)
+        share = max(0, min(raw_share, cap, remaining))
+        result[ch] = baseline[ch] + share
+        remaining -= share
+    return result
 
 
 def _protected_floor_ids(

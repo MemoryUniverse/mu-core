@@ -767,15 +767,101 @@ class RecallSettings(BaseModel):
     # recalls, and stopping the container reproduces the exact pre-AD-298 failure. With the gate
     # made reorder-only it is worth **+6.67pp** of gold_in_context.
     #
-    # **It stays OFF for COST, not for quality** — that is the whole difference from the note
+    # **It stayed OFF for COST, not for quality** — that was the whole difference from the note
     # above. Measured on real recalls: p50 3870 ms and p95 4848 ms against a documented
     # `recall_e2e_rerank` budget of p95 <= 150 ms (observability-design.md:150) — **~26x over**.
     # Cross-encoder inference over 20 candidates on CPU is the cost; nothing in the gate itself is
-    # slow. Turning this on is therefore blocked on making the inference affordable (a GPU, a
-    # smaller cross-encoder, fewer candidates, or moving the rerank off the response path the way
-    # enrichment already is), not on tuning the gate. Re-measure the SLO in the same pass that
-    # changes it.
-    rerank_enabled: bool = Field(default=False)
+    # slow.
+    #
+    # **OWNER RULING, 2026-09-26 (ADR 0091 open item, closed here) — DEFAULT FLIPPED TO `True`.**
+    # The recommendation above (leave it off pending an affordability fix) was overruled by the
+    # owner twice; this default now ships the owner's call rather than re-arguing it. The cost
+    # above is UNCHANGED by this flip — turning the knob does not make the model faster — so this
+    # is a documented, deliberate SLO breach, not a claim that the budget is met: every FULL-LOCAL
+    # recall now pays p50 ~3.9s / p95 ~4.8s for **+6.67pp gold_in_context** (reorder-only, AD-301),
+    # and `observability-design.md:150`'s `recall_e2e_rerank` p95 <= 150ms line is now WRONG for
+    # the shipped default and needs updating in the same pass that reconciles this ADR (tracked as
+    # a fix-docs delta, `docs/tracking/ARCHITECTURE-DELTAS.md`, not silently left to drift).
+    # `MU_RECALL__RERANK_ENABLED=false` remains the exact, instant, single-var rollback to the
+    # pre-flip (and pre-AD-298) latency profile — nothing about the escape hatch itself changed.
+    #
+    # **Model choice is deliberately NOT a `RecallSettings` field** — it is
+    # `ModelSettings.rerank_model` -> `ModelGroup.RERANK` -> `ShippedCatalogSettings.
+    # local_rerank_model` (`providers/settings.py`, `providers/shipped_catalog.py`; env
+    # `MU_LOCAL_RERANK_MODEL`), a provider/catalog concern this file does not own and must not
+    # duplicate. The shipped catalog default, `BAAI/bge-reranker-v2-m3` (568M params, 100+
+    # languages), is kept as the default an operator inherits by leaving that knob untouched — it
+    # is both the model this rerank_enabled flip was measured against (+6.67pp, the number cited
+    # above) and the only one of the three profiled candidates with full multilingual coverage, in
+    # line with the owner's "on, and good" intent rather than "on, and cheapest." The measured
+    # trade an operator gets by overriding `MU_LOCAL_RERANK_MODEL` instead:
+    #     model                        params  languages       latency (full-stack)  gold_in_context
+    #     bge-reranker-v2-m3 (SHIPPED)  568M    100+                     3870 ms         +6.67pp
+    #     bge-reranker-base             278M    en+zh ONLY              ~1467 ms         +3.33pp
+    #     ms-marco-MiniLM-L-6-v2         22M    en ONLY                  ~650 ms      +1.33-2.00pp
+    # A deployment that is English-only and latency-sensitive has a real, already-measured, one-
+    # env-var-away reason to move off the default; this field does not need to change for it to.
+    rerank_enabled: bool = Field(default=True)
+
+    # DYNAMIC CHANNEL BUDGETS — the owner's second Lane-B ask: "when one path yields too little
+    # context, take more from the others." Today (this field at its default `False`) every
+    # channel's pre-fusion fetch width is a FIXED constant per call — `recency_floor_limit` for
+    # the STM floor, `_effective_pool(limit)` (this file's `channel_pool_size`/
+    # `channel_pool_multiplier`) for MTM and LTM — so a channel that genuinely has only two weak
+    # candidates wastes the rest of its allotted slots while a sibling channel with real depth is
+    # truncated at the SAME fixed width regardless of how much more it could give. `ranker.py`'s
+    # `_reallocate_channel_widths` (pure, unit-tested) implements the redistribution: after the
+    # first concurrent fetch, a channel that returned FEWER items than its baseline width is
+    # STARVED (the store had no more — widening it again cannot help, and it is not re-fetched);
+    # a channel that returned AT LEAST its baseline width is SATURATED (every slot came back
+    # filled, so it may have deeper real candidates the fixed width never let it show). Only
+    # starved channels' unused width is freed, and only saturated channels receive a share of it
+    # — proportioned by each saturated channel's own baseline share, tempered by that channel's
+    # OWN tail-score density (`_tail_density`, `Scored.score` used strictly WITHIN one channel's
+    # own list — never compared across channels, exactly as `storage/domain/recall.py`'s own
+    # `Scored.score` docstring requires: "channel-native and NOT cross-channel comparable"). Only
+    # the saturated channels are re-fetched, once, at their new (wider) width — a starved channel
+    # is never asked twice for the same answer.
+    #
+    # **The FINAL result width never changes — this is the guarantee that actually keeps
+    # `gold_in_context` comparable**, the owner's own guard against "an arm that quietly widens
+    # will show a fake gain": this mechanism only reshapes the PRE-fusion channel pools, and
+    # `_merge_floor`'s own `limit` parameter (`ranker.py::rank`) is untouched by it — a caller
+    # gets exactly the same number of items back, static arm or dynamic arm, every time. What
+    # DOES shift is how many real candidates feed the fuse: a starved channel's contribution is
+    # its own (smaller) real yield, never padded, and a saturated channel may absorb up to that
+    # exact shortfall — `dynamic_channel_budget_max_multiplier` below additionally caps how much
+    # of it any ONE channel may take, with any freed width past that cap simply left unused
+    # (the same "round down, never invent" posture `width.py`'s own docstring already commits to
+    # for the derived-limit side) — so in the best case (the saturated channel has enough true
+    # depth to use it) the total candidates reaching fusion is bounded by the static baseline
+    # total, never more; `ranker.py`'s `_reallocate_channel_widths` docstring has the exact
+    # accounting, proved by `test_dynamic_channel_budget_bounds_total_actual_candidates_fed_to_
+    # fusion`. RRF itself needs no re-normalisation for the resulting unequal list lengths: a
+    # channel's contribution to any one id's fused score is `weight/(k+rank+1)` — a function of
+    # that id's OWN rank in that channel's OWN list, `weights`/`k` untouched by this mechanism —
+    # so a wider list only lets a channel's genuinely-ranked candidates compete for MORE distinct
+    # fused slots, it cannot inflate the score of a candidate already present (`fusion.py`'s own
+    # `reciprocal_rank_fusion` docstring; verified by this feature's own unit tests, which assert
+    # an already-fused id's score is unchanged by a sibling channel's width).
+    #
+    # DEFAULT `False`, on the SAME "built but not yet measured" posture this file already uses
+    # for `ltm_protect_limit`/`ltm_entity_seed_pool` (both `0`) and `sparse_strip_leading_prefix`
+    # (`False`) — the mechanism is real and independently tested, but turning it on by default,
+    # unmeasured, in the SAME pass that also flips `rerank_enabled` would make any subsequent
+    # `gold_in_context` regression or gain impossible to attribute to one change or the other.
+    # Flip once a paired, matched-width `gold_in_context` sweep (the owner's own request: "measure
+    # the two changes separately and together") reports the number — not before. Env override:
+    # `MU_RECALL__DYNAMIC_CHANNEL_BUDGET=true`.
+    dynamic_channel_budget: bool = Field(default=False)
+    # A single channel's reallocated width is capped at `baseline_width * this value` — a latency
+    # safety valve independent of how much OTHER channels' starvation frees: a widened ANN/graph
+    # fetch costs real time, and this bounds the worst case regardless of how skewed one query's
+    # channel yields turn out to be. `3.0` is a starting cap, not a measured optimum (same
+    # unmeasured-but-bounded posture as the field above) — an operator who measures a tighter or
+    # looser cap helps or hurts more can move it without a code change. Env override:
+    # `MU_RECALL__DYNAMIC_CHANNEL_BUDGET_MAX_MULTIPLIER`.
+    dynamic_channel_budget_max_multiplier: float = Field(default=3.0, ge=1.0)
 
     # HYBRID MTM — dense ⊕ sparse inside the MTM channel (mtm-retrieval-design.md §1.2/§1.3,
     # `HybridConfig`). Fusion tuning belongs under `RecallSettings`, never `ModelSettings`
