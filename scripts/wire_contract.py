@@ -542,12 +542,26 @@ def _ts_blocks(source: str) -> dict[str, str]:
 
 
 def _ts_fields(block: str) -> dict[str, FieldSpec]:
-    """Top-level ``name: <zod expr>,`` entries of one zod object block."""
+    """Top-level ``name: <zod expr>,`` entries of one zod object block.
+
+    AD-328: comments are stripped FIRST, before the depth-0 comma split below. They used to be
+    stripped per-entry AFTERWARDS, which made the parser silently lose a field whenever the
+    ``//`` comment above it contained a comma outside parentheses: that comma split the entry, the
+    fragment holding ``name: z...`` began mid-comment-line with no ``//`` left in it to strip, its
+    ``partition(":")`` produced prose instead of an identifier, and the field was skipped by the
+    ``fullmatch`` guard. MEASURED: adding the three AD-308/AD-316 temporal fields to
+    ``mu-sdk-js``'s ``recallItemViewSchema`` with an ordinary prose comment above them left
+    ``valid_at`` — and only ``valid_at`` — still reported as missing by the drift gate, with the
+    field plainly present in the file. It fails CLOSED (a dropped field reads as SDK drift, never
+    as spurious conformance) so no past green was wrong, but it points at the wrong file.
+    Comment stripping is safe over the whole block for the same reason it was safe per entry:
+    ``//`` cannot appear inside these schemas outside a comment (no URLs, grepped).
+    """
     fields: dict[str, FieldSpec] = {}
     depth = 0
     current: list[str] = []
     entries: list[str] = []
-    for ch in block:
+    for ch in _TS_STRIP_COMMENT.sub("", block):
         if ch in "([{":
             depth += 1
         elif ch in ")]}":

@@ -135,6 +135,42 @@ def test_ts_sdk_has_not_drifted(checker: ModuleType) -> None:
     assert not problems, "\n".join(problems)
 
 
+def test_a_prose_comma_in_a_comment_does_not_eat_the_field_below_it(checker: ModuleType) -> None:
+    """AD-328. ``_ts_fields`` splits a zod block into entries on depth-0 commas. It used to strip
+    ``//`` comments per-entry AFTERWARDS, so a comma in ordinary comment prose split the entry: the
+    fragment carrying ``name: z...`` began mid-comment-line with no ``//`` left to strip, its
+    ``partition(":")`` yielded prose, and the ``fullmatch`` identifier guard dropped the field.
+
+    MEASURED, not hypothetical: adding the AD-308/AD-316 temporal trio to ``mu-sdk-js``'s
+    ``recallItemViewSchema`` under a normal prose comment left ``valid_at`` — only ``valid_at``, the
+    one field whose comment line above it ended in a depth-0 comma — still reported missing by
+    ``test_ts_sdk_has_not_drifted`` while plainly present in the file. Commas inside parentheses
+    never triggered it (``(`` raises the depth), which is why the pre-existing comments in that file
+    happened to survive and this went unnoticed.
+
+    Direction of the bug matters and is asserted by the sibling ``test_the_parsers_actually_
+    extract_fields``: it fails CLOSED (a swallowed field reads as SDK drift), so no past green was
+    wrong — but it accuses the SDK of a break that is really in the parser.
+    """
+    block = """
+    kept_before: z.string(),
+    // A comment whose prose contains a comma, exactly like this one, followed by a field.
+    eaten: z.coerce.date().nullable().optional(),
+    // Commas inside parentheses (like this, and this) never split, so this one always parsed.
+    never_eaten: z.boolean().default(false),
+"""
+    fields = checker._ts_fields(block)
+    assert set(fields) == {
+        "kept_before",
+        "eaten",
+        "never_eaten",
+    }, f"a prose comma swallowed a field: parsed {sorted(fields)}"
+    # And the survivor is parsed CORRECTLY, not merely present: a fragment-mangled entry would
+    # classify from truncated text.
+    assert fields["eaten"].kinds == frozenset({"string"})  # z.coerce.date() is a wire string
+    assert fields["eaten"].required is False
+
+
 def test_the_parsers_actually_extract_fields(checker: ModuleType) -> None:
     """Guards the gate itself: a parser that silently returns empty field sets would make every
     drift check pass vacuously, which is the classic way a conformance gate rots into decoration.
