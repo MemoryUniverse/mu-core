@@ -721,10 +721,26 @@ class RecallSettings(BaseModel):
     # above. Measured on real recalls: p50 3870 ms and p95 4848 ms against a documented
     # `recall_e2e_rerank` budget of p95 <= 150 ms (observability-design.md:150) — **~26x over**.
     # Cross-encoder inference over 20 candidates on CPU is the cost; nothing in the gate itself is
-    # slow. Turning this on is therefore blocked on making the inference affordable (a GPU, a
-    # smaller cross-encoder, fewer candidates, or moving the rerank off the response path the way
-    # enrichment already is), not on tuning the gate. Re-measure the SLO in the same pass that
-    # changes it.
+    # slow.
+    #
+    # UPDATED 2026-09-26 (AD-307, ADR 0091) — six affordability levers measured, none clears the
+    # budget: a smaller cross-encoder (bge-reranker-base, 278M, EN+ZH only — NOT the 100+-language
+    # multilingual member of the family, which is v2-m3 above) gets to 714ms clean at +3.33pp
+    # gold_in_context; MiniLM-L6 (22M, English-only) gets to 561-751ms at +1.33-2.00pp; fewer
+    # candidates (`rerank_pool_size` 20->10) erases the lift on either model (dead lever); int8
+    # quantization is SLOWER on this CPU (no AVX-512/VNNI); ONNX Runtime is faster on MiniLM but
+    # REGRESSES its accuracy (-10.67pp, unexplained, not shippable) and crashes outright on this
+    # model family via the serving stack in use (a third-party warmup defect against RoBERTa
+    # position embeddings); `max_length` capping saves nothing (real candidates already average
+    # 52 tokens); this VM's CPU threads are already at PyTorch's own optimal default (4 of 8
+    # logical, more is measured WORSE, not a starvation bug); a rank-based selective-rerank signal
+    # (RRF fused_score margin) does not discriminate between queries and is not a usable gate.
+    # **The budget itself was also found broken independent of the reranker**: every OFF-arm
+    # baseline measured (202-400ms p50) already misses the 150ms p95, reranker not even running.
+    # See ADR 0091 for the full matrix, every rejected arm, and the recommended fix: a latency
+    # TIER (interactive=off, background/batch=on with a model choice per the ADR's tradeoff table)
+    # rather than a single global switch — not built in that pass, a design decision for whoever
+    # owns `services/recall/` next. Re-measure the SLO in the same pass that changes it.
     rerank_enabled: bool = Field(default=False)
 
     # HYBRID MTM — dense ⊕ sparse inside the MTM channel (mtm-retrieval-design.md §1.2/§1.3,
