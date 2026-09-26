@@ -126,3 +126,22 @@ def test_occurred_at_absent_is_byte_identical_to_pre_ad312_behaviour() -> None:
     )
     assert with_none.valid_at is None
     assert without_param.valid_at is None
+
+
+def test_occurred_at_is_stamped_onto_the_item_raw_even_when_valid_at_resolves_differently() -> None:
+    """AD-316: `MemoryItem.occurred_at` must carry the RAW `activity.occurred_at` unchanged, even
+    on a row where `valid_at` resolves to a DIFFERENT date (an in-text relative clause) — the two
+    fields exist precisely so a downstream renderer can tell them apart (dto.py's own docstring:
+    the double-count risk of showing a resolved date beside unmodified relative-phrase content).
+    Reverting `occurred_at=activity.occurred_at` in `_build_memory_item` turns this red."""
+    item = _build_memory_item(
+        _activity("I went to a support group yesterday", occurred_at=_STORY_DATE), at=_AT
+    )
+    assert item.occurred_at == _STORY_DATE
+    assert item.valid_at == _STORY_DATE - timedelta(days=1)
+    assert item.occurred_at != item.valid_at
+
+
+def test_occurred_at_absent_leaves_the_raw_field_none_too() -> None:
+    item = _build_memory_item(_activity("Ada uses Postgres", occurred_at=None), at=_AT)
+    assert item.occurred_at is None

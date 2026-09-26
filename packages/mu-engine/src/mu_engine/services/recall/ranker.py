@@ -198,6 +198,7 @@ def _to_view(
         turn_seq=item.turn_seq,  # S1b — None on any item written before it existed (dto.py)
         valid_at=item.valid_at,  # AD-308 — dto.py's own docstring has the full "why"
         valid_at_inferred=bool(item.metadata.get("valid_at_inferred", False)),
+        occurred_at=item.occurred_at,  # AD-316 — dto.py's own docstring has the full "why"
     )
 
 

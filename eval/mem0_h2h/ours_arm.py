@@ -158,13 +158,31 @@ async def sweep_one_arm(
                         dia = index.resolve(item.content)
                         stamp = turn_date.get(dia[0], "") if dia else ""
                         lines.append(f"- {stamp}: {item.content}" if stamp else f"- {item.content}")
-                        # AD-308: the PRODUCT'S OWN signal — `RecallItemView.valid_at`, threaded
-                        # end to end by this pass's engine fix — nothing corpus-side. A `None`
-                        # (never extracted/inferred for this item) renders undated, honestly.
-                        product_valid_at = getattr(item, "valid_at", None)
-                        if product_valid_at is not None:
+                        # AD-308/AD-316: the PRODUCT'S OWN signal, threaded end to end by this
+                        # lane's own engine fixes — nothing corpus-side. AD-315's 7/8-row diagnostic
+                        # found that prefixing a hit with `valid_at` (a RESOLVED date — the in-text
+                        # relative clause already shifted against its anchor) while `item.content`
+                        # still carries that SAME relative phrase unmodified causes the answering
+                        # model to double-count: it re-applies the relative offset on top of the
+                        # already-resolved prefix (the "off by exactly 7 days" / "double-applied
+                        # two days ago" failure signatures). `RecallItemView.occurred_at` (AD-316)
+                        # is the RAW, UNRESOLVED capture instant — the same shape the harness-
+                        # assisted arm's `turn_date` rejoin rendered, which is why that arm scored
+                        # 18/22 on these exact rows. Preferring it here is a real product signal,
+                        # not a corpus lookup: `occurred_at` is exactly the value this same
+                        # harness already passes into `LocalMemory.add(occurred_at=...)`
+                        # (`_turn_occurred_at` above) and gets back out through the public recall
+                        # API — never read from
+                        # `turn_date`/the corpus directly. Falls back to `valid_at` when
+                        # `occurred_at` is unset (an item with no AD-312 caller-asserted capture
+                        # time — e.g. LTM-distilled content with only a resolved/inferred date),
+                        # preserving AD-308's prior behaviour for that case.
+                        product_date = getattr(item, "occurred_at", None) or getattr(
+                            item, "valid_at", None
+                        )
+                        if product_date is not None:
                             product_dated += 1
-                            product_lines.append(f"- {product_valid_at.date()}: {item.content}")
+                            product_lines.append(f"- {product_date.date()}: {item.content}")
                         else:
                             product_lines.append(f"- {item.content}")
                     contexts.append(

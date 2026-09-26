@@ -134,3 +134,58 @@ def test_no_valid_at_maps_to_the_canonical_defaults() -> None:
     got = canonical.items[0]
     assert got.valid_at is None
     assert got.valid_at_inferred is False
+
+
+def test_occurred_at_is_forwarded_onto_the_canonical_item_separately_from_valid_at() -> None:
+    """AD-316: same class of gap AD-233/AD-308 already caught — reverting
+    ``occurred_at=item.occurred_at`` in ``mapping.py`` turns this red."""
+    captured = datetime(2023, 5, 8, tzinfo=UTC)
+    resolved = datetime(2023, 5, 7, tzinfo=UTC)
+    engine_item = RecallItemView(
+        memory_id="m5",
+        content="I went to a LGBTQ support group yesterday and it was so powerful.",
+        content_hash="h5",
+        tier=MemoryTier.STM,
+        channel="stm",
+        namespace=_NS,
+        fused_score=0.9,
+        valid_at=resolved,
+        occurred_at=captured,
+    )
+    engine_result = RecallResult(
+        namespace=_NS,
+        items=[engine_item],
+        channels_run=RecallChannels(),
+        degraded=None,
+        generated_at=_NOW,
+    )
+
+    canonical = to_canonical_recall_result(engine_result)
+
+    got = canonical.items[0]
+    assert got.occurred_at == captured
+    assert got.valid_at == resolved
+    assert got.occurred_at != got.valid_at
+
+
+def test_no_occurred_at_maps_to_the_canonical_default() -> None:
+    engine_item = RecallItemView(
+        memory_id="m6",
+        content="an item with no caller-asserted capture instant",
+        content_hash="h6",
+        tier=MemoryTier.STM,
+        channel="stm",
+        namespace=_NS,
+        fused_score=0.1,
+    )
+    engine_result = RecallResult(
+        namespace=_NS,
+        items=[engine_item],
+        channels_run=RecallChannels(),
+        degraded=None,
+        generated_at=_NOW,
+    )
+
+    canonical = to_canonical_recall_result(engine_result)
+
+    assert canonical.items[0].occurred_at is None

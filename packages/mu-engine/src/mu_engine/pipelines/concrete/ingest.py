@@ -253,6 +253,11 @@ def _build_memory_item(
         valid_at=(
             extract_valid_at(activity.text, now=activity.occurred_at or at) or activity.occurred_at
         ),
+        # AD-316: the RAW value, kept SEPARATE from the (possibly-resolved) `valid_at` above —
+        # `MemoryItem.occurred_at`'s own docstring has the full "why" (double-count risk when a
+        # renderer shows a resolved date beside unmodified relative-phrase content). `None` when
+        # the caller asserted nothing, byte-identical to pre-AD-316 behaviour.
+        occurred_at=activity.occurred_at,
         importance_score=activity.importance,
         source=activity.source,
         turn_seq=activity.turn_seq,

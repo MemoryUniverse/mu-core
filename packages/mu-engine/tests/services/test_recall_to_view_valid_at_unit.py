@@ -3,6 +3,10 @@ metadata flag onto the engine-internal ``RecallItemView`` — the ONE function e
 ``RecallResult.items`` entry this engine ever returns is built through (its own docstring).
 Reverting the ``valid_at=item.valid_at``/``valid_at_inferred=...`` lines in ``ranker.py`` turns
 this red; nothing else in the ranking pipeline is exercised here (pure unit, no store).
+
+AD-316 extends this file with the same coverage for ``occurred_at`` — the RAW capture instant,
+forwarded separately from ``valid_at`` (see ``dto.py``'s own docstring for the double-count
+rationale). Reverting ``occurred_at=item.occurred_at`` in ``ranker.py`` turns those cases red.
 """
 
 from __future__ import annotations
@@ -22,7 +26,10 @@ _NS = Namespace(org="o", workspace="w", user="u1", session="s1", visibility=Visi
 
 
 def _item(
-    *, valid_at: datetime | None = None, metadata: dict[str, object] | None = None
+    *,
+    valid_at: datetime | None = None,
+    metadata: dict[str, object] | None = None,
+    occurred_at: datetime | None = None,
 ) -> MemoryItem:
     return MemoryItem(
         content="Ada adopted a rescue dog",
@@ -31,6 +38,7 @@ def _item(
         workspace_id="w",
         session_id="s1",
         valid_at=valid_at,
+        occurred_at=occurred_at,
         metadata=metadata or {},
     )
 
@@ -64,3 +72,25 @@ def test_no_valid_at_and_no_metadata_flag_defaults_to_false() -> None:
 
     assert view.valid_at is None
     assert view.valid_at_inferred is False
+
+
+def test_occurred_at_is_forwarded_onto_the_engine_view_separately_from_valid_at() -> None:
+    captured = datetime(2023, 5, 8, tzinfo=UTC)
+    resolved = datetime(2023, 5, 7, tzinfo=UTC)
+    item = _item(valid_at=resolved, occurred_at=captured)
+    scored = Scored(item=item, score=0.5, channel=RecallChannel.MTM_DENSE)
+
+    view = _to_view(scored, "mtm")
+
+    assert view.occurred_at == captured
+    assert view.valid_at == resolved
+    assert view.occurred_at != view.valid_at
+
+
+def test_no_occurred_at_defaults_to_none() -> None:
+    item = _item(valid_at=None, occurred_at=None)
+    scored = Scored(item=item, score=0.1, channel=RecallChannel.STM_FLOOR)
+
+    view = _to_view(scored, "stm")
+
+    assert view.occurred_at is None

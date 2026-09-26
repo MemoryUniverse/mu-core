@@ -190,6 +190,18 @@ class MemoryItem(BaseModel):
     updated_at: datetime = Field(default_factory=_utcnow)
     valid_at: datetime | None = None
     invalid_at: datetime | None = None
+    # AD-316: the RAW capture instant the caller asserted for this content (`IngestActivity.
+    # occurred_at`, AD-312) — kept SEPARATELY from `valid_at` because `valid_at` may be a
+    # RESOLVED date (`extract_valid_at` shifting `occurred_at` by an in-text relative clause,
+    # e.g. "yesterday"), while `content` still carries that same relative phrase unmodified
+    # (capture-time content is never altered, CANONICAL §3.1/§7.1). A renderer that prefixes a
+    # hit with the RESOLVED `valid_at` and then shows the ORIGINAL relative text risks the reader
+    # (human or model) re-applying the relative offset on top of an already-shifted date — AD-315's
+    # own 7/8-row diagnostic found exactly this double-count shape when compared against a
+    # rendering that instead anchors on the raw, unresolved capture instant. `None` when the
+    # caller never asserted one (ordinary real-time capture, where `created_at` already IS the
+    # capture instant — no separate field is needed in that case).
+    occurred_at: datetime | None = None
 
     # D2 fix (AD-266a, ``docs/tracking/PROTOTYPE-DEBT-0924.md``): "when was this memory last
     # RECALLED" — a genuinely distinct signal from ``updated_at`` (a WRITE timestamp that also

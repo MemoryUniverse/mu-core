@@ -126,6 +126,16 @@ class RecallItemView(BaseModel):
     # distill.py:626-630`) — lets a renderer avoid presenting an inferred timestamp as an asserted
     # fact.
     valid_at_inferred: bool = False
+    # AD-316: the wire-contract half of `RecallItemView.occurred_at` — the RAW capture instant the
+    # caller asserted at write time (`AddRequest.occurred_at`, AD-312), forwarded separately from
+    # `valid_at` because `valid_at` may be a RESOLVED date (an in-text relative clause shifted
+    # against this anchor) while `content` above still carries that same relative phrase
+    # unmodified. A caller rendering a date prefix ALONGSIDE the original content should prefer
+    # this field over `valid_at` to avoid re-applying the relative offset on top of an
+    # already-resolved date (AD-315's own diagnostic: this exact double-count shape explained 7 of
+    # 8 remaining temporal misses). `None` when the underlying fact's `occurred_at` is itself
+    # unset — never a guess.
+    occurred_at: datetime | None = None
 
 
 class RecallResult(BaseModel):
