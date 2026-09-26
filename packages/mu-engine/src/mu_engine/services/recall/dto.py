@@ -732,6 +732,65 @@ class RecallSettings(BaseModel):
     # value is validated against the other. Env override: `MU_RECALL__LTM_FLAT_SEED=false`.
     ltm_flat_seed: bool = True
 
+    # AD-327 (docs/tracking/ARCHITECTURE-DELTAS.md) — the REAL ``resolve_entity`` seed.
+    #
+    # AD-289 diagnosed that ``resolve_entity`` (``falkor_ltm.py:1000``) — the method all five
+    # design files name as the graph channel's seed resolver — had ZERO production callers.
+    # ``traverse_entities``'s own token frontier (``falkor_ltm.py``, `re.findall(r"[A-Za-z0-9]+",
+    # query)`) is NOT a stand-in for it: it is single-TOKEN only, so a multi-word entity name
+    # (``"Q3 report"``, ``canonical_name="q3 report"``) never seeds the traversal — no individual
+    # token equals the full phrase, only ``"q3"`` and ``"report"`` separately.
+    #
+    # **Data diagnosis done before building this (the ordering ``GRAPH-TIER-DECISION.md`` asked
+    # for), and it changes what "real resolve_entity" can honestly claim to fix.** Reading
+    # `resolve_entity`/`_merge_entity` end to end (`falkor_ltm.py:654-676`, `:1000-1033`) found
+    # its ALIAS branch (`$canon IN e.alias_keys`) is provably dead in production: `_merge_entity`
+    # writes `alias_keys=[$canon]` ONCE at node creation, and the only write path that could grow
+    # it (its Cypher's `ON MATCH`) only fires when `$canon` already equals the node's own
+    # `canonical_name` — the exact condition under which `resolve_entity`'s OWN canonical_name
+    # branch would already have matched and returned before that MERGE ever runs. So `alias_keys`
+    # can never hold more than its creation-time singleton, and the alias branch can never fire a
+    # match the canonical_name branch would not already have fired. `EntityCandidate.similarity`
+    # is also hardcoded to `1.0` for every row `_resolve_entity_impl` returns (the Cypher WHERE
+    # clause already pre-filters to exact/alias matches only), so `entity_similarity_threshold`
+    # never actually screens anything — `resolve_entity` is exact-match only today, not fuzzy,
+    # despite the config surface implying otherwise. **A naive wiring of `resolve_entity`
+    # one-token-at-a-time would therefore have been provably no different from the existing token
+    # frontier, i.e. a re-run of `GRAPH-TIER-DECISION.md` §4 arm C's already-measured -3
+    # `gold_in_context` under a new name — recorded so nobody re-tries that shape expecting a
+    # different result.**
+    #
+    # So the one genuine, additive capability this field wires in is MULTI-WORD phrase
+    # resolution: candidate windows of 1..``ltm_query_entity_seed_max_ngram`` consecutive query
+    # WORDS (longest first) are each resolved through the REAL `GraphStorePort.resolve_entity` —
+    # never a re-derived regex match — and a deterministic hit's `entity_uid` widens
+    # `traverse_entities`'s hop-1 frontier exactly as `ltm_entity_seed_pool`'s MTM-derived uids
+    # already do (ADD, never REPLACE — same AD-258 precedent, see
+    # `ThreeChannelRecallRanker._resolve_query_entity_uids`). An ambiguous/unresolved phrase
+    # (`entity_uid is None`) contributes nothing — the same fail-silent-on-no-match posture
+    # `traverse_entities` itself already has, so this cannot make the channel LESS selective than
+    # it is today, only more.
+    #
+    # `0` disables the seed entirely (byte-identical to pre-AD-327 behaviour) — the SAME
+    # shipped-cautious posture `ltm_protect_limit`/`ltm_entity_seed_pool` both use for a
+    # built-tested-not-yet-measured lever (DEV-STANDARDS rule 3: raise it to MEASURE, not to
+    # ship). This pass proved the MECHANISM against real FalkorDB (an LTM-sourced item wins a
+    # recall slot via a multi-word alias a token-only seed cannot reach — a test that fails
+    # without this field on) but did not have VM/eval budget left to also sweep
+    # `gold_in_context`; see the pass's own report for the honest null. Bounds one
+    # `resolve_entity` store round trip per distinct candidate phrase, capped at this many
+    # distinct phrases per recall. Env override: `MU_RECALL__LTM_QUERY_ENTITY_SEED`.
+    ltm_query_entity_seed: int = Field(default=0, ge=0)
+
+    # How many WORDS wide a candidate phrase window can be when deriving `resolve_entity`
+    # candidates from the query text (``ltm_query_entity_seed`` above) — `1` only tries single
+    # tokens (subsumed by the existing token frontier, so pointless below `2`); default `3` covers
+    # the common multi-word entity names this corpus's extractor produces (`"Q3 report"`, a
+    # first+last name) without the combinatorial cost of trying every substring of a long query.
+    # Irrelevant when `ltm_query_entity_seed=0`. Env override:
+    # `MU_RECALL__LTM_QUERY_ENTITY_SEED_MAX_NGRAM`.
+    ltm_query_entity_seed_max_ngram: int = Field(default=3, ge=1, le=6)
+
     # Rerank gate (ACCURACY-PLAN-0831.md item 6 / recall-service-design.md §1.5, ADR 0010/0023):
     # `ModelRouter.rerank` (`providers/model_router.py:265`) was fully built — a local
     # `BAAI/bge-reranker-v2-m3` configured, a `Task.RERANK` route registered — and had NO caller

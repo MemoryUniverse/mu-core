@@ -119,6 +119,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
@@ -643,6 +644,13 @@ class ThreeChannelRecallRanker:
         if self._settings.ltm_max_hops <= 0:
             return hits, False
         seed_entity_uids = await self._resolve_seed_entity_uids(mtm_seed)
+        # AD-327: the REAL `resolve_entity` seed — see `RecallSettings.ltm_query_entity_seed`'s
+        # own docstring for the data diagnosis this is built against. ADDS to the MTM-derived
+        # seed above, never replaces it (both are unioned into ONE frontier-widening list — the
+        # same "ADD, never REPLACE" precedent AD-258 already established for this parameter).
+        query_entity_uids = await self._resolve_query_entity_uids(ns, query)
+        if query_entity_uids:
+            seed_entity_uids = list(dict.fromkeys([*(seed_entity_uids or ()), *query_entity_uids]))
         try:
             # C2 FIX: the caller identity set goes to the traversal arm too — it is the SAME
             # `caller` the flat `graph_recall` seed above already receives. The traversal arm
@@ -719,6 +727,50 @@ class ThreeChannelRecallRanker:
                     seen.add(uid_s)
                     uids.append(uid_s)
         return uids or None
+
+    async def _resolve_query_entity_uids(self, ns: Namespace, query: str) -> list[str]:
+        """AD-327 — the REAL ``resolve_entity`` seed (``RecallSettings.ltm_query_entity_seed``'s
+        own docstring has the full data diagnosis this is built against; read it first).
+
+        Slides a 1..``ltm_query_entity_seed_max_ngram``-word window over the query's own word
+        tokens, LONGEST windows first (a multi-word deterministic hit is tried before its own
+        substrings can burn the per-recall candidate budget), and calls the REAL
+        ``GraphStorePort.resolve_entity`` — never a re-derived regex match, unlike
+        ``traverse_entities``'s own token frontier — once per distinct candidate phrase, bounded
+        to ``ltm_query_entity_seed`` distinct phrases. Keeps only a DETERMINISTIC hit's
+        ``entity_uid`` (``EntityResolution.entity_uid is not None``) — the SAME
+        single-candidate-above-threshold gate ``FalkorLtmAdapter._merge_entity`` itself trusts at
+        WRITE time, never a raw shortlist guess at read time. Order-preserving, deduplicated.
+
+        Returns ``[]`` (never raises, never awaits the store) when the setting is `0` (the
+        shipped default) or the query has no extractable word token — `_ltm_channel` already
+        treats an empty seed list as "no content-aware seed to add", identically to
+        `_resolve_seed_entity_uids` returning `None`."""
+        cap = self._settings.ltm_query_entity_seed
+        if cap <= 0:
+            return []
+        tokens = [t for t in re.findall(r"[A-Za-z0-9]+", query) if len(t) > 1]
+        if not tokens:
+            return []
+        max_n = min(self._settings.ltm_query_entity_seed_max_ngram, len(tokens))
+        candidates: list[str] = []
+        seen_phrases: set[str] = set()
+        for n in range(max_n, 0, -1):  # longest phrases first
+            for i in range(len(tokens) - n + 1):
+                phrase = " ".join(tokens[i : i + n])
+                key = phrase.casefold()
+                if key in seen_phrases:
+                    continue
+                seen_phrases.add(key)
+                candidates.append(phrase)
+        uids: list[str] = []
+        seen_uids: set[str] = set()
+        for phrase in candidates[:cap]:
+            resolution = await self._ltm.resolve_entity(ns, phrase)
+            if resolution.entity_uid is not None and resolution.entity_uid not in seen_uids:
+                seen_uids.add(resolution.entity_uid)
+                uids.append(resolution.entity_uid)
+        return uids
 
     async def _score_stm(
         self, floor: list[Scored[MemoryItem]], query: str, query_vec: Vector
