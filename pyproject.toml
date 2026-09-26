@@ -36,6 +36,15 @@ dev = [
     "ruff>=0.8,<0.9",
     "import-linter>=2.1,<3",
     "testcontainers>=4.9,<5",
+    # AD-312/AD-314 (2026-09-26): declared explicitly — was reachable only as a transitive
+    # dependency (pulled in by another package's own requirements) until now, which
+    # `eval/mem0_h2h/ours_arm.py::_turn_occurred_at` imports directly to parse LoCoMo's free-text
+    # `session_date` ("1:56 pm on 8 May, 2023") into a real datetime. An undeclared import that
+    # happens to resolve in one dev environment is a `ModuleNotFoundError` waiting to happen on a
+    # clean install the moment the transitive chain that carried it changes — the identical defect
+    # shape the SDK-drift gate already exists to catch one layer over (DEV-STANDARDS: no
+    # undeclared dependency). Eval-only; never a product dependency.
+    "python-dateutil>=2.9,<3",
 ]
 
 # The Stage F acceptance gate (packages/mu-engine-server/tests/acceptance/) drives the PUBLIC
