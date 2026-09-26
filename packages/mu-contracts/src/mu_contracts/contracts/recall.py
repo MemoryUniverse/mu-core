@@ -111,6 +111,21 @@ class RecallItemView(BaseModel):
     # py`) for the forwarding half.
     turn_seq: int | None = None
     is_neighbor: bool = False
+    # AD-308: the wire-contract half of `mu_engine.services.recall.dto.RecallItemView.valid_at`/
+    # `.valid_at_inferred` — the bi-temporal world-time this hit is true AS OF. Before this field
+    # existed, `to_canonical_recall_result` (`mu_engine.services.recall.mapping`) had nothing to
+    # forward the engine's own `MemoryItem.valid_at` INTO, so no caller of a real recall response —
+    # an MCP tool, an injected agent context (`mu-client`'s `ContextSlab`), a REST client — could
+    # ever render a per-item date, and the model answering a temporal question saw only undated
+    # text (the exact gap `eval/mu_eval/answer_quality.py:23-36`'s harness-side date rejoin exists
+    # to work around, for the eval path only). `None` when the underlying fact's `valid_at` is
+    # itself unset — never a guess.
+    valid_at: datetime | None = None
+    # True when `valid_at` was not recovered from the source and defaulted to the transaction
+    # time (the LOUD `recorded_at` fallback, `mu-core/packages/mu-engine/src/mu_engine/pipelines/
+    # distill.py:626-630`) — lets a renderer avoid presenting an inferred timestamp as an asserted
+    # fact.
+    valid_at_inferred: bool = False
 
 
 class RecallResult(BaseModel):

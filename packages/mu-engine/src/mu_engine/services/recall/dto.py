@@ -127,6 +127,23 @@ class RecallItemView(BaseModel):
     # (a neighbour competes for its `limit` slot exactly like any other candidate once inserted,
     # `_expand_neighbors`'s own docstring: "a neighbour COSTS a slot").
     is_neighbor: bool = False
+    # AD-308: the bi-temporal world-time this hit is true AS OF (`MemoryItem.valid_at` — a
+    # dialogue turn's own capture instant, or an extracted LTM fact's resolved/inferred date).
+    # Before this field existed, `_to_view` (below) silently dropped it on every hit this engine
+    # ever returned — the ONE function every caller's `RecallItemView` is built through — so NO
+    # consumer of a real recall response (an MCP tool, an injected agent context, an eval harness)
+    # could ever render a per-item date; the eval harness that measured this engine's LoCoMo
+    # temporal-reasoning score had to work around the gap by re-matching each hit's body text back
+    # against the corpus's OWN known dates (`eval/mu_eval/answer_quality.py:23-36`), a rejoin that
+    # only works for a verbatim STM turn and leaves an LTM-distilled paraphrase undated. `None`
+    # when the underlying `MemoryItem.valid_at` is itself unset (never a guess).
+    valid_at: datetime | None = None
+    # True when `valid_at` was NOT recovered from the source text/dialogue and instead defaulted
+    # to `recorded_at`/`created_at` (the LOUD fallback, `pipelines/distill.py:626-630`,
+    # `DegradeReason.DATE_EXTRACTION_FALLBACK`; `MemoryItem.metadata["valid_at_inferred"]`) — a
+    # caller rendering the date into an answer-context prompt needs this to avoid presenting an
+    # inferred transaction time as if it were an asserted world-time fact.
+    valid_at_inferred: bool = False
 
 
 class RecallResult(BaseModel):
