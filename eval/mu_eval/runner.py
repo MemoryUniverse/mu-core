@@ -13,6 +13,7 @@ a display bug or a ranking bug. The distribution recorded here is what tells the
 from __future__ import annotations
 
 import asyncio
+import re
 import statistics
 from collections.abc import Sequence
 from typing import Any
@@ -30,10 +31,27 @@ __all__ = [
     "RunReport",
     "ScoreProvenance",
     "classify_query_admission",
+    "gold_answer_word_coverage",
     "gold_context_attribution",
     "gold_ids_present",
     "run_baseline",
 ]
+
+# Stopword list for `gold_answer_word_coverage` below — deliberately small and closed-class
+# (articles, pronouns, prepositions, copulas, a handful of vague quantifiers/time nouns), the
+# same list AD-330's own probe (`docs/tracking/eval-runs/2026-09-26-ad330-failure-buckets/
+# probe_answer_word_coverage.py`) validated the AUC claim with. Kept as a MODULE CONSTANT (not a
+# literal buried in the function body, DEV-STANDARDS rule 3) so the metric's own definition is
+# inspectable and citable independent of the probe script it was prototyped in.
+_COVERAGE_STOPWORDS: frozenset[str] = frozenset(
+    """the a an and or of to in on at for with from by is are was were be been being this
+    that these those it its he she they them his her their we you i my your our as not no yes do
+    did does done have has had what when where who whom which why how many much about into over
+    under after before during than then so such some any all both each few more most other own
+    same too very can will just don should now year years week weeks month months day days time
+    times thing things one two three""".split()
+)
+_COVERAGE_WORD_RE = re.compile(r"[a-z0-9']{3,}")
 
 # Coordination point for the neighbour-expansion arm (S1b, `TRACE-0923.md` §7 S1b; recorded as
 # AD-228 in `ARCHITECTURE-DELTAS.md`). This harness's own file ownership is `eval/` only
@@ -234,6 +252,63 @@ def gold_ids_present(items: Sequence[Any], index: TurnIndex, gold: set[str]) -> 
     that could quietly disagree with each other.
     """
     return gold_context_attribution(items, index, gold).present
+
+
+def _coverage_words(text: str) -> set[str]:
+    """Lowercase content words (len>=3, alnum/apostrophe) with `_COVERAGE_STOPWORDS` removed —
+    the SAME tokenisation `gold_answer_word_coverage` and its originating probe script use, kept
+    as its own function so a test can pin tokenisation independent of the coverage arithmetic."""
+    return {w for w in _COVERAGE_WORD_RE.findall(text.casefold()) if w not in _COVERAGE_STOPWORDS}
+
+
+def gold_answer_word_coverage(gold_answer: str, context: str) -> float:
+    """Fraction of the gold answer's own content words that appear anywhere in the assembled
+    context string, in ``[0.0, 1.0]``.
+
+    **Why this exists beside `gold_ids_present`/`gold_in_context`, not instead of it**
+    (`docs/tracking/eval-runs/2026-09-26-ad330-failure-buckets/probe_answer_word_coverage.py`,
+    ADR 0103 AD-330 / ADR 0105 AD-332). `gold_ids_present` joins on the VERBATIM turn body via
+    `TurnIndex` — exact, but blind to any write-time transformation of that body: distillation,
+    coreference resolution, summarisation, an LLM extractor's paraphrase. AD-332 measured this
+    blind spot directly — an arm whose logs showed the LTM graph covering the corpus scored
+    `gold_in_context` 6/150 (4%) purely because the join could not match paraphrased facts to the
+    turn ids that seeded them. This function is invariant to that rewriting: it asks whether the
+    ANSWER's own words made it into what the model was shown, not whether a particular turn's
+    exact body did.
+
+    **Validated, not assumed.** AD-330 first reported AUC(coverage -> judge-correct) 0.739 vs
+    AUC(gold_in_context -> judge-correct) 0.684 on one 96-row judged slice
+    (`2026-09-26-ad328-rerank-pool-and-dynamic`). This module's own re-validation
+    (`docs/tracking/eval-runs/2026-09-27-gold-word-coverage-metric/revalidate_coverage_auc.py`)
+    pooled every judged set on disk with a matching context-product artifact — 213 rows across
+    three independent runs (`ad324-trunk-n100`, `ad328-p40-n100`, `ad308-temporal-n22`) — and
+    measured AUC(coverage) 0.7501 vs AUC(gold_in_context) 0.7080 pooled, coverage ahead in all
+    three runs individually (0.7735/0.7271, 0.7386/0.6837, 0.7574/0.7206). Both numbers move
+    together with a much smaller sample than AD-330's, so the DIRECTION (coverage is the better
+    single-number predictor of judge correctness) replicates; the exact magnitude is dataset-
+    dependent and should be re-measured again as more judged sets accumulate, not treated as a
+    constant.
+
+    **Never a replacement for `gold_in_context`.** Every historical number in this repo is
+    denominated in the turn-id join; report both, always (module docstring intent) — this
+    function is additive.
+
+    Tokenisation: casefold, ``[a-z0-9']{3,}`` tokens, `_COVERAGE_STOPWORDS` removed — short
+    function words carry no signal and would inflate coverage on trivially-short gold answers.
+
+    A gold answer with NO scorable content words after stopword removal (e.g. "Yes.", a bare
+    number under 3 digits, or entirely function words) returns ``1.0`` — the same "nothing to
+    penalise" convention `ranker._tail_density` already uses in this codebase for a pool this
+    function cannot meaningfully evaluate, rather than an arbitrary 0.0 that would silently drag
+    down an aggregate mean over rows this metric has no opinion on. Such rows are EXCLUDED from
+    the AUC re-validation above (mirroring the probe script), so this convention never inflates
+    the validated correlation — it only keeps the per-row field always-populated and well-typed.
+    """
+    gold_words = _coverage_words(gold_answer)
+    if not gold_words:
+        return 1.0
+    context_words = _coverage_words(context)
+    return len(gold_words & context_words) / len(gold_words)
 
 
 class _ProvenanceAccumulator:

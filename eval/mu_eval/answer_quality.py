@@ -64,7 +64,7 @@ from mu_eval.judge import (
 from mu_eval.locomo import CATEGORY_NAMES, Conversation, LabelledQuery
 from mu_eval.openai_chat import CompletionResult, OpenAICompatChat, RateLimitError
 from mu_eval.repeats import RepeatSummary, summarize_repeats
-from mu_eval.runner import gold_ids_present
+from mu_eval.runner import gold_answer_word_coverage, gold_ids_present
 from mu_eval.usage import CallUsage
 
 __all__ = [
@@ -111,6 +111,20 @@ class QueryResult(BaseModel):
     # had a chance). See `CategoryStats.wrong_retrieved`/`wrong_not_retrieved` for the aggregate.
     gold_in_context: bool
 
+    # SECOND, WORD-COVERAGE retrieval-attribution metric — ADDITIVE beside `gold_in_context`
+    # above, never a replacement (every historical number in this repo is denominated in the
+    # turn-id join; report both). `runner.gold_answer_word_coverage`'s own docstring has the full
+    # rationale and the re-validated AUC: `gold_in_context` joins on the VERBATIM turn body, so a
+    # write-time transformation of that body (distillation, coreference resolution, an LLM
+    # extractor's paraphrase) scores as a retrieval MISS even when the retrieved context plainly
+    # carries the answer (AD-332 measured this directly: 6/150 `gold_in_context` against logs
+    # showing the LTM graph covering the corpus). This field is invariant to that rewriting — it
+    # is the fraction of the gold answer's own content words present anywhere in `context`,
+    # ``1.0`` for a gold answer with no scorable words. Default ``1.0`` (not 0.0) so an artifact
+    # written before this field existed loads as "nothing to penalise" rather than a manufactured
+    # zero that would silently drag down a mean computed over old and new rows together.
+    gold_word_coverage: float = 1.0
+
     # PER-ROW COST (CLAUDE.md eval lane: "per-row usage too, not only totals, so an expensive
     # category can be found"). One `CallUsage` per LLM call this row made — `None` only when the
     # row predates this fix (an older artifact) or the call itself never returned a usage block
@@ -150,6 +164,15 @@ class CategoryStats(BaseModel):
     gold_retrieved: int = 0  # rows (any verdict) whose gold evidence was in the context
     wrong_retrieved: int = 0  # verdict=WRONG AND gold was retrieved -> a GENERATION failure
     wrong_not_retrieved: int = 0  # verdict=WRONG AND gold was NOT retrieved -> a RETRIEVAL failure
+
+    # SECOND retrieval-attribution metric, reported ALONGSIDE the three above, never replacing
+    # them (`QueryResult.gold_word_coverage`'s own docstring / `runner.gold_answer_word_coverage`
+    # has the full rationale). Mean over the same row set `gold_retrieved` above is computed from
+    # — comparable bucket-for-bucket with it. Default 0.0 rather than 1.0 here (unlike the
+    # per-row field's own default): an artifact written before this fix has zero ROWS carrying a
+    # real value, so a mean of zero real observations is honestly 0.0, not a manufactured "fully
+    # covered" — `n == 0`/pre-fix artifacts should be read from `n`, not trusted as a real number.
+    mean_gold_word_coverage: float = 0.0
 
     # How often the budget-exhaustion retry (`_complete_with_retry`) fired on this bucket's rows,
     # and how many of the STILL-unparseable rows show the exact budget-exhaustion wire signature
@@ -401,6 +424,7 @@ def _stats(rows: Sequence[QueryResult]) -> CategoryStats:
     answer_budget_retried = sum(1 for r in rows if r.answer_budget_retried)
     judge_budget_retried = sum(1 for r in rows if r.judge_budget_retried)
     unparseable_budget_exhausted = sum(1 for r in rows if _is_budget_exhausted_row(r))
+    mean_gold_word_coverage = sum(r.gold_word_coverage for r in rows) / len(rows) if rows else 0.0
     return CategoryStats(
         n=len(rows),
         correct=correct,
@@ -409,6 +433,7 @@ def _stats(rows: Sequence[QueryResult]) -> CategoryStats:
         gold_retrieved=gold_retrieved,
         wrong_retrieved=wrong_retrieved,
         wrong_not_retrieved=wrong_not_retrieved,
+        mean_gold_word_coverage=mean_gold_word_coverage,
         answer_budget_retried=answer_budget_retried,
         judge_budget_retried=judge_budget_retried,
         unparseable_budget_exhausted=unparseable_budget_exhausted,
@@ -562,6 +587,7 @@ async def run_answer_quality(
                     context_items=len(result.items),
                     verdict=parse_judgement(verdict_raw),
                     gold_in_context=gold_ids_present(result.items, index, gold),
+                    gold_word_coverage=gold_answer_word_coverage(query.answer, context),
                     answer_usage=answer_result.usage,
                     judge_usage=judge_result.usage,
                     judge_raw=verdict_raw,

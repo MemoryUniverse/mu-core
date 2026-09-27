@@ -397,7 +397,11 @@ def _print_answer_quality_report(report: Any, *, elapsed: float) -> None:
     _print(
         f"  gold_in_context={o.gold_retrieved}/{o.n}  "
         f"wrong-and-retrieved(generation failure)={o.wrong_retrieved}  "
-        f"wrong-and-not-retrieved(retrieval failure)={o.wrong_not_retrieved}"
+        f"wrong-and-not-retrieved(retrieval failure)={o.wrong_not_retrieved}  "
+        # SECOND retrieval-attribution metric, reported beside gold_in_context always, never in
+        # place of it (`QueryResult.gold_word_coverage`'s own docstring). Invariant to write-time
+        # rewriting (distillation/paraphrase) that the verbatim turn-id join above is blind to.
+        f"gold_word_coverage(mean)={o.mean_gold_word_coverage:.4f}"
     )
     for name, stats in sorted(report.by_category.items()):
         _print(
@@ -405,7 +409,8 @@ def _print_answer_quality_report(report: Any, *, elapsed: float) -> None:
             f"unparseable={stats.unparseable:<3} accuracy={stats.accuracy:.4f} "
             f"gold_retrieved={stats.gold_retrieved:<4} "
             f"wrong_retrieved={stats.wrong_retrieved:<4} "
-            f"wrong_not_retrieved={stats.wrong_not_retrieved:<4}"
+            f"wrong_not_retrieved={stats.wrong_not_retrieved:<4} "
+            f"gold_word_coverage(mean)={stats.mean_gold_word_coverage:.4f}"
         )
 
 
