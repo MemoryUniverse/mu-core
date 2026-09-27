@@ -31,7 +31,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -41,7 +41,7 @@ sys.path.insert(0, os.environ.get("H2H_EVAL_DIR", str(Path(__file__).resolve().p
 from dateutil import parser as _dateutil_parser
 from mu_eval.corpus import ingest_conversation, local_memory_for, mtm_point_count
 from mu_eval.locomo import Turn, load_locomo
-from mu_eval.runner import _await_index, gold_ids_present
+from mu_eval.runner import _await_index, gold_answer_word_coverage, gold_ids_present
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mem0_h2h import emit
@@ -92,6 +92,11 @@ class LlmExtractProbe:
 
     def __init__(self) -> None:
         self.calls = 0
+        # AD-336: `calls` counts `extract()` invocations; `provider_calls` counts the model calls
+        # they made. The two were identical until AD-335's `_resolve_reference` made `extract` a
+        # two-call method, and keeping them separate is what makes "did the extra call actually
+        # happen" answerable from the artifact instead of inferred from wall-clock time.
+        self.provider_calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
 
@@ -102,25 +107,42 @@ class LlmExtractProbe:
         original = LlmFactExtractor.extract
         probe = self
 
-        async def _counted(self_: LlmFactExtractor, text: str, *, now: datetime) -> Any:
-            completion_holder: dict[str, Any] = {}
+        # AD-336: the wrapper must mirror `FactExtractorPort.extract`'s FULL signature, which
+        # AD-335 widened with `context`. `DistillPipeline._collect_facts` passes `context=` on
+        # EVERY call (unconditionally — the extractor, not the pipeline, decides whether to use
+        # it), so a wrapper that omits the parameter raises `TypeError: _counted() got an
+        # unexpected keyword argument 'context'` on the first distilled window and takes the whole
+        # arm down. `**kwargs` rather than a named `context` on purpose: this probe's job is to
+        # count calls, and it must not need editing again the next time the port grows a field.
+        async def _counted(
+            self_: LlmFactExtractor, text: str, *, now: datetime, **kwargs: Any
+        ) -> Any:
+            # AD-336: accumulate EVERY provider completion this one `extract` made, not just the
+            # last. `extract` became a TWO-call method when AD-335 added `_resolve_reference`, which
+            # runs BEFORE the fact call — so a holder keeping only the most recent completion
+            # silently dropped the reference call's tokens, and the AD-336 measurement arms
+            # reported `prompt_tokens` 55 871 with reference resolution ON against 55 347 with it
+            # OFF: a +524 difference for 419 extra SLM calls, which is not a plausible cost and was
+            # the first sign this was wrong. Tokens are a billable dimension (CLAUDE.md rule 5),
+            # so under-counting them is not a cosmetic defect even when the model is free.
+            seen_usage: list[Any] = []
             orig_provider_complete = self_._provider.complete
 
-            async def _counted_complete(*args: Any, **kwargs: Any) -> Any:
-                completion = await orig_provider_complete(*args, **kwargs)
-                completion_holder["completion"] = completion
+            async def _counted_complete(*args: Any, **kw: Any) -> Any:
+                completion = await orig_provider_complete(*args, **kw)
+                seen_usage.append(completion)
                 return completion
 
             self_._provider.complete = _counted_complete  # type: ignore[method-assign]
             try:
-                result = await original(self_, text, now=now)
+                result = await original(self_, text, now=now, **kwargs)
             finally:
                 self_._provider.complete = orig_provider_complete  # type: ignore[method-assign]
             probe.calls += 1
-            usage = completion_holder.get("completion")
-            if usage is not None:
-                probe.prompt_tokens += usage.usage.prompt_tokens
-                probe.completion_tokens += usage.usage.completion_tokens
+            probe.provider_calls += len(seen_usage)
+            for completion in seen_usage:
+                probe.prompt_tokens += completion.usage.prompt_tokens
+                probe.completion_tokens += completion.usage.completion_tokens
             return result
 
         LlmFactExtractor.extract = _counted  # type: ignore[assignment]
@@ -128,6 +150,53 @@ class LlmExtractProbe:
             yield probe
         finally:
             LlmFactExtractor.extract = original  # type: ignore[method-assign]
+
+
+_NO_MEMORIES = "(no memories retrieved)"
+
+
+def build_context_row(
+    *,
+    query_id: str,
+    question: str,
+    gold_answer: str,
+    category: int | str | None,
+    gold: set[str],
+    lines: Sequence[str],
+    product_lines: Sequence[str],
+    items: int,
+    product_dated: int,
+    gold_in_context: bool,
+) -> dict[str, Any]:
+    """One exported per-row artifact record — PURE, so the export's schema is testable without a
+    store (DEV-STANDARDS rule 6: the row shape is a contract, and every downstream consumer,
+    `temporal_rejudge_prep.py` and `answer_h2h.py` included, joins on it).
+
+    AD-336 is why it exists as a function: it carries BOTH retrieval metrics per row —
+    `gold_in_context` (the verbatim turn-id join, every historical number's denomination) and
+    `gold_word_coverage` (AD-334 / ADR 0107, invariant to write-time rewriting). Reported
+    together, never one alone: AD-332's LLM-extraction arm scored `gold_in_context` 4 % on a store
+    whose graph demonstrably covered the corpus, purely because the turn-id join cannot match a
+    paraphrased fact back to the turn that seeded it, and no artifact on disk carried the second
+    number that would have shown it.
+
+    Coverage is computed over `context_product` — the dates-from-the-product rendering that the
+    answer-quality arm and the judge actually see — not over the harness-rejoin `context`.
+    """
+    product_context = "\n".join(product_lines) or _NO_MEMORIES
+    return {
+        "query_id": query_id,
+        "question": question,
+        "gold_answer": gold_answer,
+        "category": category,
+        "gold": sorted(gold),
+        "context": "\n".join(lines) or _NO_MEMORIES,
+        "context_product": product_context,
+        "items": items,
+        "product_dated_items": product_dated,
+        "gold_in_context": gold_in_context,
+        "gold_word_coverage": round(gold_answer_word_coverage(gold_answer, product_context), 6),
+    }
 
 
 def _turn_occurred_at(turn: Turn) -> datetime | None:
@@ -228,6 +297,16 @@ async def sweep_one_arm(
     # rather than infer it.
     export_limit = int(os.environ.get("H2H_EXPORT_LIMIT", "0"))
     contexts: list[dict[str, Any]] = []
+    # AD-336: `gold_answer_word_coverage` (AD-334 / ADR 0107) reported by THIS harness, not only by
+    # `mu_eval`'s own runner. AD-334 shipped the metric into `mu_eval/runner.py` and
+    # `answer_quality.py`, but every headline retrieval number on SCORECARD.md comes from this
+    # script, which did not compute it — so the metric that exists precisely to SEE write-time
+    # transformations (distillation, LLM extraction, AD-335's reference resolution) was blind to
+    # exactly the arms it was built for, and AD-332's 6/150 had to be re-diagnosed by hand.
+    # Computed over `context_product` — the same string the answer-quality arm and the judge see —
+    # and therefore only at `export_limit`, where that string is built. `None` when nothing is
+    # exported, never a silent 0.0 that would read as "the words were absent".
+    coverage_scores: list[float] = []
 
     turn_date = {t.dia_id: t.session_date for t in conversation.turns}
 
@@ -307,6 +386,7 @@ async def sweep_one_arm(
         if use_llm_extract:
             emit(
                 f"  [{label}] llm_extract: calls={probe.calls} "
+                f"provider_calls={probe.provider_calls} "
                 f"prompt_tokens={probe.prompt_tokens} completion_tokens={probe.completion_tokens} "
                 f"ingest_wall_s={ingest_wall_s:.1f}"
             )
@@ -375,26 +455,34 @@ async def sweep_one_arm(
                             product_lines.append(f"- {product_date.date()}: {item.content}")
                         else:
                             product_lines.append(f"- {item.content}")
-                    contexts.append(
-                        {
-                            "query_id": query.query_id,
-                            "question": query.question,
-                            "gold_answer": query.answer,
-                            "category": query.category,
-                            "gold": sorted(gold),
-                            "context": "\n".join(lines) or "(no memories retrieved)",
-                            "context_product": "\n".join(product_lines)
-                            or "(no memories retrieved)",
-                            "items": len(result.items),
-                            "product_dated_items": product_dated,
-                            "gold_in_context": bool(present),
-                        }
+                    row = build_context_row(
+                        query_id=query.query_id,
+                        question=query.question,
+                        gold_answer=query.answer,
+                        category=query.category,
+                        gold=gold,
+                        lines=lines,
+                        product_lines=product_lines,
+                        items=len(result.items),
+                        product_dated=product_dated,
+                        gold_in_context=bool(present),
                     )
+                    coverage_scores.append(row["gold_word_coverage"])
+                    contexts.append(row)
+            # Both metrics on one line whenever both exist (ADR 0107's standing rule: report the
+            # turn-id join and the word-coverage metric TOGETHER, never one alone) — coverage only
+            # at the export width, because that is the only width whose context string is built.
+            cov = (
+                f" cov={statistics.mean(coverage_scores):.4f}"
+                if limit == export_limit and coverage_scores
+                else ""
+            )
             emit(
                 f"  [{label}] limit={limit:>3} width_mean="
                 f"{statistics.mean(bucket['widths']):.2f} "
                 f"gic={bucket['hits']}/{bucket['scored']}="
-                f"{bucket['hits'] / bucket['scored']:.4f} "
+                f"{bucket['hits'] / bucket['scored']:.4f}"
+                f"{cov} "
                 f"p50={statistics.median(bucket['lat']):.0f}ms",
             )
 
@@ -420,10 +508,16 @@ async def sweep_one_arm(
     return {
         "contexts": contexts,
         "label": label,
+        "gold_word_coverage": {
+            "limit": export_limit,
+            "rows": len(coverage_scores),
+            "mean": round(statistics.mean(coverage_scores), 6) if coverage_scores else None,
+        },
         "mtm_points": {"before_queries": mtm_before, "after_queries": mtm_after},
         "llm_extract": {
             "enabled": use_llm_extract,
             "calls": probe.calls,
+            "provider_calls": probe.provider_calls,
             "prompt_tokens": probe.prompt_tokens,
             "completion_tokens": probe.completion_tokens,
             "ingest_wall_s": round(ingest_wall_s, 3),

@@ -25,14 +25,25 @@
 #
 #   H2H_OUT=/tmp/x.json ./eval/mem0_h2h/vm_run_isolated.sh eval/mem0_h2h/verify_efficiency.py --out /tmp/x.json
 #
-# Everything else is deliberately identical to `vm_run.sh`: the same shared `flock`, the same rsync
+# Everything else is deliberately identical to `vm_run.sh`: the same EXCLUSIVE `flock` (AD-336), the same rsync
 # exclusions, the same `~/.mu_reclaim_hold` released in a trap, the same explicit env forwarding
 # (an eval run must never inherit whatever the invoking shell happened to have set).
 set -euo pipefail
 
 _LOCK="/tmp/.mu_vm_test.lock"
 exec 9>"$_LOCK"
-flock -s -w "${MU_VM_LOCK_WAIT_S:-2700}" 9 || { echo "vm_run_isolated.sh: VM lock timeout" >&2; exit 75; }
+# AD-336: **EXCLUSIVE, not shared.** This was `flock -s` and that is why two eval arms have been
+# observed running at once on this one VM — AD-333 recorded exactly that ("AD-332's base arm ran
+# 15:15:14 -> 15:17:46 — *inside* the LLM arm's 15:12:31 -> 15:26:19 window") and diagnosed it as a
+# hold-file OWNERSHIP problem. Ownership was half of it. The reason two arms overlapped at all is
+# this lock: `-s` is a READ lock, so every caller got it immediately and nothing ever queued.
+# Concurrency is not merely untidy here, it invalidates the measurement three ways: each wrapper
+# `rsync --delete`s into ONE shared `$REMOTE_DIR` and runs `uv sync` in its `.venv` (so one arm
+# rewrites the tree another is executing from), both ingest into Qdrant/FalkorDB on the same box,
+# and every p50/p95 this harness reports is measured against whatever else was running. An eval arm
+# is a whole-box workload, exactly like `vm_test.sh`'s full-suite case, and takes the same `-x`.
+# A second caller WAITS (bounded by MU_VM_LOCK_WAIT_S) instead of piling on.
+flock -x -w "${MU_VM_LOCK_WAIT_S:-2700}" 9 || { echo "vm_run_isolated.sh: VM lock timeout (another eval arm or suite holds the VM)" >&2; exit 75; }
 
 ZONE=europe-west3-b
 PROJECT=amplified-vim-504612-s4

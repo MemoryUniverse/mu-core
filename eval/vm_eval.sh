@@ -20,7 +20,18 @@ set -euo pipefail
 
 _LOCK="/tmp/.mu_vm_test.lock"
 exec 9>"$_LOCK"
-if ! flock -s -w "${MU_VM_LOCK_WAIT_S:-2700}" 9; then
+# AD-336: **EXCLUSIVE, not shared.** This was `flock -s` and that is why two eval arms have been
+# observed running at once on this one VM — AD-333 recorded exactly that ("AD-332's base arm ran
+# 15:15:14 -> 15:17:46 — *inside* the LLM arm's 15:12:31 -> 15:26:19 window") and diagnosed it as a
+# hold-file OWNERSHIP problem. Ownership was half of it. The reason two arms overlapped at all is
+# this lock: `-s` is a READ lock, so every caller got it immediately and nothing ever queued.
+# Concurrency is not merely untidy here, it invalidates the measurement three ways: each wrapper
+# `rsync --delete`s into ONE shared `$REMOTE_DIR` and runs `uv sync` in its `.venv` (so one arm
+# rewrites the tree another is executing from), both ingest into Qdrant/FalkorDB on the same box,
+# and every p50/p95 this harness reports is measured against whatever else was running. An eval arm
+# is a whole-box workload, exactly like `vm_test.sh`'s full-suite case, and takes the same `-x`.
+# A second caller WAITS (bounded by MU_VM_LOCK_WAIT_S) instead of piling on.
+if ! flock -x -w "${MU_VM_LOCK_WAIT_S:-2700}" 9; then
   echo "vm_eval.sh: waited >${MU_VM_LOCK_WAIT_S:-2700}s for the VM lock — refusing to pile on." >&2
   exit 75
 fi

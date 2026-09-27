@@ -265,16 +265,31 @@ def gold_answer_word_coverage(gold_answer: str, context: str) -> float:
     """Fraction of the gold answer's own content words that appear anywhere in the assembled
     context string, in ``[0.0, 1.0]``.
 
-    **Why this exists beside `gold_ids_present`/`gold_in_context`, not instead of it**
-    (`docs/tracking/eval-runs/2026-09-26-ad330-failure-buckets/probe_answer_word_coverage.py`,
-    ADR 0103 AD-330 / ADR 0105 AD-332). `gold_ids_present` joins on the VERBATIM turn body via
-    `TurnIndex` — exact, but blind to any write-time transformation of that body: distillation,
-    coreference resolution, summarisation, an LLM extractor's paraphrase. AD-332 measured this
-    blind spot directly — an arm whose logs showed the LTM graph covering the corpus scored
-    `gold_in_context` 6/150 (4%) purely because the join could not match paraphrased facts to the
-    turn ids that seeded them. This function is invariant to that rewriting: it asks whether the
-    ANSWER's own words made it into what the model was shown, not whether a particular turn's
-    exact body did.
+    **Why this exists beside `gold_ids_present`/`gold_in_context`, not instead of it.**
+    `gold_ids_present` joins on the VERBATIM turn body via `TurnIndex` — exact, but blind in
+    principle to a write-time transformation of that body (distillation, coreference resolution,
+    summarisation, an LLM extractor's paraphrase). This function is invariant to such rewriting: it
+    asks whether the ANSWER's own words made it into what the model was shown, not whether a
+    particular turn's exact body did.
+
+    **CORRECTED, AD-336 / ADR 0109 — the "measured blind spot" this docstring used to cite does
+    not exist.** It claimed AD-332 had demonstrated the blindness directly: an arm whose LTM graph
+    covered the corpus scoring `gold_in_context` 4 % (6/150). That arm was a DELETED Qdrant
+    collection (AD-333 / ADR 0106), and on the protected re-runs the two metrics AGREE — LLM
+    distillation scores 110/150 and coverage 0.4827, both DOWN from the heuristic arm's 117/150 and
+    0.5111. Across all 21 paired arm contrasts in that 2x2x3, `r(delta gold_in_context, delta
+    coverage) = 0.9923`, slope +0.0035 per row — i.e. `0.53/150`, exactly a rescaling. **At the ARM
+    level this metric carries no signal `gold_in_context` does not already carry on this corpus.**
+    What survives, and is the real reason to keep it, is the PER-ROW claim below: it is the better
+    single-number predictor of judge correctness.
+
+    **And it has a limitation `gold_in_context` does not (AD-336).** Coverage scores the RENDERED
+    context, so the date prefix is part of the measurement. With `H2H_OCCURRED_AT=1` an item
+    carries its real corpus date; unset, it carries its INGESTION date. On the 37 temporal rows of
+    conv-26 that difference alone moves mean coverage 0.4775 -> 0.1306 while gold PRESENCE rises by
+    4 rows — the gold answers are dates, and the date words left the rendering. **Never compare
+    coverage across arms rendered differently**; `gold_in_context` is immune to this and is the
+    metric to use for such a comparison.
 
     **Validated, not assumed.** AD-330 first reported AUC(coverage -> judge-correct) 0.739 vs
     AUC(gold_in_context -> judge-correct) 0.684 on one 96-row judged slice
