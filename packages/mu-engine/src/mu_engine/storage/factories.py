@@ -202,6 +202,11 @@ def _build_falkordb(**cfg: Any) -> FalkorLtmAdapter:
             "similarity_threshold", graph_settings.entity_similarity_threshold
         ),
         store_io_timeout_s=store_io_timeout_s,
+        # AD-331: the fuzzy-resolve candidate-pool bound, DI-threaded the same way as its two
+        # neighbours above (DEV-STANDARDS rule 3 — no hardcoded constant in adapter logic).
+        fuzzy_candidate_limit=cfg.get(
+            "fuzzy_candidate_limit", graph_settings.entity_fuzzy_candidate_limit
+        ),
     )
 
 
