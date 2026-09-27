@@ -79,10 +79,19 @@ rsync -az "${RSYNC_E[@]}" "$MU_EVAL_DATA" "user@$IP:mu_eval_data/"
 echo "[2/3] uv sync…"
 "${SSH[@]}" "export PATH=\$HOME/.local/bin:\$PATH; cd \$HOME/$REMOTE_DIR && uv sync >/dev/null 2>&1 || uv sync"
 
-"${SSH[@]}" "touch \$HOME/.mu_reclaim_hold" || true
+# PER-RUN hold entry, not the shared single file (AD-333). Every one of these wrappers used to
+# `touch ~/.mu_reclaim_hold` and `unlink` the SAME path from its EXIT trap, so a short run that
+# finished released the protection a longer run beside it was still relying on. MEASURED
+# 2026-09-27: the sweep found no hold at 15:20:01, deleted the one live `mu_mtm__*` collection, and
+# AD-332's LLM-extraction arm (mid-flight 15:12:31–15:26:19) reported `mtm: 0` for the rest of the
+# run and published 6/150 as a property of the extractor. `vm_side_reclaim.sh` now honours every
+# fresh file in `~/.mu_reclaim_hold.d/`, so this run holds its OWN entry and releases only that.
+# The 4 h MU_RECLAIM_HOLD_MAX_S cap still applies: a run longer than that must re-touch its entry.
+HOLD_ENTRY=".mu_reclaim_hold.d/$(basename "$REMOTE_DIR").$$"
+"${SSH[@]}" "mkdir -p \$HOME/.mu_reclaim_hold.d && touch \$HOME/$HOLD_ENTRY" || true
 release_hold() {
   ssh -n -i "$SSH_KEY" -o StrictHostKeyChecking=no "user@$IP" \
-    "unlink \$HOME/.mu_reclaim_hold" >/dev/null 2>&1 || true
+    "rm -f \$HOME/$HOLD_ENTRY" >/dev/null 2>&1 || true
 }
 trap release_hold EXIT
 

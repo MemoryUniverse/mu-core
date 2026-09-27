@@ -21,12 +21,23 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Callable, Sequence
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
 from mu_eval.locomo import Conversation, Turn, normalize_text
 
-__all__ = ["IngestReport", "TurnIndex", "ingest_conversation", "local_memory_for"]
+if TYPE_CHECKING:  # engine imports stay lazy at RUNTIME (see the module docstring) — this
+    # block is erased by `from __future__ import annotations` and only feeds the type checker.
+    from mu_engine.storage.domain.namespace import Namespace
+
+__all__ = [
+    "IngestReport",
+    "TurnIndex",
+    "ingest_conversation",
+    "local_memory_for",
+    "mtm_point_count",
+]
 
 
 class IngestReport(BaseModel):
@@ -141,18 +152,10 @@ async def _teardown(tag: str, settings: object | None, *, dim: int = 384) -> Non
 
     from mu_contracts.config import Settings
     from mu_engine.storage.adapters.falkor_ltm import FalkorLtmAdapter
-    from mu_engine.storage.domain.namespace import Namespace, Visibility
     from mu_engine.storage.mappers.qdrant_mapper import collection_name
 
     cfg = settings if isinstance(settings, Settings) else Settings()
-    org, workspace = f"org{tag}", f"ws{tag}"
-    # Every η this harness can create in the partition: the caller's private plane and the
-    # workspace's shared plane. `user`/`session` do not enter the MTM collection key at all and
-    # only enter the LTM graph key through `u_{user}`.
-    namespaces = [
-        Namespace(org=org, workspace=workspace, user=u, session="s", visibility=Visibility.PRIVATE)
-        for u in ("evaluser", "probeuser")
-    ] + [Namespace.shared(org=org, workspace=workspace, session="s")]
+    namespaces = _run_namespaces(tag)
 
     qdrant = AsyncQdrantClient(url=cfg.storage.vector.url)
     try:
@@ -187,6 +190,77 @@ async def _teardown(tag: str, settings: object | None, *, dim: int = 384) -> Non
             await redis.delete(*keys)
     finally:
         await redis.aclose()
+
+
+def _run_namespaces(tag: str) -> list[Namespace]:
+    """Every η this harness can create in the partition ``tag`` names: the caller's private plane
+    and the workspace's shared plane. ``user``/``session`` do not enter the MTM collection key at
+    all, and only enter the LTM graph key through ``u_{user}``.
+
+    Extracted from :func:`_teardown` so :func:`mtm_point_count` derives the SAME partitions from
+    the SAME place — two copies of this list would be two chances to check a collection the run
+    does not actually write to, which is the failure mode that makes a liveness check worse than
+    no liveness check (it would read zero and cry contamination on every clean run).
+    """
+    from mu_engine.storage.domain.namespace import Namespace, Visibility
+
+    org, workspace = f"org{tag}", f"ws{tag}"
+    return [
+        Namespace(org=org, workspace=workspace, user=u, session="s", visibility=Visibility.PRIVATE)
+        for u in ("evaluser", "probeuser")
+    ] + [Namespace.shared(org=org, workspace=workspace, session="s")]
+
+
+async def mtm_point_count(
+    conversation: Conversation,
+    *,
+    run_id: str,
+    settings: object | None = None,
+    dim: int = 384,
+) -> int:
+    """Total points across every MTM collection this run owns, or ``-1`` if the store could not be
+    asked at all.
+
+    ``-1`` is deliberately distinct from ``0``: an unreachable Qdrant and an emptied one are
+    different faults, and the caller (``ours_arm.py``) refuses on each with its OWN message rather
+    than asserting the reclaim sweep for both. It refuses on both, though — a tier whose state over
+    the query phase cannot be established is not a result.
+
+    WHY A HARNESS NEEDS THIS AT ALL (AD-333, ADR 0106). ``infra/mu-vm/vm_side_reclaim.sh`` runs from
+    the VM's crontab every 20 minutes and deletes every ``mu_mtm__*`` collection. ``ours_arm.py``
+    matches none of its process guards, so its only protection is a hold file — which was a single
+    shared path that three wrappers each released from an unconditional EXIT trap. On 2026-09-27 the
+    sweep deleted a live collection mid-run and **the arm still completed and reported
+    ``gold_in_context`` 6/150, ``width_mean`` 20.00 and a p50.** Every one of those is a real
+    measurement of a store that no longer held the corpus, and nothing in the output says so. The
+    same pass measured the cost of that failure by accident at **~72 pp** (16/150 against an
+    expected ~124/150), so this is not a small distortion that a reader might catch.
+
+    This is the AD-328 "assert, never infer" rule applied to the STORE rather than to a setting:
+    an arm should refuse to report a result it cannot show its tier was alive for.
+    """
+    from qdrant_client import AsyncQdrantClient
+
+    from mu_contracts.config import Settings
+    from mu_engine.storage.mappers.qdrant_mapper import collection_name
+
+    cfg = settings if isinstance(settings, Settings) else Settings()
+    # The SAME tag `local_memory_for` builds, from the same two inputs — not a second
+    # spelling of it (`_teardown`'s own docstring is about exactly this class of mistake).
+    tag = f"{run_id}{_slug(conversation.sample_id)}"
+    wanted = {collection_name(ns, dim) for ns in _run_namespaces(tag)}
+    qdrant = AsyncQdrantClient(url=cfg.storage.vector.url)
+    try:
+        live = {c.name for c in (await qdrant.get_collections()).collections}
+        total = 0
+        for name in wanted & live:
+            total += int((await qdrant.count(collection_name=name, exact=True)).count)
+        return total
+    except Exception:
+        return -1
+    finally:
+        with contextlib.suppress(Exception):
+            await qdrant.close()
 
 
 def _slug(value: str) -> str:

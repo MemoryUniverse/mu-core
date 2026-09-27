@@ -50,13 +50,23 @@ rsync -az -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no" \
 echo "[2/3] uv sync…"
 "${SSH[@]}" "export PATH=\$HOME/.local/bin:\$PATH; cd \$HOME/$REMOTE_DIR && uv sync >/dev/null 2>&1 || uv sync"
 
-# The VM's own reclaim cron deletes every mu_mtm__*/mu_g__* every 20 minutes; the hold file stops
-# it eating this run's collections mid-flight. Released in a trap so a crash cannot leave the
-# sweep disabled (the reclaim also ignores a hold older than MU_RECLAIM_HOLD_MAX_S).
-"${SSH[@]}" "touch \$HOME/.mu_reclaim_hold" || true
+# The VM's own reclaim cron deletes every mu_mtm__*/mu_g__* every 20 minutes; the hold stops it
+# eating this run's collections mid-flight. Released in a trap so a crash cannot leave the sweep
+# disabled (the reclaim also ignores a hold older than MU_RECLAIM_HOLD_MAX_S).
+#
+# A PER-RUN entry under `~/.mu_reclaim_hold.d/`, not the shared single file (AD-333): three
+# wrappers touched and unlinked the same `~/.mu_reclaim_hold`, so one finishing released the
+# protection another still needed — and that is how AD-332's 6/150 got measured against a
+# collection the sweep had deleted 2 minutes earlier.
+# Named from THIS shell's `$$` and then reused verbatim on both sides — `\$\$` in the remote
+# string would be the REMOTE shell's pid and would never match what the trap removes, leaving a
+# hold entry behind on every run (which the 4 h cap would eventually expire, but only after
+# disabling the sweep for 4 h).
+HOLD_ENTRY=".mu_reclaim_hold.d/vm_run.$$"
+"${SSH[@]}" "mkdir -p \$HOME/.mu_reclaim_hold.d && touch \$HOME/$HOLD_ENTRY" || true
 release_hold() {
   ssh -n -i "$SSH_KEY" -o StrictHostKeyChecking=no "user@$IP" \
-    "unlink \$HOME/.mu_reclaim_hold" >/dev/null 2>&1 || true
+    "rm -f \$HOME/$HOLD_ENTRY" >/dev/null 2>&1 || true
 }
 trap release_hold EXIT
 

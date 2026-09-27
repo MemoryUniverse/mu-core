@@ -171,9 +171,14 @@ cleanup_key() {
 # the primary fix; the hold file below is the belt-and-braces half, so a RENAME of this harness
 # cannot silently re-open the hole. Released in a trap, and the reclaim ignores a hold older than
 # MU_RECLAIM_HOLD_MAX_S (4 h) so a killed run cannot disable the sweep for ever.
-"${SSH[@]}" "touch ~/.mu_reclaim_hold" || true
+# A PER-RUN entry under `~/.mu_reclaim_hold.d/`, not the shared single file (AD-333): this script,
+# `vm_run.sh` and `vm_run_isolated.sh` all touched and unlinked the same `~/.mu_reclaim_hold`, so
+# whichever finished first released the protection the others were still relying on. Named from
+# THIS shell's `$$` so the trap removes exactly the entry this run created and no one else's.
+HOLD_ENTRY=".mu_reclaim_hold.d/vm_eval.$$"
+"${SSH[@]}" "mkdir -p \$HOME/.mu_reclaim_hold.d && touch \$HOME/$HOLD_ENTRY" || true
 release_hold() { ssh -n -i "$SSH_KEY" -o StrictHostKeyChecking=no "user@$IP" \
-  "rm -f ~/.mu_reclaim_hold" >/dev/null 2>&1 || true; }
+  "rm -f \$HOME/$HOLD_ENTRY" >/dev/null 2>&1 || true; }
 trap 'release_hold; cleanup_key' EXIT
 
 echo "[3/3] running: python -m mu_eval$ARGS"

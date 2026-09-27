@@ -39,7 +39,7 @@ from typing import Any
 sys.path.insert(0, os.environ.get("H2H_EVAL_DIR", str(Path(__file__).resolve().parent.parent)))
 
 from dateutil import parser as _dateutil_parser
-from mu_eval.corpus import ingest_conversation, local_memory_for
+from mu_eval.corpus import ingest_conversation, local_memory_for, mtm_point_count
 from mu_eval.locomo import Turn, load_locomo
 from mu_eval.runner import _await_index, gold_ids_present
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -146,6 +146,46 @@ def _turn_occurred_at(turn: Turn) -> datetime | None:
     except (ValueError, OverflowError):
         return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def mtm_liveness_verdict(before: int, after: int) -> str | None:
+    """AD-333 / ADR 0106 — ``None`` when the MTM tier's state across the query phase is acceptable,
+    otherwise the reason to refuse the run.
+
+    A separate pure function rather than an ``if`` inline in :func:`sweep_one_arm` for one reason:
+    a guard whose logic cannot be unit-tested is a guard nobody can show still works. Mutate the
+    comparison below and ``eval/tests/test_ad333_mtm_liveness_guard_unit.py`` fails.
+
+    The rule is a **halving**, not any decrease. ``DemotionService`` legitimately removes MTM points
+    (MTM->STM tier-down is a ``remove``, ``qdrant_mtm.py:1143``) and promotion moves them to LTM, so
+    a strict ``after < before`` would fire on ordinary lifecycle activity and make this guard a
+    nuisance that gets deleted — after which the real failure returns. The failure it must catch is
+    not subtle: a reclaimed collection goes to ZERO and the ``gold_in_context`` it produces
+    (~4-11 %) is ~72 pp below a healthy arm, so the threshold does not need to be tight to be
+    useful. ``-1`` (store unreadable) is handled separately because an outage and a deletion are
+    different faults and a run deserves to be told which.
+    """
+    if before <= 0:
+        # Nothing was ever written (e.g. the importance gate kept the corpus out of the vector
+        # tier), or the store could not be read before the queries either. Either way there is no
+        # baseline to compare against, and inventing contamination from that would be a false alarm.
+        return None
+    if after < 0:
+        return (
+            f"MTM vector tier was readable before the query phase ({before} points) and could NOT "
+            "be read after it. Cause unknown from here (a reclaimed collection and a store outage "
+            "look identical); either way the tier's state during the run is unverified. Refusing "
+            "to report (ADR 0106)."
+        )
+    if after * 2 < before:
+        return (
+            f"MTM vector tier collapsed DURING the query phase: {before} -> {after} points. "
+            "Almost certainly the VM's 20-minute reclaim sweep (infra/mu-vm/vm_side_reclaim.sh) "
+            "deleting this run's mu_mtm__* collection — hold it off with a fresh entry in "
+            "~/.mu_reclaim_hold.d/ (ADR 0106). Refusing to report a result measured against a "
+            "store that no longer holds the corpus."
+        )
+    return None
 
 
 async def sweep_one_arm(
@@ -279,6 +319,15 @@ async def sweep_one_arm(
         visible = await _await_index(
             memory, conversation.turns[0].text[:120], user=user, session=session
         )
+        # AD-333 / ADR 0106 — the vector tier's point count BEFORE the query phase, re-checked
+        # after it. The VM's 20-minute `vm_side_reclaim.sh` cron deletes every `mu_mtm__*`
+        # collection and this script's command line matches none of its process guards, so a sweep
+        # landing mid-run silently empties MTM. Not hypothetical: on 2026-09-27 it deleted this
+        # harness's collection 8 minutes into an arm, and the arm finished and reported
+        # `gold_in_context` 6/150 with `width_mean` 20.00. A dead tier costs ~72 pp of this metric
+        # (measured: 16/150 against an expected ~124/150) — wrong by far more than any effect this
+        # harness is used to detect, and completely ordinary-looking on the way out.
+        mtm_before = await mtm_point_count(conversation, run_id=run_id)
         for limit in limits:
             bucket = by_limit[limit]
             for query, gold in rows:
@@ -349,9 +398,29 @@ async def sweep_one_arm(
                 f"p50={statistics.median(bucket['lat']):.0f}ms",
             )
 
+        # The other half of the AD-333 guard, and it must stay INSIDE this `async with`:
+        # `local_memory_for`'s `finally` calls `_teardown`, which drops these very collections on
+        # purpose, so a count taken after the block would read 0 on a perfectly clean run and make
+        # this guard fire every time. Refuses rather than reports — a run whose corpus vanished
+        # underneath it has not measured ranking, and "it completed" is precisely how the invalid
+        # number got published in the first place.
+        mtm_after = await mtm_point_count(conversation, run_id=run_id)
+        # A HALVING, not any decrease. `DemotionService` legitimately removes MTM points (MTM->STM
+        # tier-down is a `remove`, `qdrant_mtm.py:1143`) and promotion moves them to LTM, so a
+        # strict `after < before` would fire on ordinary lifecycle activity and make this guard a
+        # nuisance that gets deleted. The failure it must catch is not subtle: a reclaimed
+        # collection goes to ZERO, and the `gold_in_context` it produces (~4-11 %) is ~72 pp below
+        # a healthy arm. Halving is far outside anything the lifecycle does across 150 queries
+        # (measured this pass: the MTM channel yielded a full pool on all 150) and far inside the
+        # signal, so the threshold does not need to be tight to be useful.
+        refusal = mtm_liveness_verdict(mtm_before, mtm_after)
+        if refusal is not None:
+            raise SystemExit(refusal)
+
     return {
         "contexts": contexts,
         "label": label,
+        "mtm_points": {"before_queries": mtm_before, "after_queries": mtm_after},
         "llm_extract": {
             "enabled": use_llm_extract,
             "calls": probe.calls,
