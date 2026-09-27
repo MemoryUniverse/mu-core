@@ -12,8 +12,11 @@ strategy pattern):
   ``other_repos/mem0/mem0/configs/prompts.py:14``). The LLM returns the *salient atomic
   fact strings* (mem0's "Call A"); the SPO structuring reuses the SAME deterministic
   decomposer so the two extractors emit identical ``ExtractedFact`` shapes. Wired behind the
-  canonical ``LLMProviderPort`` (model router). LLM-**real** integration is DEFERRED until
-  Azure reachability (box can't reach azure); the wiring is unit-tested with a fake provider.
+  canonical ``LLMProviderPort`` (model router). LLM-**real** integration against Azure is
+  DEFERRED (box can't reach azure) and unit-tested with a fake provider; against the real local
+  SLM (``qwen2.5:0.5b``, ``mu-dev-slm``) it is REAL and measured (AD-332,
+  ``eval/mem0_h2h/ours_arm.py`` + ``eval/mu_eval/corpus.py``, and this module's own AD-335
+  reference-resolution call).
 
 The mem0 ADD/UPDATE/DELETE(->SUPERSEDE)/NOOP *diff loop* itself lives in the DISTILL pipeline
 (``pipelines/distill.py``) — extraction answers "what facts", the diff loop answers "vs what
@@ -182,6 +185,33 @@ class ExtractionSettings(BaseModel):
     )
 
     llm_union_with_heuristic_floor: bool = True
+
+    # ---------------------------------------------------------------------------------------
+    # AD-335 (Lane A): write-time reference resolution.
+    #
+    # 17 of AD-330's 27 judged failures, and 11 of them OURS ALONE (not mem0's), are one
+    # mechanism: the question's vocabulary is in one conversation turn and the answer is in the
+    # turn beside it (its reply, or the turn it replies to) — "the black and white design" with
+    # no bowl in sight; "my home country" with no Sweden in sight. mem0 pays an LLM ~$4.27 per
+    # conversation to resolve this pair into one self-contained fact at write time
+    # (`other_repos/mem0/mem0/memory/main.py:432-456`). This is the $0 local-SLM attempt at the
+    # same mechanism, ported to `LlmFactExtractor` (`_resolve_reference`, below).
+    #
+    # SHIPS OFF, same posture as every unproven lever this campaign (AD-329/330/332): measured
+    # on the real dev SLM (qwen2.5:0.5b) against the 3 named failure rows plus a no-referent
+    # control, `docs/tracking/eval-runs/2026-09-27-ad335-write-time-reference-resolution/README.md`
+    # — 1 of 3 rows resolved correctly (q11 -> "Sweden"), 2 of 3 missed (q101, q127: the model
+    # cannot produce the right SHORT phrase, either echoing TARGET_TURN's own wording back or
+    # missing the referent entirely), and a hallucinated referent on the control row that the
+    # verbatim-substring guard (not the model's own judgement) is what actually catches. A 0.5B
+    # model is a real, measured, partial win here, not a full one — see that README before
+    # flipping this on, and price a stronger model against mem0's own $4.27 figure first.
+    reference_resolution_enabled: bool = False
+    # Prompt-size / cost bound on the neighbour-turn context handed to the resolution call
+    # (`pipelines/distill.py::_neighbor_context`) — never a bare literal at the call site
+    # (DEV-STANDARDS rule 3).
+    reference_resolution_max_context_chars: int = Field(default=600, gt=0)
+
     canonical_predicate_map: dict[str, str] = Field(
         default_factory=lambda: {
             "hotel_booking": "hotel",
@@ -245,7 +275,9 @@ class FactExtractorPort(Protocol):
 
     name: str
 
-    async def extract(self, text: str, *, now: datetime) -> list[ExtractedFact]: ...
+    async def extract(
+        self, text: str, *, now: datetime, context: str | None = None
+    ) -> list[ExtractedFact]: ...
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1020,7 +1052,13 @@ class HeuristicSpoExtractor:
         # min_tokens flows from central config, never inlined here (rule 3).
         self._settings = settings or ExtractionSettings()
 
-    async def extract(self, text: str, *, now: datetime) -> list[ExtractedFact]:
+    async def extract(
+        self, text: str, *, now: datetime, context: str | None = None
+    ) -> list[ExtractedFact]:
+        # `context` (AD-335 write-time reference resolution) is accepted for `FactExtractorPort`
+        # conformance and silently ignored: this extractor is deterministic pattern-matching over
+        # ONE sentence, with no model call to feed context into.
+        del context
         return decompose_to_spo(
             text, now=now, min_tokens=self._settings.min_tokens, settings=self._settings
         )
@@ -1043,6 +1081,34 @@ _MEM0_FACT_SYSTEM = (
     "Do not include any prose outside the JSON."
 )
 
+# AD-335 write-time reference resolution (see `ExtractionSettings.reference_resolution_enabled`
+# docstring for the measured accuracy this ships against). Deliberately asks for an EXTRACTIVE
+# short phrase, not a rewritten sentence: an earlier prompt shape that asked the model to rewrite
+# TARGET_TURN in place was live-tested and rejected — a 0.5B model paraphrased words it was told
+# to copy verbatim ("is" -> "was"), which is destructive on a system whose provenance/content-free
+# discipline depends on the stored text being trustworthy. Asking for ONLY the referent phrase,
+# appended by CODE (`LlmFactExtractor._resolve_reference`) rather than by the model, moves the
+# verbatim guarantee out of the model's hands entirely.
+_REFERENCE_RESOLUTION_SYSTEM = (
+    "Task: find the referent of a vague phrase.\n\n"
+    "You get CONTEXT_TURNS (one or two nearby conversation messages) and TARGET_TURN (the "
+    "message to check). TARGET_TURN may contain ONE vague phrase (a pronoun like "
+    '"it"/"this"/"that", or an underspecified noun phrase like "my home country") that names '
+    "something already stated more specifically somewhere in CONTEXT_TURNS.\n\n"
+    "Your answer is a short phrase COPIED VERBATIM (exact substring) from CONTEXT_TURNS that is "
+    "the specific referent. If TARGET_TURN has no such vague phrase, or CONTEXT_TURNS does not "
+    "specifically name it, answer with an empty string. Never answer with words taken only from "
+    "TARGET_TURN.\n\n"
+    "Examples:\n"
+    "CONTEXT_TURNS: I adopted a golden retriever puppy last month.\n"
+    "TARGET_TURN: She keeps chewing my shoes, it's driving me crazy.\n"
+    '{"referent": "a golden retriever puppy"}\n\n'
+    "CONTEXT_TURNS: The meeting got moved to Thursday at 10am.\n"
+    "TARGET_TURN: I have a meeting at 3pm tomorrow.\n"
+    '{"referent": ""}\n\n'
+    'Output ONLY JSON: {"referent": "<verbatim substring of CONTEXT_TURNS, or empty>"}.'
+)
+
 
 class LlmFactExtractor:
     """mem0 fact-extraction call behind the canonical ``LLMProviderPort`` (methodology §2.3).
@@ -1050,8 +1116,10 @@ class LlmFactExtractor:
     Runs mem0's "Call A" (the *what-is-salient* pass) with ``models.hard_extract_model``, then
     reuses the deterministic :func:`decompose_to_spo` to structure each returned fact string
     into an ``ExtractedFact`` — so an LLM-extracted fact and a heuristic-extracted fact are the
-    SAME shape downstream. LLM-real integration is DEFERRED (Azure unreachable on this box);
-    the wiring is unit-tested with a fake ``LLMProviderPort``.
+    SAME shape downstream. LLM-real integration against Azure is DEFERRED (unreachable on this
+    box) and unit-tested with a fake ``LLMProviderPort``; against the real local SLM it is real
+    (AD-332). Also runs the AD-335 write-time reference-resolution call (``_resolve_reference``,
+    ships off by default — see ``ExtractionSettings.reference_resolution_enabled``).
     """
 
     name = "llm_mem0_v1"
@@ -1068,11 +1136,22 @@ class LlmFactExtractor:
         # max_tokens/temperature flow from central config, never inlined here (rule 3).
         self._settings = settings or ExtractionSettings()
 
-    async def extract(self, text: str, *, now: datetime) -> list[ExtractedFact]:
+    async def extract(
+        self, text: str, *, now: datetime, context: str | None = None
+    ) -> list[ExtractedFact]:
+        # AD-335: resolve an unresolved reference BEFORE the mem0 salient-fact call, so a fact
+        # like "the black and white design" is retrieved carrying its referent. The degrade
+        # floor below still decomposes the ORIGINAL `text` (never `resolved_text`) — deliberately:
+        # the floor's whole contract is "reproduce exactly what the deterministic rules can see in
+        # the RAW sentence" (see its docstring), and this keeps that contract byte-identical
+        # whether or not reference resolution is even enabled.
+        resolved_text = text
+        if self._settings.reference_resolution_enabled and context:
+            resolved_text = await self._resolve_reference(text, context)
         completion = await self._provider.complete(
             [
                 Message(role=MessageRole.SYSTEM, content=_MEM0_FACT_SYSTEM),
-                Message(role=MessageRole.USER, content=text),
+                Message(role=MessageRole.USER, content=resolved_text),
             ],
             model=self._model_group,
             max_tokens=self._settings.max_tokens,
@@ -1106,6 +1185,45 @@ class LlmFactExtractor:
                 seen.add(key)
                 out.append(f)
         return out
+
+    async def _resolve_reference(self, text: str, context: str) -> str:
+        """Best-effort write-time reference resolution (AD-335, Lane A).
+
+        Calls the SAME provider with a SEPARATE, narrow prompt (`_REFERENCE_RESOLUTION_SYSTEM`):
+        find a short phrase in ``context`` (nearby turns) that is the specific referent of a
+        vague phrase in ``text``, and return ONLY that phrase. The model's answer is NEVER
+        trusted on its own judgement — live-tested on the real local SLM (see
+        `ExtractionSettings.reference_resolution_enabled`'s docstring), it sometimes echoes a
+        phrase from ``text`` itself back as if it were the referent, or invents one when
+        ``context`` names none. The GUARD below is what makes this safe to ship: the referent is
+        accepted ONLY when it is, case-insensitively, a literal substring of ``context`` —
+        anything else is discarded and ``text`` is returned byte-for-byte unchanged. This mirrors
+        the module's existing degrade-floor philosophy (`llm_union_with_heuristic_floor`): the
+        model may only ADD an annotation that can be mechanically verified, never rewrite or drop
+        a word of the text it was given.
+        """
+        bounded_context = context[: self._settings.reference_resolution_max_context_chars]
+        completion = await self._provider.complete(
+            [
+                Message(role=MessageRole.SYSTEM, content=_REFERENCE_RESOLUTION_SYSTEM),
+                Message(
+                    role=MessageRole.USER,
+                    content=f"CONTEXT_TURNS: {bounded_context}\nTARGET_TURN: {text}",
+                ),
+            ],
+            model=self._model_group,
+            max_tokens=self._settings.max_tokens,
+            temperature=self._settings.temperature,
+            response_format="json_object",
+        )
+        referent = _parse_referent(completion.text)
+        if not referent:
+            return text
+        if referent.casefold() not in bounded_context.casefold():
+            return text  # GUARD: not verbatim in context -> discard, never trust the model alone
+        if referent.casefold() in text.casefold():
+            return text  # already stated in TARGET_TURN itself -- nothing to add
+        return f"{text} [{referent}]"
 
 
 def _relation_identity(fact: ExtractedFact) -> tuple[str, str, Polarity]:
@@ -1149,6 +1267,24 @@ def _parse_mem0_facts(raw: str) -> list[str]:
         return []
     facts = payload.get("facts", []) if isinstance(payload, dict) else []
     return [f for f in facts if isinstance(f, str) and f.strip()]
+
+
+def _parse_referent(raw: str) -> str:
+    """Parse the AD-335 reference-resolution call's ``{"referent": "..."}`` JSON, tolerant of
+    code fences (same shape as ``_parse_mem0_facts``). Any parse failure or non-string value
+    returns ``""`` — the fail-safe empty referent, never an exception (the caller's guard already
+    treats "" as "nothing to resolve")."""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\n?|\n?```$", "", cleaned).strip()
+    if not cleaned:
+        return ""
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return ""
+    referent = payload.get("referent", "") if isinstance(payload, dict) else ""
+    return referent.strip() if isinstance(referent, str) else ""
 
 
 def build_extractor(

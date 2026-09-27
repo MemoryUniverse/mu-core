@@ -602,7 +602,7 @@ class DistillPipeline:
         """
         now = self._clock.now()
         out: list[MemoryItem] = []
-        for item in window:
+        for i, item in enumerate(window):
             if item.subject and item.predicate and item.object:
                 out.append(self._promote_structured(item, now))
             else:
@@ -613,9 +613,30 @@ class DistillPipeline:
                 # `now` every other item in the batch would otherwise collide on, is what keeps
                 # "she adopted a dog four years ago" resolving relative to the turn that SAID it
                 # instead of relative to whenever the distill sweep happened to run.
-                facts = await self._extractor.extract(item.content, now=item.created_at)
+                #
+                # AD-335 (Lane A): `context` is the immediate neighbour turns in THIS window, both
+                # directions (`_neighbor_context`) — a vague phrase's referent can equally live in
+                # the turn a message REPLIES to ("the black and white design" needs the turn
+                # before it) or in the turn that CLARIFIES it a beat later ("my home country"
+                # needs the turn after it, e.g. "...Sweden..."). `HeuristicSpoExtractor` ignores
+                # it; `LlmFactExtractor` only acts on it when
+                # `ExtractionSettings.reference_resolution_enabled` is set (ships OFF).
+                context = self._neighbor_context(window, i)
+                facts = await self._extractor.extract(
+                    item.content, now=item.created_at, context=context
+                )
                 out.extend(self._fact_to_item(ns, item, f) for f in facts)
         return out
+
+    @staticmethod
+    def _neighbor_context(window: Sequence[MemoryItem], i: int) -> str | None:
+        """The AD-335 reference-resolution context for ``window[i]``: its immediate neighbours'
+        content, both directions, joined with a space. ``None`` at either edge of the window with
+        no neighbour on that side, and ``None`` (not ``""``) when the window has no neighbours at
+        all — `LlmFactExtractor.extract` treats a falsy ``context`` as "skip resolution", so an
+        empty string and ``None`` are equivalent there, but ``None`` reads honestly here."""
+        parts = [window[j].content for j in (i - 1, i + 1) if 0 <= j < len(window)]
+        return " ".join(p for p in parts if p) or None
 
     @staticmethod
     def _promote_structured(item: MemoryItem, now: datetime) -> MemoryItem:
