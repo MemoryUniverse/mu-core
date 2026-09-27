@@ -71,6 +71,7 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from mu_contracts.ports.time import Clock
 from mu_engine.platform.clock import SystemClock
 from mu_engine.platform.decorators import retry_io
+from mu_engine.storage.adapters.entity_fuzzy import FuzzyCandidate, best_fuzzy_match
 from mu_engine.storage.authz import InternalEngineRead, require_shared_caller_identity_set
 from mu_engine.storage.domain.entity import EntityCandidate, EntityResolution
 from mu_engine.storage.domain.memory import MemoryItem, MemoryState
@@ -192,6 +193,12 @@ def _sanitize_rel_type(predicate: str) -> str:
 # a unit test) still gets a sane, named default rather than a silent unconfigured 0/None.
 _DEFAULT_SHORTLIST_SIZE = 5
 _DEFAULT_SIMILARITY_THRESHOLD = 0.84  # graph_falkor.py resolve_entity deterministic band
+# AD-331: bounded size of the fuzzy-candidate pool fetched from the graph when the cheap
+# exact/alias-key query (below) misses. NOT a second similarity threshold (the task brief is
+# explicit: reuse `similarity_threshold`, don't add one) — this is a perf/blast-radius bound on
+# how many `:Entity` nodes one `resolve_entity` call will pull back and score, same role as
+# `_MAX_ENUMERATE_PAGE` two lines below: a structural cap, not a tunable ranking knob.
+_DEFAULT_FUZZY_CANDIDATE_LIMIT = 200
 # Per-attempt I/O budget (DEV-STANDARDS async sharpener: "timeouts on every external call").
 _DEFAULT_STORE_IO_TIMEOUT_S = 10.0
 # Safety bound on the SUPERSEDED_BY provenance-chain walk (:meth:`FalkorLtmAdapter.
@@ -229,6 +236,7 @@ class FalkorLtmAdapter:
         similarity_threshold: float = _DEFAULT_SIMILARITY_THRESHOLD,
         store_io_timeout_s: float = _DEFAULT_STORE_IO_TIMEOUT_S,
         mtm_entity_sink: EntityUidsSink | None = None,
+        fuzzy_candidate_limit: int = _DEFAULT_FUZZY_CANDIDATE_LIMIT,
     ) -> None:
         """AD-110: ``db`` and ``db_factory`` are the EAGER and the LAZY way to supply the
         connection, and exactly one of them must be given.
@@ -271,6 +279,7 @@ class FalkorLtmAdapter:
         self._clock: Clock = clock or SystemClock()
         self._shortlist_size = shortlist_size
         self._similarity_threshold = similarity_threshold
+        self._fuzzy_candidate_limit = fuzzy_candidate_limit
         # a per-instance retry wrapper (not a class-level decorator) so `store_io_timeout_s`
         # is genuinely DI-threaded per instance, not fixed at import time.
         self._retry = retry_io(timeout_s=store_io_timeout_s)
@@ -665,6 +674,16 @@ class FalkorLtmAdapter:
             return ""
         resolution = await self._resolve_entity_impl(ns, name)
         if resolution.entity_uid is not None:
+            # AD-331 FIX: this used to return here with NO write at all, which is why
+            # `alias_keys` could only ever be set once, at node creation (below), and never grew
+            # afterwards — the bug the AD-331 task brief calls "provably dead code" on the
+            # ON-MATCH branch. A resolution reached via `resolve_entity`'s NEW fuzzy branch (a
+            # name whose casefold is NOT already in `alias_keys` — that is precisely why the
+            # cheap exact query missed it) needs this surface form recorded on the matched node,
+            # or every future call resolves it fuzzily again instead of deterministically. The
+            # write is idempotent (a `CASE WHEN ... IN ...` guard) so it is a harmless no-op on
+            # the far more common exact/alias-hit path.
+            await self._grow_entity_aliases(g, ns, resolution.entity_uid, name)
             return resolution.entity_uid
         canonical = resolution.canonical_name  # already .strip().casefold()'d
         uid = f"ent_{uuid4().hex}"
@@ -682,6 +701,28 @@ class FalkorLtmAdapter:
             g, cypher, {"ns": _user_scope_prefix(ns), "canon": canonical, "uid": uid, "raw": name}
         )
         return str(rows[0][0]) if rows else uid
+
+    async def _grow_entity_aliases(self, g: Any, ns: Namespace, entity_uid: str, name: str) -> None:
+        """AD-331: append ``name``'s casefolded key + raw form onto an ALREADY-RESOLVED entity's
+        ``alias_keys``/``aliases``, so a name that only matched via fuzzy similarity (or via an
+        existing ``alias_keys`` hit) this time matches DETERMINISTICALLY (exact ``alias_keys``
+        lookup, no scoring) next time. Idempotent (``CASE WHEN ... IN ... THEN unchanged``) —
+        correctness does not depend on the caller knowing whether this is genuinely new
+        information; a matched node the fuzzy branch never reached this write for its own name
+        every time is fine, it costs one no-op ``SET``.
+        """
+        canon = name.casefold()
+        cypher = (
+            "MATCH (e:Entity {namespace: $ns, entity_uid: $uid}) "
+            "SET e.alias_keys = CASE WHEN $canon IN e.alias_keys THEN e.alias_keys "
+            "ELSE e.alias_keys + $canon END, "
+            "e.aliases = CASE WHEN $raw IN e.aliases THEN e.aliases ELSE e.aliases + $raw END"
+        )
+        await g_query(
+            g,
+            cypher,
+            {"ns": _user_scope_prefix(ns), "uid": entity_uid, "canon": canon, "raw": name},
+        )
 
     async def _backfill_mtm_entity_uids(self, item: MemoryItem, entity_uids: list[str]) -> None:
         """D-5: push ``entity_uids`` onto the already-promoted MTM (Qdrant) point through the
@@ -1024,13 +1065,84 @@ class FalkorLtmAdapter:
             )
             for r in res
         )
-        if len(candidates) == 1 and candidates[0].similarity >= self._similarity_threshold:
+        if len(candidates) == 1:
+            # An exact `canonical_name`/`alias_keys` hit IS a real match by construction —
+            # `similarity=1.0` here is genuine, not a stand-in (AD-331: the fuzzy branch below is
+            # where a REAL, possibly-partial score first gets computed at all).
             return EntityResolution(
                 canonical_name=candidates[0].canonical_name,
                 entity_uid=candidates[0].entity_uid,
                 candidates=candidates,
             )
+        if len(candidates) > 1:
+            # Ambiguous exact hit (two aliases collided onto the same key) — unchanged pre-AD-331
+            # behaviour; orthogonal to fuzzy matching, which only ever runs when the exact query
+            # found NOTHING.
+            return EntityResolution(
+                canonical_name=canonical, entity_uid=None, candidates=candidates
+            )
+
+        # AD-331: the exact query found NOTHING — this branch used to return an empty, permanently
+        # unresolved shortlist unconditionally, which is why `entity_similarity_threshold` was
+        # decorative (nothing but exact-match candidates, always scored 1.0, ever reached it).
+        # Try a REAL fuzzy match (MinHash/LSH-bucketed Jaccard, entropy-gated) before giving up.
+        fuzzy_result = await self._fuzzy_resolve(ns, name, canonical)
+        if fuzzy_result is not None:
+            return fuzzy_result
         return EntityResolution(canonical_name=canonical, entity_uid=None, candidates=candidates)
+
+    async def _fuzzy_resolve(
+        self, ns: Namespace, name: str, canonical: str
+    ) -> EntityResolution | None:
+        """AD-331: the fuzzy half of ``_resolve_entity_impl``, reached only when the exact
+        ``canonical_name``/``alias_keys`` query returned zero candidates. Fetches a bounded pool of
+        this user's ``:Entity`` nodes and scores it with REAL similarity
+        (:func:`mu_engine.storage.adapters.entity_fuzzy.best_fuzzy_match`, ported from graphiti's
+        ``dedup_helpers.py`` — see that module's docstring for the full citation). Returns ``None``
+        when there is nothing worth returning (entropy gate failed, empty pool, or a zero score),
+        letting the caller fall back to its pre-AD-331 empty-shortlist behaviour.
+        """
+        pool_cypher = (
+            "MATCH (e:Entity) WHERE e.namespace = $ns "
+            "RETURN e.entity_uid AS uid, e.canonical_name AS cn, e.aliases AS al LIMIT $lim"
+        )
+        # Same USER-level scope as the exact query above (BUG2 FIX) — the fuzzy pool must be
+        # drawn from the identical scope the exact match already searched, or a fuzzy hit could
+        # resolve into another session's entity.
+        pool_rows = await g_query(
+            await self._graph(ns),
+            pool_cypher,
+            {"ns": _user_scope_prefix(ns), "lim": self._fuzzy_candidate_limit},
+        )
+        pool = tuple(
+            FuzzyCandidate(
+                entity_uid=str(r[0]), canonical_name=str(r[1]), aliases=tuple(r[2] or ())
+            )
+            for r in pool_rows
+        )
+        if not pool:
+            return None
+        match, score = best_fuzzy_match(name, pool)
+        if match is None or score <= 0.0:
+            return None
+        candidate = EntityCandidate(
+            entity_uid=match.entity_uid,
+            canonical_name=match.canonical_name,
+            aliases=match.aliases,
+            similarity=score,
+        )
+        if score >= self._similarity_threshold:
+            return EntityResolution(
+                canonical_name=match.canonical_name,
+                entity_uid=match.entity_uid,
+                candidates=(candidate,),
+            )
+        # Below threshold: a genuine ambiguous-middle result (AD-331 — this case literally could
+        # not occur before this module existed) — surfaced as a real-scored shortlist candidate
+        # for the caller's own tie-break, per `EntityResolution`'s own contract docstring
+        # ("ambiguous shortlist ... for the caller's narrowly-scoped tie-break"). `entity_uid`
+        # stays `None`: this is NOT a resolved match.
+        return EntityResolution(canonical_name=canonical, entity_uid=None, candidates=(candidate,))
 
     async def by_artifact(self, ns: Namespace, artifact_id: str) -> list[MemoryItem]:
         return await self._retry(self._by_artifact_impl)(ns, artifact_id)

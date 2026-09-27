@@ -190,7 +190,13 @@ class FalkorDBSettings(BaseModel):
     port: int = 6379
     graph_name: str = "mu"
     entity_shortlist_size: int = 5  # resolve_entity bounded candidate-set size
-    entity_similarity_threshold: float = 0.84  # deterministic-match band (graph_falkor.py)
+    entity_similarity_threshold: float = 0.84  # deterministic-match band (graph_falkor.py) AND
+    # (AD-331) the fuzzy Jaccard match/no-match cutoff — ONE threshold, reused, not a second
+    # tunable: the AD-331 task brief is explicit that `entity_fuzzy`'s LSH/MinHash scoring must
+    # honour this existing setting rather than adding its own.
+    entity_fuzzy_candidate_limit: int = 200  # AD-331: bounded pool size for the fuzzy fallback
+    # (mu_engine.storage.adapters.falkor_ltm.FalkorLtmAdapter._fuzzy_resolve) — a perf/blast-radius
+    # cap on `:Entity` nodes fetched+scored per miss, not a ranking knob.
     store_io_timeout_s: float = 10.0  # per-attempt retry_io budget for every openCypher call
 
     @property

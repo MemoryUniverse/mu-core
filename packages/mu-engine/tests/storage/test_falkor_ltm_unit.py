@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from mu_engine.storage.adapters.falkor_ltm import (
+    _DEFAULT_FUZZY_CANDIDATE_LIMIT,
     _DEFAULT_SHORTLIST_SIZE,
     _DEFAULT_SIMILARITY_THRESHOLD,
     _DEFAULT_STORE_IO_TIMEOUT_S,
@@ -113,15 +114,21 @@ def test_constructor_defaults_are_named_not_silent() -> None:
     adapter = FalkorLtmAdapter(MagicMock())
     assert adapter._shortlist_size == _DEFAULT_SHORTLIST_SIZE
     assert adapter._similarity_threshold == _DEFAULT_SIMILARITY_THRESHOLD
+    assert adapter._fuzzy_candidate_limit == _DEFAULT_FUZZY_CANDIDATE_LIMIT
     assert _DEFAULT_STORE_IO_TIMEOUT_S > 0
 
 
 def test_constructor_accepts_di_threaded_overrides() -> None:
     adapter = FalkorLtmAdapter(
-        MagicMock(), shortlist_size=9, similarity_threshold=0.5, store_io_timeout_s=1.0
+        MagicMock(),
+        shortlist_size=9,
+        similarity_threshold=0.5,
+        store_io_timeout_s=1.0,
+        fuzzy_candidate_limit=42,
     )
     assert adapter._shortlist_size == 9
     assert adapter._similarity_threshold == 0.5
+    assert adapter._fuzzy_candidate_limit == 42
 
 
 def test_registry_builds_falkordb_through_the_same_seam_as_other_roles(
@@ -164,3 +171,4 @@ def test_registry_build_defaults_come_from_settings_when_cfg_silent(
     graph_settings = get_settings().storage.graph
     assert adapter._shortlist_size == graph_settings.entity_shortlist_size
     assert adapter._similarity_threshold == graph_settings.entity_similarity_threshold
+    assert adapter._fuzzy_candidate_limit == graph_settings.entity_fuzzy_candidate_limit
