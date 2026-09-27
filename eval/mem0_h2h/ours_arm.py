@@ -22,12 +22,16 @@ at service construction, so THAT dimension does get its own ingest, one per arm.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import statistics
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -38,8 +42,92 @@ from dateutil import parser as _dateutil_parser
 from mu_eval.corpus import ingest_conversation, local_memory_for
 from mu_eval.locomo import Turn, load_locomo
 from mu_eval.runner import _await_index, gold_ids_present
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mem0_h2h import emit
+
+# ---------------------------------------------------------------------------------------------
+# AD-332: the LLM (SLM-backed) extraction arm. This harness has NEVER configured a model profile
+# (AD-325/AD-328/SCORECARD.md §6) — every published number used `HeuristicSpoExtractor` only.
+# Central-config home for the toggle (DEV-STANDARDS rule 3): no bare `os.environ.get` at the call
+# site, one settings object, mirrors `packages/mu-local/tests/test_local_llm_slm_int.py`'s own
+# `SlmTestSettings` exactly (same env shape, `H2H_SLM__` prefix instead of `MU_TEST_SLM__` so the
+# eval harness's env is its own namespace, not a silent alias of the integration test's).
+# ---------------------------------------------------------------------------------------------
+
+
+class H2hSlmSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="H2H_SLM__",
+        env_file=(".env", ".env.test"),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    base_url: str = "http://127.0.0.1:11435/v1"  # Ollama's OpenAI-compat shim (mu-dev-slm)
+    probe_url: str = "http://127.0.0.1:11435"
+    probe_timeout_s: float = 2.0
+    model: str = "qwen2.5:0.5b"
+    max_tokens: int = 256
+    temperature: float = 0.0
+
+
+def _slm_reachable(cfg: H2hSlmSettings) -> bool:
+    """A real env probe (HTTP GET, short timeout) — never a fabricated "it's up"."""
+    try:
+        with urllib.request.urlopen(cfg.probe_url, timeout=cfg.probe_timeout_s) as resp:  # noqa: S310
+            return bool(200 <= int(resp.status) < 300)
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+
+class LlmExtractProbe:
+    """Counts REAL `LlmFactExtractor.extract` calls + their token usage — ASSERTED, never inferred.
+
+    AD-328's own register row: "a rerank arm silently degraded to a broken fallback and the
+    numbers came back BETTER" — the standing lesson this probe exists to not repeat for
+    extraction. Wraps the bound method for the lifetime of the `async with` block only (restored
+    in `finally`, so a probe left running never leaks into an unrelated arm of the same process).
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+    @contextlib.asynccontextmanager
+    async def watch(self) -> AsyncIterator[LlmExtractProbe]:
+        from mu_engine.services.extract import LlmFactExtractor
+
+        original = LlmFactExtractor.extract
+        probe = self
+
+        async def _counted(self_: LlmFactExtractor, text: str, *, now: datetime) -> Any:
+            completion_holder: dict[str, Any] = {}
+            orig_provider_complete = self_._provider.complete
+
+            async def _counted_complete(*args: Any, **kwargs: Any) -> Any:
+                completion = await orig_provider_complete(*args, **kwargs)
+                completion_holder["completion"] = completion
+                return completion
+
+            self_._provider.complete = _counted_complete  # type: ignore[method-assign]
+            try:
+                result = await original(self_, text, now=now)
+            finally:
+                self_._provider.complete = orig_provider_complete  # type: ignore[method-assign]
+            probe.calls += 1
+            usage = completion_holder.get("completion")
+            if usage is not None:
+                probe.prompt_tokens += usage.usage.prompt_tokens
+                probe.completion_tokens += usage.usage.completion_tokens
+            return result
+
+        LlmFactExtractor.extract = _counted  # type: ignore[assignment]
+        try:
+            yield probe
+        finally:
+            LlmFactExtractor.extract = original  # type: ignore[method-assign]
 
 
 def _turn_occurred_at(turn: Turn) -> datetime | None:
@@ -118,8 +206,46 @@ async def sweep_one_arm(
     # opts in.
     use_occurred_at = os.environ.get("H2H_OCCURRED_AT", "0") == "1"
 
-    async with local_memory_for(conversation, run_id=run_id) as opaque:
+    # AD-332: point DISTILL's extractor at the real, $0 local SLM instead of the MVP-default
+    # `HeuristicSpoExtractor` — this harness has never configured a model profile at all
+    # (AD-325/AD-328/SCORECARD.md §6). Off by default (byte-identical to every prior run of this
+    # script); `H2H_LLM_EXTRACT=1` opts in. Only meaningful with `consolidate=True` — the
+    # extractor lives in DISTILL (`pipelines/distill.py`), never on the STM->MTM ingest path — so
+    # a misconfigured combination fails LOUD here rather than silently running heuristic anyway
+    # (the AD-328 lesson: assert, never infer).
+    use_llm_extract = os.environ.get("H2H_LLM_EXTRACT", "0") == "1"
+    if use_llm_extract and not consolidate:
+        raise SystemExit(
+            "H2H_LLM_EXTRACT=1 requires H2H_CONSOLIDATE=1 — LlmFactExtractor only runs in DISTILL "
+            "(MTM->LTM); the heuristic-only ingest path never calls it."
+        )
+    storage = None
+    slm_cfg: H2hSlmSettings | None = None
+    if use_llm_extract:
+        from mu_local.config import ModelProfileSettings, StorageSettings
+
+        slm_cfg = H2hSlmSettings()
+        if not _slm_reachable(slm_cfg):
+            raise SystemExit(
+                f"H2H_LLM_EXTRACT=1 but the local SLM at {slm_cfg.probe_url} is unreachable — "
+                "guard, not fake (bring it up: infra/mu-vm/vm_reup.sh / the SLM compose stack)."
+            )
+        storage = StorageSettings(
+            llm=ModelProfileSettings(
+                base_url=slm_cfg.base_url,
+                model=slm_cfg.model,
+                max_tokens=slm_cfg.max_tokens,
+                temperature=slm_cfg.temperature,
+            )
+        )
+
+    probe = LlmExtractProbe()
+    async with (
+        probe.watch(),
+        local_memory_for(conversation, run_id=run_id, storage=storage) as opaque,
+    ):
         memory: Any = opaque
+        ingest_started = time.perf_counter()
         index, report = await ingest_conversation(
             memory,
             conversation,
@@ -129,6 +255,21 @@ async def sweep_one_arm(
             consolidate=consolidate,
             occurred_at_of=_turn_occurred_at if use_occurred_at else None,
         )
+        ingest_wall_s = time.perf_counter() - ingest_started
+        if use_llm_extract and probe.calls == 0:
+            # Guard, not fake (AD-328's standing lesson): a configured profile that never actually
+            # invoked the LLM extractor must fail the run, not report a heuristic number under an
+            # LLM-arm label.
+            raise SystemExit(
+                "H2H_LLM_EXTRACT=1 but LlmFactExtractor.extract was called ZERO times — the "
+                "profile did not take. Refusing to report a heuristic result as an LLM arm."
+            )
+        if use_llm_extract:
+            emit(
+                f"  [{label}] llm_extract: calls={probe.calls} "
+                f"prompt_tokens={probe.prompt_tokens} completion_tokens={probe.completion_tokens} "
+                f"ingest_wall_s={ingest_wall_s:.1f}"
+            )
         if consolidate:
             emit(
                 f"  [{label}] consolidate: facts_extracted={report.facts_extracted} "
@@ -211,6 +352,14 @@ async def sweep_one_arm(
     return {
         "contexts": contexts,
         "label": label,
+        "llm_extract": {
+            "enabled": use_llm_extract,
+            "calls": probe.calls,
+            "prompt_tokens": probe.prompt_tokens,
+            "completion_tokens": probe.completion_tokens,
+            "ingest_wall_s": round(ingest_wall_s, 3),
+            "model": slm_cfg.model if slm_cfg is not None else None,
+        },
         "effective_config": {
             "rerank_enabled": cfg.rerank_enabled,
             "rerank_min_score": cfg.rerank_min_score,

@@ -76,18 +76,36 @@ class TurnIndex:
 
 @contextlib.asynccontextmanager
 async def local_memory_for(
-    conversation: Conversation, *, run_id: str, settings: object | None = None
+    conversation: Conversation,
+    *,
+    run_id: str,
+    settings: object | None = None,
+    storage: object | None = None,
 ) -> AsyncIterator[object]:
     """A ``LocalMemory`` bound to a partition unique to (run, conversation), torn down after.
 
     Imported lazily so ``mu_eval.locomo``/``mu_eval.metrics`` stay importable (and unit-testable)
     on a machine with no store stack — the same reason the engine's own unit tier does not import
     its adapters.
+
+    ``storage`` (AD-332, additive, default ``None``): the SAME ``mu_local.config.StorageSettings``
+    seam ``LocalMemory.__init__`` already takes as its first positional argument — threaded through
+    here so a caller can configure a real ``ModelProfileSettings`` (``storage.llm``) and exercise
+    `LlmFactExtractor` end to end, mirroring `packages/mu-local/tests/test_local_llm_slm_int.py`'s
+    `slm_mem` fixture. ``None`` (every pre-existing caller: `runner.py`, `answer_quality.py`,
+    `eval/mem0_h2h/ours_arm.py`'s own default arm) reproduces the exact prior behaviour —
+    `LocalMemory(workspace=..., namespace=..., settings=settings)` with the container's own
+    `StorageSettings()` default (heuristic-mode extraction, `storage.llm is None`).
     """
     from mu_local import LocalMemory
 
     tag = f"{run_id}{_slug(conversation.sample_id)}"
-    memory = LocalMemory(workspace=f"ws{tag}", namespace=f"org{tag}", settings=settings)
+    memory = LocalMemory(
+        storage,  # type: ignore[arg-type]
+        workspace=f"ws{tag}",
+        namespace=f"org{tag}",
+        settings=settings,
+    )
     try:
         yield memory
     finally:
